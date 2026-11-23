@@ -77,7 +77,8 @@ def split_graph_invocations(accounting, calls, *, serial=False):
     if 'error' in accounting:
         raise ValueError(f'Graph attribution failed: {accounting}')
     groups = accounting['intervals_us']
-    resolver = 'resolve_update_fetch' if 'resolve_update_fetch' in groups else 'resolve_update'
+    resolver = next((key for key in ('topk_resolve_update', 'resolve_update_fetch', 'resolve_update')
+                     if key in groups), 'resolve_update')
     if serial or 'init' in groups:
         starts = sorted(start for start, _ in groups['li' if serial else 'init'])
     else:
@@ -131,6 +132,11 @@ def split_graph_invocations(accounting, calls, *, serial=False):
                   graph_event_us=event, graph_calls=calls, measured_graphs=1,
                   percentile_source='profiler invocation spans from the same graph',
                   timing_protocol='one_profiled_graph',
+                  stage_samples_us={**{stage: [sample['stages_us'].get(stage, 0.) for sample in samples]
+                                       for stage in groups},
+                                    'within-call gaps': [s['inter_kernel_gap_us'] for s in samples],
+                                    'overlap': [s['overlap_us'] for s in samples],
+                                    'between calls + event edges (graph average)': [(event-sum(s['us'] for s in samples))/calls]},
                   stage_mean_us={stage: sum(sample['stages_us'].get(stage, 0.) for sample in samples)/calls
                                  for stage in groups},
                   inter_kernel_gap_mean_us=sum(sample['inter_kernel_gap_us'] for sample in samples)/calls,
