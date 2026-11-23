@@ -37,12 +37,14 @@ owner_tail=false
 early_handoff=false
 score_equivalence=false
 owner_topk=false
+joined_timing=false
+owner_topk_revision=888db6b1603d22f4142bd2ccffe0518611856a31
 serial_g10_reference=
 performance_reference=
 exact_handoff_rev=67b49a2748fde8f8779c4551410416596b35cf76
 score_candidate_rev=1040d7133028ff4cd36904bef0393783be884877
 arm_iterations=20
-unset KVIP_Q4_OWNER_TAIL KVIP_Q4_TAIL_REFERENCE KVIP_Q4_EARLY_HANDOFF KVIP_Q4_SCORE_EQUIVALENCE KVIP_Q4_OWNER_TOPK
+unset KVIP_Q4_OWNER_TAIL KVIP_Q4_TAIL_REFERENCE KVIP_Q4_EARLY_HANDOFF KVIP_Q4_SCORE_EQUIVALENCE KVIP_Q4_OWNER_TOPK KVIP_Q4_JOINED_TIMING KVIP_Q4_JOINED_ARCHIVE
 plan_candidate=
 packet_reference=
 plan_control=
@@ -53,6 +55,12 @@ resume=
 anchor=
 has_anchor=false
 four_field=5072f2c907f0fbd3bf1c1fbe499dd979c8c1dfca
+if [[ ${1:-} == --joined-tail-timing ]]; then
+    joined_timing=true
+    export KVIP_Q4_JOINED_TIMING=1
+    shift
+    set -- --owner-topk "$@"
+fi
 if [[ ${1:-} == --serial-g10-only ]]; then
     [[ $# == 2 && -d $2 ]] || { echo 'Usage: --serial-g10-only COMPLETED_G10_CANDIDATE_ROOT' >&2; exit 2; }
     serial_g10_reference=$(cd "$2" && pwd -P)
@@ -175,7 +183,9 @@ elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-pa
         if "$early_handoff"; then export KVIP_Q4_EARLY_HANDOFF=1; else export KVIP_Q4_OWNER_TAIL=1; fi
     fi
     offset_groups=(7 2 10 17 4)
-    if "$owner_topk"; then
+    if "$joined_timing"; then
+        offset_groups=(2 7)
+    elif "$owner_topk"; then
         offset_groups=(4 10 17 7 2)
     elif "$early_handoff"; then
         offset_groups=(10 4 17 7)
@@ -421,7 +431,8 @@ fi
 if [[ -n "$ranked" ]]; then
     if "$query_owner"; then
         if ! git -C "$root" cat-file -e "$ranked^{commit}" 2>/dev/null; then
-            if "$owner_tail"; then git -C "$root" fetch -q origin refs/heads/diag/urma-q4-cutoff-tail
+            if "$joined_timing"; then git -C "$root" fetch -q origin refs/heads/diag/urma-q4-joined-timing
+            elif "$owner_tail"; then git -C "$root" fetch -q origin refs/heads/diag/urma-q4-cutoff-tail
             elif "$owner_topk"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-owner-topk
             elif "$score_equivalence"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-native-score-ties
             elif "$early_handoff"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-early-index-handoff
@@ -558,7 +569,9 @@ if "$query_owner"; then
     if "$row_deps"; then
         allowed+=(':(exclude)csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_vector.h')
     fi
-    if "$owner_topk"; then
+    if "$joined_timing"; then
+        [[ $(git -C "$ranked_candidate" rev-parse HEAD^) == "$owner_topk_revision" ]] || { echo "Expected diagnostic at the production owner TopK revision" >&2; exit 1; }
+    elif "$owner_topk"; then
         git -C "$ranked_candidate" merge-base --is-ancestor "$score_candidate_rev" HEAD ||
             { echo 'Expected the owner TopK implementation based on Q1 handoff with free cutoff ties' >&2; exit 1; }
     elif "$score_equivalence"; then
@@ -589,7 +602,11 @@ if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA physical_NPU=%s logical_device=0 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$peer_physical_npu" "$ranked_sha" "$ranked" "$transport"
     if "$owner_topk"; then
         printf '%s\n' "$performance_reference" >"$out/free-ties-reference.txt"
-        echo "CONFIG measured=owner-topk reference=$performance_reference G2_native_oracle=cache_or_untimed_LI level=1 warmup=4 calls=20"
+        if "$joined_timing"; then
+            echo "CONFIG diagnostic=joined-tail-timing independent_states=20 passes=off_before,odd_on,even_on,off_after"
+        else
+            echo "CONFIG measured=owner-topk reference=$performance_reference G2_native_oracle=cache_or_untimed_LI level=1 warmup=4 calls=20"
+        fi
     elif "$score_equivalence"; then
         printf '%s\n' "$KVIP_Q4_TAIL_REFERENCE" >"$out/exact-handoff-reference.txt"
         echo "CONFIG measured=score-equivalence reference=$KVIP_Q4_TAIL_REFERENCE serial_sets=archive level=1 warmup=4 calls=20"
@@ -711,7 +728,8 @@ run_arm() (
         mode=(--fused-only --candidate-root "$src/auto-${candidate:0:8}" --candidate-snapshot "$snapshot")
     fi
     local display_label=$label
-    if "$owner_topk"; then display_label=owner-topk
+    if "$joined_timing"; then display_label=joined-tail-timing
+    elif "$owner_topk"; then display_label=owner-topk
     elif "$score_equivalence"; then display_label=score-equivalence
     elif "$early_handoff"; then display_label=early-index-handoff; fi
     printf 'CASE_BEGIN G%s %s\n' "$group" "$display_label"
@@ -871,7 +889,15 @@ if [[ -n "$ranked" ]]; then
         case_dir="$out/g$group"
         if "$query_owner"; then trace=${owner_traces[$group]}
         else trace=$(bash "$tools/peer_g2_input.sh" "$work" "$group"); fi
-        if "$owner_topk" && [[ $group == 2 ]]; then
+        if "$joined_timing"; then
+            if [[ $group == 2 ]]; then KVIP_Q4_JOINED_ARCHIVE="$area/fused.gbxKC9"
+            else KVIP_Q4_JOINED_ARCHIVE="$area/fused.N7n8ZP"; fi
+            [[ $(<"$KVIP_Q4_JOINED_ARCHIVE/logical-ties.txt") == "$owner_topk_revision" &&
+               $(<"$KVIP_Q4_JOINED_ARCHIVE/physical_npu.txt") == 4 ]] || { echo "Wrong G$group archived production candidate" >&2; exit 1; }
+            export KVIP_Q4_JOINED_ARCHIVE
+            previous_node=$("$PYTHON" -B "$tools/support/owner_pack_tail.py" numa "$KVIP_Q4_JOINED_ARCHIVE" "$group")
+            bind_cpu_service "${previous_node:-$node}"
+        elif "$owner_topk" && [[ $group == 2 ]]; then
             export KVIP_Q4_NATIVE_LI_CACHE="$area/native-li-reference-g2"
             bind_cpu_service "$node"
         elif "$owner_tail" || "$early_handoff"; then
@@ -886,7 +912,9 @@ if [[ -n "$ranked" ]]; then
         for label in "${order[@]}"; do
             run_arm "$label" "$group" "$case_dir"
         done
-        if "$owner_topk"; then
+        if "$joined_timing"; then
+            "$PYTHON" -B "$tools/support/joined_tail_timing.py" "$out" "$group" "$KVIP_Q4_JOINED_ARCHIVE" | tee -a "$out/summary.txt"
+        elif "$owner_topk"; then
             "$PYTHON" -B "$tools/support/owner_topk_report.py" "$out" "$group" "$performance_reference" | tee -a "$out/summary.txt"
         elif "$score_equivalence"; then
             "$PYTHON" -B "$tools/support/score_equivalence_report.py" --root "$out" --group "$group" --reference "$KVIP_Q4_TAIL_REFERENCE" | tee -a "$out/summary.txt"
@@ -911,7 +939,20 @@ if [[ -n "$ranked" ]]; then
         fi
         order=("${order[@]:1}" "${order[0]}")
     done
-    if "$owner_tail"; then
+    if "$joined_timing"; then
+        entries=(summary.txt candidate.txt logical-ties.txt physical_npu.txt)
+        for group in "${groups[@]}"; do
+            arm="g$group/logical-ties"
+            raw=("$out/$arm"/results/*/cases/diagnose/fused/joined_tail.json)
+            [[ ${#raw[@]} == 1 && -f ${raw[0]} ]] || { echo "Missing G$group joined tail capture" >&2; exit 1; }
+            relative=${raw[0]#"$out/"}
+            fused=${relative%/*}
+            entries+=("$relative" "$fused/path_result.json" "${fused%/*}/config.json"
+                      "${fused%/*}/replay_input.json" "$arm/thp.json")
+        done
+        tar -C "$out" -czf "$out/joined-tail.tar.gz" "${entries[@]}"
+        printf 'RETURN_FILE=%s/joined-tail.tar.gz\n' "$out"
+    elif "$owner_tail"; then
         entries=(summary.txt archive-tail.txt archive-calls.json owner-tail-reference.txt logical-ties.txt physical_npu.txt)
         for group in "${groups[@]}"; do entries+=("g$group/owner_tail.json"); done
         tar -C "$out" -czhf "$out/owner-tail.tar.gz" "${entries[@]}"

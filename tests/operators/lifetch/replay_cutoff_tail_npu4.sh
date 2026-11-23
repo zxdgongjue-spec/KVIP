@@ -11,6 +11,10 @@ case "$mode" in
     early-index-handoff)
         native=${4:?expected full candidate revision}
         groups=(10 4 17 7) ;;
+    joined-tail-timing)
+        native=${4:?expected full diagnostic revision}
+        [[ $# == 4 ]] || { echo 'joined-tail-timing runs G2 and G7' >&2; exit 2; }
+        groups=(2 7) ;;
     owner-topk)
         native=${4:?expected full candidate revision}
         groups=(4 10 17 7 2)
@@ -28,7 +32,7 @@ esac
 work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold}
 ref="$work/peer-baseline/fused.m3IizR"
 if [[ $mode == score-equivalence ]]; then ref="$work/peer-baseline/fused.0SOIpe"; fi
-if [[ $mode == owner-topk || $mode == fill-g10-g2 ]]; then ref="$work/peer-baseline/fused.fmn5ww"; fi
+if [[ $mode == owner-topk || $mode == fill-g10-g2 || $mode == joined-tail-timing ]]; then ref="$work/peer-baseline/fused.fmn5ww"; fi
 runner="$work/fused-scan-sources/reader-$reader"
 git -C "$repo" cat-file -e "$native^{commit}"
 git -C "$repo" cat-file -e "$reader^{commit}"
@@ -71,8 +75,12 @@ prepare_rc=0
 prepare_reader >"$log" 2>&1 || prepare_rc=$?
 cat "$log"
 if (( prepare_rc )); then exit "$prepare_rc"; fi
-if [[ $mode == score-equivalence || $mode == owner-topk || $mode == fill-g10-g2 ]]; then
+if [[ $mode == score-equivalence || $mode == owner-topk || $mode == fill-g10-g2 || $mode == joined-tail-timing ]]; then
     run_selected() {
+        if [[ $mode == joined-tail-timing ]]; then
+            local area="$work/peer-baseline"
+            "$area/python-da318bdb/bin/python" -B "$runner/tests/operators/lifetch/support/joined_tail_archive.py" "$area" || return $?
+        fi
         if [[ $mode == fill-g10-g2 ]]; then
             local current="$work/peer-baseline/fused.N7n8ZP"
             local serial_rc=0
@@ -88,7 +96,7 @@ if [[ $mode == score-equivalence || $mode == owner-topk || $mode == fill-g10-g2 
     rc=0
     run_selected 2>&1 |
         tee -a "$log" | while IFS= read -r line; do
-            case "$line" in RESULT_ROOT=*|CASE_BEGIN\ *|G[0-9]*\ *|REPLAY_COMPLETE*) printf '%s\n' "$line" ;; esac
+            case "$line" in RESULT_ROOT=*|RETURN_FILE=*|ARCHIVE\ G*|CASE_BEGIN\ *|G[0-9]*\ *|REPLAY_COMPLETE*) printf '%s\n' "$line" ;; esac
         done || rc=$?
     if (( rc != 0 )); then tail -n 30 "$log" >&2; fi
     exit "$rc"
