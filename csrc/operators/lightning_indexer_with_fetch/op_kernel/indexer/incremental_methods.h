@@ -95,7 +95,12 @@ __aicore__ inline void ExportWindowCold(uint32_t query) {
 #if KVIP_PARALLEL_TERMINAL
         topkSharedTmpLocal_[128],covered,runtimeShape_.history,valid,terminal?2048U:rank,limit,rankTrace_?rankClocks:nullptr,terminal?0U:limit/2,windowCoveredEmpty_);
 #else
-        topkSharedTmpLocal_[128],covered,runtimeShape_.history,valid,rank,ctx->windowLimit/4,rankTrace_?rankClocks:nullptr,(ctx->windowLimit/4)/2,windowCoveredEmpty_);
+        topkSharedTmpLocal_[128],covered,
+#if KVIP_DUAL_WINDOW_RANK
+        valid?valid:runtimeShape_.history,valid,rank,ctx->windowLimit/4,rankTrace_?rankClocks:nullptr,(ctx->windowLimit/4)/2,windowCoveredEmpty_,windowRankCut_);
+#else
+        runtimeShape_.history,valid,rank,ctx->windowLimit/4,rankTrace_?rankClocks:nullptr,(ctx->windowLimit/4)/2,windowCoveredEmpty_);
+#endif
 #endif
     if(rankTrace_) {
         uint64_t delta[3]={rankClocks[1]-rankClocks[0],rankClocks[4]-rankClocks[1],1};
@@ -162,6 +167,60 @@ __aicore__ inline void SeedIncremental(uint32_t query,uint32_t row) {
     meta[2]=0;
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
 }
+#if KVIP_DUAL_WINDOW_RANK
+// The staged window winners and the prefetch cutoff are two ranks of the
+// same input. The terminal uses the ordinary dense prefix and cursor.
+uint32_t windowRank_ = 0, windowRankCut_ = UINT32_MAX;
+uint16_t windowFloor_ = 0;
+__aicore__ inline bool MergeWindowRanks(uint32_t added, uint32_t base) {
+    if (!windowRank_ || added > 1024 || topkOp_.GetSharedTmpBufferSize() < 30000)
+        return false;
+    auto scratch = topkSharedTmpLocal_;
+    auto hist = scratch[7152].template ReinterpretCast<uint16_t>();
+    auto cuts = scratch[7232].template ReinterpretCast<uint16_t>();
+    auto slots = scratch[3072];
+    PipeBarrier<PIPE_V>();
+    DataCopy(mrgValueLocal_, scoreOutLocal_, 2048);
+    uint32_t floor = windowFloor_;
+    if (!floor) {
+        lifetch_incremental::Minimum(reinterpret_cast<__ubuf__ uint16_t *>(scoreOutLocal_.GetPhyAddr()),
+                                     reinterpret_cast<__ubuf__ uint32_t *>(scratch.GetPhyAddr()));
+        SetFlag<HardEvent::V_S>(EVENT_ID5);
+        WaitFlag<HardEvent::V_S>(EVENT_ID5);
+        floor = scratch.template ReinterpretCast<uint16_t>().GetValue(0);
+    }
+    auto keys = reinterpret_cast<__ubuf__ uint16_t *>(mrgValueLocal_.GetPhyAddr());
+    auto cdf = reinterpret_cast<__ubuf__ uint16_t *>(hist.GetPhyAddr());
+    uint32_t count = 2048 + added;
+    PipeBarrier<PIPE_V>();
+    kvip_window_ranks::AddScores(keys, cdf, floor, count, true);
+    PipeBarrier<PIPE_V>();
+    kvip_window_ranks::ReadCuts(cdf, reinterpret_cast<__ubuf__ uint16_t *>(cuts.GetPhyAddr()), floor, count,
+                                windowRank_);
+    SetFlag<HardEvent::V_S>(EVENT_ID5);
+    WaitFlag<HardEvent::V_S>(EVENT_ID5);
+    uint32_t cut = cuts.GetValue(0), rankCut = cuts.GetValue(128);
+    if (cut < floor || rankCut < floor || cut - floor >= 64 || rankCut - floor >= 64)
+        return false;
+    DataCopy(scratch, indicesOutLocal_, 2048);
+    lifetch_incremental::BuildAddedMap(reinterpret_cast<__ubuf__ uint16_t *>(incrementalNew_.GetPhyAddr()),
+                                       reinterpret_cast<__ubuf__ uint32_t *>(scratch[2048].GetPhyAddr()), added,
+                                       base);
+    auto positions = reinterpret_cast<__ubuf__ uint32_t *>(slots.GetPhyAddr());
+    kvip_window_ranks::ScoreSlots<false>(keys, count, cut, positions);
+    PipeBarrier<PIPE_V>();
+    kvip_window_ranks::GatherPairs<false>(
+        positions, reinterpret_cast<__ubuf__ uint32_t *>(scratch.GetPhyAddr()), keys, 2048,
+        reinterpret_cast<__ubuf__ uint32_t *>(indicesOutLocal_.GetPhyAddr()),
+        reinterpret_cast<__ubuf__ uint32_t *>(scoreOutLocal_.GetPhyAddr()));
+    SetFlag<HardEvent::V_S>(EVENT_ID5);
+    WaitFlag<HardEvent::V_S>(EVENT_ID5);
+    scratch.SetValue(0, cut);
+    windowRankCut_ = rankCut;
+    mappedExport_ = true;
+    return true;
+}
+#endif
 __aicore__ inline void FlushIncremental(uint32_t count,uint32_t base,bool clearCandidates=true) {
     if(incrementalIdsPending_){WaitFlag<HardEvent::MTE2_V>(EVENT_ID7);incrementalIdsPending_=false;}
     mappedExport_=false;
@@ -170,6 +229,9 @@ __aicore__ inline void FlushIncremental(uint32_t count,uint32_t base,bool clearC
     if(incrementalOutputPending_) {
         WaitFlag<HardEvent::MTE3_V>(EVENT_ID6);incrementalOutputPending_=false;
     }
+#if KVIP_DUAL_WINDOW_RANK
+    if (MergeWindowRanks(count,base)) return;
+#endif
     PipeBarrier<PIPE_V>();
     DataCopy(mrgValueLocal_,scoreOutLocal_,2048);
     DataCopy(incrementalOld_,indicesOutLocal_,2048);
@@ -257,6 +319,9 @@ __aicore__ inline void PreloadIncremental(uint32_t half) {
     incrementalInputPending_=true;
 }
 __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t end1,uint32_t half) {
+#if KVIP_DUAL_WINDOW_RANK
+    windowRank_=0; windowRankCut_=UINT32_MAX;
+#endif
     constexpr uint32_t prefixBytes=4*2048*6+1024;
     auto meta=IncrementalMeta(query);
     if(!incrementalMetadataActive_)kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
@@ -457,6 +522,15 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
     // this Q performs TopK, ID mapping, threshold reduction and writeback.
 
     PreloadIncremental(half);
+#if KVIP_DUAL_WINDOW_RANK
+    if (packed && packed<=1024 && exportWindowCold_ && rankedEpoch_<runtimeShape_.rounds) {
+        const auto recent=kvip_recent_index::RecentRange(ctx,query/4,mappedValid_);
+        uint32_t initial=kvip_coverage::Covered(0,0,runtimeShape_.resident,mappedValid_,0,recent.begin,recent.end);
+        uint32_t covered=kvip_coverage::Covered(prior[0],prior[1],runtimeShape_.resident,mappedValid_,half,recent.begin,recent.end);
+        windowRank_=kvip_coverage::Rank(covered,initial,mappedValid_,ctx->prefetchRankStart?uint32_t(ctx->prefetchRankStart):1024);
+        windowFloor_=cutoff;
+    }
+#endif
     FlushIncremental(packed,packBase,false);
     PipeBarrier<PIPE_V>();
     // A nonzero cutoff already describes the unchanged TopK when this

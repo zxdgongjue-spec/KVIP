@@ -32,6 +32,9 @@
 #include "recent_seed.h"
 #include "incremental_vector_helpers.h"
 #include "window_fast_vector.h"
+#if KVIP_DUAL_WINDOW_RANK
+#include "window_rank_pair.h"
+#endif
 #endif
 
 namespace QLIKernel {
