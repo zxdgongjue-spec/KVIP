@@ -1,0 +1,692 @@
+diff --git a/csrc/operators/common/lifetch/p1_overlap_schedule.h b/csrc/operators/common/lifetch/p1_overlap_schedule.h
+new file mode 100644
+index 00000000..82038eab
+--- /dev/null
++++ b/csrc/operators/common/lifetch/p1_overlap_schedule.h
+@@ -0,0 +1,65 @@
++#pragma once
++#include <cstring>
++#include <type_traits>
++#include "score_window_plan.h"
++
++namespace kvip_score_t2 {
++// P1 uses one MIX block per request. Each score block uses two AIV lanes
++// in the current kernel's execution layout. Paired TopK can use fewer
++// than 2B lanes, with each lane looping over its remaining query pairs.
++inline uint32_t P1ServiceBlocks(uint32_t batch, uint32_t availableAivs) {
++    if (!batch || batch > 16) return 0;
++    const uint32_t scoreAivs = 2 * batch;
++    if (availableAivs <= scoreAivs) return 0;
++    const uint32_t spare = availableAivs - scoreAivs;
++    return spare < scoreAivs ? spare : scoreAivs;
++}
++
++// Prevalidate every launch and event before either stream is mutated.
++// When streams alias, use the same kernels with serialized dependencies.
++template<class Backend>
++uint32_t SubmitP1Overlap(const rotating::RuntimeShape& shape, uint32_t availableAivs,
++    void* scoreStream, void* serviceStream, void* const* ready, uint32_t readyCount,
++    void* serviceDone, Backend& backend) {
++    constexpr uint32_t invalid = 100000;
++    const uint32_t blocks = P1ServiceBlocks(shape.batch,availableAivs);
++    const bool overlap = scoreStream != serviceStream;
++    // RuntimeShape has a fixed all-integer ABI. Recompute derived fields
++    // before enqueueing instead of trusting inconsistent lane geometry.
++    static_assert(std::has_unique_object_representations<rotating::RuntimeShape>::value);
++    auto prepared = shape;
++    if (!scoreStream || !serviceStream || !blocks ||
++        rotating::PrepareShape(&prepared) != 0 || std::memcmp(&prepared,&shape,sizeof(shape)) != 0 ||
++        !rotating::UseSequenceSplit(shape) ||
++        shape.serviceLanes > availableAivs-2*shape.batch ||
++        (overlap && (!ready || readyCount < shape.rounds || !serviceDone))) return invalid;
++    uint32_t covered = 0;
++    for (uint32_t epoch=0; epoch<shape.rounds; ++epoch) {
++        auto wave = PlanWindow(shape,epoch,1);
++        if (wave.begin != covered || wave.parts != 1 ||
++            !ValidWindow(shape.batch,wave.begin,wave.end,1,shape.aicCount) ||
++            (overlap && (!ready[epoch] || ready[epoch]==serviceDone))) return invalid;
++        covered = wave.end;
++        if (overlap) for (uint32_t earlier=0; earlier<epoch; ++earlier) {
++            if (ready[epoch]==ready[earlier]) return invalid;
++        }
++    }
++    if (covered != shape.history) return invalid;
++    for (uint32_t epoch=0; epoch<shape.rounds; ++epoch) {
++        auto wave = PlanWindow(shape,epoch,1);
++        uint32_t result = backend.Score(scoreStream,wave,epoch);
++        if (!result && epoch==0) result = backend.Resident(scoreStream);
++        if (!result && overlap) result = backend.Record(scoreStream,ready[epoch]);
++        if (!result && overlap) result = backend.Wait(serviceStream,ready[epoch]);
++        if (!result) result = backend.TopK(serviceStream,blocks,wave,epoch);
++        if (!result) result = backend.Post(serviceStream,wave,epoch);
++        if (result) return result;
++    }
++    if (overlap) {
++        uint32_t result = backend.Record(serviceStream,serviceDone);
++        if (!result) result = backend.Wait(scoreStream,serviceDone);
++        if (result) return result;
++    }
++    return backend.Finish(scoreStream);
++}
++}
+diff --git a/csrc/operators/lightning_indexer_with_fetch/include/api.h b/csrc/operators/lightning_indexer_with_fetch/include/api.h
+index 7e175d4d..f49f8683 100644
+--- a/csrc/operators/lightning_indexer_with_fetch/include/api.h
++++ b/csrc/operators/lightning_indexer_with_fetch/include/api.h
+@@ -11,6 +11,12 @@ uint32_t kvip_lifetch_score_t2_forward(void* bindings, void* update, void* works
+ // MR14 direct score/predicate shards + MR23 window admission/Fetch/commit.
+ uint32_t kvip_lifetch_score_window_forward(void* bindings, void* update, void* workspace, void* stream,
+                                     const rotating::RuntimeShape* shape, uint32_t workers, uint32_t parts);
++// Experimental P1 overlap. The caller owns two streams and one distinct,
++// reusable event per epoch, plus serviceDone. Final and Resolve finish on
++// scoreStream. On error, drain both streams before releasing any storage.
++uint32_t kvip_lifetch_score_p1_overlap_forward(void* bindings, void* update, void* workspace,
++    void* scoreStream, void* serviceStream, void* const* scoreReady, uint32_t readyCount,
++    void* serviceDone, const rotating::RuntimeShape* shape, uint32_t workers, uint32_t availableAivs);
+ 
+ uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape);
+ uint32_t v9_init(void* bindings, void* stream,const rotating::RuntimeShape* shape);
+diff --git a/csrc/operators/lightning_indexer_with_fetch/op_host/launch.cpp b/csrc/operators/lightning_indexer_with_fetch/op_host/launch.cpp
+index 42cb1576..9a23d9dc 100644
+--- a/csrc/operators/lightning_indexer_with_fetch/op_host/launch.cpp
++++ b/csrc/operators/lightning_indexer_with_fetch/op_host/launch.cpp
+@@ -3,6 +3,8 @@
+ #include "context.h"
+ #include "../../common/lifetch/score_partition.h"
+ #include "../../common/lifetch/score_window_plan.h"
++#include "../../common/lifetch/p1_overlap_schedule.h"
++#include <acl/acl.h>
+ extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
+ extern "C" uint32_t aclrtlaunch_v9_init_kernel(uint32_t,void*,void*,uint32_t,void*,
+     uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
+@@ -135,6 +137,7 @@ extern "C" uint32_t aclrtlaunch_v9_li_kernel_score_window_t2(uint32_t,void*,void
+ extern "C" uint32_t aclrtlaunch_v9_li_window_service(uint32_t,void*,void*,uint32_t,uint32_t,uint32_t);
+ extern "C" uint32_t aclrtlaunch_v9_li_window_topk(uint32_t,void*,void*,uint32_t,uint32_t,uint32_t);
+ extern "C" uint32_t aclrtlaunch_v9_li_window_post(uint32_t,void*,void*,uint32_t,uint32_t,uint32_t);
++extern "C" uint32_t aclrtlaunch_v9_li_window_topk_paired(uint32_t,void*,void*,uint32_t,uint32_t,uint32_t);
+ template<bool QueryParallel> static uint32_t LaunchScoreWindow(void* bindings,void* update,void* workspace,void* stream,
+     const rotating::RuntimeShape* shape,uint32_t workers,uint32_t parts) {
+     if (!bindings || !update || !workspace || !stream || !shape || shape->finalWorkers!=4 ||
+@@ -174,6 +177,44 @@ extern "C" uint32_t kvip_lifetch_score_query_forward(void* bindings,void* update
+     return LaunchScoreWindow<true>(bindings,update,workspace,stream,shape,workers,parts);
+ }
+ 
++namespace {
++struct P1Backend {
++    void* bindings;
++    void* workspace;
++    const rotating::RuntimeShape& shape;
++    uint32_t resolveBlocks;
++    uint32_t Score(void* stream,const kvip_score_t2::Window& wave,uint32_t epoch) {
++        return aclrtlaunch_v9_li_kernel_score_window_t2(shape.batch,stream,bindings,1,wave.begin,wave.end,epoch!=0);
++    }
++    uint32_t Resident(void* stream) { return aclrtlaunch_v9_li_kernel_1(shape.liCores,stream,bindings); }
++    uint32_t Record(void* stream,void* event) { return aclrtRecordEvent(event,stream); }
++    uint32_t Wait(void* stream,void* event) { return aclrtStreamWaitEvent(stream,event); }
++    uint32_t TopK(void* stream,uint32_t blocks,const kvip_score_t2::Window& wave,uint32_t epoch) {
++        return aclrtlaunch_v9_li_window_topk_paired(blocks,stream,bindings,epoch,wave.end0,wave.end1);
++    }
++    uint32_t Post(void* stream,const kvip_score_t2::Window& wave,uint32_t epoch) {
++        return aclrtlaunch_v9_li_window_post(shape.serviceLanes,stream,bindings,epoch,wave.end0,wave.end1);
++    }
++    uint32_t Finish(void* stream) {
++        uint32_t result=aclrtlaunch_v9_li_kernel_3(shape.liCores,stream,bindings);
++        if (!result) result=aclrtlaunch_v9_streaming_resolve_update(resolveBlocks,stream,workspace);
++        return result;
++    }
++};
++}
++extern "C" uint32_t kvip_lifetch_score_p1_overlap_forward(void* bindings,void* update,void* workspace,
++    void* scoreStream,void* serviceStream,void* const* scoreReady,uint32_t readyCount,
++    void* serviceDone,const rotating::RuntimeShape* shape,uint32_t workers,uint32_t availableAivs) {
++    if (!bindings || !update || !workspace || !shape || shape->finalWorkers!=4 ||
++        shape->resident>131072 || !rotating::UseSequenceSplit(*shape) || shape->liCores!=2*shape->batch ||
++        !shape->serviceLanes || (workers!=1 && workers!=2 && workers!=4)) return 100000;
++    auto resolveBlocks=shape->batch*pipeline_ab::kResolveCores+4*workers;
++    if (resolveBlocks>availableAivs || shape->liCores*2>availableAivs) return 100000;
++    P1Backend backend{bindings,workspace,*shape,resolveBlocks};
++    return kvip_score_t2::SubmitP1Overlap(*shape,availableAivs,scoreStream,serviceStream,
++        scoreReady,readyCount,serviceDone,backend);
++}
++
+ extern "C" uint32_t kvip_transport_snapshot(void* source, void* destination, uint32_t bytes, void* stream) {
+     if (!source || !destination || !stream || !bytes || bytes % 32 ||
+         reinterpret_cast<uintptr_t>(source) % 32 || bytes > 64U * 1024U * 1024U) return 100000;
+diff --git a/csrc/operators/lightning_indexer_with_fetch/op_kernel/score_window_service.cpp b/csrc/operators/lightning_indexer_with_fetch/op_kernel/score_window_service.cpp
+index 3d4f0604..fb486ad9 100644
+--- a/csrc/operators/lightning_indexer_with_fetch/op_kernel/score_window_service.cpp
++++ b/csrc/operators/lightning_indexer_with_fetch/op_kernel/score_window_service.cpp
+@@ -16,13 +16,17 @@ template<uint32_t Mode> __aicore__ inline void WindowService(
+         auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
+         auto ctx=reinterpret_cast<__gm__ rotating::Context*>(a[14]);
+         auto s=rotating::LoadRuntimeShape(ctx);
++        constexpr bool queryOwner=Mode==1 || Mode==4;
++        constexpr uint32_t queriesPerOwner=Mode==4?2:1;
+         const uint32_t group=GetBlockIdx()/2, sub=GetBlockIdx()%2;
+-        const uint32_t core=rotating::ServiceCore(s.batch,s.splitQ,s.serviceAics,epoch,group);
+-        const uint32_t lane=rotating::ServiceLane(s.batch,s.splitQ,s.serviceAics,core,sub);
+-        // Same-stream producer completion joins all P shards and all four Q.
+-        // Only the lane consuming a request publishes its two MR23 cursors.
++        const uint32_t core=queryOwner?0:rotating::ServiceCore(s.batch,s.splitQ,s.serviceAics,epoch,group);
++        const uint32_t lane=queryOwner?0:rotating::ServiceLane(s.batch,s.splitQ,s.serviceAics,core,sub);
++        const uint32_t firstQuery=GetBlockIdx()*queriesPerOwner;
++        // The stream dependency has joined all Score shards for this epoch.
++        // Each owner publishes cursors only for its own queries.
+         if constexpr (Mode==1) {
+-            auto ready=reinterpret_cast<__gm__ uint32_t*>(ctx->progress)+GetBlockIdx()*32;
++            if(firstQuery>=4*s.batch)return;
++            auto ready=reinterpret_cast<__gm__ uint32_t*>(ctx->progress)+firstQuery*32;
+             ready[0]=end0;ready[16]=end1;
+             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ready),128);
+         } else if constexpr (Mode==0 || Mode==3) {
+@@ -40,7 +44,7 @@ template<uint32_t Mode> __aicore__ inline void WindowService(
+         c.sparseCount=2048;c.kCacheBlockSize=128;c.maxBlockNumPerBatch=s.history/128;
+         c.headDim=128;c.mBaseSize=4*s.indexHeads;
+         QLITilingData tiling{};
+-        op.InitParams(c,&tiling,false);op.SetServiceBlock(Mode==1?GetBlockIdx():core*2+sub);
++        op.InitParams(c,&tiling,false);op.SetServiceBlock(queryOwner?GetBlockIdx():core*2+sub);
+         op.SetPrefixStorage(reinterpret_cast<GM_ADDR>(a[13]));
+         op.SetRotationContext(reinterpret_cast<GM_ADDR>(a[14]));
+         op.SetStreamingWorkspace(reinterpret_cast<GM_ADDR>(a[15]));
+@@ -51,14 +55,25 @@ template<uint32_t Mode> __aicore__ inline void WindowService(
+         // bank credits on those same IDs, causing duplicate SetFlag signals.
+ #if defined(KVIP_WINDOW_TOPK_PROBE) && KVIP_WINDOW_TOPK_PROBE
+         auto clocks=reinterpret_cast<__gm__ uint64_t*>(a[11])+GetBlockIdx()*16;
+-        if constexpr(Mode==1 || Mode==3)clocks[0]=GetSystemCycle();
++        if constexpr(queryOwner || Mode==3)clocks[0]=GetSystemCycle();
+ #endif
+-        if constexpr (Mode==1)op.AdvanceQueryWindow(GetBlockIdx(),epoch,rotating::SequenceHalfWindow(s));
+-        else if constexpr (Mode==2)op.PostWindow(epoch,rotating::SequenceHalfWindow(s));
+-        else if constexpr (Mode==3)op.AdvanceWindow(epoch,rotating::SequenceHalfWindow(s));
+-        else op.RotateFetch(epoch,rotating::SequenceHalfWindow(s));
++        const uint32_t half=rotating::SequenceHalfWindow(s);
++        if constexpr (Mode==4) {
++            for(uint32_t pair=GetBlockIdx();pair<2*s.batch;pair+=GetBlockNum()) {
++                for(uint32_t q=0;q<2;++q) {
++                    const uint32_t query=2*pair+q;
++                    auto ready=reinterpret_cast<__gm__ uint32_t*>(ctx->progress)+query*32;
++                    ready[0]=end0;ready[16]=end1;
++                    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ready),128);
++                    op.AdvanceQueryWindow(query,epoch,half);
++                }
++            }
++        } else if constexpr (Mode==1)op.AdvanceQueryWindow(firstQuery,epoch,half);
++        else if constexpr (Mode==2)op.PostWindow(epoch,half);
++        else if constexpr (Mode==3)op.AdvanceWindow(epoch,half);
++        else op.RotateFetch(epoch,half);
+ #if defined(KVIP_WINDOW_TOPK_PROBE) && KVIP_WINDOW_TOPK_PROBE
+-        if constexpr(Mode==1 || Mode==3){clocks[1]=GetSystemCycle();kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(clocks),16);}
++        if constexpr(queryOwner || Mode==3){clocks[1]=GetSystemCycle();kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(clocks),16);}
+ #endif
+         pipe.Destroy();
+     }
+@@ -131,6 +146,13 @@ extern "C" __global__ __aicore__ void v9_li_window_post(
+     WindowService<2>(bindings,epoch,end0,end1);
+ #endif
+ }
++extern "C" __global__ __aicore__ void v9_li_window_topk_paired(
++    GM_ADDR bindings,uint32_t epoch,uint32_t end0,uint32_t end1) {
++#if defined(__CCE_AICORE__)
++    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
++    WindowService<4>(bindings,epoch,end0,end1);
++#endif
++}
+ #if defined(KVIP_WINDOW_TOPK_PROBE) && KVIP_WINDOW_TOPK_PROBE
+ // Contract/Model control: the real original AdvanceWindow, without URMA posting.
+ extern "C" __global__ __aicore__ void v9_li_window_topk_serial_probe(
+diff --git a/experiments/lifetch_score_t2/p1_overlap_model/CMakeLists.txt b/experiments/lifetch_score_t2/p1_overlap_model/CMakeLists.txt
+new file mode 100644
+index 00000000..1fac87bd
+--- /dev/null
++++ b/experiments/lifetch_score_t2/p1_overlap_model/CMakeLists.txt
+@@ -0,0 +1,25 @@
++cmake_minimum_required(VERSION 3.16)
++project(lifetch_p1_overlap_probe LANGUAGES C CXX)
++set(CMAKE_BUILD_TYPE Release)
++set(RUN_MODE sim CACHE STRING "sim or npu")
++set(SOC_VERSION Ascend950PR_9599 CACHE STRING "SoC")
++set(ASCEND_CANN_PACKAGE_PATH /usr/local/Ascend/cann CACHE PATH "CANN")
++set(KVAF_INCLUDE "" CACHE PATH "Patched KVAF device headers")
++include(${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
++get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
++set(OP "${REPO_ROOT}/csrc/operators/lightning_indexer_with_fetch")
++ascendc_library(p1_overlap_kernel STATIC ${OP}/op_kernel/score_window_service.cpp ${OP}/op_kernel/indexer.cpp)
++ascendc_include_directories(p1_overlap_kernel PRIVATE ${OP}/include ${OP}/op_kernel ${OP}/op_kernel/indexer
++  ${KVAF_INCLUDE} ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
++ascendc_compile_options(p1_overlap_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WORKER=1 -DKVIP_FUSE_QUERY_WORK=1
++  -O2 -g --cce-auto-sync=off -mllvm -user-reserved-ub-size=223232 -DV9_USER_UB_BYTES=223232
++  -DV9_PARTIAL_SCAN_SIMD=1 -DV9_PROBE_EPOCH=0 -DV9_INTERMEDIATE_PROFILING=0 -DV9_BATCH_POST=2
++  -DSIM_Q=4 -DSIM_CAPTURE_HITS=1 -DV9_SIMULATION=0 -DROTATION_PUBLISH_TILES=1)
++add_executable(p1_overlap_smoke ../p1_overlap_smoke.cpp)
++target_include_directories(p1_overlap_smoke PRIVATE ${OP}/include ${KVAF_INCLUDE})
++target_link_libraries(p1_overlap_smoke PRIVATE p1_overlap_kernel host_intf_pub ascendcl)
++target_link_options(p1_overlap_smoke PRIVATE -Wl,--allow-shlib-undefined)
++if(RUN_MODE STREQUAL "sim")
++  target_compile_definitions(p1_overlap_smoke PRIVATE KVIP_CANN_MODEL=1)
++  target_link_libraries(p1_overlap_smoke PRIVATE "-Wl,-rpath-link,${ASCEND_CANN_PACKAGE_PATH}/tools/simulator/${SOC_VERSION}/lib")
++endif()
+diff --git a/experiments/lifetch_score_t2/p1_overlap_schedule_test.cpp b/experiments/lifetch_score_t2/p1_overlap_schedule_test.cpp
+new file mode 100644
+index 00000000..3479f0ee
+--- /dev/null
++++ b/experiments/lifetch_score_t2/p1_overlap_schedule_test.cpp
+@@ -0,0 +1,132 @@
++// CPU-only sequence and error propagation checks for the native P1 submitter.
++#include "../../csrc/operators/lightning_indexer_with_fetch/include/runtime_shape.h"
++namespace rotating {
++#include "../../csrc/operators/common/lifetch/sequence_schedule.h"
++}
++#include "../../csrc/operators/common/lifetch/p1_overlap_schedule.h"
++#include <cassert>
++#include <cstdint>
++#include <iostream>
++#include <string>
++#include <vector>
++
++namespace {
++struct Call {
++    std::string stage;
++    void* stream;
++    uint32_t epoch;
++    uint32_t blocks;
++    void* event;
++};
++
++struct LogBackend {
++    std::vector<Call> calls;
++    bool failFirstPost=false;
++
++    uint32_t Score(void* stream,const kvip_score_t2::Window& wave,uint32_t epoch) {
++        assert(wave.parts==1);
++        assert(wave.begin<wave.end && wave.end0<=wave.end1 && wave.end1==wave.end);
++        calls.push_back({"Score",stream,epoch,0,nullptr});return 0;
++    }
++    uint32_t Resident(void* stream) { calls.push_back({"Resident",stream,0,0,nullptr});return 0; }
++    uint32_t Record(void* stream,void* event) { calls.push_back({"Record",stream,0,0,event});return 0; }
++    uint32_t Wait(void* stream,void* event) { calls.push_back({"Wait",stream,0,0,event});return 0; }
++    uint32_t TopK(void* stream,uint32_t blocks,const kvip_score_t2::Window&,uint32_t epoch) {
++        calls.push_back({"TopK",stream,epoch,blocks,nullptr});return 0;
++    }
++    uint32_t Post(void* stream,const kvip_score_t2::Window&,uint32_t epoch) {
++        calls.push_back({"Post",stream,epoch,0,nullptr});return failFirstPost && epoch==0?17:0;
++    }
++    uint32_t Finish(void* stream) { calls.push_back({"Finish",stream,0,0,nullptr});return 0; }
++};
++
++void CheckCall(const Call& call,const std::string& stage,void* stream,uint32_t epoch=0,
++    uint32_t blocks=0,void* event=nullptr) {
++    assert(call.stage==stage && call.stream==stream && call.epoch==epoch && call.blocks==blocks && call.event==event);
++}
++}
++
++int main() {
++    rotating::RuntimeShape shape{};
++    shape.batch=16;shape.history=131072;shape.resident=16384;shape.indexHeads=32;
++    shape.aicCount=32;shape.splitQ=1;shape.rounds=4;shape.tokenBytes=656;
++    assert(rotating::PrepareShape(&shape)==0 && rotating::UseSequenceSplit(shape));
++    const uint32_t windowEnds[]={16384,54784,93184,131072};
++    for (uint32_t epoch=0; epoch<shape.rounds; ++epoch) {
++        const auto wave=kvip_score_t2::PlanWindow(shape,epoch,1);
++        assert(wave.begin==(epoch?windowEnds[epoch-1]:0) && wave.end==windowEnds[epoch]);
++    }
++    int scoreToken,serviceToken,epochTokens[4],doneToken;
++    void* score=&scoreToken;
++    void* service=&serviceToken;
++    void* done=&doneToken;
++    void* ready[]={&epochTokens[0],&epochTokens[1],&epochTokens[2],&epochTokens[3]};
++
++    for (uint32_t aivs:{56U,64U}) {
++        const uint32_t topkBlocks=aivs-32;
++        assert(kvip_score_t2::P1ServiceBlocks(16,aivs)==topkBlocks);
++        std::vector<uint32_t> ownership(64,0);
++        for (uint32_t lane=0;lane<topkBlocks;++lane)
++            for (uint32_t pair=lane;pair<2*shape.batch;pair+=topkBlocks) {
++                ++ownership[2*pair];++ownership[2*pair+1];
++            }
++        for (auto owners:ownership) assert(owners==1);
++
++        LogBackend log;
++        assert(kvip_score_t2::SubmitP1Overlap(shape,aivs,score,service,ready,4,done,log)==0);
++        uint32_t cursor=0;
++        for (uint32_t epoch=0;epoch<shape.rounds;++epoch) {
++            CheckCall(log.calls[cursor++],"Score",score,epoch);
++            if (epoch==0) CheckCall(log.calls[cursor++],"Resident",score);
++            CheckCall(log.calls[cursor++],"Record",score,0,0,ready[epoch]);
++            CheckCall(log.calls[cursor++],"Wait",service,0,0,ready[epoch]);
++            CheckCall(log.calls[cursor++],"TopK",service,epoch,topkBlocks);
++            CheckCall(log.calls[cursor++],"Post",service,epoch);
++        }
++        CheckCall(log.calls[cursor++],"Record",service,0,0,done);
++        CheckCall(log.calls[cursor++],"Wait",score,0,0,done);
++        CheckCall(log.calls[cursor++],"Finish",score);
++        assert(log.calls.size()==cursor);
++    }
++
++    LogBackend serial;
++    assert(kvip_score_t2::SubmitP1Overlap(shape,64,score,score,nullptr,0,nullptr,serial)==0);
++    uint32_t cursor=0;
++    for (uint32_t epoch=0;epoch<shape.rounds;++epoch) {
++        CheckCall(serial.calls[cursor++],"Score",score,epoch);
++        if (epoch==0) CheckCall(serial.calls[cursor++],"Resident",score);
++        CheckCall(serial.calls[cursor++],"TopK",score,epoch,32);
++        CheckCall(serial.calls[cursor++],"Post",score,epoch);
++    }
++    CheckCall(serial.calls[cursor++],"Finish",score);
++    assert(serial.calls.size()==cursor);
++
++    LogBackend invalid;
++    assert(kvip_score_t2::SubmitP1Overlap(shape,47,score,service,ready,4,done,invalid)==100000);
++    assert(kvip_score_t2::SubmitP1Overlap(shape,64,score,service,ready,3,done,invalid)==100000);
++    assert(kvip_score_t2::SubmitP1Overlap(shape,64,score,service,ready,4,ready[3],invalid)==100000);
++    auto invalidGeometry=shape;
++    invalidGeometry.serviceLanes=0;
++    assert(kvip_score_t2::SubmitP1Overlap(invalidGeometry,64,score,service,ready,4,done,invalid)==100000);
++    invalidGeometry=shape;
++    invalidGeometry.serviceAics=0;
++    assert(kvip_score_t2::SubmitP1Overlap(invalidGeometry,64,score,service,ready,4,done,invalid)==100000);
++    invalidGeometry=shape;
++    invalidGeometry.postThreads=0;
++    assert(kvip_score_t2::SubmitP1Overlap(invalidGeometry,64,score,service,ready,4,done,invalid)==100000);
++    invalidGeometry=shape;
++    invalidGeometry.resident=shape.history;
++    assert(kvip_score_t2::SubmitP1Overlap(invalidGeometry,64,score,service,ready,4,done,invalid)==100000);
++    invalidGeometry=shape;
++    invalidGeometry.aicCount=31;
++    assert(kvip_score_t2::SubmitP1Overlap(invalidGeometry,64,score,service,ready,4,done,invalid)==100000);
++    ready[3]=ready[2];
++    assert(kvip_score_t2::SubmitP1Overlap(shape,64,score,service,ready,4,done,invalid)==100000);
++    assert(invalid.calls.empty());
++
++    LogBackend partial;
++    partial.failFirstPost=true;
++    assert(kvip_score_t2::SubmitP1Overlap(shape,64,score,score,nullptr,0,nullptr,partial)==17);
++    assert(partial.calls.size()==4 && partial.calls.back().stage=="Post");
++    std::cout<<"P1_SCHEDULER_PASS B16 Q4 H131072 W4 front_AIV56/64\n";
++}
+diff --git a/experiments/lifetch_score_t2/p1_overlap_smoke.cpp b/experiments/lifetch_score_t2/p1_overlap_smoke.cpp
+new file mode 100644
+index 00000000..c62f0db4
+--- /dev/null
++++ b/experiments/lifetch_score_t2/p1_overlap_smoke.cpp
+@@ -0,0 +1,281 @@
++// Real numerical Score/Threshold/TopK/Post/Final on serial or independent ACL streams.
++// This fixture has no URMA or Resolve. Both routes execute the same kernels.
++#include <acl/acl.h>
++#include "context.h"
++#include "../../csrc/operators/common/lifetch/p1_overlap_schedule.h"
++#include <algorithm>
++#include <cstdlib>
++#include <cstring>
++#include <iostream>
++#include <numeric>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++extern "C" uint32_t aclrtlaunch_v9_li_kernel_score_window_t2(uint32_t,void*,void*,uint32_t,uint32_t,uint32_t,uint32_t);
++extern "C" uint32_t aclrtlaunch_v9_li_kernel_1(uint32_t,void*,void*);
++extern "C" uint32_t aclrtlaunch_v9_li_kernel_3(uint32_t,void*,void*);
++extern "C" uint32_t aclrtlaunch_v9_li_window_topk(uint32_t,void*,void*,uint32_t,uint32_t,uint32_t);
++extern "C" uint32_t aclrtlaunch_v9_li_window_topk_paired(uint32_t,void*,void*,uint32_t,uint32_t,uint32_t);
++extern "C" uint32_t aclrtlaunch_v9_li_window_post(uint32_t,void*,void*,uint32_t,uint32_t,uint32_t);
++
++namespace {
++constexpr uint32_t heads=32, top=2048, resident=2048, rounds=3, guard=128;
++constexpr uint32_t prefixBytes=4*top*6+1024;
++
++void Check(uint32_t code) {
++    if(code) throw std::runtime_error("ACL/launch error "+std::to_string(code));
++}
++
++struct Runtime {
++    uint32_t device;
++    bool initialized=false, deviceSet=false;
++    aclrtStream score=nullptr,service=nullptr;
++    std::vector<void*> events;
++    std::vector<void*> memory;
++
++    explicit Runtime(uint32_t id):device(id) {}
++    void Open(bool dual) {
++        Check(aclInit(nullptr)); initialized=true;
++        Check(aclrtSetDevice(device)); deviceSet=true;
++        Check(aclrtCreateStream(&score));
++        if (dual) Check(aclrtCreateStream(&service)); else service=score;
++    }
++    void CreateEvents(uint32_t count) {
++        events.resize(count,nullptr);
++        for (auto& event:events) Check(aclrtCreateEvent(&event));
++    }
++    template<class T> uint64_t Put(const std::vector<T>& values) {
++        void* buffer=nullptr;
++        const size_t bytes=values.size()*sizeof(T);
++        Check(aclrtMalloc(&buffer,bytes,ACL_MEM_MALLOC_HUGE_FIRST)); memory.push_back(buffer);
++        Check(aclrtMemcpy(buffer,bytes,values.data(),bytes,ACL_MEMCPY_HOST_TO_DEVICE));
++        return reinterpret_cast<uint64_t>(buffer);
++    }
++    template<class T> std::vector<T> Get(uint64_t address,size_t count) {
++        std::vector<T> values(count);
++        const size_t bytes=count*sizeof(T);
++        Check(aclrtMemcpy(values.data(),bytes,reinterpret_cast<void*>(address),bytes,ACL_MEMCPY_DEVICE_TO_HOST));
++        return values;
++    }
++    void Close(bool check) {
++        auto Verify=[check](uint32_t status) { if(check) Check(status); };
++        // If synchronization fails, a stream may still reference these
++        // allocations. Leave the remaining cleanup to process teardown.
++        if (score) {
++            const auto status=aclrtSynchronizeStream(score);
++            if (status) { Verify(status); return; }
++        }
++        if (service && service!=score) {
++            const auto status=aclrtSynchronizeStream(service);
++            if (status) { Verify(status); return; }
++        }
++        for (auto& buffer:memory) if(buffer) { auto status=aclrtFree(buffer); buffer=nullptr; Verify(status); }
++        for (auto& event:events) if(event) { auto status=aclrtDestroyEvent(event); event=nullptr; Verify(status); }
++        if (service && service!=score) { auto status=aclrtDestroyStream(service); service=nullptr; Verify(status); }
++        if (score) { auto status=aclrtDestroyStream(score); score=service=nullptr; Verify(status); }
++        if (deviceSet) { auto status=aclrtResetDevice(device); deviceSet=false; Verify(status); }
++        if (initialized) { auto status=aclFinalize(); initialized=false; Verify(status); }
++    }
++    ~Runtime() { Close(false); }
++};
++
++struct Backend {
++    void* bindings;
++    const rotating::RuntimeShape& shape;
++    uint32_t Score(void* stream,const kvip_score_t2::Window& wave,uint32_t epoch) {
++        return aclrtlaunch_v9_li_kernel_score_window_t2(shape.batch*wave.parts,stream,bindings,
++            wave.parts,wave.begin,wave.end,epoch!=0);
++    }
++    uint32_t Resident(void* stream) { return aclrtlaunch_v9_li_kernel_1(shape.liCores,stream,bindings); }
++    uint32_t Record(void* stream,void* event) { return aclrtRecordEvent(event,stream); }
++    uint32_t Wait(void* stream,void* event) { return aclrtStreamWaitEvent(stream,event); }
++    uint32_t TopK(void* stream,uint32_t blocks,const kvip_score_t2::Window& wave,uint32_t epoch) {
++        return aclrtlaunch_v9_li_window_topk_paired(blocks,stream,bindings,epoch,wave.end0,wave.end1);
++    }
++    uint32_t QueryTopK(void* stream,const kvip_score_t2::Window& wave,uint32_t epoch) {
++        return aclrtlaunch_v9_li_window_topk(shape.batch*4,stream,bindings,epoch,wave.end0,wave.end1);
++    }
++    uint32_t Post(void* stream,const kvip_score_t2::Window& wave,uint32_t epoch) {
++        return aclrtlaunch_v9_li_window_post(shape.serviceLanes,stream,bindings,epoch,wave.end0,wave.end1);
++    }
++    uint32_t Finish(void* stream) { return aclrtlaunch_v9_li_kernel_3(shape.liCores,stream,bindings); }
++};
++
++uint32_t SubmitQueryP2(Backend& backend,void* stream) {
++    const auto& shape=backend.shape;
++    for (uint32_t epoch=0; epoch<shape.rounds; ++epoch) {
++        const auto wave=kvip_score_t2::PlanWindow(shape,epoch,2);
++        if (!kvip_score_t2::ValidWindow(shape.batch,wave.begin,wave.end,wave.parts,shape.aicCount))
++            return 100000;
++    }
++    for (uint32_t epoch=0; epoch<shape.rounds; ++epoch) {
++        const auto wave=kvip_score_t2::PlanWindow(shape,epoch,2);
++        auto result=backend.Score(stream,wave,epoch);
++        if (!result && epoch==0) result=backend.Resident(stream);
++        if (!result) result=backend.QueryTopK(stream,wave,epoch);
++        if (!result) result=backend.Post(stream,wave,epoch);
++        if (result) return result;
++    }
++    return backend.Finish(stream);
++}
++
++uint32_t ScoreRank(uint32_t history,uint32_t batch,uint32_t token) {
++    return (token*37U+batch*151U)%history;
++}
++
++// Each query uses a different FP8 key component. A different quarter of the
++// ranks is masked for each query, so swapping two queries' TopK rows fails.
++bool ActiveKey(uint32_t rank,uint32_t query) {
++    return ((rank/128U)%4U)!=query;
++}
++
++// The dot is exactly 0 or 1 per head. The scale permutation keeps the
++// positive scores distinct and the TopK cutoff unambiguous.
++uint32_t ScoreBits(uint32_t history,uint32_t batch,uint32_t q,uint32_t token) {
++    if (token>=history-4) return 0;
++    const uint32_t rank=ScoreRank(history,batch,token);
++    return ActiveKey(rank,q)?0x3f80U+rank+128U*q:0;
++}
++
++uint64_t Run(uint32_t device,uint32_t batch,const std::string& route,uint32_t availableAivs,
++    uint32_t history,uint32_t availableAics) {
++    const bool dual=route=="dual", queryP2=route=="query-p2";
++    if (queryP2 && 4*batch>availableAivs) throw std::runtime_error("query-p2 needs 4B AIVs");
++    Runtime runtime(device);runtime.Open(dual);
++    if (dual) runtime.CreateEvents(rounds+1);
++
++    rotating::Context ctx{};
++    auto& shape=ctx.shape;
++    shape.batch=batch;shape.history=history;shape.resident=resident;shape.indexHeads=heads;
++    shape.aicCount=availableAics;shape.splitQ=1;shape.rounds=rounds;shape.tokenBytes=656;
++    Check(rotating::PrepareShape(&shape));
++    if (shape.rounds!=rounds || !rotating::UseSequenceSplit(shape)) throw std::runtime_error("invalid fixture geometry");
++    ctx.windowLimit=128;
++    ctx.prefetchLimit=0;
++
++    std::vector<uint8_t> key(batch*history*128+guard,0);
++    std::vector<float> kScale(batch*history,1);
++    for (uint32_t b=0;b<batch;++b) for (uint32_t t=0;t<history-4;++t) {
++        const uint32_t token=b*history+t;
++        const uint32_t rank=ScoreRank(history,b,t);
++        for (uint32_t q=0;q<4;++q) {
++            if (ActiveKey(rank,q)) key[token*128+q]=0x38;
++        }
++        const uint32_t bits=(0x3f80U+rank-5*128U)<<16;
++        std::memcpy(&kScale[token],&bits,sizeof(bits));
++    }
++    std::vector<uint8_t> query(batch*4*heads*128,0);
++    std::vector<uint16_t> weights(batch*4*heads);
++    for (uint32_t q=0;q<batch*4;++q) {
++        for (uint32_t head=0;head<heads;++head) query[(q*heads+head)*128+q%4]=0x38;
++        std::fill_n(weights.begin()+q*heads,heads,0x3f80+(q%4)*128);
++    }
++    std::vector<int32_t> pages(batch*history/128);
++    std::iota(pages.begin(),pages.end(),0);
++    const size_t keys=batch*4*history;
++    const size_t incrementalBytes=batch*(512+prefixBytes+(history+255)/256*32);
++    std::vector<uint8_t> incremental(incrementalBytes+guard,0);
++    std::fill(incremental.end()-guard,incremental.end(),0x5a);
++    std::vector<uint16_t> scores(keys+guard,0x5a5a);
++    std::vector<uint8_t> prefix(batch*prefixBytes+keys/4+guard,0x5a);
++    std::vector<uint64_t> args(16);
++    args[0]=runtime.Put(query);
++    args[1]=runtime.Put(key);args[2]=runtime.Put(weights);
++    args[3]=runtime.Put(std::vector<float>(batch*4*heads,1));args[4]=runtime.Put(kScale);
++    args[5]=runtime.Put(std::vector<uint32_t>(batch,4));args[6]=runtime.Put(std::vector<uint32_t>(batch,history));
++    args[7]=runtime.Put(pages);args[9]=runtime.Put(std::vector<int32_t>(batch*4*top+guard,-1));
++    args[12]=runtime.Put(scores);args[13]=runtime.Put(prefix);
++    ctx.hits=args[13]+batch*prefixBytes;
++    ctx.progress=runtime.Put(std::vector<uint32_t>(batch*128));
++    ctx.rows=runtime.Put(std::vector<rotating::Row>(batch));
++    ctx.mapping=runtime.Put(std::vector<uint32_t>(batch*history,UINT32_MAX));
++    ctx.locations=runtime.Put(std::vector<uint32_t>(batch*8192+guard,UINT32_MAX));
++    ctx.events=runtime.Put(std::vector<rotating::Event>(shape.rounds*shape.serviceLanes));
++    ctx.incremental=runtime.Put(incremental);
++    args[14]=runtime.Put(std::vector<rotating::Context>{ctx});
++    Backend backend{reinterpret_cast<void*>(runtime.Put(args)),shape};
++
++    std::cout<<"P1_OVERLAP_BEGIN B"<<batch<<" Q4 H"<<history<<" R"<<resident<<" W"<<rounds
++             <<" route="<<route<<" score_aivs="<<(queryP2?4:2)*batch
++             <<" topk_aivs="<<(queryP2?4*batch:kvip_score_t2::P1ServiceBlocks(batch,availableAivs))
++             <<" post_aivs="<<shape.serviceLanes<<std::endl;
++    if (queryP2) Check(SubmitQueryP2(backend,runtime.score));
++    else Check(kvip_score_t2::SubmitP1Overlap(shape,availableAivs,runtime.score,runtime.service,
++        runtime.events.data(),dual?rounds:0,dual?runtime.events.back():nullptr,backend));
++    Check(aclrtSynchronizeStream(runtime.score));
++
++    const auto events=runtime.Get<rotating::Event>(ctx.events,shape.rounds*shape.serviceLanes);
++    for (uint32_t epoch=0;epoch<rounds;++epoch) for (uint32_t lane=0;lane<shape.serviceLanes;++lane) {
++        const auto& event=events[epoch*shape.serviceLanes+lane];
++        if (!event.complete || event.epoch!=epoch || event.postedCount)
++            throw std::runtime_error("Post completion or budget mismatch for epoch "+std::to_string(epoch));
++    }
++    const auto rows=runtime.Get<rotating::Row>(ctx.rows,batch);
++    for (const auto& row:rows) {
++        if (row.sequence!=rounds || row.requests || row.error || row.pending)
++            throw std::runtime_error("invalid Post request state");
++        for (uint32_t epoch=0;epoch<rounds;++epoch) if (row.epochOrder[epoch]!=epoch+1)
++            throw std::runtime_error("non-exclusive or out-of-order Post owner");
++    }
++    const auto result=runtime.Get<uint16_t>(args[12],scores.size());
++    const auto indices=runtime.Get<int32_t>(args[9],batch*4*top+guard);
++    uint64_t hash=1469598103934665603ULL;
++    for (uint32_t q=0;q<batch*4;++q) {
++        std::vector<uint32_t> oracle(history);
++        std::iota(oracle.begin(),oracle.end(),0);
++        for (uint32_t token=0;token<history;++token) {
++            const auto expected=uint16_t(0x8000U^ScoreBits(history,q/4,q%4,token));
++            const auto actual=result[q*history+token];
++            if (actual!=expected) throw std::runtime_error("Score mismatch: Q="+std::to_string(q)+
++                " token="+std::to_string(token)+" expected="+std::to_string(expected)+" actual="+std::to_string(actual));
++        }
++        std::partial_sort(oracle.begin(),oracle.begin()+top,oracle.end(),[history,q](uint32_t a,uint32_t b) {
++            return ScoreBits(history,q/4,q%4,a)>ScoreBits(history,q/4,q%4,b);
++        });
++        // Histogram TopK emits matching IDs in traversal order. The scores
++        // are unique at the cutoff here, so exact membership is unambiguous.
++        std::vector<uint8_t> expectedIds(history,0);
++        for (uint32_t i=0;i<top;++i) expectedIds[oracle[i]]=1;
++        for (uint32_t i=0;i<top;++i) {
++            const auto id=indices[q*top+i];
++            if (id<0 || uint32_t(id)>=history || !expectedIds[id]) throw std::runtime_error("Final TopK membership mismatch: Q="+
++                std::to_string(q)+" output_slot="+std::to_string(i)+" invalid, duplicate, or non-TopK id="+std::to_string(id));
++            expectedIds[id]=0;
++            hash=(hash^oracle[i])*1099511628211ULL;
++        }
++    }
++    if (!std::all_of(result.begin()+keys,result.end(),[](uint16_t v){return v==0x5a5a;}) ||
++        !std::all_of(indices.end()-guard,indices.end(),[](int32_t v){return v==-1;}))
++        throw std::runtime_error("output guard overwritten");
++    const auto state=runtime.Get<uint8_t>(ctx.incremental,incremental.size());
++    if (!std::equal(state.end()-guard,state.end(),incremental.end()-guard))
++        throw std::runtime_error("incremental guard overwritten");
++    runtime.Close(true);
++    return hash;
++}
++}
++
++int main(int argc,char** argv) {
++    try {
++        if (argc<5 || argc>7) throw std::runtime_error(
++            "p1_overlap_smoke DEVICE BATCH serial|dual|query-p2 AVAILABLE_AIVS [HISTORY [AVAILABLE_AICS]]");
++        const uint32_t device=std::stoul(argv[1]),batch=std::stoul(argv[2]),aivs=std::stoul(argv[4]);
++        const std::string route=argv[3];
++        const uint32_t history=argc>5?std::stoul(argv[5]):8192,aics=argc>6?std::stoul(argv[6]):32;
++        if (batch<2 || batch>16 || aivs<4*batch || aivs>64 || 2*batch>aics || aics>32 ||
++            (history!=4096 && history!=8192) || (route!="serial" && route!="dual" && route!="query-p2"))
++            throw std::runtime_error("invalid B, H, AIC/AIV budget or route");
++        const uint64_t hash=Run(device,batch,route,aivs,history,aics);
++        std::cout<<"P1_OVERLAP_PASS B"<<batch<<" route="<<route<<" output_hash="<<hash
++                 <<" scope=numerical_score_threshold_ranked_export_post_no_urma_final"<<std::endl;
++#if defined(KVIP_CANN_MODEL) && KVIP_CANN_MODEL
++        // Match the accepted query probe's workaround for CANN 9.1's duplicate teardown.
++        std::_Exit(0);
++#endif
++        return 0;
++    } catch (const std::exception& error) {
++        std::cerr<<error.what()<<std::endl;
++        return 1;
++    }
++}

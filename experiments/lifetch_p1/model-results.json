@@ -1,0 +1,213 @@
+{
+  "model": "CANN 9.1 Ascend950PR_9599",
+  "unit": "scheduler_model_ticks",
+  "transport": "synchronous_local_gm_copy",
+  "history_scope": "archived_legacy_implementation",
+  "queries_per_request": 4,
+  "miss_percent": 5,
+  "prefetch_budget_per_request": 512,
+  "prefetch_budget_per_window": 128,
+  "bs2_prefix_pair": {
+    "batch": 2,
+    "history": 4096,
+    "resident": 2048,
+    "aic": 4,
+    "aiv": 8,
+    "windows": 3,
+    "score_words_checked_per_arm": 24576,
+    "first_window_prefetch_tokens_per_arm": 74,
+    "arms": {
+      "serial": {
+        "closed_kernel_intervals": {
+          "Init": [
+            479,
+            7686
+          ],
+          "Score0": [
+            7877,
+            15739
+          ],
+          "Threshold": [
+            15741,
+            24247
+          ],
+          "TopK0": [
+            24249,
+            34063
+          ],
+          "Post0": [
+            34065,
+            72520
+          ],
+          "Score1": [
+            72522,
+            78064
+          ],
+          "TopK1": [
+            78066,
+            92231
+          ]
+        },
+        "comparable_prefix_ticks": 70187,
+        "exit_code": 124,
+        "binary_sha256": "6e988431be3e614802849a2470496936e59520b40643b2ca0ec8c9d346d8f282",
+        "raw_model_log_sha256": "b59d68c4e6ffbf4097c958141bfcd224a7a5f92904d27e24c2f56edacbb19cf3"
+      },
+      "dual": {
+        "closed_kernel_intervals": {
+          "Init": [
+            496,
+            7848
+          ],
+          "Score0": [
+            8051,
+            15995
+          ],
+          "Threshold": [
+            15997,
+            24325
+          ],
+          "Score1": [
+            24473,
+            29830
+          ],
+          "TopK0": [
+            24580,
+            34579
+          ],
+          "Post0": [
+            34581,
+            74381
+          ]
+        },
+        "comparable_prefix_ticks": 66330,
+        "exit_code": -15,
+        "binary_sha256": "6e988431be3e614802849a2470496936e59520b40643b2ca0ec8c9d346d8f282",
+        "raw_model_log_sha256": "09e00e362fef7719317f636ba2eb0ae4aa9f4fab19f92aa9f2117dfd067617f3"
+      }
+    }
+  },
+  "bs16_short_prefix": {
+    "batch": 16,
+    "history": 3584,
+    "resident": 2048,
+    "aic": 32,
+    "aiv": 64,
+    "windows": 4,
+    "closed_kernel_intervals": {
+      "Init": [
+        1072,
+        14899
+      ],
+      "Score0": [
+        15091,
+        26331
+      ],
+      "Threshold": [
+        26333,
+        41887
+      ],
+      "Score1": [
+        42035,
+        49734
+      ],
+      "TopK0": [
+        42130,
+        55028
+      ]
+    },
+    "score_words_checked": 163840,
+    "open_stages_at_timeout": {
+      "Post0": 55030
+    },
+    "score1_topk0_overlap_ticks": 7604,
+    "exit_code": 124,
+    "raw_model_log_sha256": "685bbb46c125625f841a41ceee0c7803dbb2067b0e794fb63e00401b17054e67"
+  },
+  "bs16_full_history": {
+    "batch": 16,
+    "history": 131072,
+    "resident": 16384,
+    "aic": 32,
+    "aiv": 64,
+    "windows": 4,
+    "closed_kernel_intervals": {
+      "Init": [
+        6960,
+        21733
+      ],
+      "Score0": [
+        21940,
+        58717
+      ],
+      "Threshold": [
+        58719,
+        77148
+      ],
+      "Score1": [
+        77295,
+        157019
+      ],
+      "TopK0": [
+        77437,
+        89714
+      ],
+      "Post0": [
+        89716,
+        157673
+      ],
+      "Score2": [
+        157167,
+        235925
+      ],
+      "TopK1": [
+        157695,
+        179905
+      ],
+      "Post1": [
+        179907,
+        239273
+      ],
+      "Score3": [
+        236071,
+        313600
+      ],
+      "TopK2": [
+        239295,
+        260186
+      ],
+      "Post2": [
+        260188,
+        319074
+      ],
+      "TopK3": [
+        319096,
+        339591
+      ],
+      "Post3": [
+        339593,
+        397974
+      ],
+      "Final+classify": [
+        398275,
+        420085
+      ]
+    },
+    "score_overlap_ticks": {
+      "TopK": 55378,
+      "Post": 180441
+    },
+    "early_tokens_per_window": [
+      1184,
+      1024,
+      1024,
+      1024
+    ],
+    "early_tokens_in_final_selection": 4256,
+    "open_stages_at_timeout": {
+      "ResolveGetOutputIndex": 420087
+    },
+    "exit_code": 124,
+    "raw_model_log_sha256": "ffe5249b95626b61e56c51f54429a91c6ae8e1e980b882d8fd2fc54f42c720a7"
+  }
+}
