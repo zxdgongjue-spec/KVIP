@@ -40,6 +40,86 @@ __simd_vf__ inline void PackUncovered(__ubuf__ uint32_t* ids,__ubuf__ uint16_t* 
     StoreUnAlignPost(packed,store);ReduceSum(total,sum,all);
     auto first=CreateMask<uint32_t,MaskPattern::VL1>();StoreAlign(count,total,first);
 }
+// Compress both the score and its index in the original Top2048 into one
+// word. Original IDs can be tagged or wider than 16 bits and stay untouched.
+template<bool Empty>
+__simd_vf__ inline void PackWindowEntries(__ubuf__ uint32_t* ids, __ubuf__ uint16_t* scores,
+    __ubuf__ uint32_t* covered, __ubuf__ uint32_t* entries, __ubuf__ uint32_t* count, uint32_t valid) {
+    using namespace MicroAPI;
+    auto all = CreateMask<uint32_t, MaskPattern::ALL>();
+    auto first = CreateMask<uint32_t, MaskPattern::VL1>();
+    RegTensor<uint32_t> id, safe, zero, index, bits, shift, ordinal, entry, packed, ones, sum, total, low5, low1;
+    RegTensor<int32_t> lane;
+    RegTensor<uint16_t> score;
+    MaskReg take, missing;
+    UnalignRegForStore store;
+    Duplicate(zero, uint32_t(0));
+    Duplicate(sum, uint32_t(0));
+    Duplicate(low5, uint32_t(31));
+    Duplicate(low1, uint32_t(1));
+    Arange(lane, int32_t(0));
+    ClearSpr<SpecialPurposeReg::AR>();
+    for (uint16_t i = 0; i < 2048; i += 64) {
+        LoadAlign(id, ids + i);
+        LoadAlign<uint16_t, LoadDist::DIST_UNPACK_B16>(score, scores + i);
+        CompareScalar<uint32_t, CMPMODE::LT>(take, id, valid, all);
+        if constexpr (!Empty) {
+            Select(safe, id, zero, take);
+            ShiftRights(index, safe, int16_t(5), all);
+            Gather(bits, covered, index, all);
+            And(shift, safe, low5, all);
+            ShiftRight(bits, bits, reinterpret_cast<RegTensor<int32_t>&>(shift), all);
+            And(bits, bits, low1, all);
+            CompareScalar<uint32_t, CMPMODE::EQ>(missing, bits, uint32_t(0), all);
+            MaskAnd(take, take, missing, all);
+        }
+        Adds(ordinal, reinterpret_cast<RegTensor<uint32_t>&>(lane), uint32_t(i), all);
+        ShiftLefts(ordinal, ordinal, int16_t(16), all);
+        Or(entry, ordinal, reinterpret_cast<RegTensor<uint32_t>&>(score), all);
+        Squeeze<uint32_t, MicroAPI::GatherMaskMode::STORE_REG>(packed, entry, take);
+        StoreUnAlign<uint32_t, PostLiteral::POST_MODE_UPDATE>(entries, packed, store);
+        Duplicate<uint32_t, MaskMergeMode::ZEROING>(ones, uint32_t(1), take);
+        Add(sum, sum, ones, all);
+    }
+    StoreUnAlignPost(entries, store);
+    ReduceSum(total, sum, all);
+    StoreAlign(count, total, first);
+}
+
+// Retain the exact public prefetch order: strictly higher scores first,
+// then ties, each in the order of the original unmodified Top2048.
+__simd_vf__ inline void EmitWindowEntries(__ubuf__ uint32_t* ids, __ubuf__ uint32_t* entries,
+    __ubuf__ uint32_t* output, __ubuf__ uint32_t* count, uint32_t n, uint32_t threshold) {
+    using namespace MicroAPI;
+    auto all = CreateMask<uint32_t, MaskPattern::ALL>();
+    auto first = CreateMask<uint32_t, MaskPattern::VL1>();
+    RegTensor<uint32_t> entry, score, idx, id, packed, ones, sum, total, low16;
+    MaskReg take;
+    UnalignRegForStore store;
+    Duplicate(sum, uint32_t(0));
+    ClearSpr<SpecialPurposeReg::AR>();
+    Duplicate(low16, uint32_t(65535));
+    for (uint16_t pass = 0; pass < 2; ++pass) {
+        uint32_t left = n;
+        for (uint16_t i = 0; i < n; i += 64) {
+            auto valid = UpdateMask<uint32_t>(left);
+            LoadAlign(entry, entries + i);
+            And(score, entry, low16, all);
+            if (pass == 0) CompareScalar<uint32_t, CMPMODE::GT>(take, score, threshold, valid);
+            else CompareScalar<uint32_t, CMPMODE::EQ>(take, score, threshold, valid);
+            ShiftRights(idx, entry, int16_t(16), all);
+            Gather(id, ids, idx, take);
+            Squeeze<uint32_t, MicroAPI::GatherMaskMode::STORE_REG>(packed, id, take);
+            StoreUnAlign<uint32_t, PostLiteral::POST_MODE_UPDATE>(output, packed, store);
+            Duplicate<uint32_t, MaskMergeMode::ZEROING>(ones, uint32_t(1), take);
+            Add(sum, sum, ones, all);
+        }
+    }
+    StoreUnAlignPost(output, store);
+    ReduceSum(total, sum, all);
+    StoreAlign(count, total, first);
+}
+
 __simd_vf__ inline void Narrow(__ubuf__ uint32_t* input,__ubuf__ uint16_t* output,uint32_t n,uint32_t padded) {
     using namespace MicroAPI;auto all=CreateMask<uint32_t,MaskPattern::ALL>();
     RegTensor<uint32_t> value,zero;Duplicate(zero,uint32_t(0));
@@ -70,6 +150,7 @@ __simd_vf__ inline void Emit(__ubuf__ uint32_t* ids,__ubuf__ uint16_t* scores,
 // scratch >= 14 KiB, output >= 8 KiB (ties are truncated after compaction).
 // Scratch holds cold count and threshold banks. Optional clocks
 // isolate pack, window rank, quota rank and emit without changing the helper.
+template<bool CompactEntries=false>
 __aicore__ inline uint32_t Select(LocalTensor<uint32_t> ids,LocalTensor<uint16_t> scores,
     LocalTensor<uint32_t> output,LocalTensor<uint32_t> scratch,
     uint32_t resident,uint32_t valid,uint32_t rank,uint32_t quota,bool compact=true,
@@ -100,7 +181,7 @@ __aicore__ inline uint32_t Select(LocalTensor<uint32_t> ids,LocalTensor<uint16_t
     bool capNeeded=!compact||n>quota;
     // Reuse the packed cold scores for both ranks; no additional sort or buffer.
     if(capNeeded || (minimum && n>minimum && threshold)) {
-        Narrow(p+packedOffset,cold,compact?n:2048,padded);PipeBarrier<PIPE_V>();
+        Narrow(CompactEntries ? out+2048 : p+packedOffset,cold,compact?n:2048,padded);PipeBarrier<PIPE_V>();
     }
     if(capNeeded){
         RegisterThreshold(cold,cap,padded/256,padded-quota+1);
@@ -117,7 +198,8 @@ __aicore__ inline uint32_t Select(LocalTensor<uint32_t> ids,LocalTensor<uint16_t
     }
     if(capThreshold>threshold)threshold=capThreshold;
     if(clocks)clocks[3]=GetSystemCycle();
-    Emit(id,score,out,stats+8,resident,valid,threshold);
+    if constexpr (CompactEntries) EmitWindowEntries(id,out+2048,out,stats+8,n,threshold);
+    else Emit(id,score,out,stats+8,resident,valid,threshold);
     SetFlag<HardEvent::V_S>(EVENT_ID4);WaitFlag<HardEvent::V_S>(EVENT_ID4);
     uint32_t count=scratch.GetValue(3208);
     if(clocks)clocks[4]=GetSystemCycle();
@@ -192,6 +274,35 @@ __aicore__ inline uint32_t SelectBitmap(LocalTensor<uint32_t> ids,LocalTensor<ui
     uint32_t count=Select(eligible,scores,output,scratch,0,valid,rank,quota,true,clocks,minimum,4096);
     if(clocks)clocks[0]=begin;
     return count;
+}
+
+// Windows keep the compact entries in the second half of the existing output
+// bank. The bitmap may use all 24 KiB of rank scratch until selection starts.
+__aicore__ inline uint32_t SelectWindowBitmap(LocalTensor<uint32_t> ids, LocalTensor<uint16_t> scores,
+    LocalTensor<uint32_t> output, LocalTensor<uint32_t> scratch, __gm__ uint32_t* covered,
+    uint32_t history, uint32_t valid, uint32_t rank, uint32_t quota, uint64_t* clocks=nullptr,
+    uint32_t minimum=0, bool coveredEmpty=false) {
+    if (!coveredEmpty && history > 6144 * 32)
+        return SelectBitmap(ids,scores,output,scratch,covered,history,valid,rank,quota,clocks,minimum,coveredEmpty);
+    auto begin = clocks ? GetSystemCycle() : 0;
+    auto p = reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr());
+    auto id = reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr());
+    auto score = reinterpret_cast<__ubuf__ uint16_t*>(scores.GetPhyAddr());
+    auto entries = reinterpret_cast<__ubuf__ uint32_t*>(output.GetPhyAddr()) + 2048;
+    // The count may overwrite a bitmap word: all gathers finish before the
+    // final count store. The bitmap is never read after the pack completes.
+    if (coveredEmpty) {
+        PackWindowEntries<true>(id,score,p,entries,p+3200,valid);
+    } else {
+        GlobalTensor<uint32_t> bits;
+        bits.SetGlobalBuffer(covered);
+        DataCopy(scratch,bits,(history+255)/256*8);
+        SetFlag<HardEvent::MTE2_V>(EVENT_ID4); WaitFlag<HardEvent::MTE2_V>(EVENT_ID4);
+        PackWindowEntries<false>(id,score,p,entries,p+3200,valid);
+    }
+    uint32_t result=Select<true>(ids,scores,output,scratch,0,valid,rank,quota,true,clocks,minimum);
+    if (clocks) clocks[0]=begin;
+    return result;
 }
 
 // Private incremental IDs retain stable local residency from the prefix.

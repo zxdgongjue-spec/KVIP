@@ -87,16 +87,20 @@ __aicore__ inline void ExportWindowCold(uint32_t query) {
     auto covered=reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddress(
         ctx->incremental,runtimeShape_.batch,runtimeShape_.history,b));
     uint64_t rankClocks[5];
+    const uint32_t limit=ctx->windowLimit/4;
+    uint32_t count;
 #if KVIP_PARALLEL_TERMINAL
-    const bool terminal=rankedEpoch_==runtimeShape_.rounds;
-    const uint32_t limit=terminal?2048U:ctx->windowLimit/4;
+    if (rankedEpoch_==runtimeShape_.rounds) {
+        count=kvip_prefetch_rank::SelectBitmap(indicesOutLocal_,scoreOutLocal_,compact,
+            topkSharedTmpLocal_[128],covered,runtimeShape_.history,valid,2048U,2048U,
+            rankTrace_?rankClocks:nullptr,0U,windowCoveredEmpty_);
+    } else
 #endif
-    uint32_t count=kvip_prefetch_rank::SelectBitmap(indicesOutLocal_,scoreOutLocal_,compact,
-#if KVIP_PARALLEL_TERMINAL
-        topkSharedTmpLocal_[128],covered,runtimeShape_.history,valid,terminal?2048U:rank,limit,rankTrace_?rankClocks:nullptr,terminal?0U:limit/2,windowCoveredEmpty_);
-#else
-        topkSharedTmpLocal_[128],covered,runtimeShape_.history,valid,rank,ctx->windowLimit/4,rankTrace_?rankClocks:nullptr,(ctx->windowLimit/4)/2,windowCoveredEmpty_);
-#endif
+    {
+        count=kvip_prefetch_rank::SelectWindowBitmap(indicesOutLocal_,scoreOutLocal_,compact,
+            topkSharedTmpLocal_[128],covered,runtimeShape_.history,valid,rank,limit,
+            rankTrace_?rankClocks:nullptr,limit/2,windowCoveredEmpty_);
+    }
     if(rankTrace_) {
         uint64_t delta[3]={rankClocks[1]-rankClocks[0],rankClocks[4]-rankClocks[1],1};
         for(uint32_t k=0;k<3;++k) {
