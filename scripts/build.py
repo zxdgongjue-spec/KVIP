@@ -123,9 +123,28 @@ def prepare_dependency(root, transport="urma"):
     print(f"KVAF {transport} dependency ready: {root} @ {head}", flush=True)
 
 
+def prepare_main_device_sources(root, transport):
+    """Apply only the device changes verified on the unified Runtime baseline."""
+    revision = "813f1750"
+    head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+    if not head.startswith(revision):
+        raise RuntimeError(f"Expected KVAF main revision {revision}, found {head}")
+    patches = [(ROOT / "scripts/patches/kvaf-main-fused-device.patch", ())]
+    if transport == "ubmem":
+        patches.append((patch_path(UBMEM_DEVICE_PATCH), ("--include=access_operator/include/ubmem/*",)))
+    for path, options in patches:
+        command = ["git", "-C", str(root), "apply", *options]
+        reverse = subprocess.run([*command, "--reverse", "--check", path], capture_output=True)
+        if reverse.returncode != 0:
+            call([*command, "--check", path])
+            call([*command, path])
+
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kvaf-root", type=Path, help="existing checkout; otherwise download to third_party/KVAF")
+    parser.add_argument("--prepare-main-device", action="store_true", help="prepare unified Runtime device headers only")
     parser.add_argument("--prepare-only", action="store_true", help="prepare pinned source, without CANN builds")
     parser.add_argument("--skip-kvaf-build", action="store_true", help="use an already rebuilt KVAF")
     parser.add_argument("--skip-lidu-build", action="store_true", help="reuse existing LIDU vendor/Python libraries")
@@ -136,6 +155,11 @@ def main():
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")
+    if args.prepare_main_device:
+        if args.kvaf_root is None:
+            parser.error("--prepare-main-device requires --kvaf-root")
+        prepare_main_device_sources(args.kvaf_root.resolve(), args.transport)
+        return
     if not args.prepare_only:
         runtime_preflight()
     dependency = (args.kvaf_root or ROOT / "third_party/KVAF").resolve()
