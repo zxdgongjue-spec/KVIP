@@ -1,5 +1,5 @@
 diff --git a/access_operator/include/access_operator.h b/access_operator/include/access_operator.h
-index 7c8444c..ca98d71 100644
+index 7c8444c1..ca98d710 100644
 --- a/access_operator/include/access_operator.h
 +++ b/access_operator/include/access_operator.h
 @@ -147,6 +147,18 @@ class AccessOperator {
@@ -30,7 +30,7 @@ index 7c8444c..ca98d71 100644
    Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
    Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
 diff --git a/access_operator/include/ubmem/access_operator.h b/access_operator/include/ubmem/access_operator.h
-index 0f170af..c803316 100644
+index 0f170af6..c8033164 100644
 --- a/access_operator/include/ubmem/access_operator.h
 +++ b/access_operator/include/ubmem/access_operator.h
 @@ -19,6 +19,7 @@ class AccessOperator final : public kvaf::AccessOperator {
@@ -42,7 +42,7 @@ index 0f170af..c803316 100644
    Status FinishGetGraph(void*, bool) override;
    Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
 diff --git a/access_operator/providers/ubmem_aiv/access_operator.cc b/access_operator/providers/ubmem_aiv/access_operator.cc
-index f137aa3..80b9a3e 100644
+index f137aa3d..80b9a3e0 100644
 --- a/access_operator/providers/ubmem_aiv/access_operator.cc
 +++ b/access_operator/providers/ubmem_aiv/access_operator.cc
 @@ -167,6 +167,14 @@ Status AccessOperator::PrepareGetGraph(const GetGraphOptions& options) {
@@ -61,7 +61,7 @@ index f137aa3..80b9a3e 100644
    std::lock_guard<std::mutex> lock(resources_->mutex);
    if (!resources_->invocation->graph_active) return Status::NotFound("UBMEM graph lease not found");
 diff --git a/access_operator/providers/urma_aiv/access_operator.cc b/access_operator/providers/urma_aiv/access_operator.cc
-index 8e772f0..99ba810 100644
+index 8e772f07..99ba8100 100644
 --- a/access_operator/providers/urma_aiv/access_operator.cc
 +++ b/access_operator/providers/urma_aiv/access_operator.cc
 @@ -141,6 +141,19 @@ Status DefaultAccessOperator::PrepareGetGraph(const GetGraphOptions& options) {
@@ -85,7 +85,7 @@ index 8e772f0..99ba810 100644
    return UrmaAivGetOperator::FinishGraph(stream, discard, resources_->GetView(), resources_->invocation());
  }
 diff --git a/bindings/src/npu_python_runtime.cc b/bindings/src/npu_python_runtime.cc
-index 5c86827..da755be 100644
+index 5c868270..050a2b0b 100644
 --- a/bindings/src/npu_python_runtime.cc
 +++ b/bindings/src/npu_python_runtime.cc
 @@ -1131,6 +1131,34 @@ class NpuPythonRuntime final {
@@ -123,26 +123,19 @@ index 5c86827..da755be 100644
    void EndGetGraph(std::uint64_t id, const py::object& stream, bool discard) {
      const auto native_stream = ResolveStream(stream);
      Status status;
-@@ -1658,6 +1686,8 @@ void BindNpuPythonRuntime(py::module_& module) {
-       .def("begin_put_input", &NpuPythonRuntime::BeginPutInput, py::arg("execution"),
-            py::arg("input"), py::arg("request_capacity"), py::arg("stream") = py::none(),
-            "Bind URMA AIV or AICPU input for repeated synchronous Puts. Keep its storage and stream "
-+      .def("get_graph_urma_resources", &NpuPythonRuntime::GetGraphUrmaResources, py::arg("lease"),
-+           "Borrow the URMA launch resources until the prepared graph lease ends.")
-            "alive and do not resize or replace storage until end_put_input succeeds.")
-       .def("end_put_input", &NpuPythonRuntime::EndPutInput, py::arg("lease"),
-            "Release reusable Put input registration after its transaction completes; failure retains owners.")
-@@ -1669,6 +1699,8 @@ void BindNpuPythonRuntime(py::module_& module) {
+@@ -1669,6 +1697,10 @@ void BindNpuPythonRuntime(py::module_& module) {
             "Drain pending Get and unregister its reusable output; failure retains the binding.")
        .def("begin_get_graph", &NpuPythonRuntime::BeginGetGraph, py::arg("execution"),
             py::arg("output"), py::arg("request_capacity"), py::arg("stream") = py::none())
++      .def("get_graph_urma_resources", &NpuPythonRuntime::GetGraphUrmaResources, py::arg("lease"),
++           "Borrow the URMA launch resources until the prepared graph lease ends.")
 +      .def("get_graph_mapped_base", &NpuPythonRuntime::GetGraphMappedBase, py::arg("lease"),
 +           "Borrow the UBmem mapped base for the lifetime of the prepared graph lease.")
        .def("end_get_graph", &NpuPythonRuntime::EndGetGraph, py::arg("lease"),
             py::arg("stream") = py::none(), py::kw_only(), py::arg("discard_result") = false)
        .def("warmup", &NpuPythonRuntime::WarmupPut, py::arg("execution"), py::kw_only(),
 diff --git a/runtime/execution/execution_dispatcher.cc b/runtime/execution/execution_dispatcher.cc
-index 4e4b1ea..18802f9 100644
+index 4e4b1ea6..afba4115 100644
 --- a/runtime/execution/execution_dispatcher.cc
 +++ b/runtime/execution/execution_dispatcher.cc
 @@ -868,6 +868,29 @@ Status ExecutionDispatcher::BeginGetGraph(GetExecutionConfig c, const GetGraphOp
@@ -167,7 +160,7 @@ index 4e4b1ea..18802f9 100644
 +  GetGraphNode* node = nullptr;
 +  auto status = FindGraphNode(nullptr, id, &node);
 +  if (!status.ok()) return status;
-+  if (!node) return Status::InvalidArgument("a live Get graph lease is required");
++  if (!node || node->ending) return Status::InvalidArgument("a live Get graph lease is required");
 +  return WithGraphNode(*node, [&](GetResourceView view) {
 +    return view.operation()->GetPreparedGraphMappedBase(base);
 +  });
@@ -176,7 +169,7 @@ index 4e4b1ea..18802f9 100644
    std::shared_lock<std::shared_mutex> life(lifecycle_);
    std::lock_guard<std::mutex> lock(get_mutex_);
 diff --git a/runtime/include/execution_dispatcher.h b/runtime/include/execution_dispatcher.h
-index bd790b9..333a09b 100644
+index bd790b90..333a09be 100644
 --- a/runtime/include/execution_dispatcher.h
 +++ b/runtime/include/execution_dispatcher.h
 @@ -32,6 +32,8 @@ class ExecutionDispatcher final : public AccessOperator {
@@ -189,7 +182,7 @@ index bd790b9..333a09b 100644
    Status BeginGetOutput(GetExecutionConfig, const GetOutputOptions&, std::uint64_t*) override;
    Status EndGetOutput(std::uint64_t) override;
 diff --git a/runtime/include/runtime.h b/runtime/include/runtime.h
-index d6da9ac..df8f0d4 100644
+index d6da9acb..df8f0d4b 100644
 --- a/runtime/include/runtime.h
 +++ b/runtime/include/runtime.h
 @@ -139,6 +139,12 @@ class RuntimeCore {
