@@ -51,8 +51,19 @@ def describe(events, records, clock, first_terminal):
     # Independent releases, instantaneous teams, and zero coordination overhead.
     ideal_64 = [(final_end-max(e['end_cycles']-fraction*e['incremental_cycles'] for e in final))/clock
                 for fraction in (0.5,0.75)]
+    # Advance the previous window on the same lane. Only its overlap with the
+    # measured wait can advance final-window work; keep the other lanes in the max.
+    previous = {e['lane']: e for e in groups[-2]}
+    two_window = []
+    for last_reduction in (0.5, 0.75):
+        finishes = []
+        for event in final:
+            previous_saved = 0.5 * previous[event['lane']]['incremental_cycles']
+            wait_saved = min(previous_saved, event['predecessor_wait_cycles'])
+            finishes.append(event['end_cycles'] - last_reduction * event['incremental_cycles'] - wait_saved)
+        two_window.append((final_end - max(finishes)) / clock)
     ready = [pct for _,_,epoch,pct,_,_ in records if epoch == 3]
-    return by_epoch, halves, correlation(delta,duration), rank_counts, ideal_64, ready
+    return by_epoch, halves, correlation(delta,duration), rank_counts, ideal_64, two_window, ready
 
 
 def window_report(profile, details):
@@ -66,14 +77,14 @@ def window_report(profile, details):
             raise ValueError(f'Expected three LI launches, saw {len(stages)}')
         lo,hi = sorted(stages)[2]
         li3.append(hi-lo)
-    windows, halves, correlations, counts, ideal, readiness = [], [], [], [], [], []
+    windows, halves, correlations, counts, ideal, both, readiness = [], [], [], [], [], [], []
     for detail in details:
         head = detail['streaming_cycles'][0]
         timeline = head['terminal_timeline']
         first = min(s['start_cycles'] for c in timeline['cores'] for s in c['stages'] if 'start_cycles' in s)
-        w,h,c,r,upper,ready = describe(head['prefetch_services'],detail['rank_progress'],timeline['clock_mhz'],first)
+        w,h,c,r,upper,two_window,ready = describe(head['prefetch_services'],detail['rank_progress'],timeline['clock_mhz'],first)
         windows.append(w); halves.append(h); correlations.append(c); counts.append(r)
-        ideal.append(upper); readiness.extend(ready)
+        ideal.append(upper); both.append(two_window); readiness.extend(ready)
     return dict(
         timed_graph_mean_us=profile['timing']['event_mean_us'],
         timed_LI3_mean_us=mean(li3),
@@ -83,6 +94,12 @@ def window_report(profile, details):
             'half_aggregate_time_removed':mean(v[0] for v in ideal),
             'three_quarters_removed':mean(v[1] for v in ideal),
             'three_quarters_spare_above_graph_10pct':mean(v[1] for v in ideal)-0.1*profile['timing']['event_mean_us'],
+        },
+        two_window_ideal_final_event_advance_us={
+            'penultimate_half_last_half': mean(v[0] for v in both),
+            'penultimate_half_last_three_quarters': mean(v[1] for v in both),
+            'assumptions': 'Fixed snapshot work, immediate helper availability, no new coordination cost. '
+                           'Only the original final-event finish is modeled.',
         },
         separate_diagnostic_calls=len(details),
         diagnostic_mean_Q_with_rank_per_window=list(map(mean,zip(*counts))),
