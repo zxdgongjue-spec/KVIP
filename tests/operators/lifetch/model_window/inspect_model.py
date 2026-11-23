@@ -162,7 +162,8 @@ def inspect(folder):
         results.append(dict(**timing, mode=mode, fixture=fixture, helpers=helper_state, incremental_winners_checked=checked_winners,
                             scores_sha=hashlib.sha256(scores.tobytes()).hexdigest(),
                             seed_sha=hashlib.sha256(seeds).hexdigest(),
-                            frontier=meta[:, :, 4].tolist(), tokens=tokens_by_window))
+                            frontier=meta[:, :, 4].tolist(), processed_frontier=meta[:, :, 1].tolist(),
+                            tokens=tokens_by_window))
     return results
 
 
@@ -194,6 +195,7 @@ def main():
             report.append(dict(**timings, mode=result["mode"], fixture=result["fixture"], helpers=result["helpers"], incremental_winners_checked=result["incremental_winners_checked"],
                                posts_by_window=[[len(w) for w in row] for row in result["tokens"]],
                                same_frontiers=result["frontier"] == reference["frontier"],
+                               same_processed_frontiers=result["processed_frontier"] == reference["processed_frontier"],
                                same_prefetch_token_sets=membership, same_prefetch_order=order))
         output[str(folder)] = report
     print(json.dumps(output, indent=2))

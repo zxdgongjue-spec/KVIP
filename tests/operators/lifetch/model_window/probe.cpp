@@ -67,32 +67,50 @@ int main(int argc, char **argv) {
     std::vector<float> qs(Q * Heads);
     const char *fixtureOption = std::getenv("KVIP_MODEL_SCORE_FIXTURE");
     const std::string fixture = fixtureOption ? fixtureOption : "default";
-    if (fixture != "default" && fixture != "adjacent-cutoff")
+    if (fixture != "default" && fixture != "adjacent-cutoff" && fixture != "sparse-first-window")
       throw std::runtime_error("unknown score fixture: " + fixture);
     const bool closeScores = fixture == "adjacent-cutoff";
-    auto querySign = [closeScores](unsigned query, unsigned h) {
-      if (closeScores)
+    const bool sparseFirst = fixture == "sparse-first-window";
+    auto scaledRow = [closeScores, sparseFirst](unsigned row) {
+      return closeScores || (sparseFirst && row == 0);
+    };
+    auto querySign = [scaledRow](unsigned query, unsigned h) {
+      if (scaledRow(query / 4))
         return h == query % Heads ? 1 : -1;
       return (h + query) % 3 == 0 ? -1 : 1;
     };
-    auto keySign = [closeScores](unsigned t) { return !closeScores && t % 3 == 0 ? -1 : 1; };
-    auto weightSign = [closeScores](unsigned query, unsigned h) {
-      if (closeScores && h == query % Heads)
+    auto keySign = [scaledRow](unsigned row, unsigned token) {
+      return !scaledRow(row) && token % 3 == 0 ? -1 : 1;
+    };
+    auto weightSign = [scaledRow](unsigned query, unsigned h) {
+      if (scaledRow(query / 4) && h == query % Heads)
         return 1;
       return (query + 2 * h) % 5 < 2 ? -1 : 1;
     };
-    auto magnitude = [closeScores](unsigned t) { return 1 + unsigned(!closeScores && t >= R); };
+    auto magnitude = [scaledRow](unsigned row, unsigned token) {
+      return 1 + unsigned(!scaledRow(row) && token >= R);
+    };
     for (unsigned query = 0; query < Q; query++)
       for (unsigned h = 0; h < Heads; h++) {
         std::fill_n(&q[(query * Heads + h) * D], D,
                     querySign(query, h) < 0 ? 0xb8 : 0x38);
         w[query * Heads + h] = weightSign(query, h) < 0 ? 0xbf80 : 0x3f80;
-        qs[query * Heads + h] = closeScores ? 1 : 1 + (h % 3);
+        qs[query * Heads + h] = scaledRow(query / 4) ? 1 : 1 + (h % 3);
       }
     std::vector<float> keyScales(B * H, 1.0f);
     for (unsigned row = 0; row < B; row++)
       for (unsigned t = 0; t < H; t++) {
-        if (closeScores) {
+        if (sparseFirst && row == 0) {
+          // Seed with 1536 equal minimum scores. Across the entire cold
+          // history only 384 tokens exceed that score, so any first
+          // nonempty strict pack preserves the seed cutoff for all four Qs.
+          unsigned target = 128;
+          if (t < R)
+            target += t % 4 == 0;
+          else if (t % 8 == 0)
+            target += 1 + ((t - R) / 512) % 2;
+          keyScales[row * H + t] = float(target) / 128.0f;
+        } else if (closeScores) {
           // The sole active head gives an exact dot product of 128. Each
           // integer in [128, 136] is one BF16 step from the next integer.
           unsigned high = row == 0 ? 129 : 131;
@@ -103,8 +121,8 @@ int main(int argc, char **argv) {
           }
           keyScales[row * H + t] = float(target) / 128.0f;
         }
-        uint8_t value = magnitude(t) == 1 ? 0x38 : 0x40;
-        if (keySign(t) < 0)
+        uint8_t value = magnitude(row, t) == 1 ? 0x38 : 0x40;
+        if (keySign(row, t) < 0)
           value |= 0x80;
         std::fill_n(&k[(row * H + t) * D], D, value);
       }
@@ -314,8 +332,8 @@ int main(int argc, char **argv) {
           float val = 0;
           for (unsigned h = 0; h < Heads; h++)
             val += weightSign(qi, h) * qs[qi * Heads + h] *
-                   std::max(0, querySign(qi, h) * keySign(t) *
-                                   int(D * magnitude(t)));
+                   std::max(0, querySign(qi, h) * keySign(qi / 4, t) *
+                                   int(D * magnitude(qi / 4, t)));
           val *= keyScales[(qi / 4) * H + t];
           uint32_t u;
           std::memcpy(&u, &val, 4);

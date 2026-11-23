@@ -15,6 +15,8 @@ The fixture runs the actual resident scoring, resident threshold and cold scorin
 
 To exercise adjacent BF16 cutoffs, set `KVIP_MODEL_SCORE_FIXTURE=adjacent-cutoff` for both the reference and the candidate. The first row starts with resident scores of 128 and 129, and has cold scores of 129, 130 and 132. The second starts with 128 and 131, and has cold scores of 131, 132 and 134. A single active dot product of 128 and an exact FP32 scale per token give an independent expected score for every position. Use the default input to measure a larger cutoff jump separately.
 
+With `KVIP_MODEL_SCORE_FIXTURE=sparse-first-window`, row 0 has 1,536 resident tokens at the minimum score of 128 and just 384 cold tokens strictly above it across the full history. This fixes a stable first cutoff for its four queries. Row 1 reuses the default signed query, key and weight inputs. This paired fixture checks whether forwarding the resident cutoff helps when the first merge can preserve it.
+
 Window service writes its normal WQEs into simulator memory. The verifier checks the resident scores, seed IDs, thresholds, uniqueness of each source, destination addresses and the resulting Index entries. It prints per-window prefetch membership and order changes separately. Communication completions and final TopK/KV processing are outside these three launches. The combined span covers the earliest resident-task start through the latest cold-task completion across all twelve cores.
 
 
