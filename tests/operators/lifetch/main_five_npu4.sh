@@ -14,8 +14,14 @@ arm_label=mainline_parallel_tail
 owner_rev=888db6b1603d22f4142bd2ccffe0518611856a31
 transport=a2857b460a74704114fd30a849ae38666cc2c372
 serial=da318bdb81344672b5d9013e04d517669d3eb142
-peer_physical_npu=4
-export PEER_PHYSICAL_NPU=4 ASCEND_RT_VISIBLE_DEVICES=4 PEER_LOCAL_ONLY=1
+# Existing mainline/LI readers default to B24. NPU0 is the independent paced-tail arm.
+peer_physical_npu=${PEER_PHYSICAL_NPU:-4}
+case "$peer_physical_npu" in
+    0) [[ "$native" == 6d7f257b3d664a8b4991cfd3ebd12da4f2038d04 ]] || { echo "Expected the paced-tail candidate on NPU0" >&2; exit 2; } ;;
+    4) ;;
+    *) echo "Unsupported physical NPU: $peer_physical_npu" >&2; exit 2 ;;
+esac
+export PEER_PHYSICAL_NPU="$peer_physical_npu" ASCEND_RT_VISIBLE_DEVICES="$peer_physical_npu" PEER_LOCAL_ONLY=1
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export PATH="/usr/local/python3.12.13/bin:$PATH"
 unset PEER_RANKED_INPUT PEER_RANKED_HASH_FILE
@@ -30,17 +36,25 @@ if [[ $native != "$main_rev" ]]; then
         echo "Expected a full candidate SHA based on the tested parallel terminal" >&2
         exit 2
     }
-    label=li-window
-    arm_label=li_windows
-    prefix=li-window-five
-    [[ -r "$reference/main.txt" && $(<"$reference/main.txt") == "$main_rev" &&
-       -r "$reference/physical_npu.txt" && $(<"$reference/physical_npu.txt") == 4 ]] || {
-        echo "Expected measured upstream on physical NPU4 at $reference" >&2
-        exit 1
-    }
+    if [[ $peer_physical_npu == 0 ]]; then
+        label=paced-tail
+        arm_label=paced-tail
+        prefix=host20-npu0-paced-tail
+        reference=
+    else
+        label=li-window
+        arm_label=li_windows
+        prefix=li-window-five
+        [[ -r "$reference/main.txt" && $(<"$reference/main.txt") == "$main_rev" &&
+           -r "$reference/physical_npu.txt" && $(<"$reference/physical_npu.txt") == 4 ]] || {
+            echo "Expected measured upstream on physical NPU4 at $reference" >&2
+            exit 1
+        }
+    fi
 fi
 out=$(mktemp -d "$area/$prefix.XXXXXX")
 echo "RESULT_ROOT=$out"
+if [[ $peer_physical_npu == 0 ]]; then echo "LOG=$out/run.log"; fi
 exec > >(tee "$out/run.log") 2>&1
 
 checkout() {
@@ -59,27 +73,28 @@ checkout() {
 }
 reader_src=$(checkout reader "$reader")
 checkout_name=upstream
-if [[ $native != "$main_rev" ]]; then checkout_name=li-window; fi
+if [[ $native != "$main_rev" ]]; then checkout_name=$label; fi
 main_src=$(checkout "$checkout_name" "$native")
 support="$reader_src/tests/operators/lifetch/support"
 printf '%s\n' "$main_rev" >"$out/main.txt"
 if [[ $native != "$main_rev" ]]; then
     printf '%s\n' "$native" >"$out/candidate.txt"
-    printf '%s\n' "$reference" >"$out/reference.txt"
+    if [[ -n "$reference" ]]; then printf '%s\n' "$reference" >"$out/reference.txt"; fi
 fi
 printf '%s\n' "$reader" >"$out/reader.txt"
 printf '%s\n' "$transport" >"$out/kvaf.txt"
-printf '4\n' >"$out/physical_npu.txt"
+printf '%s\n' "$peer_physical_npu" >"$out/physical_npu.txt"
 cat /proc/sys/kernel/hostname >"$out/host.txt"
 cat /proc/sys/kernel/random/boot_id >"$out/boot_id.txt"
 if [[ -r /etc/machine-id ]]; then cat /etc/machine-id >"$out/machine_id.txt"; fi
-echo "CONFIG measured=$native main=$main_rev reader=$reader NPU=4 transport=urma BS=16 Q=4 token_bytes=656 warmup=4 calls=20"
+echo "CONFIG measured=$native main=$main_rev reader=$reader physical_NPU=$peer_physical_npu logical_device=0 transport=urma BS=16 Q=4 token_bytes=656 warmup=4 calls=20"
 groups=(10 4 17 7 2)
 archive_for() {
     if [[ $1 == 2 ]]; then printf '%s\n' "$area/fused.gbxKC9"
     else printf '%s\n' "$area/fused.N7n8ZP"; fi
 }
 for group in "${groups[@]}"; do
+    if [[ $peer_physical_npu == 0 ]]; then continue; fi
     archive=$(archive_for "$group")
     if [[ $native != "$main_rev" && ! -s "$reference/g$group/mainline/thp.json" ]]; then
         echo "Missing upstream G$group archive at $reference" >&2
@@ -128,7 +143,14 @@ run_group() (
     arm="$out/g$group/$label"
     mkdir -p "$arm"
     trace=$(bash "$reader_src/tests/operators/lifetch/peer_g2_input.sh" "$work" "$group")
-    if [[ $native == "$main_rev" ]]; then
+    oracle_args=(--owner-archive "$archive")
+    if [[ $peer_physical_npu == 0 ]]; then
+        node=$("$PYTHON" -B "$support/paced_host20.py" node "$out" "$group")
+        if ! "$PYTHON" -B "$support/paced_host20.py" oracle "$archive" "$group"; then
+            oracle_args=()
+            export KVIP_Q4_NATIVE_LI_CACHE="${KVIP_Q4_NATIVE_LI_CACHE:-$work/native-li-reference}"
+        fi
+    elif [[ $native == "$main_rev" ]]; then
         node=$("$PYTHON" -B "$support/owner_pack_tail.py" numa "$archive" "$group")
     else
         node=$("$PYTHON" -B "$support/li_window_report.py" numa "$reference/g$group/mainline/thp.json")
@@ -164,7 +186,7 @@ run_group() (
     monitor=$!
     echo "CASE_BEGIN G$group $arm_label"
     if ! (cd "$arm" && timeout 1800 "$PYTHON" -B "$support/main_five_run.py" \
-        --main "$main_src" --revision "$native" --trace "$trace" --group "$group" --owner-archive "$archive" \
+        --main "$main_src" --revision "$native" --trace "$trace" --group "$group" "${oracle_args[@]}" --physical-npu "$peer_physical_npu" \
         --kvaf-root "$kvaf" --kvaf-server "127.0.0.1:$port" --output "$arm") >"$arm/worker.log" 2>&1; then
         echo "FAILED_ARM=G$group/$label WORKER_LOG=$arm/worker.log" >&2
         tail -30 "$arm/worker.log" >&2
@@ -172,7 +194,9 @@ run_group() (
     fi
     if ! wait "$monitor"; then cat "$arm/thp.log" >&2; exit 1; fi
     monitor=
-    if [[ $native == "$main_rev" ]]; then
+    if [[ $peer_physical_npu == 0 ]]; then
+        "$PYTHON" -B "$support/paced_host20.py" report "$out" "$group" | tee -a "$out/summary.txt"
+    elif [[ $native == "$main_rev" ]]; then
         "$PYTHON" -B "$support/main_five_report.py" "$out" "$group" "$archive" | tee -a "$out/summary.txt"
     else
         "$PYTHON" -B "$support/li_window_report.py" group "$out" "$group" "$archive" "$reference" | tee -a "$out/summary.txt"
@@ -198,7 +222,9 @@ if (( ${#failed[@]} )); then
     echo "REPLAY_INCOMPLETE groups=${failed[*]} RESULT_ROOT=$out" >&2
     exit 1
 fi
-if [[ $native != "$main_rev" ]]; then
+if [[ $peer_physical_npu == 0 ]]; then
+    "$PYTHON" -B "$support/paced_host20.py" summary "$out" | tee -a "$out/summary.txt"
+elif [[ $native != "$main_rev" ]]; then
     "$PYTHON" -B "$support/li_window_report.py" summary "$out" | tee -a "$out/summary.txt"
 fi
 echo "REPLAY_COMPLETE RESULT_ROOT=$out"

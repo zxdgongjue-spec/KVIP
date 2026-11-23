@@ -25,7 +25,7 @@ def fixture(area, monkeypatch):
         inputs['source_paths'].append(str(manifest))
     ident = serial.dp_capture_id(10, inputs)
     monkeypatch.setitem(serial.INPUT_AND_RESULTS, 10, (ident, {}))
-    monkeypatch.setattr(serial, 'from_this_host', lambda r: r == root)
+    monkeypatch.setattr(serial, 'from_this_host', lambda r, physical='4': r == root and physical == '4')
     write(case/'config.json', dict(group=10, warmup=4, iterations=20, device=0, round_range=[1,1],
                                     mode='diagnose', input='real', intermediate_fetches=4,
                                     prefetch_tokens=1024, prefetch_rank_start=1024))

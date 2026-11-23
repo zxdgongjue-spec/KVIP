@@ -52,12 +52,13 @@ def worker(args):
     sequence = ArchiveSequence(args.trace, args.group, (1, 1))
     sequence.cache_ranked_round()
     inputs = next(iter(sequence))
-    _, receipt = archived_oracle(args.owner_archive, args.group)
     operand_hashes = {}
     for name in ('query', 'weights', 'query_scale', 'logical_keys', 'logical_scales', 'query_ends', 'captured_layout'):
         operand_hashes[name] = digest(getattr(inputs, name))
-    if operand_hashes != receipt['native_reference']['identity']['inputs']:
-        raise ValueError(f'G{args.group}: captured mainline operands do not match the archived strong serial')
+    if args.owner_archive:
+        _, receipt = archived_oracle(args.owner_archive, args.group)
+        if operand_hashes != receipt['native_reference']['identity']['inputs']:
+            raise ValueError(f'G{args.group}: captured mainline operands do not match the archived strong serial')
     # native_li_reference imports the archived reporting module for its cache
     # writer. Start the production imports with an independent module namespace.
     for module_name in ('workloads', 'reporting'):
@@ -91,7 +92,7 @@ def worker(args):
     folder.mkdir(parents=True, exist_ok=False)
     atomic_json(folder / 'config.json', {**{k: str(v) if isinstance(v, Path) else v
                                            for k, v in vars(cfg).items()},
-                                       'physical_npu': 4, 'fused_only': True, 'production_root': str(main),
+                                       'physical_npu': args.physical_npu, 'fused_only': True, 'production_root': str(main),
                                        'production_revision': args.revision})
     pages = ReplayPagePlan(sequence)
     paths = [str(ref.manifest_path) for refs in sequence.rounds for ref in refs]
@@ -192,12 +193,10 @@ def main(args):
     from score_equivalence import save_checked
     from workloads import ReplaySequence
 
-    if (os.environ.get('ASCEND_RT_VISIBLE_DEVICES') != '4' or
+    if (os.environ.get('ASCEND_RT_VISIBLE_DEVICES') != str(args.physical_npu) or
             subprocess.check_output(['git', '-C', args.main, 'rev-parse', 'HEAD'], text=True).strip() != args.revision or
             subprocess.check_output(['git', '-C', args.main, 'status', '--porcelain', '-uno'], text=True).strip()):
-        raise ValueError('Expected clean pinned production mainline on physical NPU4')
-    serial, receipt = archived_oracle(args.owner_archive, args.group)
-    source = receipt['native_reference']
+        raise ValueError(f'Expected a clean pinned production checkout on physical NPU{args.physical_npu}')
     # The reader and mainline have different modules named execution,
     # performance, correctness, etc. Keep the production process independent.
     subprocess.run([sys.executable, '-B', __file__, *sys.argv[1:], '--worker'], check=True)
@@ -205,8 +204,25 @@ def main(args):
     ids_file = fused / 'measured_ids.npy'
     outputs = np.load(ids_file, allow_pickle=False)
     inputs = next(iter(ReplaySequence(args.trace, args.group, (1, 1))))
-    save_checked(fused, args.group, inputs, serial,
-                 {**source, 'origin': 'completed-owner-archive', 'archive_path': str(args.owner_archive)}, outputs)
+    if args.owner_archive:
+        serial, receipt = archived_oracle(args.owner_archive, args.group)
+        source = {**receipt['native_reference'], 'origin': 'completed-owner-archive',
+                  'archive_path': str(args.owner_archive)}
+    else:
+        # The timed worker has exited and released its queues and HBM. Obtain only
+        # the official LI IDs for scoring, outside both the graph and its process.
+        import torch
+        import torch_npu
+        from execution import native_li
+        from native_li_reference import get_reference
+        torch.npu.set_device(0)
+        refs, source = get_reference(inputs, torch, torch_npu, torch.device('npu:0'),
+                                     native_li, fused, strong_only=True)
+        serial = refs['strong_serial']
+    proof = json.loads((fused / 'mainline_checks.json').read_text())
+    if proof['capture_operand_hashes'] != source['identity']['inputs']:
+        raise ValueError('Measured inputs differ from the native TopK operands')
+    save_checked(fused, args.group, inputs, serial, source, outputs)
     result_file = fused / 'path_result.json'
     result = json.loads(result_file.read_text())
     result['topk_set_digests'] = [topk_fingerprint(value) for value in outputs]
@@ -216,11 +232,15 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ('main', 'trace', 'owner-archive', 'kvaf-root', 'output'):
+    for name in ('main', 'trace', 'kvaf-root', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--owner-archive', type=Path)
+    parser.add_argument('--physical-npu', type=int, choices=(0, 4), default=4)
     parser.add_argument('--revision', default=REVISION)
     parser.add_argument('--kvaf-server', required=True)
     parser.add_argument('--group', type=int, choices=(2, 4, 7, 10, 17), required=True)
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parsed = parser.parse_args()
+    if parsed.physical_npu == 4 and not parsed.owner_archive:
+        parser.error('--owner-archive is required for the NPU4 archive comparison')
     (worker if parsed.worker else main)(parsed)

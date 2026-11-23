@@ -21,7 +21,7 @@ OWNER_TOPK = '888db6b1603d22f4142bd2ccffe0518611856a31'
 MARKER = 'host24-npu4-g10-serial2.json'
 
 
-def from_this_host(root):
+def from_this_host(root, physical='4'):
     host = platform.node()
     if not (root / 'host.txt').is_file() or (root / 'host.txt').read_text().strip() != host:
         return False
@@ -38,14 +38,14 @@ def from_this_host(root):
     if not boot.is_file() or not all((root / name).is_file() for name in parts):
         return False
     candidate, reference, harness, key = ((root / name).read_text().strip() for name in parts)
-    record = [candidate, reference, host, boot.read_text().strip(), harness, '4']
+    record = [candidate, reference, host, boot.read_text().strip(), harness, physical]
     return hashlib.sha256(('\n'.join(record) + '\n').encode()).hexdigest()[:20] == key
 
 
-def serial_measurement(root):
-    if not from_this_host(root) or (root / 'physical_npu.txt').read_text().strip() != '4':
-        raise ValueError('Expected the serial G10 replay on physical NPU4')
-    arm = load_serial(root, GROUP, 'serial2')
+def serial_measurement(root, group=GROUP, physical='4'):
+    if not from_this_host(root, physical) or (root / 'physical_npu.txt').read_text().strip() != physical:
+        raise ValueError(f'Expected the serial G{group} replay on physical NPU{physical}')
+    arm = load_serial(root, group, 'serial2')
     cfg, timing = arm['config'], arm['timing']
     if (cfg['device'] != 0 or cfg['round_range'] != [1, 1] or cfg['mode'] != 'diagnose'
             or cfg['input'] != 'real' or cfg['iterations'] != 20 or cfg.get('serial_workers', 2) != 2
