@@ -120,30 +120,6 @@ __simd_vf__ inline void EmitWindowEntries(__ubuf__ uint32_t* ids, __ubuf__ uint3
     StoreAlign(count, total, first);
 }
 
-// Up to 64 admitted entries fit in one vector. Even score zero must follow
-// every positive score, exactly as in the general strict-then-tie emitter.
-__simd_vf__ inline void EmitAdmittedVector(__ubuf__ uint32_t* ids, __ubuf__ uint32_t* entries,
-    __ubuf__ uint32_t* output, uint32_t n) {
-    using namespace MicroAPI;
-    auto valid = UpdateMask<uint32_t>(n);
-    RegTensor<uint32_t> entry, index, score, id, packed, low16;
-    MaskReg positive, zero;
-    UnalignRegForStore store;
-    LoadAlign(entry, entries);
-    Duplicate(low16, uint32_t(65535));
-    And(score, entry, low16, valid);
-    ShiftRights(index, entry, int16_t(16), valid);
-    Gather(id, ids, index, valid);
-    CompareScalar<uint32_t, CMPMODE::GT>(positive, score, uint32_t(0), valid);
-    CompareScalar<uint32_t, CMPMODE::EQ>(zero, score, uint32_t(0), valid);
-    ClearSpr<SpecialPurposeReg::AR>();
-    Squeeze<uint32_t, MicroAPI::GatherMaskMode::STORE_REG>(packed, id, positive);
-    StoreUnAlign<uint32_t, PostLiteral::POST_MODE_UPDATE>(output, packed, store);
-    Squeeze<uint32_t, MicroAPI::GatherMaskMode::STORE_REG>(packed, id, zero);
-    StoreUnAlign<uint32_t, PostLiteral::POST_MODE_UPDATE>(output, packed, store);
-    StoreUnAlignPost(output, store);
-}
-
 __simd_vf__ inline void Narrow(__ubuf__ uint32_t* input,__ubuf__ uint16_t* output,uint32_t n,uint32_t padded) {
     using namespace MicroAPI;auto all=CreateMask<uint32_t,MaskPattern::ALL>();
     RegTensor<uint32_t> value,zero;Duplicate(zero,uint32_t(0));
@@ -192,17 +168,6 @@ __aicore__ inline uint32_t Select(LocalTensor<uint32_t> ids,LocalTensor<uint16_t
     if(clocks)clocks[1]=GetSystemCycle();
     if(!quota||!n){if(clocks)clocks[2]=clocks[3]=clocks[4]=clocks[1];return 0;}
     minimum=minimum<quota?minimum:quota;
-    if constexpr (CompactEntries) {
-        if (n<=64 && (n<=minimum || (rank==2048 && n<=quota))) {
-            EmitAdmittedVector(id,out+2048,out,n);
-            if (clocks) {
-                clocks[2]=clocks[3]=clocks[1];
-                SetFlag<HardEvent::V_S>(EVENT_ID4); WaitFlag<HardEvent::V_S>(EVENT_ID4);
-                clocks[4]=GetSystemCycle();
-            }
-            return n;
-        }
-    }
     uint32_t threshold=0;
     // Last window accepts the full Top2048; its minimum cannot reject any input.
     if(rank<2048 && !(minimum && n<=minimum)) {
