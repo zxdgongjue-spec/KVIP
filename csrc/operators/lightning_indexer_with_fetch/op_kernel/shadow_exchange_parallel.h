@@ -2,7 +2,11 @@
 // Experimental partial-permutation batches; one AIV owns all mutable maps.
 #pragma once
 namespace pipeline_ab {
+#if KVIP_PARALLEL_TERMINAL
+constexpr uint32_t EMPTY=UINT32_MAX, MAP=kMapSize, THREADS=512, SET=1024, CHUNK=512;
+#else
 constexpr uint32_t EMPTY=UINT32_MAX, MAP=kMapSize, THREADS=512, SET=2048, CHUNK=512;
+#endif
 constexpr uint32_t KEYS_POS=0, VALUES_POS=MAP, KEYS_ROW=2*MAP, VALUES_ROW=3*MAP;
 constexpr uint32_t SRCSET=4*MAP, DSTSET=SRCSET+SET, PLAN_SRC=DSTSET+SET;
 constexpr uint32_t PLAN_DST=PLAN_SRC+2*CHUNK, CONTROL=PLAN_DST+2*CHUNK, STAGING=CONTROL+128;
@@ -19,8 +23,13 @@ __simt_callee__ inline uint32_t positionIndex(__ubuf__ uint32_t* keys,uint32_t k
 }
 #endif
 __simt_callee__ inline bool put(__ubuf__ uint32_t* key,__ubuf__ uint32_t* val,uint32_t k,uint32_t v){uint32_t h=hash(k);for(uint32_t i=0;i<MAP;++i){uint32_t old=asc_atomic_cas(key+h,EMPTY,k);if(old==EMPTY||old==k){val[h]=v;return true;}h=(h+1)&(MAP-1);}return false;}
+#if KVIP_PARALLEL_TERMINAL
+__simt_callee__ inline bool insert(__ubuf__ uint32_t* table,uint32_t k){uint32_t h=((k*0x9e3779b9U)>>21)&(SET-1);for(uint32_t i=0;i<SET;++i){uint32_t old=asc_atomic_cas(table+h,EMPTY,k);if(old==EMPTY)return true;if(old==k)return false;h=(h+1)&(SET-1);}return false;}
+__simt_callee__ inline bool contains(__ubuf__ uint32_t* table,uint32_t k){uint32_t h=((k*0x9e3779b9U)>>21)&(SET-1);for(uint32_t i=0;i<SET;++i){uint32_t old=table[h];if(old==k)return true;if(old==EMPTY)return false;h=(h+1)&(SET-1);}return false;}
+#else
 __simt_callee__ inline bool insert(__ubuf__ uint32_t* table,uint32_t k){uint32_t h=(k*0x9e3779b9U)>>21;for(uint32_t i=0;i<SET;++i){uint32_t old=asc_atomic_cas(table+h,EMPTY,k);if(old==EMPTY)return true;if(old==k)return false;h=(h+1)&(SET-1);}return false;}
 __simt_callee__ inline bool contains(__ubuf__ uint32_t* table,uint32_t k){uint32_t h=(k*0x9e3779b9U)>>21;for(uint32_t i=0;i<SET;++i){uint32_t old=table[h];if(old==k)return true;if(old==EMPTY)return false;h=(h+1)&(SET-1);}return false;}
+#endif
 __simt_callee__ inline void InvalidateFreedHot(__gm__ uint32_t* valid,uint32_t dst,uint32_t resident){if(dst<resident)asc_stcg(valid+dst,uint32_t(0));}
 __simt_callee__ inline uint32_t prefix(uint32_t x,__ubuf__ uint32_t* scan){uint32_t tid=threadIdx.x,lane=tid%32,warp=tid/32,v=x;for(uint32_t d=1;d<32;d*=2){uint32_t p=asc_shfl_up(v,d);if(lane>=d)v+=p;}if(lane==31)scan[warp]=v;asc_syncthreads();if(!warp){uint32_t p=lane<16?scan[lane]:0;for(uint32_t d=1;d<32;d*=2){uint32_t t=asc_shfl_up(p,d);if(lane>=d)p+=t;}scan[lane]=p;}asc_syncthreads();return v-x+(warp?scan[warp-1]:0);}
 __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void InitShadow(__ubuf__ uint32_t* m){for(uint32_t i=threadIdx.x;i<4*MAP;i+=THREADS)m[i]=EMPTY;if(threadIdx.x<128)m[CONTROL+threadIdx.x]=0;asc_syncthreads();}

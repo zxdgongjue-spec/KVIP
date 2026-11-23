@@ -319,6 +319,47 @@ __aicore__ inline bool SubmitWqesAt(uint32_t rt_tokenBytes,uint64_t entityAddres
     }
     return true;
 }
+#if KVIP_PARALLEL_TERMINAL
+__aicore__ inline bool WriteReservedWqes(uint32_t rt_tokenBytes,uint64_t entityAddress,uint64_t queueAddress,uint64_t output,LocalTensor<uint32_t> slots,LocalTensor<uint32_t> words,
+    LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize,bool final,__gm__ Row* row,uint32_t offset,uint32_t total,__gm__ uint32_t* boundTemplate,uint64_t originalHead) {
+    if(!count)return false;
+    auto cfg64=cfg.ReinterpretCast<uint64_t>();uint64_t head=originalHead+offset;
+    uint32_t sqDepth=cfg.GetValue(17);uint64_t sqAddress=cfg64.GetValue(12);
+    if(final && (head>UINT64_MAX-count || count>=sqDepth))return false;
+    SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
+    GlobalTensor<uint32_t> sq;sq.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(sqAddress));
+    // selected and locations are both dead: their contiguous 64KiB holds
+    // 1024 WQEs, halving the dispatch/DMA fences for the usual final batch.
+    if(count<=bankSize){
+        FinalBuild(rt_tokenBytes,reinterpret_cast<__ubuf__ uint32_t*>(remoteLow.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(remoteHigh.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(slots.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(words.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),0,count,total-offset);
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        uint32_t start=uint32_t(head)&(sqDepth-1),first=count<sqDepth-start?count:sqDepth-start;
+        DataCopy(sq[start*16],words,first*16);
+        if(first!=count)DataCopy(sq,words[first*16],(count-first)*16);
+        SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+    }else{
+    for(uint32_t begin=0;begin<count;begin+=bankSize) {
+        uint32_t n=count-begin<bankSize?count-begin:bankSize;
+        FinalBuild(rt_tokenBytes,reinterpret_cast<__ubuf__ uint32_t*>(remoteLow.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(remoteHigh.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(slots.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(words.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),begin,n,total-offset);
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        uint32_t start=uint32_t(head+begin)&(sqDepth-1),first=n<sqDepth-start?n:sqDepth-start;
+        DataCopy(sq[start*16],words,first*16);
+        if(first!=n)DataCopy(sq,words[first*16],(n-first)*16);
+        SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+    }
+    }
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    return true;
+}
+#endif
 __aicore__ inline bool SubmitWqes(uint32_t rt_tokenBytes,__gm__ Row* row,LocalTensor<uint32_t> slots,LocalTensor<uint32_t> words,
     LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize=1024,bool final=false) {
     return SubmitWqesAt(rt_tokenBytes,row->entity,row->queue,row->output,slots,words,remoteLow,remoteHigh,cfg,count,bankSize,final,row);
@@ -428,11 +469,23 @@ inline void PrepareCandidateWqes(uint32_t rt_resident,__ubuf__ uint32_t* ids,__u
     __ubuf__ uint32_t* hi,__ubuf__ uint32_t* slots,__gm__ uint32_t* map,
     __gm__ uint64_t* addresses,uint32_t count,uint32_t slotBase,__gm__ Context* ctx,uint32_t batch,__gm__ uint32_t* admitted) {
     for(uint32_t i=threadIdx.x;i<count;i+=256) {
+#if KVIP_PARALLEL_TERMINAL
+        uint32_t token=ids[i],slot=slotBase+i;/* Addresses prefetched with compact IDs. */
+#else
         uint32_t token=ids[i],slot=slotBase+i;uint64_t remote=asc_ldcg(addresses+token);
+#endif
         uint32_t physical=PhysicalSlot(rt_resident,ctx,batch,slot);
+#if KVIP_PARALLEL_TERMINAL
+        slots[i]=physical;asc_stcg(map+token,physical);
+#else
         lo[i]=uint32_t(remote);hi[i]=uint32_t(remote>>32);slots[i]=physical;asc_stcg(map+token,slot);
+#endif
         TrackMapping(ctx,batch,slot-rt_resident,token,i+1==count);
+#if KVIP_PARALLEL_TERMINAL
+        // Final window: no later window reads the covered bitmap.
+#else
         asc_atomic_or(admitted+token/32,1U<<(token%32));
+#endif
         RecordPrefetchSlot(rt_resident,ctx,batch,slot,token,physical);
     }
     asc_threadfence();
