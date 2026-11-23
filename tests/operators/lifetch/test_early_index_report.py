@@ -53,6 +53,15 @@ def test_archived_oracle_and_level1_savings(tmp_path, monkeypatch, capsys):
     with pytest.raises(ValueError, match='inputs'):
         tail.archived_references(archive, 10, dict(identity, inputs='different'))
     write(new, reused, metadata, 398, 399, 276, 116)
+    (new / 'logical-ties.txt').write_text(tail.HANDOFF_REVISION)
+    # The Q1 archive carries its own copy of the measured native references.
+    # Its parent does not have to be present when the next candidate runs.
+    q1_refs, q1_meta = tail.archived_references(new, 10, identity, expected_revision=tail.HANDOFF_REVISION)
+    for name, ids in refs.items():
+        np.testing.assert_array_equal(q1_refs[name], ids)
+    assert Path(q1_meta['archive_path']).is_relative_to(new)
+    with pytest.raises(ValueError, match='revision'):
+        tail.archived_references(new, 10, identity)
     assert report.report(new, 10) == 0
     output = capsys.readouterr().out
     assert 'queries=1280/1280' in output and 'same_event_calls=20/20' in output

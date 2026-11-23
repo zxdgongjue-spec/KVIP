@@ -3896,7 +3896,11 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused, n
                 from native_li_reference import fused_li_output, write_comparison
                 refs, identity = native_reference
                 outputs = [fused_li_output(state) for state in states]
-                write_comparison(directory, config.group, inputs, refs, identity, outputs)
+                if os.environ.get('KVIP_Q4_SCORE_EQUIVALENCE') == '1':
+                    from score_equivalence import save_checked
+                    save_checked(directory, config.group, inputs, refs['strong_serial'], identity, outputs)
+                else:
+                    write_comparison(directory, config.group, inputs, refs, identity, outputs)
             if lean or candidate:
                 route_history['measured'] = checked_routes(states, **route_step(config.warmup + 1), low=True)
             rounds[inputs.source_round] = measured['timing']
@@ -4059,9 +4063,12 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             raise ValueError('Native LI reference requires one fixed owner-pack round with 20 measured calls')
         if os.environ.get('KVIP_Q4_EARLY_HANDOFF') == '1':
             from native_li_reference import identities
-            from owner_pack_tail import archived_references
+            from owner_pack_tail import CUTOFF_REVISION, HANDOFF_REVISION, archived_references
+            reference_revision = (HANDOFF_REVISION if os.environ.get('KVIP_Q4_SCORE_EQUIVALENCE') == '1'
+                                  else CUTOFF_REVISION)
             native_reference = archived_references(Path(os.environ['KVIP_Q4_TAIL_REFERENCE']), config.group,
-                                                    identities(initial, torch, torch_npu, device))
+                                                    identities(initial, torch, torch_npu, device),
+                                                    expected_revision=reference_revision)
         else:
             from native_li_reference import get_reference
             native_reference = get_reference(initial, torch, torch_npu, device, native_li, directory)
@@ -4200,6 +4207,11 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         if os.environ.get('KVIP_Q4_OWNER_TAIL') == '1':
             from owner_pack_tail import check_serial
             check_serial(state, native_reference)
+        elif os.environ.get('KVIP_Q4_SCORE_EQUIVALENCE') == '1':
+            from native_li_reference import fused_li_output
+            from score_equivalence import check_scores
+            refs, _ = native_reference
+            check_scores(initial, refs['strong_serial'], [fused_li_output(state)])
         elif os.environ.get('KVIP_Q4_LOGICAL_TIES') == '1':
             from native_li_reference import fused_li_output, native_priority, write_comparison
             refs, identity = native_reference

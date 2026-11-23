@@ -14,10 +14,12 @@ from peer_delta import pair_placement, read, single_numa_node
 from reporting import atomic_json
 
 REPEATS = 5
+CUTOFF_REVISION = '24c619b9581aad43fd53c815928def26a1e19560'
+HANDOFF_REVISION = '67b49a2748fde8f8779c4551410416596b35cf76'
 
 
-def archived_references(root, group, identity=None):
-    _, digest, _, _ = reference(root, group)
+def archived_references(root, group, identity=None, *, expected_revision=CUTOFF_REVISION):
+    _, digest, _, _ = reference(root, group, expected_revision=expected_revision)
     path, = (root / f'g{group}/logical-ties/results').glob('*/cases/diagnose/fused/native_li_compare.json')
     comparison = read(path)
     if (comparison['group'], comparison['phase'], comparison['measured_calls'],
@@ -120,9 +122,9 @@ def capture(state, inputs, config, directory, ticks_per_us, replay_and_time, exp
     return checked
 
 
-def reference(root, group):
-    if (root/'logical-ties.txt').read_text().strip() != '24c619b9581aad43fd53c815928def26a1e19560':
-        raise ValueError('Unexpected uninstrumented cutoff revision')
+def reference(root, group, *, expected_revision=CUTOFF_REVISION):
+    if (root/'logical-ties.txt').read_text().strip() != expected_revision:
+        raise ValueError(f'Unexpected native reference revision, expected {expected_revision}')
     summary = load(root, group, 'logical-ties', row_dependencies=True)
     compare_layout_receipts({'logical-ties': summary[11]}, 'logical-ties')
     if len(set(summary[1])) != 1:

@@ -11,10 +11,15 @@ case "$mode" in
     early-index-handoff)
         native=${4:?expected full candidate revision}
         groups=(10 4 17 7) ;;
+    score-equivalence)
+        native=1040d7133028ff4cd36904bef0393783be884877
+        groups=(10 4 17 7)
+        if (( $# > 3 )); then groups=("${@:4}"); fi ;;
     *) echo "Unknown replay mode: $mode" >&2; exit 2 ;;
 esac
 work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold}
 ref="$work/peer-baseline/fused.m3IizR"
+if [[ $mode == score-equivalence ]]; then ref="$work/peer-baseline/fused.0SOIpe"; fi
 runner="$work/fused-scan-sources/reader-$reader"
 git -C "$repo" cat-file -e "$native^{commit}"
 test -r "$ref/logical-ties.txt"
@@ -31,4 +36,13 @@ export PATH="/usr/local/python3.12.13/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 PYTHO
 unset PEER_RANKED_INPUT PEER_RANKED_HASH_FILE KVIP_Q4_NATIVE_LI_CACHE
 log=$(mktemp "$work/host24-npu4-$mode.XXXXXX")
 echo "LOG=$log"
+if [[ $mode == score-equivalence ]]; then
+    rc=0
+    bash "$runner/tests/operators/lifetch/peer_fused.sh" "--$mode" "$native" --reference "$ref" "${groups[@]}" 2>&1 |
+        tee "$log" | while IFS= read -r line; do
+            case "$line" in RESULT_ROOT=*|CASE_BEGIN\ *|G[0-9]*\ *|REPLAY_COMPLETE*) printf '%s\n' "$line" ;; esac
+        done || rc=$?
+    if (( rc != 0 )); then tail -n 30 "$log" >&2; fi
+    exit "$rc"
+fi
 bash "$runner/tests/operators/lifetch/peer_fused.sh" "--$mode" "$native" --reference "$ref" "${groups[@]}" 2>&1 | tee "$log"
