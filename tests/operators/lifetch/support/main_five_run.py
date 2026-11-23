@@ -92,7 +92,7 @@ def worker(args):
     atomic_json(folder / 'config.json', {**{k: str(v) if isinstance(v, Path) else v
                                            for k, v in vars(cfg).items()},
                                        'physical_npu': 4, 'fused_only': True, 'production_root': str(main),
-                                       'production_revision': REVISION})
+                                       'production_revision': args.revision})
     pages = ReplayPagePlan(sequence)
     paths = [str(ref.manifest_path) for refs in sequence.rounds for ref in refs]
     if (inputs.geometry['batch'], inputs.geometry['token_bytes'], len(sequence.rounds)) != (BATCH, 656, 1):
@@ -176,7 +176,7 @@ def worker(args):
                    npu=torch.npu.get_device_name(torch.device('npu:0')), torch=str(torch.__version__),
                    torch_npu=str(torch_npu.__version__), cann=str(getattr(torch.version, 'cann', '')))
     atomic_json(fused / 'mainline_checks.json', dict(
-        runtime=runtime, capture_operand_hashes=operand_hashes, production_revision=REVISION,
+        runtime=runtime, capture_operand_hashes=operand_hashes, production_revision=args.revision,
         production_python=str(Path(kvip.__file__).resolve()),
         loaded_library=str(library), library_sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
         production_terminal=True, profiled_terminal_kernel='v9_parallel_terminal',
@@ -193,7 +193,7 @@ def main(args):
     from workloads import ReplaySequence
 
     if (os.environ.get('ASCEND_RT_VISIBLE_DEVICES') != '4' or
-            subprocess.check_output(['git', '-C', args.main, 'rev-parse', 'HEAD'], text=True).strip() != REVISION or
+            subprocess.check_output(['git', '-C', args.main, 'rev-parse', 'HEAD'], text=True).strip() != args.revision or
             subprocess.check_output(['git', '-C', args.main, 'status', '--porcelain', '-uno'], text=True).strip()):
         raise ValueError('Expected clean pinned production mainline on physical NPU4')
     serial, receipt = archived_oracle(args.owner_archive, args.group)
@@ -218,6 +218,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('main', 'trace', 'owner-archive', 'kvaf-root', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--revision', default=REVISION)
     parser.add_argument('--kvaf-server', required=True)
     parser.add_argument('--group', type=int, choices=(2, 4, 7, 10, 17), required=True)
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)

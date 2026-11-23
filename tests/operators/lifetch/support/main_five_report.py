@@ -100,15 +100,67 @@ def main_times(folder, timing):
                 final_topk_through_tail=(mean(after), median(after)))
 
 
+def measured_parallel(root, group, arm, revision, owner, native, old_receipt, archived_inputs, *, verify_library):
+    from li_restore_archive import check_snapshot
+    from ranked_integration_sets import INPUT_AND_RESULTS
+    from score_equivalence_report import measured_sets
+
+    folder = case_folder(root, group, arm)
+    out = read(folder / 'path_result.json')
+    config = read(folder.parent / 'config.json')
+    inputs = read(folder.parent / 'replay_input.json')
+    if inputs != archived_inputs:
+        check_snapshot(group, INPUT_AND_RESULTS[group][0], archived_inputs, inputs)
+    if out['input_paths'] != inputs['source_paths'] or inputs['geometry'] != out['geometry']:
+        raise ValueError(f'G{group}: output capture metadata mismatch')
+    expected = dict(group=group, transport='urma', input='real', device=0, physical_npu=4, warmup=4,
+                    iterations=20, intermediate_fetches=4, prefetch_tokens=1024, prefetch_rank_start=1024,
+                    fused_only=True, production_revision=revision)
+    differences = [name for name, value in expected.items() if config.get(name) != value]
+    if differences:
+        raise ValueError(f'G{group}: unexpected replay settings: {differences}')
+    if ((out['path'], out['transport'], out['runtime_workers']) != ('fused', 'urma', 40)
+            or out['correctness'] != 'PASS' or out['failures']):
+        raise ValueError(f'G{group}: mainline device validation or transport setup failed')
+    proof = read(folder / 'mainline_checks.json')
+    if (proof['production_revision'] != revision or proof['production_terminal'] is not True
+            or proof['profiled_terminal_kernel'] != 'v9_parallel_terminal'
+            or (proof['measured_calls'], proof['measured_kv_index_rows']) != (20, 320)
+            or (proof['ordered_diagnostic_calls'], proof['ordered_diagnostic_rows']) != (20, 320)):
+        raise ValueError(f'G{group}: incomplete mainline kernel, measured outputs or ordered Index evidence')
+    sha = proof['library_sha256']
+    if len(sha) != 64 or any(c not in '0123456789abcdef' for c in sha):
+        raise ValueError(f'G{group}: missing build digest')
+    if verify_library:
+        digest = hashlib.sha256()
+        with Path(proof['loaded_library']).open('rb') as library:
+            for block in iter(lambda: library.read(2 ** 20), b''):
+                digest.update(block)
+        if digest.hexdigest() != sha:
+            raise ValueError(f'G{group}: loaded binary differs from the recorded build')
+    receipt = read(folder / 'score_topk_check.json')
+    source = receipt['native_reference']
+    if (source['origin'] != 'completed-owner-archive' or Path(source['archive_path']).resolve() != owner.resolve()
+            or source['identity'] != old_receipt['native_reference']['identity']):
+        raise ValueError(f'G{group}: mainline and owner archive used different native oracles')
+    if proof['capture_operand_hashes'] != source['identity']['inputs']:
+        raise ValueError(f'G{group}: measured input differs from the archived native operands')
+    exact = measured_sets(folder, group, (inputs, out['topk_set_digests']), native, receipt)
+    new_times = main_times(folder, out['all_rounds'])
+    thp = read(root / f'g{group}/{arm}/thp.json')
+    if (thp.get('status') != 'measured' or thp.get('page_mode') != 'thp'
+            or thp['bytes'] <= 0):
+        raise ValueError(f'G{group}: THP or registered DDR range differs from the candidate archive')
+    return new_times, exact, thp, proof, config
+
+
 def report(root, group, owner):
     # Delay reader imports: the upstream device worker uses archived_oracle alone,
     # and must import upstream modules under their native Python names.
-    from li_restore_archive import check_snapshot
     from li_restore_report import saved, serial_graph_line, stats
     from owner_topk_report import times
     from peer_delta import pair_placement
     from query_owner_report import load
-    from ranked_integration_sets import INPUT_AND_RESULTS
     from score_equivalence_report import measured_sets
     from strong_serial_g10 import comparison_line
 
@@ -120,48 +172,11 @@ def report(root, group, owner):
     old_folder = case_folder(owner, group, 'logical-ties')
     measured_sets(old_folder, group, old, native, old_receipt)
     old_times = times(old_folder, old[3:5], joined=True)
-    folder = case_folder(root, group, 'mainline')
-    out = read(folder / 'path_result.json')
-    config = read(folder.parent / 'config.json')
-    inputs = read(folder.parent / 'replay_input.json')
-    if inputs != old[0]:
-        check_snapshot(group, INPUT_AND_RESULTS[group][0], old[0], inputs)
-    if out['input_paths'] != inputs['source_paths'] or inputs['geometry'] != out['geometry']:
-        raise ValueError(f'G{group}: output capture metadata mismatch')
-    expected = dict(group=group, transport='urma', input='real', device=0, physical_npu=4, warmup=4,
-                    iterations=20, intermediate_fetches=4, prefetch_tokens=1024, prefetch_rank_start=1024,
-                    fused_only=True, production_revision=MAIN)
-    differences = [name for name, value in expected.items() if config.get(name) != value]
-    if differences:
-        raise ValueError(f'G{group}: unexpected replay settings: {differences}')
-    if ((out['path'], out['transport'], out['runtime_workers']) != ('fused', 'urma', 40)
-            or out['correctness'] != 'PASS' or out['failures']):
-        raise ValueError(f'G{group}: mainline device validation or transport setup failed')
-    proof = read(folder / 'mainline_checks.json')
-    if (proof['production_revision'] != MAIN or proof['production_terminal'] is not True
-            or proof['profiled_terminal_kernel'] != 'v9_parallel_terminal'
-            or (proof['measured_calls'], proof['measured_kv_index_rows']) != (20, 320)
-            or (proof['ordered_diagnostic_calls'], proof['ordered_diagnostic_rows']) != (20, 320)):
-        raise ValueError(f'G{group}: incomplete mainline kernel, measured outputs or ordered Index evidence')
-    with Path(proof['loaded_library']).open('rb') as library:
-        sha = hashlib.sha256()
-        for block in iter(lambda: library.read(2 ** 20), b''):
-            sha.update(block)
-    if sha.hexdigest() != proof['library_sha256'] or sha.hexdigest() == old[5]:
-        raise ValueError(f'G{group}: loaded binary identity differs from the recorded mainline build')
-    receipt = read(folder / 'score_topk_check.json')
-    source = receipt['native_reference']
-    if (source['origin'] != 'completed-owner-archive' or Path(source['archive_path']).resolve() != owner.resolve()
-            or source['identity'] != old_receipt['native_reference']['identity']):
-        raise ValueError(f'G{group}: mainline and owner archive used different native oracles')
-    if proof['capture_operand_hashes'] != source['identity']['inputs']:
-        raise ValueError(f'G{group}: measured input differs from the archived native operands')
-    exact = measured_sets(folder, group, (inputs, out['topk_set_digests']), native, receipt)
-    new_times = main_times(folder, out['all_rounds'])
-    thp = read(root / f'g{group}/mainline/thp.json')
-    if (thp.get('status') != 'measured' or thp.get('page_mode') != 'thp'
-            or thp['bytes'] != old[2]['bytes'] or old[2]['page_mode'] != 'thp'):
-        raise ValueError(f'G{group}: THP or registered DDR range differs from the candidate archive')
+    new_times, exact, thp, proof, config = measured_parallel(
+        root, group, 'mainline', MAIN, owner, native, old_receipt, old[0], verify_library=True)
+    if proof['library_sha256'] == old[5] or thp['bytes'] != old[2]['bytes'] or old[2]['page_mode'] != 'thp':
+        raise ValueError(f'G{group}: expected different native operators and a matched registered DDR range')
+    inputs = read(case_folder(root, group, 'mainline').parent/'replay_input.json')
     placement = pair_placement(old[2], thp, local_baseline=True)
     print(f'G{group} CHECK TopK_score_vs_strong_serial=PASS calls=20/20 queries=1280/1280 '
           f'exact_ID_sets={exact.sum()}/1280 cutoff_tie_only_sets={exact.size-exact.sum()}/1280 '
