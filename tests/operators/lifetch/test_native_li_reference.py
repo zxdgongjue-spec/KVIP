@@ -90,6 +90,11 @@ def test_native_cache_integrity_and_physical_mapping(tmp_path, monkeypatch):
     assert get()[1]['origin'] == 'fresh' and len(calls) == 6
     inputs.captured_layout = np.roll(inputs.captured_layout, 1, axis=1)
     assert get()[1]['cache_path'] != str(path) and len(calls) == 9
+    single, receipt = ref.get_reference(inputs, torch, None, None, native_li, tmp_path, strong_only=True)
+    assert calls[9:] == [False] and receipt['origin'] == 'fresh' and set(single) == {'strong_serial'}
+    np.testing.assert_array_equal(single['strong_serial'], positions)
+    cached = ref.get_reference(inputs, torch, None, None, native_li, tmp_path, strong_only=True)[1]
+    assert cached['origin'] == 'validated-cache' and len(calls) == 10
 
 
 def test_sparse_lengths_and_scope():

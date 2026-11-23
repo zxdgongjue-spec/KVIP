@@ -39,5 +39,8 @@ def save_checked(directory, group, inputs, reference, metadata, outputs):
     if len(outputs) != 20 or inputs.geometry['batch'] != 16:
         raise ValueError('Expected 20 measured Q4 calls with batch 16')
     result = check_scores(inputs, reference, outputs)
-    np.savez_compressed(directory / 'score_topk_ids.npz', fused=np.asarray(outputs))
+    # The standalone native LI reference is part of this result archive, even
+    # if a later run prunes its build or native LI cache.
+    extra = {'strong_serial': reference} if metadata.get('origin') in ('fresh', 'validated-cache') else {}
+    np.savez_compressed(directory / 'score_topk_ids.npz', fused=np.asarray(outputs), **extra)
     atomic_json(directory / 'score_topk_check.json', dict(group=group, native_reference=metadata, **result))

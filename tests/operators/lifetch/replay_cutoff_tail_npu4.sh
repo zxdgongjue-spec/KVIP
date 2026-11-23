@@ -13,8 +13,12 @@ case "$mode" in
         groups=(10 4 17 7) ;;
     owner-topk)
         native=${4:?expected full candidate revision}
-        groups=(4 10 17 7)
+        groups=(4 10 17 7 2)
         if (( $# > 4 )); then groups=("${@:5}"); fi ;;
+    fill-g10-g2)
+        native=${4:?expected full candidate revision}
+        [[ $# == 4 ]] || { echo 'fill-g10-g2 takes only the current candidate revision' >&2; exit 2; }
+        groups=(2) ;;
     score-equivalence)
         native=1040d7133028ff4cd36904bef0393783be884877
         groups=(10 4 17 7)
@@ -24,7 +28,7 @@ esac
 work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold}
 ref="$work/peer-baseline/fused.m3IizR"
 if [[ $mode == score-equivalence ]]; then ref="$work/peer-baseline/fused.0SOIpe"; fi
-if [[ $mode == owner-topk ]]; then ref="$work/peer-baseline/fused.fmn5ww"; fi
+if [[ $mode == owner-topk || $mode == fill-g10-g2 ]]; then ref="$work/peer-baseline/fused.fmn5ww"; fi
 runner="$work/fused-scan-sources/reader-$reader"
 git -C "$repo" cat-file -e "$native^{commit}"
 test -r "$ref/logical-ties.txt"
@@ -41,9 +45,22 @@ export PATH="/usr/local/python3.12.13/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 PYTHO
 unset PEER_RANKED_INPUT PEER_RANKED_HASH_FILE KVIP_Q4_NATIVE_LI_CACHE
 log=$(mktemp "$work/host24-npu4-$mode.XXXXXX")
 echo "LOG=$log"
-if [[ $mode == score-equivalence || $mode == owner-topk ]]; then
+if [[ $mode == score-equivalence || $mode == owner-topk || $mode == fill-g10-g2 ]]; then
+    run_selected() {
+        if [[ $mode == fill-g10-g2 ]]; then
+            local current="$work/peer-baseline/fused.N7n8ZP"
+            local serial_rc=0
+            [[ $(<"$current/logical-ties.txt") == "$native" ]] || { echo "Expected current owner TopK result at $current" >&2; return 1; }
+            bash "$runner/tests/operators/lifetch/peer_fused.sh" --serial-g10-only "$current" || serial_rc=$?
+            if (( serial_rc )); then printf 'G10 FAILED rc=%s log=%s\n' "$serial_rc" "$log" >&2; fi
+            bash "$runner/tests/operators/lifetch/peer_fused.sh" --owner-topk "$native" --reference "$ref" 2 || return $?
+            return "$serial_rc"
+        else
+            bash "$runner/tests/operators/lifetch/peer_fused.sh" "--$mode" "$native" --reference "$ref" "${groups[@]}"
+        fi
+    }
     rc=0
-    bash "$runner/tests/operators/lifetch/peer_fused.sh" "--$mode" "$native" --reference "$ref" "${groups[@]}" 2>&1 |
+    run_selected 2>&1 |
         tee "$log" | while IFS= read -r line; do
             case "$line" in RESULT_ROOT=*|CASE_BEGIN\ *|G[0-9]*\ *|REPLAY_COMPLETE*) printf '%s\n' "$line" ;; esac
         done || rc=$?

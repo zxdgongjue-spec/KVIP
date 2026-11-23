@@ -51,7 +51,8 @@ def saved(old, new):
 
 # User's 2-Get-worker serial RARs, device 4, one profiled graph, 20 samples.
 # Their replay_input.json equals the eight-rank capture bound by INPUT_AND_RESULTS.
-SERIAL_NPU4 = {7: (589.598798752, 575.597625), 17: (436.236286163, 426.187875),
+SERIAL_NPU4 = {2: (298.7185478210449, 292.69750000000045),
+               7: (589.598798752, 575.597625), 17: (436.236286163, 426.187875),
                4: (399.551296234, 391.969375)}
 FIRST_EXACT = '81e22933b1166685f82b7f0d8a44495c6e628a70'
 

@@ -106,12 +106,13 @@ def check_positions(positions, ends):
         raise ValueError('Native LI output contains duplicate or out-of-domain positions')
 
 
-def get_reference(inputs, torch, torch_npu, device, native_li, directory):
+def get_reference(inputs, torch, torch_npu, device, native_li, directory, *, strong_only=False):
     identity = identities(inputs, torch, torch_npu, device)
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     cache = Path(os.environ.get('KVIP_Q4_NATIVE_LI_CACHE', directory / 'native-li-reference'))
     cache.mkdir(parents=True, exist_ok=True)
-    path = cache / f'{key}.npz'
+    modes = ('strong_serial',) if strong_only else MODES
+    path = cache / (f'{key}.strong-serial.npz' if strong_only else f'{key}.npz')
     ends = native_ends(inputs)
     positions = {}
     origin = 'fresh'
@@ -120,7 +121,7 @@ def get_reference(inputs, torch, torch_npu, device, native_li, directory):
             with np.load(path, allow_pickle=False) as data:
                 if json.loads(data['identity'].item()) != identity:
                     raise ValueError('Native reference cache input identity differs')
-                for mode in MODES:
+                for mode in modes:
                     value = data[mode]
                     check_positions(value, ends)
                     if digest(value) != data[f'{mode}_sha256'].item():
@@ -131,7 +132,7 @@ def get_reference(inputs, torch, torch_npu, device, native_li, directory):
             positions.clear()
     if not positions:
         operands = NativeReplayLI(torch, device, inputs.geometry)
-        for mode in MODES:
+        for mode in modes:
             if mode != 'strong_serial_repeat':
                 operands.prepare(inputs, physical=(mode == 'same_layout_native'))
             selected = native_li(torch_npu, operands.fixture).cpu().numpy()
@@ -153,9 +154,10 @@ def get_reference(inputs, torch, torch_npu, device, native_li, directory):
             temporary.replace(path)
         finally:
             temporary.unlink(missing_ok=True)
-    ids = dict(strong_serial=positions['strong_serial'], strong_serial_repeat=positions['strong_serial_repeat'],
-               same_layout_native=inputs.captured_layout[np.arange(len(ends))[:, None, None],
-                                                          positions['same_layout_native']].astype(np.int32))
+    ids = positions.copy()
+    if not strong_only:
+        ids['same_layout_native'] = inputs.captured_layout[np.arange(len(ends))[:, None, None],
+                                                           positions['same_layout_native']].astype(np.int32)
     metadata = dict(origin=origin, cache_path=str(path), cache_key=key, identity=identity,
                     layout_query='BSND', layout_key='PA_BSND', sparse_count=2048,
                     effective_native_ends=ends.tolist(), input_paths=list(map(str, inputs.source_paths)))

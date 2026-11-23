@@ -16,10 +16,15 @@ def checked_outputs(root, group, current, serial, identity, oracle_path):
     folder, = (root / f'g{group}/logical-ties/results').glob('*/cases/diagnose/fused')
     receipt = read(folder / 'score_topk_check.json')
     source = receipt['native_reference']
-    if (receipt['group'] != group or (receipt['calls'], receipt['queries']) != (20, 1280)
-            or source['origin'] != 'completed-archive' or source['identity'] != identity
+    if (source['origin'] != 'completed-archive' or source['identity'] != identity
             or Path(source['archive_path']).resolve() != oracle_path.resolve()):
-        raise ValueError('Incomplete score-equivalent check or different strong serial archive')
+        raise ValueError('Different strong serial archive')
+    return folder, source, measured_sets(folder, group, current, serial, receipt)
+
+
+def measured_sets(folder, group, current, serial, receipt):
+    if receipt['group'] != group or (receipt['calls'], receipt['queries']) != (20, 1280):
+        raise ValueError('Incomplete score-equivalent check')
     if receipt['serial_set_digest'] != topk_fingerprint(serial):
         raise ValueError('Strong serial oracle differs between runs')
     with np.load(folder / 'score_topk_ids.npz', allow_pickle=False) as raw:
@@ -31,7 +36,7 @@ def checked_outputs(root, group, current, serial, identity, oracle_path):
     if (exact.sum(), exact.all(axis=(1, 2)).sum()) != (receipt['exact_queries'], receipt['exact_calls']):
         raise ValueError('Reported exact-token overlap differs from the saved outputs')
 
-    return folder, source, exact
+    return exact
 
 
 def report(root, group, reference):

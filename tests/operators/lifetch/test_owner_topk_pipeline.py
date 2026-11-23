@@ -103,3 +103,50 @@ def test_report_pairs_one_oracle_and_two_archived_score_receipts(tmp_path, monke
     (parent / 'logical-ties.txt').write_text('wrong')
     with pytest.raises(ValueError, match='score-equivalent parent'):
         report.report(new, 4, parent)
+
+
+def test_g2_report_checks_local_native_reference_without_parent(tmp_path, monkeypatch, capsys):
+    import hashlib
+    import numpy as np
+    import li_restore_report
+    import owner_topk_report as report
+    from correctness import topk_fingerprint
+    from score_equivalence import save_checked
+    from test_score_equivalence import example
+
+    folder = tmp_path / 'g2/logical-ties/results/job/cases/diagnose/fused'
+    profile = folder / 'diagnose/round-1'
+    profile.mkdir(parents=True)
+    (tmp_path/'physical_npu.txt').write_text('4')
+    result = split_graph_invocations(trace(joined=True, li_count=3), 20)
+    (profile/'full_attribution.json').write_text(json.dumps(
+        dict(samples=[dict(accounting=s) for s in result['samples']])))
+    inputs, serial = example(16)
+    identity = dict(operator='torch_npu.npu_quant_lightning_indexer', visible='4')
+    source = dict(origin='fresh', cache_key=hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest(),
+                  identity=identity, layout_query='BSND', layout_key='PA_BSND', sparse_count=2048,
+                  effective_native_ends=inputs.query_ends.tolist(), input_paths=['same-input']*8)
+    outputs = np.broadcast_to(serial, (20, *serial.shape)).copy()
+    outputs[7:, 1, 3, -1] = 2048
+    save_checked(folder, 2, inputs, serial, source, outputs)
+    rows = [[('a'*64, 'b'*64)]*16 for _ in range(20)]
+    record = (dict(source_paths=source['input_paths']), [topk_fingerprint(call) for call in outputs], None,
+              301, 300, None, None, None, None, None, None, rows)
+    monkeypatch.setattr(report, 'load', lambda *args, **kwargs: record)
+    monkeypatch.setattr(report, 'dp_capture_id', lambda group, _: report.INPUT_AND_RESULTS[group][0])
+    monkeypatch.setattr(li_restore_report, 'dp_capture_id', report.dp_capture_id)
+    report.report(tmp_path, 2, tmp_path/'no-parent-measurement')
+    output = capsys.readouterr().out
+    assert 'cutoff_tie_only_sets=13/1280' in output and 'native_LI_reference=fresh' in output
+    assert 'vs_q1_handoff_free_ties UNAVAILABLE' in output
+    assert 'graph_saved_mean/P50_us=-2.28/-7.30' in output
+    assert 'graph_saved_mean/P50_us=+21.88/+15.59' in output
+    monkeypatch.setattr(report, 'dp_capture_id', lambda *_: 'wrong')
+    with pytest.raises(ValueError, match='archived G2'):
+        report.report(tmp_path, 2, tmp_path/'no-parent-measurement')
+    monkeypatch.setattr(report, 'dp_capture_id', lambda *_: None)
+    monkeypatch.setattr(li_restore_report, 'dp_capture_id', report.dp_capture_id)
+    report.report(tmp_path, 2, tmp_path/'no-parent-measurement')
+    output = capsys.readouterr().out
+    assert 'G2 CHECK TopK_score_vs_strong_serial=PASS' in output
+    assert 'vs_serial2_archive UNVERIFIED' in output and 'vs_original_fusion UNVERIFIED' in output

@@ -4062,7 +4062,13 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         if not (fused and config.query_owner_arm == 'owner-pack' and config.production_root
                 and config.iterations == 20 and len(sequence.rounds) == 1):
             raise ValueError('Native LI reference requires one fixed owner-pack round with 20 measured calls')
-        if os.environ.get('KVIP_Q4_EARLY_HANDOFF') == '1':
+        if config.group == 2 and os.environ.get('KVIP_Q4_OWNER_TOPK') == '1':
+            # G2's archived strong serial timing has no raw logical TopK. Run
+            # only its native LI on cache miss, before creating any replay graph.
+            from native_li_reference import get_reference
+            native_reference = get_reference(initial, torch, torch_npu, device, native_li, directory,
+                                             strong_only=True)
+        elif os.environ.get('KVIP_Q4_EARLY_HANDOFF') == '1':
             from native_li_reference import identities
             from owner_pack_tail import CUTOFF_REVISION, HANDOFF_REVISION, archived_references
             reference_revision = (HANDOFF_REVISION if os.environ.get('KVIP_Q4_SCORE_EQUIVALENCE') == '1'

@@ -1,4 +1,4 @@
-"""Per-call logical TopK set fingerprints of the four archived 1d2486a7 baseline runs."""
+"""Per-call logical TopK set fingerprints of the archived 1d2486a7 baseline runs."""
 import numpy as np
 
 from correctness import topk_fingerprint
@@ -8,6 +8,9 @@ from li_restore_archive import dp_capture_id
 # The input fingerprint includes group, original round, ordered request identities and eight
 # capture payload SHA256s. The replay reader checks the actual payloads before using them.
 INPUT_AND_RESULTS = {
+    2: ('86b35676301c9497a36f99710d0f8779d1bf532830995597d1aee65f2def2c78', {
+        'c138af2109a1678b6adf88f3d37aff3b23c8058910b40ab7aab6c3974da30a13': 20,
+    }),
     7: ('e444e32559b4b59e98d41ea2e2ff31965441706c9d9f75ab8e1fab9b357f0989', {
         '85ac041bccf42c57ae0a5983e09afc824e1534ac0c28787e5298e8c6cc5d5124': 9,
         'de8b33ed7359f108819b1fdf0e4f41ca419a46735925d1fd6e6040de0772c1cf': 4,

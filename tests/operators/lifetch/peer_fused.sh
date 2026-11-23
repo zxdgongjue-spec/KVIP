@@ -37,6 +37,7 @@ owner_tail=false
 early_handoff=false
 score_equivalence=false
 owner_topk=false
+serial_g10_reference=
 performance_reference=
 exact_handoff_rev=67b49a2748fde8f8779c4551410416596b35cf76
 score_candidate_rev=1040d7133028ff4cd36904bef0393783be884877
@@ -52,7 +53,16 @@ resume=
 anchor=
 has_anchor=false
 four_field=5072f2c907f0fbd3bf1c1fbe499dd979c8c1dfca
-if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
+if [[ ${1:-} == --serial-g10-only ]]; then
+    [[ $# == 2 && -d $2 ]] || { echo 'Usage: --serial-g10-only COMPLETED_G10_CANDIDATE_ROOT' >&2; exit 2; }
+    serial_g10_reference=$(cd "$2" && pwd -P)
+    [[ $peer_physical_npu == 4 && $(<"$serial_g10_reference/physical_npu.txt") == 4 ]] || {
+        echo 'G10 serial reference requires the B24 physical NPU4 candidate archive' >&2; exit 2
+    }
+    export PEER_LOCAL_ONLY=1
+    unset KVIP_Q4_LI_RESTORE KVIP_Q4_LOGICAL_TIES
+    shift 2
+elif [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
     if [[ $1 == --ranked-joint ]]; then joint=true; fi
     ranked=${2:?supply full helper candidate revision}
     [[ $ranked =~ ^[0-9a-f]{40}$ && $ranked != "$four_field" ]] || { echo 'Expected the full helper candidate SHA' >&2; exit 2; }
@@ -165,7 +175,9 @@ elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-pa
         if "$early_handoff"; then export KVIP_Q4_EARLY_HANDOFF=1; else export KVIP_Q4_OWNER_TAIL=1; fi
     fi
     offset_groups=(7 2 10 17 4)
-    if "$early_handoff"; then
+    if "$owner_topk"; then
+        offset_groups=(4 10 17 7 2)
+    elif "$early_handoff"; then
         offset_groups=(10 4 17 7)
     elif [[ $plan_candidate == owner-pack || $plan_candidate == li-restore || $plan_candidate == logical-ties ]]; then
         offset_groups=(7 10 17 4)
@@ -368,19 +380,38 @@ else
 fi
 if [[ -r /usr/local/Ascend/nnal/atb/set_env.sh ]]; then source /usr/local/Ascend/nnal/atb/set_env.sh; fi
 set -euo pipefail
+if [[ -n "$serial_g10_reference" ]]; then
+    cached_python="$area/python-${serial_revision:0:8}/bin/python"
+    if [[ ! -x "$cached_python" ]]; then cached_python=/usr/local/python3.12.13/bin/python3; fi
+    cache_rc=0
+    "$cached_python" -B "$tools/support/strong_serial_g10.py" cached "$area" "$serial_g10_reference" | tee "$out/summary.txt" || cache_rc=$?
+    if (( cache_rc == 0 )); then
+        printf 'REPLAY_COMPLETE RESULT_ROOT=%s\n' "$out"
+        exit 0
+    fi
+    if (( cache_rc != 3 )); then exit "$cache_rc"; fi
+    printf '%s\n' "$peer_physical_npu" >"$out/physical_npu.txt"
+    cat /proc/sys/kernel/hostname >"$out/host.txt"
+    cat /proc/sys/kernel/random/boot_id >"$out/boot_id.txt"
+    if [[ -r /etc/machine-id ]]; then cat /etc/machine-id >"$out/machine_id.txt"; fi
+fi
 pin() {
     local repo=$1 checkout=$2 sha=$3
     if [[ ! -e "$checkout" ]]; then git -C "$repo" worktree add -q --detach "$checkout" "$sha"; fi
     [[ $(git -C "$checkout" rev-parse HEAD) == "$sha" ]] || { echo "Unexpected revision in $checkout" >&2; exit 1; }
     git -C "$checkout" diff --quiet && git -C "$checkout" diff --cached --quiet || { echo "Modified source: $checkout" >&2; exit 1; }
 }
-if [[ -z "$ranked" ]]; then trace=$(bash "$tools/peer_g2_input.sh" "$work"); fi
 local_baseline=false
-if [[ -n "$ranked" || ( -n "$adaptive" && -z "$reuse" ) ]]; then
+if [[ -n "$serial_g10_reference" ]]; then
+    trace=$(bash "$tools/peer_g2_input.sh" "$work" 10)
+elif [[ -z "$ranked" ]]; then
+    trace=$(bash "$tools/peer_g2_input.sh" "$work")
+fi
+if [[ -n "$ranked" || -n "$serial_g10_reference" || ( -n "$adaptive" && -z "$reuse" ) ]]; then
     local_baseline=true
     source "$tools/support/peer_node_prepare.sh"
     preparation=${ranked:+fused-only}
-    if "$ranked_auto"; then preparation=full; fi
+    if "$ranked_auto" || [[ -n "$serial_g10_reference" ]]; then preparation=full; fi
     peer_prepare_node "$root" "$baseline" "$clean" "$work" "$out" "$preparation"
 fi
 if [[ -z "$ranked" ]]; then
@@ -473,7 +504,7 @@ elif [[ -n "$adaptive" ]]; then
     adaptive_src="$src/urma-main-${adaptive:0:8}"
     pin "$root" "$adaptive_src" "$adaptive"
     printf '%s\n' "$adaptive" >"$out/candidate.txt"
-else
+elif [[ -z "$serial_g10_reference" ]]; then
     git -C "$root" fetch -q origin test/peer-g2-low-cq
     pin "$root" "$src/auto-${old:0:8}" "$old"
     pin "$root" "$src/auto-${new:0:8}" "$new"
@@ -483,7 +514,7 @@ if ! git -C "$clean" cat-file -e "$transport^{commit}" 2>/dev/null; then
 fi
 pin "$clean" "$kvaf" "$transport"
 pin "$clean" "$clean" de4fd37e02fa86357f71fe4fcbbbecc3e75d1d58
-[[ -n "$ranked" || -n "$adaptive" || -s "$snapshot/manifest.json" ]] || { echo "Missing G2 snapshot $snapshot" >&2; exit 1; }
+[[ -n "$ranked" || -n "$adaptive" || -n "$serial_g10_reference" || -s "$snapshot/manifest.json" ]] || { echo "Missing G2 snapshot $snapshot" >&2; exit 1; }
 if "$local_baseline"; then
     cann="$ASCEND_CANN_PACKAGE_PATH"
 else
@@ -558,7 +589,7 @@ if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA physical_NPU=%s logical_device=0 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$peer_physical_npu" "$ranked_sha" "$ranked" "$transport"
     if "$owner_topk"; then
         printf '%s\n' "$performance_reference" >"$out/free-ties-reference.txt"
-        echo "CONFIG measured=owner-topk reference=$performance_reference serial_sets=archive level=1 warmup=4 calls=20"
+        echo "CONFIG measured=owner-topk reference=$performance_reference G2_native_oracle=cache_or_untimed_LI level=1 warmup=4 calls=20"
     elif "$score_equivalence"; then
         printf '%s\n' "$KVIP_Q4_TAIL_REFERENCE" >"$out/exact-handoff-reference.txt"
         echo "CONFIG measured=score-equivalence reference=$KVIP_Q4_TAIL_REFERENCE serial_sets=archive level=1 warmup=4 calls=20"
@@ -610,6 +641,8 @@ with library.open('rb') as handle:
 print(f"BUILD_READY source={source.name} cache={library.parent.name}", flush=True)
 BUILD
     done
+elif [[ -n "$serial_g10_reference" ]]; then
+    echo "CONFIG G10 strong_serial workers=2 physical_NPU=$peer_physical_npu level=3 warmup=4 calls=20"
 elif [[ -n "$adaptive" ]]; then
     printf 'CONFIG G2 physical_NPU=%s logical_device=0 BS16 Q4 656B main=%.8s candidate=%.8s\n' "$peer_physical_npu" "$main_sha" "$adaptive"
     echo 'UNITS us  DETAIL=p50/max[observed/eligible] auxiliary=true  DRIFT=within_graph_last5_minus_first5'
@@ -666,6 +699,7 @@ run_arm() (
         after) candidate=$new ;;
     esac
     limits=(--prefetch-tokens 1024 --intermediate-fetches 4)
+    if [[ -n "$serial_g10_reference" ]]; then level=3; fi
     if "$query_owner"; then
         owner_arm=$label
         if [[ $label == li-restore || $label == logical-ties ]]; then owner_arm=owner-pack; fi
@@ -722,7 +756,7 @@ run_arm() (
     fi
     if ! wait "$monitor"; then cat "$arm/thp.log" >&2; exit 1; fi
     monitor=
-    if [[ -n "$ranked" ]]; then exit 0; fi
+    if [[ -n "$ranked" || -n "$serial_g10_reference" ]]; then exit 0; fi
     if [[ -z "$adaptive" ]]; then
         "$PYTHON" -B "$tools/support/peer_delta.py" "$out" "$label"
     else
@@ -774,6 +808,14 @@ if "$joint_local"; then
     fi
 fi
 bind_cpu_service "$node"
+if [[ -n "$serial_g10_reference" ]]; then
+    previous_node=$("$PYTHON" -B "$tools/support/owner_pack_tail.py" numa "$serial_g10_reference" 10)
+    bind_cpu_service "${previous_node:-$node}"
+    run_arm serial2 10 "$out/g10"
+    "$PYTHON" -B "$tools/support/strong_serial_g10.py" publish "$out" "$serial_g10_reference" | tee "$out/summary.txt"
+    echo "REPLAY_COMPLETE RESULT_ROOT=$out"
+    exit 0
+fi
 if [[ -n "$help_reference" ]] || "$joint_local"; then
     source "$tools/support/ranked_help_run.sh"
     if "$ranked_auto"; then
@@ -829,7 +871,10 @@ if [[ -n "$ranked" ]]; then
         case_dir="$out/g$group"
         if "$query_owner"; then trace=${owner_traces[$group]}
         else trace=$(bash "$tools/peer_g2_input.sh" "$work" "$group"); fi
-        if "$owner_tail" || "$early_handoff"; then
+        if "$owner_topk" && [[ $group == 2 ]]; then
+            export KVIP_Q4_NATIVE_LI_CACHE="$area/native-li-reference-g2"
+            bind_cpu_service "$node"
+        elif "$owner_tail" || "$early_handoff"; then
             # Preserve reference NUMA placement when the original was observable.
             previous_node=$("$PYTHON" -B "$tools/support/owner_pack_tail.py" numa "${performance_reference:-$KVIP_Q4_TAIL_REFERENCE}" "$group")
             bind_cpu_service "${previous_node:-$node}"
