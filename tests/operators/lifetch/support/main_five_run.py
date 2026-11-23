@@ -235,7 +235,7 @@ if __name__ == '__main__':
     for name in ('main', 'trace', 'kvaf-root', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--owner-archive', type=Path)
-    parser.add_argument('--physical-npu', type=int, choices=(0, 4), default=4)
+    parser.add_argument('--physical-npu', type=int, choices=(0, 4, 5), default=4)
     parser.add_argument('--revision', default=REVISION)
     parser.add_argument('--kvaf-server', required=True)
     parser.add_argument('--group', type=int, choices=(2, 4, 7, 10, 17), required=True)

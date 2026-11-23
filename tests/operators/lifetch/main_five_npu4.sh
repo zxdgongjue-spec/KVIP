@@ -14,10 +14,10 @@ arm_label=mainline_parallel_tail
 owner_rev=888db6b1603d22f4142bd2ccffe0518611856a31
 transport=a2857b460a74704114fd30a849ae38666cc2c372
 serial=da318bdb81344672b5d9013e04d517669d3eb142
-# Existing mainline/LI readers default to B24. NPU0 is the independent paced-tail arm.
+# Existing mainline/LI readers default to B24. NPU0 and NPU5 use the B20 paced-tail candidate.
 peer_physical_npu=${PEER_PHYSICAL_NPU:-4}
 case "$peer_physical_npu" in
-    0) [[ "$native" == 6d7f257b3d664a8b4991cfd3ebd12da4f2038d04 ]] || { echo "Expected the paced-tail candidate on NPU0" >&2; exit 2; } ;;
+    0|5) [[ "$native" == 6d7f257b3d664a8b4991cfd3ebd12da4f2038d04 ]] || { echo "Expected the paced-tail candidate on NPU$peer_physical_npu" >&2; exit 2; } ;;
     4) ;;
     *) echo "Unsupported physical NPU: $peer_physical_npu" >&2; exit 2 ;;
 esac
@@ -36,10 +36,10 @@ if [[ $native != "$main_rev" ]]; then
         echo "Expected a full candidate SHA based on the tested parallel terminal" >&2
         exit 2
     }
-    if [[ $peer_physical_npu == 0 ]]; then
+    if [[ $peer_physical_npu != 4 ]]; then
         label=paced-tail
         arm_label=paced-tail
-        prefix=host20-npu0-paced-tail
+        prefix="host20-npu${peer_physical_npu}-paced-tail"
         reference=
     else
         label=li-window
@@ -54,7 +54,7 @@ if [[ $native != "$main_rev" ]]; then
 fi
 out=$(mktemp -d "$area/$prefix.XXXXXX")
 echo "RESULT_ROOT=$out"
-if [[ $peer_physical_npu == 0 ]]; then echo "LOG=$out/run.log"; fi
+if [[ $peer_physical_npu != 4 ]]; then echo "LOG=$out/run.log"; fi
 exec > >(tee "$out/run.log") 2>&1
 
 checkout() {
@@ -94,7 +94,7 @@ archive_for() {
     else printf '%s\n' "$area/fused.N7n8ZP"; fi
 }
 for group in "${groups[@]}"; do
-    if [[ $peer_physical_npu == 0 ]]; then continue; fi
+    if [[ $peer_physical_npu != 4 ]]; then continue; fi
     archive=$(archive_for "$group")
     if [[ $native != "$main_rev" && ! -s "$reference/g$group/mainline/thp.json" ]]; then
         echo "Missing upstream G$group archive at $reference" >&2
@@ -144,7 +144,7 @@ run_group() (
     mkdir -p "$arm"
     trace=$(bash "$reader_src/tests/operators/lifetch/peer_g2_input.sh" "$work" "$group")
     oracle_args=(--owner-archive "$archive")
-    if [[ $peer_physical_npu == 0 ]]; then
+    if [[ $peer_physical_npu != 4 ]]; then
         node=$("$PYTHON" -B "$support/paced_host20.py" node "$out" "$group")
         if ! "$PYTHON" -B "$support/paced_host20.py" oracle "$archive" "$group"; then
             oracle_args=()
@@ -194,7 +194,7 @@ run_group() (
     fi
     if ! wait "$monitor"; then cat "$arm/thp.log" >&2; exit 1; fi
     monitor=
-    if [[ $peer_physical_npu == 0 ]]; then
+    if [[ $peer_physical_npu != 4 ]]; then
         "$PYTHON" -B "$support/paced_host20.py" report "$out" "$group" | tee -a "$out/summary.txt"
     elif [[ $native == "$main_rev" ]]; then
         "$PYTHON" -B "$support/main_five_report.py" "$out" "$group" "$archive" | tee -a "$out/summary.txt"
@@ -222,7 +222,7 @@ if (( ${#failed[@]} )); then
     echo "REPLAY_INCOMPLETE groups=${failed[*]} RESULT_ROOT=$out" >&2
     exit 1
 fi
-if [[ $peer_physical_npu == 0 ]]; then
+if [[ $peer_physical_npu != 4 ]]; then
     "$PYTHON" -B "$support/paced_host20.py" summary "$out" | tee -a "$out/summary.txt"
 elif [[ $native != "$main_rev" ]]; then
     "$PYTHON" -B "$support/li_window_report.py" summary "$out" | tee -a "$out/summary.txt"

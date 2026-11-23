@@ -1,4 +1,4 @@
-"""Report the paced terminal on physical NPU0 with explicit timing provenance."""
+"""Report the paced terminal on the selected B20 NPU with explicit timing provenance."""
 import argparse
 import hashlib
 import os
@@ -24,13 +24,20 @@ B24_SERIAL = {**SERIAL_NPU4, 10: (356.98, 348.26)}
 ARCHIVE_ERRORS = (OSError, KeyError, ValueError, TypeError, IndexError, AssertionError)
 
 
-def local_archives(area, group, arm):
+def run_device(root):
+    physical = (root/'physical_npu.txt').read_text().strip()
+    if physical not in ('0', '5'):
+        raise ValueError(f'Unexpected B20 physical device {physical}')
+    return physical
+
+
+def local_archives(area, group, arm, physical):
     # Prefer the newest compatible archive, independently of the measured latency.
     files = sorted(area.glob(f'*/g{group}/{arm}/thp.json'), key=lambda p: p.stat().st_mtime_ns, reverse=True)
     for f in files:
         root = f.parents[2]
         try:
-            if (root/'physical_npu.txt').read_text().strip() != '0' or not from_this_host(root, '0'):
+            if (root/'physical_npu.txt').read_text().strip() != physical or not from_this_host(root, physical):
                 continue
             if arm == 'mainline' and ((root/'candidate.txt').exists() or (root/'main.txt').read_text().strip() != MAIN):
                 continue
@@ -40,8 +47,9 @@ def local_archives(area, group, arm):
 
 
 def target_node(root, group):
+    physical = run_device(root)
     for arm in ('mainline', 'serial2'):
-        for _, thp in local_archives(root.parent, group, arm):
+        for _, thp in local_archives(root.parent, group, arm, physical):
             if thp.get('status') != 'measured' or 'numa_pages_overlapping_vmas' not in thp:
                 continue
             node = single_numa_node(thp)
@@ -66,7 +74,7 @@ def main_archive(root, group, current_proof, current_cfg):
     proof = read(folder/'mainline_checks.json')
     cfg = read(folder.parent/'config.json')
     result = read(folder/'path_result.json')
-    if (cfg['physical_npu'] != 0 or proof['runtime'] != current_proof['runtime']
+    if (cfg['physical_npu'] != current_cfg['physical_npu'] or proof['runtime'] != current_proof['runtime']
             or cfg['kvaf_root'] != current_cfg['kvaf_root'] or proof['production_revision'] != MAIN
             or cfg['production_revision'] != MAIN or proof['capture_operand_hashes'] != current_proof['capture_operand_hashes']
             or not proof['production_terminal'] or proof['ordered_diagnostic_rows'] != 320
@@ -76,13 +84,14 @@ def main_archive(root, group, current_proof, current_cfg):
 
 
 def compare_local(area, group, arm, new, thp, inputs, proof, cfg):
+    physical = str(cfg['physical_npu'])
     skipped = []
-    for root, old_thp in local_archives(area, group, arm):
+    for root, old_thp in local_archives(area, group, arm, physical):
         try:
             if old_thp['bytes'] != thp['bytes'] or pair_placement(old_thp, thp, local_baseline=True) != 'matched':
                 raise ValueError('DDR placement differs')
             if arm == 'serial2':
-                archive, old, _ = serial_measurement(root, group, '0')
+                archive, old, _ = serial_measurement(root, group, physical)
                 old_inputs = archive['inputs']
             else:
                 old, old_inputs = main_archive(root, group, proof, cfg)
@@ -91,11 +100,11 @@ def compare_local(area, group, arm, new, thp, inputs, proof, cfg):
         except ARCHIVE_ERRORS as exc:
             skipped.append(f'{root.name} ({exc})')
             continue
-        print(f'G{group} vs_B20_NPU0_{arm} archived_graph_mean/P50_us={stats(old)} '
+        print(f'G{group} vs_B20_NPU{physical}_{arm} archived_graph_mean/P50_us={stats(old)} '
               f'graph_saved_mean/P50_us={saved(old,new)} gain_mean/P50_pct={percent(old,new)} source={root}')
         return list(old)
     why = '; '.join(skipped[:2]) if skipped else 'no_matching_local_archive'
-    print(f'G{group} vs_B20_NPU0_{arm} UNAVAILABLE reason={why}')
+    print(f'G{group} vs_B20_NPU{physical}_{arm} UNAVAILABLE reason={why}')
     return None
 
 
@@ -104,6 +113,7 @@ def percent(old, new):
 
 
 def report(root, group):
+    physical = run_device(root)
     folder = case_folder(root, group, 'paced-tail')
     proof = read(folder/'mainline_checks.json')
     cfg = read(folder.parent/'config.json')
@@ -111,8 +121,8 @@ def report(root, group):
     result = read(folder/'path_result.json')
     inputs = read(folder.parent/'replay_input.json')
     if ((root/'candidate.txt').read_text().strip() != PACED or cfg['production_revision'] != PACED
-            or proof['production_revision'] != PACED or cfg['physical_npu'] != 0 or cfg['device'] != 0
-            or proof['runtime']['visible'] != '0' or result['correctness'] != 'PASS' or result['failures']
+            or proof['production_revision'] != PACED or cfg['physical_npu'] != int(physical) or cfg['device'] != 0
+            or proof['runtime']['visible'] != physical or result['correctness'] != 'PASS' or result['failures']
             or not proof['production_terminal'] or proof['profiled_terminal_kernel'] != 'v9_parallel_terminal'
             or [proof[k] for k in ('measured_calls','measured_kv_index_rows','ordered_diagnostic_calls','ordered_diagnostic_rows')]
                != [20,320,20,320]
@@ -123,7 +133,7 @@ def report(root, group):
     if source['origin'] == 'completed-owner-archive':
         serial, _ = archived_oracle(Path(source['archive_path']),group)
     else:
-        if source['origin'] not in ('fresh', 'validated-cache') or source['identity']['visible'] != '0':
+        if source['origin'] not in ('fresh', 'validated-cache') or source['identity']['visible'] != physical:
             raise ValueError('unverified native LI reference')
         with np.load(folder/'score_topk_ids.npz', allow_pickle=False) as ids:
             serial = ids['strong_serial']
@@ -156,6 +166,7 @@ def gate(values):
 
 
 def summary(root):
+    physical = run_device(root)
     rows = {g: read(root/f'g{g}/paced_comparison.json') for g in GROUPS}
     def compare(groups, arm, i, factor):
         ok = []
@@ -169,7 +180,7 @@ def summary(root):
         return gate(ok)
     for name, groups, arm, factor in [('G7_over_20pct',(7,),'serial2',.8),
                                       ('other_four_no_regression',(10,4,17,2),'mainline',1)]:
-        print(f'B20_NPU0_GATE {name}_mean/P50=' +
+        print(f'B20_NPU{physical}_GATE {name}_mean/P50=' +
               '/'.join(compare(groups,arm,i,factor) for i in range(2)))
 
 
