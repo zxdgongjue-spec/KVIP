@@ -103,7 +103,16 @@ def test_final_window_cost_uses_last_finishing_row_then_last_query(tmp_path):
     rows[15] = [early, late, early, early]
     put(tmp_path/'diagnose/round-1/detail_samples.json', [detail]*20)
     put(tmp_path/'window_workers.json', dict(calls=[rows]*20))
-    assert report.critical_window_workers(tmp_path) == ([1.5]*20, [0.5]*20, [8.0]*20)
+    workers = report.critical_window_workers(tmp_path)
+    assert workers['timings'] == ([1.5]*20, [0.5]*20, [8.0]*20)
+    assert workers['last_rows'] == [0]*15 + [20]
+    assert workers['last_queries'] == [0, 20, 0, 0]
+    assert workers['tied_rows'] == workers['tied_queries'] == 0
+    events[3]['end_cycles'] = events[15]['end_cycles']
+    put(tmp_path/'diagnose/round-1/detail_samples.json', [detail]*20)
+    tied = report.critical_window_workers(tmp_path)
+    assert tied['last_rows'][3] == 20 and tied['last_queries'] == [20, 0, 0, 0]
+    assert tied['tied_rows'] == tied['tied_queries'] == 20
 
 
 def test_counts_completed_work_and_ignores_late_offers():

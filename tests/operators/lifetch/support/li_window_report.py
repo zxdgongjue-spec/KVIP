@@ -33,18 +33,33 @@ def critical_window_workers(folder):
     if len(calls) != 20 or len(calls) != len(details):
         raise ValueError('Incomplete final-window worker trace')
     late, dispatch, work = [], [], []
+    last_rows = [0] * 16
+    last_queries = [0] * 4
+    tied_rows = tied_queries = 0
     for rows, detail in zip(calls, details):
         head = detail['streaming_cycles'][0]
         events = [e for e in head['prefetch_services'] if e['epoch'] == 3]
-        if len(rows) != 16 or len({e['lane'] for e in events}) != 16:
+        if len(rows) != 16 or len(events) != 16 or {e['lane'] for e in events} != set(range(16)):
             raise ValueError('Incomplete final-window service lanes')
-        lane = max(events, key=lambda e: e['end_cycles'])['lane']
+        latest = max(e['end_cycles'] for e in events)
+        lanes = sorted(e['lane'] for e in events if e['end_cycles'] == latest)
+        tied_rows += len(lanes) > 1
+        lane = lanes[0]
+        last_rows[lane] += 1
         mhz = head['terminal_timeline']['clock_mhz']
-        arrival, snapshot, begin, end, *_ = max(rows[lane], key=lambda query: query[3])
+        queries = rows[lane]
+        if len(queries) != 4:
+            raise ValueError('Incomplete final-window queries on the last row')
+        finish = max(query[3] for query in queries)
+        last = [i for i, query in enumerate(queries) if query[3] == finish]
+        tied_queries += len(last) > 1
+        last_queries[last[0]] += 1
+        arrival, snapshot, begin, end, *_ = queries[last[0]]
         late.append(max(0, arrival-snapshot)/mhz)
         dispatch.append((begin-max(arrival, snapshot))/mhz)
         work.append((end-begin)/mhz)
-    return late, dispatch, work
+    return dict(timings=(late, dispatch, work), last_rows=last_rows, last_queries=last_queries,
+                tied_rows=tied_rows, tied_queries=tied_queries)
 
 
 def penultimate_worker_counts(calls):
@@ -118,7 +133,11 @@ def compare(root, group, owner, ref):
         columns = ('arrival_after_snapshot','handoff','query_compute')
         print(f'G{group} last_finishing_row_and_Q diagnostic', *(
             f'{name}_mean/P50_us={mean(values):.2f}/{median(values):.2f}'
-            for name, values in zip(columns, workers)))
+            for name, values in zip(columns, workers['timings'])))
+        print(f'G{group} last_finishing_counts diagnostic',
+              'row0_to_15=' + '/'.join(map(str, workers['last_rows'])),
+              'Q1_to_Q4=' + '/'.join(map(str, workers['last_queries'])),
+              f'tied_rows={workers["tied_rows"]}/20 tied_Qs={workers["tied_queries"]}/20 tie_pick=lowest_id')
     early = candidate_folder/'penultimate_workers.json'
     if early.is_file():
         none, one, two = penultimate_worker_counts(read(early)['calls'])
