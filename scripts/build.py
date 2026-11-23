@@ -58,8 +58,14 @@ def prepare_dependency(root, transport):
     patches = [
         (ROOT / "scripts/patches/kvaf-aiv-direct-get-capacity.patch", ()),
         (ROOT / "scripts/patches/kvaf-main-fused-device.patch", ()),
-        (ROOT / "scripts/patches/kvaf-main-fused-resources.patch", ()),
     ]
+    lease_fix = ROOT / "scripts/patches/kvaf-prepared-get-lease.patch"
+    lease_command = ["git", "-C", str(root), "apply"]
+    lease_fixed = subprocess.run(
+        [*lease_command, "--reverse", "--check", lease_fix], capture_output=True
+    ).returncode == 0
+    if not lease_fixed:
+        patches.append((ROOT / "scripts/patches/kvaf-main-fused-resources.patch", ()))
     if transport == "ubmem":
         patches.append((ROOT / "patches/kvaf-ubmem-device-get.patch", ("--include=access_operator/include/ubmem/*",)))
     pending = []
@@ -71,6 +77,8 @@ def prepare_dependency(root, transport):
             pending.append([*command, path])
     for command in pending:
         call(command)
+    if not lease_fixed:
+        call([*lease_command, lease_fix])
 
 
 def main():
