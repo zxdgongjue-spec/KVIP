@@ -208,6 +208,22 @@ def main():
                 cwd=dependency,
                 env=env,
             )
+    if args.main_batch_get:
+        for kind in ("get", "put"):
+            kernel = build_dir / "bin" / f"kvaf_execute_batch_{kind}_kernels.o"
+            if not kernel.is_file():
+                raise RuntimeError(f"Unified KVAF kernel missing: {kernel}")
+        package = build_dir / "python/kvaf"
+        if not (package / "__init__.py").is_file() or not list(package.glob("*.so")):
+            raise RuntimeError(f"Unified KVAF Python extension missing: {package}")
+        verifier = dependency / "bindings/verify_python_binding.py"
+        call(
+            [sys.executable, "-I", "-c",
+             "import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); "
+             "sys.argv.pop(0); runpy.run_path(sys.argv[0], run_name='__main__')",
+             build_dir / "python", verifier, "--require-npu"],
+            env=env,
+        )
     build_lidu(env, args.skip_lidu_build)
     if args.main_batch_get:
         call([sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", ROOT])
