@@ -18,7 +18,7 @@ import time
 import traceback
 from collections import deque
 from collections.abc import Callable
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -3691,7 +3691,6 @@ class NativeReplayState:
 
 def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
     """One graph contains iterations independent cache states, reused per round."""
-    from contextlib import ExitStack
     from diagnostics import algorithm_before, algorithm_after
     from performance import profile_graph_batch
     directory = Path(directory)
@@ -3752,12 +3751,13 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             for state in states:
                 state.forward()
 
-        with ExitStack() as scopes, torch.npu.stream(capture):
+        with ExitStack() as scopes:
             pending = True
             if fused:
                 for lease in {id(state.lease): state.lease for state in states}.values():
                     scopes.enter_context(lease.capture_scope())
-            else:
+            scopes.enter_context(torch.npu.stream(capture))
+            if not fused:
                 resources = scopes.enter_context(capture_native_get(states[0].native.owner.session.runtime,
                                                                     capture, forward_batch))
                 for state in states:
@@ -3765,7 +3765,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             with torch.npu.graph(graph, stream=capture):
                 forward_batch()
             capture.synchronize()
-            pending = False
+        pending = False
         if fused:
             for lease in {id(state.lease): state.lease for state in states}.values():
                 if hasattr(lease, "retain_graph"):
@@ -4053,8 +4053,13 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         scope = state.lease.capture_scope() if fused else capture_native_get(runtime, capture_stream, state.forward)
         pending = True
         replay_stage('graph capture')
-        with torch.npu.stream(capture_stream), scope as resources:
+
+        with ExitStack() as scopes:
+            if fused:
+                scopes.enter_context(scope)
+            scopes.enter_context(torch.npu.stream(capture_stream))
             if not fused:
+                resources = scopes.enter_context(scope)
                 state.reset()
             with torch.npu.graph(graph, stream=capture_stream):
                 state.forward()
