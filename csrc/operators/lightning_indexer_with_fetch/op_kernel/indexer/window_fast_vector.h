@@ -1,4 +1,5 @@
 #pragma once
+#include "cutoff_suffix.h"
 // Native LI bitmap layout; preserve exact candidates and the existing TopK primitive.
 namespace lifetch_incremental {
 __simd_vf__ inline void MarkNonemptyTiles(__ubuf__ uint16_t* bitmap,__ubuf__ uint16_t* flags,uint32_t n){

@@ -166,7 +166,7 @@ __aicore__ inline void SeedIncremental(uint32_t query,uint32_t row) {
     meta[2]=0;
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
 }
-__aicore__ inline void FlushIncremental(uint32_t count,uint32_t base,bool clearCandidates=true) {
+__aicore__ inline void FlushIncremental(uint32_t count,uint32_t base,bool clearCandidates=true,uint16_t savedCutoff=0) {
     if(incrementalIdsPending_){WaitFlag<HardEvent::MTE2_V>(EVENT_ID7);incrementalIdsPending_=false;}
     mappedExport_=false;
     if(!count)return;
@@ -174,6 +174,14 @@ __aicore__ inline void FlushIncremental(uint32_t count,uint32_t base,bool clearC
     if(incrementalOutputPending_) {
         WaitFlag<HardEvent::MTE3_V>(EVENT_ID6);incrementalOutputPending_=false;
     }
+#if KVIP_STREAMING_LI && !KVIP_PARALLEL_TERMINAL
+    if (savedCutoff && lifetch_incremental::MergeUnchangedCutoff(count,base,savedCutoff,
+        indicesOutLocal_,scoreOutLocal_,incrementalOld_,incrementalNew_,mrgValueLocal_[2048])) {
+        topkSharedTmpLocal_.SetValue(0,savedCutoff);
+        mappedExport_=true;
+        return;
+    }
+#endif
     PipeBarrier<PIPE_V>();
     DataCopy(mrgValueLocal_,scoreOutLocal_,2048);
     DataCopy(incrementalOld_,indicesOutLocal_,2048);
@@ -461,7 +469,7 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
     // this Q performs TopK, ID mapping, threshold reduction and writeback.
 
     PreloadIncremental(half);
-    FlushIncremental(packed,packBase,false);
+    FlushIncremental(packed,packBase,false,exportWindowCold_ && callsBefore==incrementalCalls_ ? cutoff : 0);
     PipeBarrier<PIPE_V>();
     // A nonzero cutoff already describes the unchanged TopK when this
     // window did not flush any candidates. Final TopK keeps its old path.
