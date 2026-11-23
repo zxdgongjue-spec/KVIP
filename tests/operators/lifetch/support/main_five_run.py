@@ -105,6 +105,8 @@ def worker(args):
     current = None
     outputs = {}
     ordered = {}
+    window_workers = {}
+    team_trace = (main / 'csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/final_window_queries.h').is_file()
     library_paths = set()
     label_pattern = re.compile(r'(measured|detail)/input(\d+)/round1$')
 
@@ -141,6 +143,15 @@ def worker(args):
                         raise ValueError(f'G{cfg.group} call {call} row {row}: inconsistent Index admission count')
                     verify_assignments(self.input_layout[row], layout[row], sample.captured_hot_valid[row], valid[row],
                                        sources[row, :count], destinations[row, :count])
+                if team_trace:
+                    ticks = self.rotating.rank_progress[:, :, 24:32].cpu().tolist()
+                    for queries in ticks:
+                        if len(queries) != 4 or len({q[1] for q in queries}) != 1:
+                            raise ValueError('Final-window workers reported inconsistent row snapshots')
+                        for arrival, snapshot, begin, end, *_ in queries:
+                            if min(arrival, snapshot) <= 0 or not max(arrival, snapshot) <= begin <= end:
+                                raise ValueError('Missing or unordered final-window worker stamps')
+                    window_workers[call] = ticks
                 ordered[call] = self.batch
             return layout, valid
 
@@ -182,6 +193,12 @@ def worker(args):
         production_terminal=True, profiled_terminal_kernel='v9_parallel_terminal',
         measured_calls=len(outputs), measured_kv_index_rows=len(outputs) * BATCH,
         ordered_diagnostic_calls=len(ordered), ordered_diagnostic_rows=sum(ordered.values())))
+    if team_trace:
+        if set(window_workers) != set(outputs):
+            raise ValueError('Missing final-window worker diagnostic calls')
+        atomic_json(fused/'window_workers.json', dict(
+            fields=['arrival','snapshot','begin','end','ready_packed','topk_calls','scanned_tokens','merge_candidates'],
+            calls=[window_workers[i] for i in range(CALLS)]))
     np.save(fused / 'measured_ids.npy', np.stack([outputs[i] for i in range(CALLS)]), allow_pickle=False)
 
 

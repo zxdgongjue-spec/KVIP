@@ -91,3 +91,16 @@ def test_explicit_main_cannot_accidentally_rerun_the_archive():
     launcher = Path(__file__).parent/'main_five_npu4.sh'
     bad = subprocess.run(['bash', launcher, '/unavailable', 'reader', MAIN], capture_output=True, text=True)
     assert bad.returncode == 2 and 'independent candidate' in bad.stderr
+
+
+def test_final_window_cost_uses_last_finishing_row_then_last_query(tmp_path):
+    assert report.critical_window_workers(tmp_path) is None
+    events = [dict(epoch=3, lane=row, end_cycles=5000+row) for row in range(16)]
+    detail = dict(streaming_cycles=[dict(terminal_timeline=dict(clock_mhz=100), prefetch_services=events)])
+    early = [900, 1000, 1100, 1500, 0, 0, 0, 0]
+    late = [1150, 1000, 1200, 2000, 0, 0, 0, 0]
+    rows = [[early]*4 for _ in range(16)]
+    rows[15] = [early, late, early, early]
+    put(tmp_path/'diagnose/round-1/detail_samples.json', [detail]*20)
+    put(tmp_path/'window_workers.json', dict(calls=[rows]*20))
+    assert report.critical_window_workers(tmp_path) == ([1.5]*20, [0.5]*20, [8.0]*20)

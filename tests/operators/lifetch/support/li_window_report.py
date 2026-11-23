@@ -24,6 +24,29 @@ def details(folder):
     return [mean(series) for series in zip(*phases)], fetches
 
 
+def critical_window_workers(folder):
+    evidence = folder/'window_workers.json'
+    if not evidence.is_file():
+        return
+    calls = read(evidence)['calls']
+    details = read(folder/'diagnose/round-1/detail_samples.json')
+    if len(calls) != 20 or len(calls) != len(details):
+        raise ValueError('Incomplete final-window worker trace')
+    late, dispatch, work = [], [], []
+    for rows, detail in zip(calls, details):
+        head = detail['streaming_cycles'][0]
+        events = [e for e in head['prefetch_services'] if e['epoch'] == 3]
+        if len(rows) != 16 or len({e['lane'] for e in events}) != 16:
+            raise ValueError('Incomplete final-window service lanes')
+        lane = max(events, key=lambda e: e['end_cycles'])['lane']
+        mhz = head['terminal_timeline']['clock_mhz']
+        arrival, snapshot, begin, end, *_ = max(rows[lane], key=lambda query: query[3])
+        late.append(max(0, arrival-snapshot)/mhz)
+        dispatch.append((begin-max(arrival, snapshot))/mhz)
+        work.append((end-begin)/mhz)
+    return late, dispatch, work
+
+
 def compare(root, group, owner, ref):
     if (Path((root/'reference.txt').read_text().strip()).resolve() != ref.resolve()
             or any((x/'main.txt').read_text().strip() != MAIN or (x/'kvaf.txt').read_text().strip() != KVAF
@@ -70,6 +93,13 @@ def compare(root, group, owner, ref):
     graph_gain = [100 * (a-b) / a for a, b in zip(old['graph'], new['graph'])]
     print(f'G{group} vs_mainline_archive', *(f'{k}_saved_mean/P50_us={saved(old[k], v)}' for k, v in new.items()),
           f'graph_gain_mean/P50_pct={graph_gain[0]:+.2f}/{graph_gain[1]:+.2f} placement={placement}')
+    workers = critical_window_workers(candidate_folder)
+    if workers:
+        from statistics import median
+        columns = ('arrival_after_snapshot','handoff','query_compute')
+        print(f'G{group} last_finishing_row_and_Q diagnostic', *(
+            f'{name}_mean/P50_us={mean(values):.2f}/{median(values):.2f}'
+            for name, values in zip(columns, workers)))
     from li_restore_report import serial_graph_line
     from strong_serial_g10 import comparison_line
     print(comparison_line(owner.parent, inputs, new['graph']) if group == 10 else serial_graph_line(group, inputs, new['graph']))
