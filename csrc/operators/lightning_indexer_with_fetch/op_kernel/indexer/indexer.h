@@ -762,6 +762,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
             QLICommon::RunInfo info;
             CalcRunInfo(0, 0, info, 0, 0);
             if constexpr (Phase == SequenceLiPhase::Threshold) {
+#if !V9_UBMEM && KVIP_STREAMING_LI && !KVIP_PARALLEL_TERMINAL
+                vectorService.ResetLastWindowMail(batch*SIM_Q+tmpBlockIdx%SIM_Q);
+#endif
                 vectorService.ProcessResidentTopK(info, tmpBlockIdx % SIM_Q);
             } else {
                 vectorService.ProcessTopK(info, tmpBlockIdx % SIM_Q);
@@ -824,6 +827,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
                 if (end > runtimeShape_.history / S2_BASE_SIZE) end = runtimeShape_.history / S2_BASE_SIZE;
                 ScanSequenceHalf(begin, end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
                 if ASCEND_IS_AIV {
+#if !V9_UBMEM && KVIP_STREAMING_LI && !KVIP_PARALLEL_TERMINAL
+                    if(epoch+1==runtimeShape_.rounds && vectorService.HasLastWindowTeam())
+                        vectorService.CompleteLastWindow(serviceEpoch,halfTokens);
+                    else
+#endif
                     if (serviceEpoch == epoch) vectorService.RotateFetch(epoch, halfTokens);
                 }
             }

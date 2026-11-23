@@ -101,10 +101,16 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
 }
 
 #endif
+#if !V9_UBMEM && KVIP_STREAMING_LI && !KVIP_PARALLEL_TERMINAL
+#include "final_window_queries.h"
+#endif
     __aicore__ inline void RotateFetch(uint32_t epoch, uint32_t sequenceHalfWindow = 0) {
 #if !V9_UBMEM
         AdvanceWindow(epoch,sequenceHalfWindow);
 #endif
+        PostWindow(epoch,sequenceHalfWindow);
+    }
+    __aicore__ inline void PostWindow(uint32_t epoch, uint32_t sequenceHalfWindow) {
         // Join this producer's hit publication. Other producers remain free.
         PipeBarrier<PIPE_ALL>();
 #if defined(V9_UBMEM) && V9_UBMEM
