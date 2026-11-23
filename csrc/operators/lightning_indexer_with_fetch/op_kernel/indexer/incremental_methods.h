@@ -166,7 +166,13 @@ __aicore__ inline void SeedIncremental(uint32_t query,uint32_t row) {
     meta[2]=0;
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
 }
+// The earlier-cutoff shortcut belongs only to LI window service. Keep the
+// terminal merge and its call site identical to the production terminal path.
+#if KVIP_STREAMING_LI && !KVIP_PARALLEL_TERMINAL
 __aicore__ inline void FlushIncremental(uint32_t count,uint32_t base,bool clearCandidates=true,uint16_t savedCutoff=0) {
+#else
+__aicore__ inline void FlushIncremental(uint32_t count,uint32_t base,bool clearCandidates=true) {
+#endif
     if(incrementalIdsPending_){WaitFlag<HardEvent::MTE2_V>(EVENT_ID7);incrementalIdsPending_=false;}
     mappedExport_=false;
     if(!count)return;
@@ -469,7 +475,11 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
     // this Q performs TopK, ID mapping, threshold reduction and writeback.
 
     PreloadIncremental(half);
+#if KVIP_STREAMING_LI && !KVIP_PARALLEL_TERMINAL
     FlushIncremental(packed,packBase,false,exportWindowCold_ && callsBefore==incrementalCalls_ ? cutoff : 0);
+#else
+    FlushIncremental(packed,packBase,false);
+#endif
     PipeBarrier<PIPE_V>();
     // A nonzero cutoff already describes the unchanged TopK when this
     // window did not flush any candidates. Final TopK keeps its old path.
