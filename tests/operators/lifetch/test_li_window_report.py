@@ -104,3 +104,14 @@ def test_final_window_cost_uses_last_finishing_row_then_last_query(tmp_path):
     put(tmp_path/'diagnose/round-1/detail_samples.json', [detail]*20)
     put(tmp_path/'window_workers.json', dict(calls=[rows]*20))
     assert report.critical_window_workers(tmp_path) == ([1.5]*20, [0.5]*20, [8.0]*20)
+
+
+def test_counts_completed_work_and_ignores_late_offers():
+    unused = [1, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    active = [1, 1, 12, 24, 50, 1, 256, 7, 1, 32, 0, 20]
+    rows = [[unused, unused]] * 14 + [[active, unused], [active, active]]
+    assert report.penultimate_worker_counts([rows]*20) == [280, 20, 20]
+    incomplete = list(active)
+    incomplete[1] = 0
+    with pytest.raises(ValueError, match='completion'):
+        report.penultimate_worker_counts([[*rows[:-1], [active, incomplete]]]*20)

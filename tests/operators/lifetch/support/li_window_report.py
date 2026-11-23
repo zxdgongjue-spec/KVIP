@@ -47,6 +47,25 @@ def critical_window_workers(folder):
     return late, dispatch, work
 
 
+def penultimate_worker_counts(calls):
+    if len(calls) != 20 or any(len(rows) != 16 for rows in calls):
+        raise ValueError('Expected 20 penultimate-window diagnostics with 16 rows each')
+    histogram = [0, 0, 0]
+    for rows in calls:
+        for queries in rows:
+            if len(queries) != 2:
+                raise ValueError('Expected the Q1 and Q4 helper slots')
+            used = 0
+            for available, done, arrival, begin, end, _, _, _, assigned, _, _, snapshot in queries:
+                if available not in (0, 1) or assigned not in (0, 1) or done != assigned:
+                    raise ValueError('Penultimate-window dispatch and completion disagree')
+                if assigned and (not available or min(arrival, snapshot) <= 0 or not max(arrival, snapshot) <= begin <= end):
+                    raise ValueError('Invalid penultimate-window helper timing')
+                used += assigned
+            histogram[used] += 1
+    return histogram
+
+
 def compare(root, group, owner, ref):
     if (Path((root/'reference.txt').read_text().strip()).resolve() != ref.resolve()
             or any((x/'main.txt').read_text().strip() != MAIN or (x/'kvaf.txt').read_text().strip() != KVAF
@@ -100,6 +119,11 @@ def compare(root, group, owner, ref):
         print(f'G{group} last_finishing_row_and_Q diagnostic', *(
             f'{name}_mean/P50_us={mean(values):.2f}/{median(values):.2f}'
             for name, values in zip(columns, workers)))
+    early = candidate_folder/'penultimate_workers.json'
+    if early.is_file():
+        none, one, two = penultimate_worker_counts(read(early)['calls'])
+        print(f'G{group} penultimate_window diagnostic rows_with_0/1/2_helpers={none}/{one}/{two} '
+              f'assigned_and_completed_queries={one+2*two}/640')
     from li_restore_report import serial_graph_line
     from strong_serial_g10 import comparison_line
     print(comparison_line(owner.parent, inputs, new['graph']) if group == 10 else serial_graph_line(group, inputs, new['graph']))

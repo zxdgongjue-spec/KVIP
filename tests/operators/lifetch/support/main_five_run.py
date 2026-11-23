@@ -106,7 +106,10 @@ def worker(args):
     outputs = {}
     ordered = {}
     window_workers = {}
-    team_trace = (main / 'csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/final_window_queries.h').is_file()
+    team_header = main / 'csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/final_window_queries.h'
+    team_trace = team_header.is_file()
+    spare_trace = team_trace and 'struct SpareAssignment' in team_header.read_text()
+    spare_workers = {}
     library_paths = set()
     label_pattern = re.compile(r'(measured|detail)/input(\d+)/round1$')
 
@@ -144,7 +147,11 @@ def worker(args):
                     verify_assignments(self.input_layout[row], layout[row], sample.captured_hot_valid[row], valid[row],
                                        sources[row, :count], destinations[row, :count])
                 if team_trace:
-                    ticks = self.rotating.rank_progress[:, :, 24:32].cpu().tolist()
+                    # Only the separate diagnostic replay reads worker mailboxes.
+                    progress = self.rotating.rank_progress.cpu().numpy()
+                    ticks = progress[:, :, 24:32].tolist()
+                    if spare_trace:
+                        spare_workers[call] = progress[:, (0, 3), 8:20].tolist()
                     for queries in ticks:
                         if len(queries) != 4 or len({q[1] for q in queries}) != 1:
                             raise ValueError('Final-window workers reported inconsistent row snapshots')
@@ -199,6 +206,12 @@ def worker(args):
         atomic_json(fused/'window_workers.json', dict(
             fields=['arrival','snapshot','begin','end','ready_packed','topk_calls','scanned_tokens','merge_candidates'],
             calls=[window_workers[i] for i in range(CALLS)]))
+    if spare_trace:
+        atomic_json(fused/'penultimate_workers.json', dict(
+            queries=[0, 3],
+            fields=['available','done','arrival','begin','end','topk_calls','scanned','candidates',
+                    'assigned','ready_packed','covered_empty','snapshot'],
+            calls=[spare_workers[i] for i in range(CALLS)]))
     np.save(fused / 'measured_ids.npy', np.stack([outputs[i] for i in range(CALLS)]), allow_pickle=False)
 
 
