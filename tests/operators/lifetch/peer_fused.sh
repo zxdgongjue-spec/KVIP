@@ -940,7 +940,8 @@ if [[ -n "$ranked" ]]; then
         order=("${order[@]:1}" "${order[0]}")
     done
     if "$joined_timing"; then
-        entries=(summary.txt candidate.txt logical-ties.txt physical_npu.txt)
+        entries=(summary.txt candidate.txt logical-ties.txt physical_npu.txt "ranked-${ranked:0:8}.binary.sha256")
+        production_entries=()
         for group in "${groups[@]}"; do
             arm="g$group/logical-ties"
             raw=("$out/$arm"/results/*/cases/diagnose/fused/joined_tail.json)
@@ -949,8 +950,19 @@ if [[ -n "$ranked" ]]; then
             fused=${relative%/*}
             entries+=("$relative" "$fused/path_result.json" "${fused%/*}/config.json"
                       "${fused%/*}/replay_input.json" "$arm/thp.json")
+            archive_name=fused.N7n8ZP
+            if [[ $group == 2 ]]; then archive_name=fused.gbxKC9; fi
+            src_arm="$archive_name/$arm"
+            profiles=("$area/$src_arm"/results/*/cases/diagnose/fused/path_result.json)
+            [[ ${#profiles[@]} == 1 && -f ${profiles[0]} ]] || { echo "Missing G$group production record" >&2; exit 1; }
+            prod=${profiles[0]#"$area/"}
+            prod=${prod%/*}
+            production_entries+=("$archive_name/logical-ties.txt" "$archive_name/physical_npu.txt"
+                "$archive_name/ranked-${owner_topk_revision:0:8}.binary.sha256" "$src_arm/thp.json"
+                "$prod/path_result.json" "$prod/score_topk_check.json" "${prod%/*}/replay_input.json"
+                "${prod%/*}/config.json" "$prod/diagnose/round-1/full_attribution.json")
         done
-        tar -C "$out" -czf "$out/joined-tail.tar.gz" "${entries[@]}"
+        tar -czf "$out/joined-tail.tar.gz" -C "$out" "${entries[@]}" -C "$area" "${production_entries[@]}"
         printf 'RETURN_FILE=%s/joined-tail.tar.gz\n' "$out"
     elif "$owner_tail"; then
         entries=(summary.txt archive-tail.txt archive-calls.json owner-tail-reference.txt logical-ties.txt physical_npu.txt)
