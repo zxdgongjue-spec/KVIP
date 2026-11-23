@@ -56,6 +56,7 @@ def prepare_dependency(root, transport):
     if head != REVISION:
         raise RuntimeError(f"Expected KVAF main revision {REVISION}, found {head}")
     patches = [
+        (ROOT / "scripts/patches/kvaf-aiv-direct-get-capacity.patch", ()),
         (ROOT / "scripts/patches/kvaf-main-fused-device.patch", ()),
         (ROOT / "scripts/patches/kvaf-main-fused-resources.patch", ()),
     ]
