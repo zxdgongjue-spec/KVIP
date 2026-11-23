@@ -164,7 +164,7 @@ def worker(args):
 
         def validate(self, sample):
             super().validate(sample)
-            if current and current[1] == 'measured':
+            if current and current[1] == ('detail' if args.availability_only else 'measured'):
                 call = int(current[2])
                 if call in outputs:
                     raise ValueError(f'Repeated measured verification for call {call}')
@@ -172,6 +172,9 @@ def worker(args):
                 # layout and require the public logical output to select the same IDs.
                 outputs[call] = fused_li_output(self)
 
+    if args.availability_only:
+        from window_ready_replay import measure
+        ex.measure_replay_batch = measure
     ex.CorrectnessRecorder = Recorder
     ex.FusedReplayState = AuditedState
     fused = folder / 'fused'
@@ -180,6 +183,21 @@ def worker(args):
         raise ValueError(f'Official mainline replay failed: {result["failures"]}')
     if set(outputs) != set(range(CALLS)) or set(ordered) != set(outputs) or len(library_paths) != 1:
         raise ValueError('Incomplete measured or diagnostic verification')
+    if args.availability_only:
+        from check_isolated_device import extract
+        library, = library_paths
+        sections = extract(library)['parallel_terminal_kernel']
+        tail, = [code for key, code in sections.items() if key[1] == 1 and key[4] == '.text']
+        digest = hashlib.sha256(tail).hexdigest()
+        if digest != '5054a60bd3822bd0790b781620f21cbfd9b8816f6d08684adc1f540a9f1083b4':
+            raise ValueError(f'Loaded terminal code differs from B24 upstream: {digest} ({library})')
+        atomic_json(fused / 'ready_checks.json', dict(physical_npu=4, production_revision=args.revision,
+            terminal_text_sha256=digest,
+            capture_operand_hashes=operand_hashes, loaded_library=str(library),
+            library_sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
+            kv_calls=len(outputs), ordered_index_calls=len(ordered), ordered_index_rows=sum(ordered.values())))
+        np.save(fused / 'diagnostic_ids.npy', np.stack([outputs[i] for i in range(CALLS)]), allow_pickle=False)
+        return
     samples = json.loads((fused / 'diagnose/round-1/full_attribution.json').read_text())['samples']
     for i, sample in enumerate(samples):
         entry = sample['accounting']
@@ -232,7 +250,7 @@ def main(args):
     # performance, correctness, etc. Keep the production process independent.
     subprocess.run([sys.executable, '-B', __file__, *sys.argv[1:], '--worker'], check=True)
     fused = case_path(args) / 'fused'
-    ids_file = fused / 'measured_ids.npy'
+    ids_file = fused / ('diagnostic_ids.npy' if args.availability_only else 'measured_ids.npy')
     outputs = np.load(ids_file, allow_pickle=False)
     inputs = next(iter(ReplaySequence(args.trace, args.group, (1, 1))))
     save_checked(fused, args.group, inputs, serial,
@@ -242,6 +260,21 @@ def main(args):
     result['topk_set_digests'] = [topk_fingerprint(value) for value in outputs]
     atomic_json(result_file, result)
     ids_file.unlink()
+    if args.availability_only:
+        import shutil
+        ref = json.loads((fused / 'score_topk_check.json').read_text())
+        checks = json.loads((fused / 'ready_checks.json').read_text())
+        if (ref['calls'], ref['queries'], checks['kv_calls'], checks['ordered_index_rows']) != (CALLS, CALLS*4*BATCH, CALLS, CALLS*BATCH):
+            raise ValueError('Incomplete availability replay checks')
+        output = args.output.parent
+        for name in ('detail_samples.json', 'owner_availability.json', 'raw_rank_progress.npz'):
+            shutil.copyfile(fused / 'diagnose/round-1' / name, output / name)
+        atomic_json(output/'ready_checks.json', dict(**checks, score_check=ref))
+        print(f'G{args.group} DIAGNOSTIC_CHECK TopK_score_vs_strong_serial=PASS '
+              f'calls={ref["calls"]}/{CALLS} queries={ref["queries"]}/{4*BATCH*CALLS} '
+              f'exact_sets={ref["exact_queries"]}/{ref["queries"]} '
+              f'KV=PASS ordered_Index=PASS rows={checks["ordered_index_rows"]}/{CALLS*BATCH} '
+              f'workers_per_call={BATCH*4} last_window_queries_per_call={BATCH*4} terminal_text_vs_upstream=PASS', flush=True)
 
 
 if __name__ == '__main__':
@@ -251,6 +284,7 @@ if __name__ == '__main__':
     parser.add_argument('--revision', default=REVISION)
     parser.add_argument('--kvaf-server', required=True)
     parser.add_argument('--group', type=int, choices=(2, 4, 7, 10, 17), required=True)
+    parser.add_argument('--availability-only', action='store_true')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parsed = parser.parse_args()
     (worker if parsed.worker else main)(parsed)

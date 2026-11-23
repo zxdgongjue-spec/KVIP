@@ -39,6 +39,24 @@ if [[ $native != "$main_rev" ]]; then
         exit 1
     }
 fi
+availability=${PEER_AVAILABILITY_ONLY:-0}
+extra=()
+if [[ $availability == 1 ]]; then
+    dual=aa6889e773c57ff737fd5ddec75307613d8949dc
+    dual_archive="$area/li-window-five.gv5LRE"
+    if [[ $native == "$dual" ]] || ! git -C "$repo" merge-base --is-ancestor "$dual" "$native" ||
+       [[ ! -r $dual_archive/candidate.txt || $(<"$dual_archive/candidate.txt") != "$dual" ||
+          ! -r $dual_archive/physical_npu.txt || $(<"$dual_archive/physical_npu.txt") != 4 ]]; then
+        echo "Expected dedicated diagnostics descended from dual-cut and its B24 NPU4 archive at $dual_archive" >&2
+        exit 1
+    fi
+    extra=(--availability-only)
+    arm_label=diagnostic_only
+    prefix=li-ready-diagnosis
+elif [[ $availability != 0 ]]; then
+    echo 'PEER_AVAILABILITY_ONLY must be 0 or 1' >&2
+    exit 2
+fi
 out=$(mktemp -d "$area/$prefix.XXXXXX")
 echo "RESULT_ROOT=$out"
 exec > >(tee "$out/run.log") 2>&1
@@ -61,6 +79,11 @@ reader_src=$(checkout reader "$reader")
 checkout_name=upstream
 if [[ $native != "$main_rev" ]]; then checkout_name=li-window; fi
 main_src=$(checkout "$checkout_name" "$native")
+trace_header="$main_src/csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/window_ready_trace.h"
+if [[ ( $availability == 1 && ! -f $trace_header ) || ( $availability == 0 && -f $trace_header ) ]]; then
+    echo 'Dedicated readiness diagnostic requires both the instrumented build and PEER_AVAILABILITY_ONLY=1' >&2
+    exit 1
+fi
 support="$reader_src/tests/operators/lifetch/support"
 printf '%s\n' "$main_rev" >"$out/main.txt"
 if [[ $native != "$main_rev" ]]; then
@@ -73,7 +96,12 @@ printf '4\n' >"$out/physical_npu.txt"
 cat /proc/sys/kernel/hostname >"$out/host.txt"
 cat /proc/sys/kernel/random/boot_id >"$out/boot_id.txt"
 if [[ -r /etc/machine-id ]]; then cat /etc/machine-id >"$out/machine_id.txt"; fi
-echo "CONFIG measured=$native main=$main_rev reader=$reader NPU=4 transport=urma BS=16 Q=4 token_bytes=656 warmup=4 calls=20"
+if [[ $availability == 1 ]]; then
+    printf '%s\n' "$dual_archive" >"$out/diagnostic_reference.txt"
+    echo "CONFIG diagnostic_only=$native archive=$dual_archive NPU=4 transport=urma calls=20 profiled_calls=0"
+else
+    echo "CONFIG measured=$native main=$main_rev reader=$reader NPU=4 transport=urma BS=16 Q=4 token_bytes=656 warmup=4 calls=20"
+fi
 groups=(10 4 17 7 2)
 archive_for() {
     if [[ $1 == 2 ]]; then printf '%s\n' "$area/fused.gbxKC9"
@@ -165,13 +193,17 @@ run_group() (
     echo "CASE_BEGIN G$group $arm_label"
     if ! (cd "$arm" && timeout 1800 "$PYTHON" -B "$support/main_five_run.py" \
         --main "$main_src" --revision "$native" --trace "$trace" --group "$group" --owner-archive "$archive" \
-        --kvaf-root "$kvaf" --kvaf-server "127.0.0.1:$port" --output "$arm") >"$arm/worker.log" 2>&1; then
+        --kvaf-root "$kvaf" --kvaf-server "127.0.0.1:$port" --output "$arm" "${extra[@]}") >"$arm/worker.log" 2>&1; then
         echo "FAILED_ARM=G$group/$label WORKER_LOG=$arm/worker.log" >&2
         tail -30 "$arm/worker.log" >&2
         exit 1
     fi
     if ! wait "$monitor"; then cat "$arm/thp.log" >&2; exit 1; fi
     monitor=
+    if [[ $availability == 1 ]]; then
+        grep -E "^G${group} DIAGNOSTIC_CHECK " "$arm/worker.log" | tee -a "$out/summary.txt"
+        return
+    fi
     if [[ $native == "$main_rev" ]]; then
         "$PYTHON" -B "$support/main_five_report.py" "$out" "$group" "$archive" | tee -a "$out/summary.txt"
     else
@@ -198,7 +230,16 @@ if (( ${#failed[@]} )); then
     echo "REPLAY_INCOMPLETE groups=${failed[*]} RESULT_ROOT=$out" >&2
     exit 1
 fi
-if [[ $native != "$main_rev" ]]; then
+if [[ $availability == 1 ]]; then
+    "$PYTHON" -B "$support/audit_ready_diagnostics.py" "$out" "$dual_archive" | tee -a "$out/summary.txt"
+    "$PYTHON" -B "$support/idle_query_schedule.py" "$out" | tee -a "$out/summary.txt"
+    files=(candidate.txt reader.txt main.txt host.txt boot_id.txt physical_npu.txt kvaf.txt diagnostic_reference.txt summary.txt)
+    for g in "${groups[@]}"; do
+        files+=("g$g/owner_availability.json" "g$g/detail_samples.json" "g$g/raw_rank_progress.npz" "g$g/ready_checks.json" "g$g/li-window/thp.json")
+    done
+    tar -C "$out" -czf "$out/window-ready-diagnostics.tar.gz" "${files[@]}"
+    echo "RETURN_FILE=$out/window-ready-diagnostics.tar.gz"
+elif [[ $native != "$main_rev" ]]; then
     "$PYTHON" -B "$support/li_window_report.py" summary "$out" | tee -a "$out/summary.txt"
 fi
 echo "REPLAY_COMPLETE RESULT_ROOT=$out"
