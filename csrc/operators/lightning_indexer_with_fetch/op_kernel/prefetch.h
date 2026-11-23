@@ -14,6 +14,7 @@ namespace kvaf_device { using ubmem_device::CleanCacheLines; constexpr uint32_t 
 #include "simt_api/device_warp_functions.h"
 #include "context.h"
 #include "indexer/ranked_candidates.h"
+#include "indexer/window_handoff.h"
 #include "../../common/lifetch/prefetch_budget.h"
 
 // Imported from direct_slots.h
@@ -494,7 +495,7 @@ inline void PrepareCandidateWqes(uint32_t rt_resident,__ubuf__ uint32_t* ids,__u
 // compact IDs, never scan the history-sized set. Each warp reserves output once.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
-    __ubuf__ uint32_t* ids,__ubuf__ uint32_t* cfg,uint32_t stride,
+    __ubuf__ uint32_t* ids,__ubuf__ uint32_t* cfg,uint32_t stride,uint32_t physicalStride,
     uint32_t n0,uint32_t n1,uint32_t n2,uint32_t n3,uint32_t limit,uint32_t words,bool last,
     __gm__ uint32_t* mapping,__gm__ Context* ctx,uint32_t batch,uint32_t resident) {
     uint32_t tid=threadIdx.x,lane=tid%32;
@@ -502,7 +503,7 @@ inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
         uint32_t q=i/stride,j=i%stride,n=q==0?n0:q==1?n1:q==2?n2:n3;
         bool fresh=false;uint32_t token=0;
         if(j<n) {
-            token=input[i];
+            token=input[q*physicalStride+j];
             // The predecessor service is joined before this window. Its map
             // is authoritative even when the exported eligibility is stale.
             // Never create a second Index exchange for an admitted source.
@@ -530,7 +531,7 @@ inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
 template<bool captureIo, bool predecessorChecked=false>
 __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,
-    uint32_t sequenceHalfWindow) {
+    uint32_t sequenceHalfWindow, kvip_window::Lists* local=nullptr) {
     uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;
     uint64_t scanBegin=0,candidateBegin=0,postBegin=0,begin=0;
     uint64_t firstDoorbell=0,lastDoorbell=0;
@@ -583,10 +584,9 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         GlobalTensor<uint32_t> metadata,compact;
         metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(rotating::TopKHeader(ctx))+b*128);
         compact.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192);
-        DataCopy(cfg[128],metadata,128);
-        SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-        uint32_t counts[4],maxCount=0;
-        for(uint32_t q=0;q<4;++q){counts[q]=cfg.GetValue(128+q*32+6);if(counts[q]>maxCount)maxCount=counts[q];}
+        uint32_t counts[4];
+        uint32_t ownedRow = b/rt_serviceLanes;
+        uint32_t maxCount=kvip_window::ReadCounts(local,ownedRow,metadata,cfg,counts);
         cfg.SetValue(40,0);
         Duplicate(scratch,uint32_t(0),rt_history/32);
         auto input=scratch[rt_history/32];
@@ -595,18 +595,15 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         // overwrite ctx->locations in the original downstream submission path.
         for(uint32_t start=0;start<maxCount;start+=256) {
             uint32_t width=maxCount-start;if(width>256)width=256;width=(width+7)/8*8;
-            SetFlag<HardEvent::V_MTE2>(EVENT_ID5);WaitFlag<HardEvent::V_MTE2>(EVENT_ID5);
-            DataCopyExtParams copy;copy.blockCount=4;copy.blockLen=width*4;copy.srcStride=(2048-width)*4;copy.dstStride=0;
-            DataCopyPadExtParams<uint32_t> pad{false,0,0,0};
-            DataCopyPad(input,compact[start],copy,pad);
-            SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
+            uint32_t physicalStride;
+            auto list=kvip_window::ReadInput(local,ownedRow,start,width,compact,input,physicalStride);
             SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
             uint32_t n[4];for(uint32_t q=0;q<4;++q)n[q]=counts[q]>start?((counts[q]-start)<width?counts[q]-start:width):0;
             Simt::VF_CALL<UnionColdTopk>(Simt::Dim3{256,1,1},
-                reinterpret_cast<__ubuf__ uint32_t*>(input.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(list.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),width,n[0],n[1],n[2],n[3],available<kCandidateCapacity?available:kCandidateCapacity,rt_history/32,start+256>=maxCount,
+                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),width,physicalStride,n[0],n[1],n[2],n[3],available<kCandidateCapacity?available:kCandidateCapacity,rt_history/32,start+256>=maxCount,
                 reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(b)*rt_history,ctx,b,rt_resident);
         }
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
@@ -761,12 +758,12 @@ if (rt_batchedRows) {
 namespace rotating {
 __aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_splitQ,uint32_t rt_rounds,uint32_t rt_serviceAics,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer, uint32_t epoch, uint32_t core,
     uint32_t lane, LocalTensor<uint32_t> scratch, LocalTensor<uint16_t> flags,
-    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false) {
+    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false, kvip_window::Lists* local=nullptr) {
     // RotateFetch calls AdvanceWindow first, which joins the same lane's
     // predecessor before touching incremental state. A second CQ-independent
     // poll here adds no ordering and delays the resumed score producer.
-    if(captureIo) FastService<true,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
-    else FastService<false,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
+    if(captureIo) FastService<true,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow,local);
+    else FastService<false,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow,local);
 }
 }
 
