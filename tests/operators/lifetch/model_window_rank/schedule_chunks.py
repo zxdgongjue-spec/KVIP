@@ -158,6 +158,8 @@ def import_representatives(args, groups, ledger):
 
 def worker(directory, lease):
     job = json_read(directory / "job.json")
+    if job.get("idle_cpu"):
+        os.sched_setscheduler(0, os.SCHED_IDLE, os.sched_param(0))
     env = os.environ.copy()
     env["CAMODEL_LOG_PATH"] = str(directory)
     env["CAMODEL_CONFIG_PATH"] = job["config"]
@@ -250,10 +252,15 @@ def allowed(args, last):
             except (FileNotFoundError, PermissionError):
                 continue
     return (
-        not protected
-        and free_cpu >= args.reserve_cores + args.job_cores
-        and spare_mib >= args.reserve_mib + args.job_mib
-    ), (now, used)
+        (
+            not protected
+            and free_cpu >= args.reserve_cores + args.job_cores
+            and spare_mib >= args.reserve_mib + args.job_mib
+        ),
+        (now, used),
+        free_cpu,
+        spare_mib,
+    )
 
 
 def next_chunk(args, groups, missing, held):
@@ -292,6 +299,7 @@ def start_job(args, groups, group, ids, variants):
         runner=str(args.host / "probe"),
         mode=mode,
         config=str(args.config),
+        idle_cpu=args.idle_cpu,
     )
     atomic_text(folder / "job.json", json.dumps(job))
     # The open-file-description lock survives the scheduler and is released on worker exit.
@@ -413,11 +421,35 @@ def schedule(args):
         if exhausted:
             raise RuntimeError(f"More than {args.attempts} attempts for {exhausted[:5]}; see logs")
         time.sleep(args.poll)
-        room, last = allowed(args, last)
+        room, last, free_cpu, free_mib = allowed(args, last)
         clear = clear + 1 if room else 0
         active_external = sum(state not in ("T", "t") for _, state in held.values())
         active_jobs = sum(owned(p.parent) for p in (args.out / "jobs").glob("*/job.json"))
-        if clear < args.clear_polls or active_jobs + active_external >= args.max_jobs:
+        cap = args.max_jobs
+        if args.cap_file:
+            cap = int(args.cap_file.read_text().strip())
+            if not 1 <= cap <= args.max_jobs:
+                raise ValueError(f"Requested cap {cap} outside [1, {args.max_jobs}]")
+        if args.telemetry:
+            with (args.out / "utilization.jsonl").open("a") as out:
+                pairs = {
+                    g: sum((g, i, 0) in ledger and (g, i, 1) in ledger for i in range(len(groups[g][0])))
+                    for g in args.groups
+                }
+                print(
+                    json.dumps(
+                        dict(
+                            time=time.time(),
+                            active=active_jobs + active_external,
+                            cap=cap,
+                            free_cores=round(free_cpu, 2),
+                            free_mib=round(free_mib),
+                            pairs=pairs,
+                        )
+                    ),
+                    file=out,
+                )
+        if clear < args.clear_polls or active_jobs + active_external >= cap:
             continue
         suspended = next(((g, pid) for g, (pid, state) in held.items() if state in ("T", "t")), None)
         if suspended and args.resume_existing:
@@ -445,6 +477,11 @@ if __name__ == "__main__":
     p.add_argument("--resume-existing", action="store_true")
     p.add_argument("--chunk", type=int, default=16)
     p.add_argument("--max-jobs", type=int, default=2)
+    p.add_argument("--cap-file", type=Path, help="Optional live concurrency cap, 1..max-jobs")
+    p.add_argument("--idle-cpu", action="store_true", help="Use Linux SCHED_IDLE for model worker threads")
+    p.add_argument(
+        "--telemetry", action="store_true", help="Log headroom and checked pairs by group each poll"
+    )
     p.add_argument("--reserve-cores", type=float, default=3)
     p.add_argument("--job-cores", type=float, default=2)
     p.add_argument("--reserve-mib", type=int, default=1024)
