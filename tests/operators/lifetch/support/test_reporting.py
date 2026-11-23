@@ -48,13 +48,16 @@ def test_missing_batch_report_cannot_be_success(tmp_path):
     from types import SimpleNamespace
     from reporting import atomic_json, collect_results, timing_summary
     config = SimpleNamespace(transport='urma', mode='bench', batches=(1, 2), fetch_jettys_per_aiv=1)
-    atomic_json(tmp_path / 'one/report.json', dict(batch=1, correctness='PASS', fetch_jettys_per_aiv=1,
+    atomic_json(tmp_path / 'one/report.json', dict(batch=1, correctness='PASS', fetch_jettys_per_aiv=2,
+        fetch_path='parallel_terminal', effective_fetch_jettys_per_aiv=1,
         native_misses_per_request=[0], fused_read_counts=[dict(prefetch=0, final=0)], timing=dict(
             native_chain=timing_summary([10]), prototype_with_update=timing_summary([8]))))
     rows = collect_results(tmp_path, config, 0)
     assert len(rows) == 2
     assert rows[0]['accepted'] and not rows[1]['accepted']
-    assert rows[0]['fetch_jettys_per_aiv'] == 1
+    assert rows[0]['fetch_jettys_per_aiv'] == 2
+    assert rows[0]['fetch_path'] == 'parallel_terminal'
+    assert rows[0]['effective_fetch_jettys_per_aiv'] == 1
     assert rows[0]['serial_read_bytes'] == rows[0]['fused_total_bytes_mean'] == 0
     assert 'fused_total_entries_max' not in rows[1]
     assert rows[1]['batch'] == 2 and rows[1]['execution'] == 'INCOMPLETE'

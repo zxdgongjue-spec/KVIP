@@ -43,8 +43,18 @@ __aicore__ inline void TagResident(uint32_t query) {
 }
 // Optimized B window path; A retains methods.h for the fixed comparison.
 bool incrementalIdsPending_=false;
+// Do not consume the primed LI/TopK events (MTE3_V 3, 4, 7).
+static constexpr uint32_t WINDOW_COLD_OUTPUT_EVENT = EVENT_ID1;
 bool coldOutputPending_=false;
-__aicore__ inline void JoinColdOutput(){if(coldOutputPending_){WaitFlag<HardEvent::MTE3_V>(EVENT_ID7);coldOutputPending_=false;}}
+__aicore__ inline void JoinColdOutput() {
+    static_assert(WINDOW_COLD_OUTPUT_EVENT != TOPK_MTE3_V_EVENT &&
+                  WINDOW_COLD_OUTPUT_EVENT != VEC1_MTE3_V_EVENT &&
+                  WINDOW_COLD_OUTPUT_EVENT != VEC1_MTE3_V_EVENT + 1);
+    if (coldOutputPending_) {
+        WaitFlag<HardEvent::MTE3_V>(WINDOW_COLD_OUTPUT_EVENT);
+        coldOutputPending_ = false;
+    }
+}
 bool mappedExport_=false;uint32_t mappedValid_=0;
 // QLIVector member: called after ID recovery while the complete Q is in UB.
 bool exportWindowCold_=false;bool rankTrace_=false;
@@ -77,8 +87,16 @@ __aicore__ inline void ExportWindowCold(uint32_t query) {
     auto covered=reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddress(
         ctx->incremental,runtimeShape_.batch,runtimeShape_.history,b));
     uint64_t rankClocks[5];
+#if KVIP_PARALLEL_TERMINAL
+    const bool terminal=rankedEpoch_==runtimeShape_.rounds;
+    const uint32_t limit=terminal?2048U:ctx->windowLimit/4;
+#endif
     uint32_t count=kvip_prefetch_rank::SelectBitmap(indicesOutLocal_,scoreOutLocal_,compact,
+#if KVIP_PARALLEL_TERMINAL
+        topkSharedTmpLocal_[128],covered,runtimeShape_.history,valid,terminal?2048U:rank,limit,rankTrace_?rankClocks:nullptr,terminal?0U:limit/2,windowCoveredEmpty_);
+#else
         topkSharedTmpLocal_[128],covered,runtimeShape_.history,valid,rank,ctx->windowLimit/4,rankTrace_?rankClocks:nullptr,(ctx->windowLimit/4)/2,windowCoveredEmpty_);
+#endif
     if(rankTrace_) {
         uint64_t delta[3]={rankClocks[1]-rankClocks[0],rankClocks[4]-rankClocks[1],1};
         for(uint32_t k=0;k<3;++k) {
@@ -93,11 +111,16 @@ __aicore__ inline void ExportWindowCold(uint32_t query) {
     mappedExport_=true;
     if(incrementalMetadataActive_)incrementalMetadata_.SetValue(incrementalMetadataIndex_*16+3,count);
     else {auto meta=IncrementalMeta(query);meta[3]=count;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);}
+#if KVIP_PARALLEL_TERMINAL
+    if(count && rankedEpoch_!=runtimeShape_.rounds) {
+        GlobalTensor<uint32_t> jobs;jobs.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(rankedEpoch_==runtimeShape_.rounds?ctx->sourceBlocks:ctx->locations)+query*2048);
+#else
     if(count) {
         GlobalTensor<uint32_t> jobs;jobs.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048);
+#endif
         SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
         DataCopy(jobs,compact,(count+7)/8*8);
-        if(mappedExport_){SetFlag<HardEvent::MTE3_V>(EVENT_ID7);coldOutputPending_=true;}
+        if(mappedExport_){SetFlag<HardEvent::MTE3_V>(WINDOW_COLD_OUTPUT_EVENT);coldOutputPending_=true;}
         else {SetFlag<HardEvent::MTE3_V>(EVENT_ID5);WaitFlag<HardEvent::MTE3_V>(EVENT_ID5);}
     }
 }
@@ -220,7 +243,11 @@ __aicore__ inline void PreloadIncremental(uint32_t half) {
     raw.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(source));
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     mask.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(ctx->hits)+uint64_t(query)*runtimeShape_.history/8);
-    SetFlag<HardEvent::V_MTE2>(EVENT_ID6);WaitFlag<HardEvent::V_MTE2>(EVENT_ID6);
+    static_assert(V_MTE2_EVENT3 != VEC1_V_MTE2_EVENT_QSCALE &&
+                  V_MTE2_EVENT3 != VEC1_V_MTE2_EVENT_QSCALE + 1);
+    // Q-scale bank 0 owns a primed V_MTE2 event 6 throughout this window.
+    // Use the balanced scratch event: wait for this Q's reads, not that signal.
+    SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
     DataCopy(incrementalInput_,scores,2048);
 
     DataCopy(incrementalInput_[2048],raw[base],n);

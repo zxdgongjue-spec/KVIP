@@ -162,3 +162,5 @@ python tests/operators/lifetch/test_lifetch.py bench --input real \
 ```
 
 每次运行结果由唯一目录保存，失败也保留已完成 case。
+
+主线四 Q 并行尾段：支持的 URMA sequence-split 几何使用 `parallel_terminal`，每个 Q 独占一个 Jetty；`--fetch-jettys-per-aiv` 仍控制旧 streaming Fetch 路径。`report.json` 和 `results.csv` 的 `fetch_path`、`effective_fetch_jettys_per_aiv` 记录实际路径和有效数量，原 `fetch_jettys_per_aiv` 字段保留请求配置。独立 serial-get 继续输出，各级汇总遵循主线的分布表格式；逐次明细在 `diagnostic_replays.log`。

@@ -90,6 +90,7 @@ def binding_fixture(transport="urma", batch=1, history=131072, resident=16384, h
         arguments=[Tensor(np.zeros(32, dtype=np.uint8)) for _ in range(15)],
         library=SimpleNamespace(
             kvip_lifetch_streaming_forward=Mock(return_value=0),
+            kvip_parallel_tail_supported=Mock(return_value=0),
             kvip_streaming_resolver_cores=Mock(return_value=3),
             kvip_streaming_flag_count=Mock(return_value=16),
         ),
@@ -228,3 +229,12 @@ int main(){
     binary = tmp_path / 'failure'
     subprocess.run(['c++', '-std=c++17', '-fsanitize=address,undefined', str(source), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
+
+
+def test_terminal_reports_effective_jettys_separately_from_legacy_option():
+    rotating, update = binding_fixture()
+    forward = LIFetchForward(rotating, update, fetch_jettys_per_aiv=2)
+    assert forward.effective_fetch_jettys_per_aiv == 2
+    forward.terminal = object()
+    assert forward.fetch_jettys_per_aiv == 2
+    assert forward.effective_fetch_jettys_per_aiv == 1

@@ -22,7 +22,8 @@ def timing_summary(samples):
 
 def _timing_distribution(values):
     return dict(mean_us=float(values.mean()), p50_us=float(np.median(values)),
-                p99_us=float(np.percentile(values, 99)), samples=len(values))
+                p90_us=float(np.percentile(values, 90)), p99_us=float(np.percentile(values, 99)),
+                min_us=float(values.min()), max_us=float(values.max()), samples=len(values))
 
 
 def atomic_json(path, value):
@@ -63,7 +64,7 @@ def comparison_row(case_id, serial, fused, correctness, execution='COMPLETED'):
     row = dict(case=case_id, execution=execution, correctness=correctness,
                timing='COMPLETE' if serial and fused else 'INCOMPLETE')
     for name, timing in [('serial', serial), ('fused', fused)]:
-        for metric in ('mean_us', 'profiler_mean_us', 'p50_us', 'p99_us', 'samples', 'timing_protocol', 'stage_mean_us', 'inter_kernel_gap_mean_us', 'overlap_mean_us', 'outside_invocations_mean_us'):
+        for metric in ('mean_us', 'profiler_mean_us', 'p50_us', 'p90_us', 'p99_us', 'min_us', 'max_us', 'samples', 'stage_samples_us', 'timing_protocol', 'stage_mean_us', 'inter_kernel_gap_mean_us', 'overlap_mean_us', 'outside_invocations_mean_us'):
             row[f'{name}_{metric}'] = timing.get(metric) if timing else None
     if serial and fused:
         row['reduction'] = 1 - fused['mean_us'] / serial['mean_us']
@@ -88,32 +89,19 @@ def save_summary(directory, rows):
     temporary.replace(directory / 'results.csv')
     batched = any(row.get('serial_timing_protocol') == 'one_profiled_graph' for row in rows)
     headers = ['#', 'Transport', 'BS', 'Miss%', 'Execution', 'Check',
-               'Serial mean', 'Fused mean', 'Gain', 'Serial p50/p99', 'Fused p50/p99']
-    if batched:
-        headers[6:8] = ['Serial event mean', 'Fused event mean']
-        headers += ['Serial prof mean', 'Fused prof mean']
-        headers[9:11] = ['Serial prof p50/p99', 'Fused prof p50/p99']
-    get_only = any(row.get('serial_get_only_mean_us') is not None for row in rows)
-    if get_only:
-        headers += ['Serial Get mean', 'Serial Get p50/p99']
+               'Serial event mean' if batched else 'Serial mean',
+               'Fused event mean' if batched else 'Fused mean', 'Gain']
     cells = []
     for index, row in enumerate(rows, 1):
         def number(key):
             value = row.get(key)
             return '—' if value is None else f'{value:.2f}'
-        def percentiles(prefix):
-            return f"{number(prefix + '_p50_us')}/{number(prefix + '_p99_us')}"
         miss = row.get('miss_percent')
         reduction = row.get('reduction')
         cells.append([str(index), row.get('transport') or '—', str(row.get('batch') or '—'),
                       '—' if miss is None else f'{miss:g}', row['execution'], row['correctness'],
                       number('serial_mean_us'), number('fused_mean_us'),
-                      '—' if reduction is None else f'{reduction:+.2%}',
-                      percentiles('serial'), percentiles('fused')])
-        if batched:
-            cells[-1] += [number('serial_profiler_mean_us'), number('fused_profiler_mean_us')]
-        if get_only:
-            cells[-1] += [number('serial_get_only_mean_us'), percentiles('serial_get_only')]
+                      '—' if reduction is None else f'{reduction:+.2%}'])
     widths = [max(len(line[col]) for line in [headers, *cells]) for col in range(len(headers))]
     def formatted(line):
         return ' | '.join(value.ljust(width) if col in (1, 4, 5) else value.rjust(width)
@@ -123,27 +111,50 @@ def save_summary(directory, rows):
              formatted(headers), separator, *(formatted(line) for line in cells), separator,
              f"Completed: {sum(row['execution'] == 'COMPLETED' for row in rows)}/{len(rows)}; "
              f"correctness PASS: {sum(row['correctness'] == 'PASS' for row in rows)}/{len(rows)}"]
-    if batched:
-        stage_rows = []
-        for index, row in enumerate(rows, 1):
-            for path in ('serial', 'fused'):
-                for stage, value in (row.get(f'{path}_stage_mean_us') or {}).items():
-                    stage_rows.append([str(index), path, stage, f'{value:.2f}'])
-                value = row.get(f'{path}_inter_kernel_gap_mean_us')
-                if value is not None:
-                    stage_rows.append([str(index), path, 'within-call gaps', f'{value:.2f}'])
-                value = row.get(f'{path}_overlap_mean_us')
-                if value:
-                    stage_rows.append([str(index), path, 'subtract overlap', f'{-value:.2f}'])
-                value = row.get(f'{path}_outside_invocations_mean_us')
-                if value is not None:
-                    stage_rows.append([str(index), path, 'between calls + event edges', f'{value:.2f}'])
-        stage_headers = ['#', 'Path', 'Same-graph stage', 'Mean us/call']
-        stage_widths = [max(len(r[i]) for r in [stage_headers, *stage_rows]) for i in range(4)]
-        lines += ['', 'Profiler stages from the same measured graph; per-call spans include internal gaps.',
-                  ' | '.join(v.ljust(w) for v, w in zip(stage_headers, stage_widths)),
-                  '-+-'.join('-'*w for w in stage_widths)]
-        lines += [' | '.join(v.ljust(w) for v, w in zip(r, stage_widths)) for r in stage_rows]
+    def aggregate_table(title, identities, entries):
+        if not entries:
+            return
+        table_headers = [*identities, 'avg', 'p50', 'p90', 'p99', 'min', 'max', 'N']
+        table_rows = [[str(v) if isinstance(v, str) else '-' if v is None else f'{v:.2f}'
+                       for v in r] for r in entries]
+        widths = [max(len(r[i]) for r in [table_headers, *table_rows]) for i in range(len(table_headers))]
+        lines.extend(['', title, ' | '.join(v.ljust(w) for v, w in zip(table_headers, widths)),
+                      '-+-'.join('-'*w for w in widths)])
+        lines.extend(' | '.join(v.ljust(w) for v, w in zip(r, widths)) for r in table_rows)
+
+    overall_rows, stage_rows = [], []
+    for index, row in enumerate(rows, 1):
+        for path in ('serial', 'fused'):
+            mean = row.get(f'{path}_profiler_mean_us') if batched else row.get(f'{path}_mean_us')
+            overall_rows.append([str(index), path, mean, *[row.get(f'{path}_{k}') for k in
+                ('p50_us', 'p90_us', 'p99_us', 'min_us', 'max_us')], str(row.get(f'{path}_samples') or 0)])
+            raw = row.get(f'{path}_stage_samples_us') or {}
+            for stage, value in (row.get(f'{path}_stage_mean_us') or {}).items():
+                values = raw.get(stage, [])
+                stats = ([float(np.mean(values)), *np.percentile(values, [50, 90, 99]).tolist(),
+                          min(values), max(values), str(len(values))] if len(values)>1 else
+                         [value, None, None, None, values[0] if values else None,
+                          values[0] if values else None, str(len(values))])
+                stage_rows.append([str(index), path, stage, *stats])
+            for stage, key in (('within-call gaps', 'inter_kernel_gap_mean_us'), ('overlap', 'overlap_mean_us'),
+                               ('between calls + event edges (graph average)', 'outside_invocations_mean_us')):
+                value = row.get(f'{path}_{key}')
+                if value is None:
+                    continue
+                values = raw.get(stage, [])
+                stats = ([float(np.mean(values)), *np.percentile(values, [50, 90, 99]).tolist(),
+                          min(values), max(values), str(len(values))] if len(values)>1 else
+                         [value, None, None, None, values[0] if values else None,
+                          values[0] if values else None, str(len(values))])
+                stage_rows.append([str(index), path, stage, *stats])
+    aggregate_table('Profiler invocation distribution (us; same measured graph)' if batched else
+                    'Invocation distribution (us)', ['#', 'Path'], overall_rows)
+    aggregate_table('Profiler stages from the same measured graph (us/call)', ['#', 'Path', 'Stage'], stage_rows)
+    get_rows = [[str(index), *[row.get(f'serial_get_only_{key}') for key in
+                 ('mean_us', 'p50_us', 'p90_us', 'p99_us', 'min_us', 'max_us')],
+                 str(row.get('serial_get_only_samples') or 0)]
+                for index, row in enumerate(rows, 1) if row.get('serial_get_only_mean_us') is not None]
+    aggregate_table('Serial Get mean and distribution (us; independent Get graph events)', ['#'], get_rows)
     for index, row in enumerate(rows, 1):
         if row.get('mode') == 'check' or row['execution'] != 'COMPLETED' or row['correctness'] != 'PASS':
             lines.append(f"[{index}] {row['case']}" + (f": {row['reason']}" if row.get('reason') else ''))
@@ -182,7 +193,7 @@ def add_profile_metrics(rows, diagnostic):
     captures = {Path(capture['source']).resolve(): capture['samples'] for capture in diagnostic['captures']}
     stage_order = dict(
         serial=('total', 'li', 'lidu_prepare', 'get'),
-        fused=('total', 'init', 'li', 'resolve_update', 'resolve_update_fetch', 'resolver_span',
+        fused=('total', 'init', 'li', 'topk_resolve_update', 'resolve_update', 'resolve_update_fetch', 'resolver_span',
                'output_pack_span', 'index_apply_span', 'prefetch_span', 'final_get_span',
                'transfer_span', 'finalize_span'),
     )
@@ -226,7 +237,7 @@ def add_profile_metrics(rows, diagnostic):
             for stage in stages:
                 values = times[stage]
                 distribution = (_timing_distribution(np.asarray(values)) if values else
-                                dict(mean_us=None, p50_us=None, p99_us=None, samples=0))
+                                dict(mean_us=None, p50_us=None, p90_us=None, p99_us=None, min_us=None, max_us=None, samples=0))
                 for key, value in distribution.items():
                     row[f'{prefix}_{stage}_{key}'] = value
             if path == 'fused':
@@ -266,10 +277,13 @@ def collect_results(directory, config, exit_code):
             fetch_jettys = report.get('fetch_jettys_per_aiv', getattr(config, 'fetch_jettys_per_aiv', None))
             if fetch_jettys is not None:
                 row['fetch_jettys_per_aiv'] = fetch_jettys
+        for key in ('fetch_path', 'effective_fetch_jettys_per_aiv'):
+            if key in report:
+                row[key] = report[key]
         if report.get('fused_attribution'):
             row['fused_attribution'] = str((path.parent / report['fused_attribution']).resolve())
         if timing.get('native_get_only'):
-            for key in ('mean_us', 'p50_us', 'p99_us', 'samples'):
+            for key in ('mean_us', 'p50_us', 'p90_us', 'p99_us', 'min_us', 'max_us', 'samples'):
                 row[f'serial_get_only_{key}'] = timing['native_get_only'].get(key)
         add_transfer_counts(row, report)
         rows.append(row)

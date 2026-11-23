@@ -228,13 +228,24 @@ def require_stateful_round(source_round, hot_tokens, prefetch, final):
             assert not tokens.intersection(range(4096, 6144)), 'B/C failed to evict A'
 
 
-def transfer_coverage(posts, destinations, lru_slots, stride, resident):
+def transfer_coverage(posts, destinations, lru_slots, stride, resident, *, allocated_slots=None, prior_counts=None):
     """Prove conflict descriptors and fallback destinations from actual output."""
     import numpy as np
     posts, destinations, lru_slots = map(np.asarray, (posts, destinations, lru_slots))
     destinations = destinations.reshape(-1)
     evidence = []
     for row in range(len(posts)):
+        if allocated_slots is not None:
+            count = int(posts[row, :, 0].sum())
+            begin = int(prior_counts[row])
+            selected = np.asarray(allocated_slots[row, begin:begin+count], dtype=np.int64)
+            if len(selected) != count or np.any(selected < 0) or np.any(selected >= resident):
+                raise RuntimeError('Invalid terminal hot-slot allocations')
+            if len(np.unique(selected)) != count:
+                raise RuntimeError('Terminal repairs alias one destination')
+            evidence.append(dict(request=row, final=count, conflicts=0, path='parallel',
+                fallback_slots=len(set(selected.tolist()) - set(map(int, lru_slots[row])))))
+            continue
         slots, conflicts = [], 0
         for post in posts[row]:
             count, start, safe = map(int, (post[0], post[4], post[5]))
@@ -256,7 +267,7 @@ def transfer_coverage(posts, destinations, lru_slots, stride, resident):
 
 def require_transfer_coverage(rows):
     assert rows and all(row['fallback_slots'] > 0 for row in rows), 'Hot-pool fallback was not exercised'
-    assert all(row['conflicts'] > 0 for row in rows), 'Prefetch destination conflict was not exercised'
+    assert all(row.get('path') == 'parallel' or row['conflicts'] > 0 for row in rows), 'Prefetch destination conflict was not exercised'
 
 
 def check_sfa(torch, tensors, geometry, before, after, *, output_path=None):

@@ -66,7 +66,7 @@ def test_level_one_reports_final_and_combined_scope_without_summing_overlap(tmp_
     sample = result['captures'][0]['samples'][0]
     assert sample['combined_observed_bandwidth']['span_us'] == 45
     assert sample['combined_observed_bandwidth']['bytes'] == 10 * 656
-    assert 'metric=final_get_bandwidth' in (tmp_path / 'diagnostic_summary.log').read_text()
+    assert 'metric=final_get_bandwidth' in (tmp_path / 'diagnostic_replays.log').read_text()
     row = dict(report=str(tmp_path / 'report.json'))
     add_profile_metrics([row], result)
     assert row['fused_profiled_resolver_span_p50_us'] == 6

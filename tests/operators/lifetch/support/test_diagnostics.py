@@ -70,8 +70,8 @@ def test_real_rounds_keep_separate_repeat_distributions(tmp_path):
     assert result['trace'] == 'COMPLETE'
     assert [capture['stage_summary']['li']['mean_us'] for capture in result['captures']] == [15, 40]
     assert [capture['samples'][0]['source_round'] for capture in result['captures']] == [51, 52]
-    assert 'source_round=51' in (tmp_path / 'diagnostic_summary.log').read_text()
-    assert 'source_round=52' in (tmp_path / 'diagnostic_summary.log').read_text()
+    assert 'source_round=51' in (tmp_path / 'diagnostic_replays.log').read_text()
+    assert 'source_round=52' in (tmp_path / 'diagnostic_replays.log').read_text()
 
 
 def test_level_one_requests_intervals_and_zero_bandwidth(tmp_path):
@@ -87,7 +87,7 @@ def test_level_one_requests_intervals_and_zero_bandwidth(tmp_path):
         report = summarize(root, SimpleNamespace(iterations=1, level=1,
                             stages=('li', 'fetch'), transport=transport))
         assert report['trace'] == 'COMPLETE'
-        log = (root / 'diagnostic_summary.log').read_text()
+        log = (root / 'diagnostic_replays.log').read_text()
         assert 'request=0 initial_hot_valid=16384 selected_unique=2048 initial_cold=0' in log
         assert report['captures'][0]['samples'][0]['accounting']['intervals_us']['li'] == [[100, 110]]
         assert 'GB/s=N/A' in log
@@ -132,7 +132,7 @@ def test_level_one_terminal_is_tables_not_raw_dump(tmp_path, capsys):
         accounting=dict(stages_us=dict(li=12)))]))
     summarize(tmp_path, SimpleNamespace(iterations=1, level=1, stages=('li',), transport='urma'))
     output = capsys.readouterr().out
-    assert 'Stage distribution' in output and 'Per-request counts' in output
+    assert 'Stage distribution' in output and 'Source round' in output and 'p90' in output
     assert 'Effective bandwidth' in output
     assert 'ACCOUNTING repeat=' not in output
     assert (tmp_path / 'level1_summary.log').read_text().strip() == output.strip()
@@ -156,7 +156,7 @@ def test_level_two_tables_keep_replay_core_and_query_identity():
     result = dict(level=3, transport='urma', trace='COMPLETE', missing=[], unavailable=[],
         captures=[dict(source='test', stage_summary={}, samples=[sample])])
     output = level_two_tables(result)
-    for value in ('repeat=2', 'Last block=3', 'fetch Q1 lane0', 'Window prefetch / unused',
+    for value in ('Active cores', 'Last frequency', '3.00', 'fetch Q1 lane0', 'Window prefetch / unused',
                   'Per-Q demand / repair', 'Fetch Jettys per AIV', '1.00', '2.00'):
         assert value in output
     assert 'Per-Q resolver / update' in level_two_tables(dict(result, level=2))
