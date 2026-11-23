@@ -1,4 +1,5 @@
 #include "terminal_runtime_abi.h"
+#include "final_batches.h"
 #include "window_types.h"
 #if defined(__CCE_AICORE__)
 #include "shadow_exchange_parallel.h"
@@ -16,6 +17,19 @@ constexpr uint32_t TAIL_SRCSET=0, TAIL_DSTSET=2048, TAIL_PLAN_SRC=4096,
 #include "staged_fetch_worker.h"
 namespace rotating {
 #include "terminal_transport.h"
+}
+// The private SQ has been fully written by MTE3. Mark at most three additional
+// completions before publishing its first prefix. Each WQE is one cache line.
+__simt_vf__ __aicore__ LAUNCH_BOUND(32) inline void MarkTerminalPrefixes(
+ __gm__ uint32_t* sq,uint32_t depth,uint64_t head,uint32_t first,uint32_t second,
+ uint32_t third,uint32_t cuts){
+ const uint32_t i=threadIdx.x;
+ if(i<cuts){
+  uint32_t end=i==0?first:(i==1?second:third);
+  uint64_t last=head+end-1;
+  asc_stcg(sq+(uint32_t(last)&(depth-1))*16,terminal_batches::CompletionControl(last,depth));
+ }
+ asc_threadfence();
 }
 // Per-request fences occupy independent cache lines. No all-device barrier.
 __aicore__ inline void Signal(__gm__ uint32_t* flags,uint32_t n,uint32_t generation){flags[n*32]=generation;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+n*32),128);}
@@ -166,6 +180,9 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  if(profile)ts[11]=GetSystemCycle();
  uint32_t own=postScratch.GetValue(bitmapWords);
  uint32_t slotBase=postScratch.GetValue(bitmapWords+1),all=own,offset=0;
+ uint32_t total=postScratch.GetValue(bitmapWords+13);
+ const bool paced=terminal_batches::ShouldPace(own,total,priorSlots);
+ uint32_t firstPostCount=own;
  if(profile){ts[20]=own;ts[21]=all;ts[22]=slotBase;}
  if(profile)ts[12]=GetSystemCycle();
  auto ids=op.TerminalIds();
@@ -183,10 +200,19 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
   if(profile)ts[13]=GetSystemCycle();
   rotating::WriteReservedWqes(s.tokenBytes,args->channel_entity,args->queue_state,args->output,postWork[4096],postScratch,postWork,postWork[2048],postWork[6144],own,256,false,nullptr,offset,all,reinterpret_cast<__gm__ uint32_t*>(runtime->templates)+query*32,originalHead);
  }
+ if(paced){
+  const auto batches=terminal_batches::MakePlan(own,total,priorSlots);
+  firstPostCount=batches.ends[0];
+  auto cfg=postWork[6144];auto sq=cfg.ReinterpretCast<uint64_t>().GetValue(12);
+  Simt::VF_CALL<MarkTerminalPrefixes>(Simt::Dim3{32,1,1},
+   reinterpret_cast<__gm__ uint32_t*>(sq),cfg.GetValue(17),originalHead,
+   batches.ends[0],batches.ends[1],batches.ends[2],batches.count-1);
+  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ }
  if(profile)ts[14]=GetSystemCycle();
  // Logical IDs are emitted with slots after all admissions are visible.
  if(profile)ts[15]=GetSystemCycle();
- rotating::CommitTerminalPost(args,originalHead,own,post);
+ rotating::CommitTerminalPost(args,originalHead,firstPostCount,post);
  if(profile)ts[4]=GetSystemCycle();
 
  op.FreeEventID();
@@ -198,7 +224,6 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),64);
  if(profile && !q)ts[30]=(reinterpret_cast<__gm__ volatile rotating::MappingJournal*>(ctx->mappingJournal)+uint64_t(b)*1)->count;
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->rows)+uint64_t(b)*sizeof(rotating::Row),128);
- uint32_t total=postScratch.GetValue(bitmapWords+13);
  // Include the actual prior-prefetch Index work, after all output readers join.
  uint32_t first=total*q/4,last=total*(q+1)/4,n=total<=rotating::kChangeCapacity?last-first:0;
  auto src=(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity)+first;auto dst=(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+uint64_t(b)*rotating::kChangeCapacity)+first;
@@ -243,7 +268,13 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  }
  ownError|=(indexError<<4);
  if(profile)ts[16]=GetSystemCycle();
- uint64_t cqError=rotating::CompleteTerminalPost(args,post);
+ uint64_t cqError;
+ if(paced){
+  const auto batches=terminal_batches::MakePlan(own,total,priorSlots);
+  cqError=rotating::CompleteTerminalBatches(args,post,batches,originalHead);
+ }else{
+  cqError=rotating::CompleteTerminalPost(args,post);
+ }
  if(profile)ts[24]=GetSystemCycle();
  if(q==1)rotating::CompleteTerminalPrefetch(ctx,b);
  ownError|=uint32_t(cqError);
