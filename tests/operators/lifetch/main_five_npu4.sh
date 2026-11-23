@@ -6,9 +6,9 @@ reader=${2:?supply the full replay reader revision}
 main_rev=609fa26fd715f9409bbe74e1b2d3685c58dfb0cf
 native=${3-$main_rev}
 mode=${4-b24}
-if (( $# > 4 )) || { (( $# == 4 )) && [[ $mode != b20 ]]; } ||
+if (( $# > 4 )) || { (( $# == 4 )) && [[ $mode != b20 && $mode != b20-npu4 ]]; } ||
     { (( $# >= 3 )) && [[ -z $native || $native == "$main_rev" ]]; }; then
-    echo 'Usage: REPO READER [NEW_CANDIDATE_SHA [b20]]; supply an independent candidate when passing NEW_CANDIDATE_SHA' >&2
+    echo 'Usage: REPO READER [NEW_CANDIDATE_SHA [b20|b20-npu4]]; supply an independent candidate when passing NEW_CANDIDATE_SHA' >&2
     exit 2
 fi
 label=mainline
@@ -36,8 +36,8 @@ if [[ $native != "$main_rev" ]]; then
     label=li-window
     arm_label=li_windows
     prefix=li-window-five
-    if [[ $mode == b20 ]]; then
-        prefix=b20-li-window-five
+    if [[ $mode != b24 ]]; then
+        prefix="$mode-li-window-five"
     elif [[ ! -r "$reference/main.txt" || $(<"$reference/main.txt") != "$main_rev" ||
             ! -r "$reference/physical_npu.txt" || $(<"$reference/physical_npu.txt") != 4 ]]; then
         echo "Expected measured upstream on physical NPU4 at $reference" >&2
@@ -184,8 +184,8 @@ run_group() (
     fi
     if ! wait "$monitor"; then cat "$arm/thp.log" >&2; exit 1; fi
     monitor=
-    if [[ $mode == b20 ]]; then
-        "$PYTHON" -B "$support/b20_window_report.py" group "$out" "$group" | tee -a "$out/summary.txt"
+    if [[ $mode != b24 ]]; then
+        "$PYTHON" -B "$support/b20_window_report.py" group "$out" "$group" --physical-npu "$peer_physical_npu" | tee -a "$out/summary.txt"
     elif [[ $native == "$main_rev" ]]; then
         "$PYTHON" -B "$support/main_five_report.py" "$out" "$group" "$archive" | tee -a "$out/summary.txt"
     else
@@ -212,8 +212,8 @@ if (( ${#failed[@]} )); then
     echo "REPLAY_INCOMPLETE groups=${failed[*]} RESULT_ROOT=$out" >&2
     exit 1
 fi
-if [[ $mode == b20 ]]; then
-    "$PYTHON" -B "$support/b20_window_report.py" summary "$out" | tee -a "$out/summary.txt"
+if [[ $mode != b24 ]]; then
+    "$PYTHON" -B "$support/b20_window_report.py" summary "$out" --physical-npu "$peer_physical_npu" | tee -a "$out/summary.txt"
 elif [[ $native != "$main_rev" ]]; then
     "$PYTHON" -B "$support/li_window_report.py" summary "$out" | tee -a "$out/summary.txt"
 fi
