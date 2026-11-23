@@ -31,20 +31,46 @@ if [[ $mode == score-equivalence ]]; then ref="$work/peer-baseline/fused.0SOIpe"
 if [[ $mode == owner-topk || $mode == fill-g10-g2 ]]; then ref="$work/peer-baseline/fused.fmn5ww"; fi
 runner="$work/fused-scan-sources/reader-$reader"
 git -C "$repo" cat-file -e "$native^{commit}"
+git -C "$repo" cat-file -e "$reader^{commit}"
 test -r "$ref/logical-ties.txt"
-mkdir -p "$(dirname "$runner")"
-if [[ ! -e "$runner" ]]; then
-    git -C "$repo" worktree add -q --detach "$runner" "$reader"
-fi
-if [[ "$(git -C "$runner" rev-parse HEAD)" != "$reader" || -n "$(git -C "$runner" status --porcelain)" ]]; then
-    echo "RUNNER_MISMATCH=$runner" >&2
-    exit 1
-fi
+reader_ready() {
+    local path=$1 head status
+    if [[ ! -e "$path/.git" ]]; then
+        printf 'READER_PATH=%s missing .git at the worktree root\n' "$path" >&2
+        return 1
+    fi
+    head=$(git -C "$path" rev-parse --verify HEAD) || return 1
+    status=$(git --no-optional-locks -C "$path" status --porcelain=v1 --untracked-files=normal) || return 1
+    if [[ $head != "$reader" || -n $status ]]; then
+        printf 'READER_PATH=%s expected=%s actual=%s\n' "$path" "$reader" "$head" >&2
+        if [[ -n $status ]]; then sed -n '1,12p' <<< "$status" >&2; fi
+        return 1
+    fi
+}
+prepare_reader() {
+    local base=$runner
+    mkdir -p "$(dirname "$base")" || return 1
+    if [[ ! -e "$base" && ! -L "$base" ]]; then
+        git -C "$repo" worktree add -q --detach "$base" "$reader" || echo "Could not create preferred reader at $base" >&2
+    fi
+    if ! reader_ready "$base"; then
+        # Keep the original checkout and its Git registration intact.
+        runner=$(mktemp -d "$base.XXXXXX") || return 1
+        printf 'READER_RETRY=%s\n' "$runner"
+        git -C "$repo" worktree add -q --detach "$runner" "$reader" || return 1
+        reader_ready "$runner" || return 1
+    fi
+    printf 'READER_READY=%s commit=%s\n' "$runner" "$reader"
+}
 export PEER_G2_WORK="$work" PEER_PHYSICAL_NPU=4 ASCEND_RT_VISIBLE_DEVICES=4 PEER_LOCAL_ONLY=1
 export PATH="/usr/local/python3.12.13/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 unset PEER_RANKED_INPUT PEER_RANKED_HASH_FILE KVIP_Q4_NATIVE_LI_CACHE
 log=$(mktemp "$work/host24-npu4-$mode.XXXXXX")
 echo "LOG=$log"
+prepare_rc=0
+prepare_reader >"$log" 2>&1 || prepare_rc=$?
+cat "$log"
+if (( prepare_rc )); then exit "$prepare_rc"; fi
 if [[ $mode == score-equivalence || $mode == owner-topk || $mode == fill-g10-g2 ]]; then
     run_selected() {
         if [[ $mode == fill-g10-g2 ]]; then
@@ -61,10 +87,10 @@ if [[ $mode == score-equivalence || $mode == owner-topk || $mode == fill-g10-g2 
     }
     rc=0
     run_selected 2>&1 |
-        tee "$log" | while IFS= read -r line; do
+        tee -a "$log" | while IFS= read -r line; do
             case "$line" in RESULT_ROOT=*|CASE_BEGIN\ *|G[0-9]*\ *|REPLAY_COMPLETE*) printf '%s\n' "$line" ;; esac
         done || rc=$?
     if (( rc != 0 )); then tail -n 30 "$log" >&2; fi
     exit "$rc"
 fi
-bash "$runner/tests/operators/lifetch/peer_fused.sh" "--$mode" "$native" --reference "$ref" "${groups[@]}" 2>&1 | tee "$log"
+bash "$runner/tests/operators/lifetch/peer_fused.sh" "--$mode" "$native" --reference "$ref" "${groups[@]}" 2>&1 | tee -a "$log"
