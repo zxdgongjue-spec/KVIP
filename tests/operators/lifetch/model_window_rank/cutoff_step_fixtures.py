@@ -76,7 +76,7 @@ def tag(ids, order, eligible, tail):
     return phys
 
 
-def group(archive, group, rows, reps):
+def group(archive, group, rows, reps, first_merges):
     src = archive / f"g{group}" / "probe_inputs.npz"
     with np.load(src) as z:
         s, ends, bounds, tail, eligible, old_id, old_v, cuts = [
@@ -111,6 +111,7 @@ def group(archive, group, rows, reps):
                 chunk = order[first:last]
                 ids = chunk[(chunk < end) & ((chunk < bounds[b, 0]) | (chunk >= bounds[b, 1]))]
                 intervals.append(ids)
+            first_by_geometry = {}
             # Verify all eight source steps before combining adjacent steps as a four-window fixture.
             for w, ids in enumerate(intervals):
                 adds = ids[key[ids] > cuts[b, q, w]]
@@ -122,6 +123,11 @@ def group(archive, group, rows, reps):
                     and np.array_equal(check_i, old_id[b, q, w + 1])
                     and check_c == cuts[b, q, w + 1]
                 )
+                if len(adds) and 8 not in first_by_geometry:
+                    assert np.array_equal(old_id[b, q, w], seed_i) and np.array_equal(old_v[b, q, w], seed_s)
+                    pos, first_branch = verified_select(seed_s, key[adds], seed_c)
+                    assert np.array_equal(np.r_[seed_i, adds][pos], check_i)
+                    first_by_geometry[8] = (w, first_branch, check_c - seed_c, len(adds))
             # Keep the candidate state resident across all four updates, with original residency tags.
             prior_id = tag(seed_i, order, eligible[b], tail[b])
             prior_s = seed_s
@@ -139,6 +145,9 @@ def group(archive, group, rows, reps):
                 assert new_cut == cuts[b, q, w + 2]
                 ix, branch = verified_select(prior_s, key[adds], cut)
                 assert np.array_equal(combined_s[ix], next_s) and np.array_equal(combined_i[ix], next_i)
+                if len(adds) and 4 not in first_by_geometry:
+                    assert np.array_equal(old_id[b, q, w], seed_i) and np.array_equal(prior_s, seed_s)
+                    first_by_geometry[4] = (w // 2, branch, new_cut - seed_c, len(adds))
                 lost = int(len(adds) - np.count_nonzero(ix >= K))
                 row = dict(
                     group=group,
@@ -161,6 +170,22 @@ def group(archive, group, rows, reps):
                         (row, write_case(prior_id, prior_s, phys, key[adds], cut, next_i, next_s))
                     )
                 prior_id, prior_s = combined_i[ix], combined_s[ix]
+            for geometry in (4, 8):
+                initial_empty, first_branch, delta, added = first_by_geometry.get(
+                    geometry, (geometry, "never", None, 0)
+                )
+                first_merges.append(
+                    dict(
+                        group=group,
+                        b=b,
+                        q=q,
+                        geometry=geometry,
+                        branch=first_branch,
+                        initial_empty_windows=initial_empty,
+                        delta=delta,
+                        raw_above_seed=added,
+                    )
+                )
 
 
 def synthetic():
@@ -187,12 +212,13 @@ def main():
     )
     args = p.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
+    first_merges = []
     records = []
     rows = []
     summary = []
     for g in (10, 4, 17, 7, 2):
         reps = defaultdict(list)
-        group(args.input, g, rows, reps)
+        group(args.input, g, rows, reps, first_merges)
         if args.all_fixtures:
             full = sorted(
                 (entry for branch in reps.values() for entry in branch),
@@ -235,6 +261,7 @@ def main():
     for name, data in (
         ("cases.json", [r for r, _ in records]),
         ("all.json", rows),
+        ("first-nonempty.json", first_merges),
         ("summary.json", summary),
     ):
         (args.output / name).write_text(json.dumps(data, indent=2) + "\n")
