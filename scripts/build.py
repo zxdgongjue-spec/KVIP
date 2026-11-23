@@ -150,8 +150,12 @@ def prepare_main_device_sources(root, transport):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kvaf-root", type=Path, help="existing checkout; otherwise download to third_party/KVAF")
-    parser.add_argument(
+    main_mode = parser.add_mutually_exclusive_group()
+    main_mode.add_argument(
         "--main-batch-get", action="store_true", help="build unified Runtime and LIDU for native BatchGet"
+    )
+    main_mode.add_argument(
+        "--main-ubmem-fused", action="store_true", help="build unified Runtime with the UBmem LIFetch lease"
     )
     parser.add_argument("--prepare-main-device", action="store_true", help="prepare unified Runtime fusion patch sources")
     parser.add_argument("--prepare-only", action="store_true", help="prepare pinned source, without CANN builds")
@@ -172,13 +176,18 @@ def main():
     if not args.prepare_only:
         runtime_preflight()
     dependency = (args.kvaf_root or ROOT / "third_party/KVAF").resolve()
-    revision = MAIN_REVISION if args.main_batch_get else REVISION
-    if args.main_batch_get:
+    main_runtime = args.main_batch_get or args.main_ubmem_fused
+    revision = MAIN_REVISION if main_runtime else REVISION
+    if args.main_ubmem_fused and args.transport != "ubmem":
+        parser.error("--main-ubmem-fused requires --transport ubmem")
+    if main_runtime:
         if args.kvaf_root is None:
-            parser.error("--main-batch-get requires an explicit --kvaf-root")
+            parser.error("unified Runtime builds require an explicit --kvaf-root")
         head = subprocess.check_output(["git", "-C", str(dependency), "rev-parse", "HEAD"], text=True).strip()
         if head != revision:
             raise RuntimeError(f"Expected KVAF {revision}, found {head}; existing checkout left unchanged")
+        if args.main_ubmem_fused:
+            prepare_main_device_sources(dependency, args.transport)
     else:
         prepare_dependency(dependency, args.transport)
     (ROOT / "build").mkdir(exist_ok=True)
@@ -211,7 +220,7 @@ def main():
                 cwd=dependency,
                 env=env,
             )
-    if args.main_batch_get:
+    if main_runtime:
         for kind in ("get", "put"):
             kernel = build_dir / "bin" / f"kvaf_execute_batch_{kind}_kernels.o"
             if not kernel.is_file():
@@ -219,6 +228,14 @@ def main():
         package = build_dir / "python/kvaf"
         if not (package / "__init__.py").is_file() or not list(package.glob("*.so")):
             raise RuntimeError(f"Unified KVAF Python extension missing: {package}")
+        if args.main_ubmem_fused:
+            call(
+                [sys.executable, "-I", "-c",
+                 "import sys; sys.path.insert(0, sys.argv[1]); import kvaf; "
+                 "getattr(kvaf.NpuRuntime, 'get_graph_mapped_base')",
+                 build_dir / "python"],
+                env=env,
+            )
         verifier = dependency / "bindings/verify_python_binding.py"
         call(
             [sys.executable, "-I", "-c",
