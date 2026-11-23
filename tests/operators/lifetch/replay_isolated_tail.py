@@ -39,8 +39,8 @@ def loaded_library(root, revision):
     raise ValueError(f'No loaded library matches the recorded SHA-256 in {root}: {sorted(builds)}')
 
 
-def run_fixed(repo, work):
-    for revision in (READER, FIXED):
+def run_candidate(repo, work, candidate):
+    for revision in (READER, candidate):
         subprocess.run(['git', '-C', str(repo), 'cat-file', '-e', f'{revision}^{{commit}}'], check=True)
     source = subprocess.check_output(['git', '-C', str(repo), 'show',
                                       f'{READER}:tests/operators/lifetch/main_five_npu4.sh'])
@@ -50,7 +50,7 @@ def run_fixed(repo, work):
     with tempfile.TemporaryDirectory() as tmp:
         runner = Path(tmp) / 'replay.sh'
         runner.write_bytes(source)
-        command = ['bash', str(runner), str(repo), READER, FIXED]
+        command = ['bash', str(runner), str(repo), READER, candidate]
         with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
             for line in proc.stdout:
                 print(line, end='', flush=True)
@@ -85,12 +85,39 @@ def main():
     parser.add_argument('repo', type=Path)
     parser.add_argument('work', type=Path)
     parser.add_argument('--result', type=Path, help='only verify this completed isolated replay')
+    parser.add_argument('--li-window', nargs=2, metavar=('COMMIT', 'LI_VECTOR_SHA256'),
+                        help='replay five cases and compare their loaded instructions with the local simulator build')
     args = parser.parse_args()
+    if args.li_window:
+        from support.check_isolated_device import compare, extract
+
+        candidate, vector_hash = args.li_window
+        for value, length in ((candidate, 40), (vector_hash, 64)):
+            if len(value) != length or any(c not in '0123456789abcdef' for c in value):
+                parser.error('use the full lowercase commit and instruction SHA-256')
+        baseline = args.work / 'peer-baseline/main-five.hF6qQ8'
+        main_code = extract(loaded_library(baseline, MAIN))
+        result = args.result or run_candidate(args.repo, args.work, candidate)
+        if Path((result / 'reference.txt').read_text().strip()).resolve() != baseline.resolve():
+            raise ValueError(f'Unexpected reference in {result}')
+        code = extract(loaded_library(result, candidate))
+        print(compare('TAIL', main_code['parallel_terminal_kernel'], code['parallel_terminal_kernel']))
+        expected = {
+            ('parallel_terminal_kernel', 1): '5054a60bd3822bd0790b781620f21cbfd9b8816f6d08684adc1f540a9f1083b4',
+            ('v9_kernel', 0): vector_hash,
+            ('v9_kernel', 1): '7863fcf3cfc86d7cbedbc5f901f6f5b7af58493f17fa99fa1bacf9f8bf7307f9',
+        }
+        actual = {(name, key[1]): hashlib.sha256(blob).hexdigest()
+                  for name, sections in code.items() for key, blob in sections.items() if key[4] == '.text'}
+        if actual != expected:
+            raise ValueError(f'MODEL_CODE_MISMATCH result={result} expected={expected} actual={actual}')
+        print(f'MODEL_CODE_MATCH tail_and_LI RESULT_ROOT={result}', flush=True)
+        return
     before = args.work / 'peer-baseline/li-window-five.DRHZaO'
     baseline = Path((before / 'reference.txt').read_text().strip())
     old_main = loaded_library(baseline, MAIN)
     old_candidate = loaded_library(before, BEFORE)
-    fixed = args.result or run_fixed(args.repo, args.work)
+    fixed = args.result or run_candidate(args.repo, args.work, FIXED)
     if Path((fixed / 'reference.txt').read_text().strip()).resolve() != baseline.resolve():
         raise ValueError('Isolated replay selected a different mainline archive')
     new_candidate = loaded_library(fixed, FIXED)
