@@ -119,6 +119,9 @@ __aicore__ inline void RunLastWindowQuery(uint32_t query,uint32_t half,bool trac
 }
 
 __aicore__ inline void CompleteLastWindow(uint32_t role,uint32_t half) {
+    // All four Qs now have different UB banks. Earlier-window service lanes
+    // must publish their lists to the original shared GM handoff for this row.
+    localWindowLists_=false;
     const uint32_t row=rotating::ServiceLane(runtimeShape_.batch,runtimeShape_.splitQ,
         runtimeShape_.serviceAics,blockId_/2,blockId_%2);
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
