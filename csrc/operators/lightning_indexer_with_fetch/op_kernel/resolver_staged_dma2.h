@@ -103,11 +103,17 @@ inline void StagedInitializeReady(__ubuf__ uint32_t* selected,__ubuf__ uint32_t*
     asc_syncthreads();
 }
 
+// A joined owner can reach the protected allocator before its peers finish
+// their TopK. Suspend in UB at that boundary; the scalar core waits for them.
+enum class StagedPhase { Complete, UntilPeerBitmap, ResumeWithPeerBitmap };
+constexpr uint32_t kPendingAdded = 24, kPendingUnresolved = 25, kPendingAllocated = 26;
+
+template<StagedPhase Phase = StagedPhase::Complete>
 __simt_callee__
 inline void StagedQuery(uint32_t query,uint32_t history,uint32_t resident,uint32_t bytes,
     uint32_t batch,uint32_t used,StagedContextPointer ctx,__ubuf__ uint32_t* selected,__ubuf__ uint32_t* loc,
     __ubuf__ uint32_t* keys,__ubuf__ uint32_t* ranks,__ubuf__ uint16_t* ids,__ubuf__ uint32_t* slots,
-    __ubuf__ uint32_t* scratch,__ubuf__ uint32_t* ctl,__gm__ uint32_t* deferredProtection=nullptr) {
+    __ubuf__ uint32_t* scratch,__ubuf__ uint32_t* ctl,__gm__ uint32_t* deferredProtection=nullptr, bool peerMapsReady=true) {
     const uint32_t tid=threadIdx.x,owner=OwnerRow(ctx,batch),stride=OutputStride(resident,ctx);
     auto bitmap=ctl+1024;
     uint32_t buckets=ctl[7];
@@ -128,68 +134,94 @@ inline void StagedQuery(uint32_t query,uint32_t history,uint32_t resident,uint32
             asc_syncthreads();
         }
         const uint32_t begin=query*kTop,end=begin+kTop,oldCount=ctl[0];
-        for(uint32_t i=begin+tid;i<end;i+=512){
-            uint32_t token=selected[i];
-            if(token==UINT32_MAX){loc[i]=UINT32_MAX;continue;}
-            // Reuse the original resolver's Q3/Q1, Q4/Q2 same-position
-            // shortcut: the earlier query has already published its slot.
-            if(query>=2 && selected[i-2*kTop]==token){loc[i]=loc[i-2*kTop];continue;}
-            if(loc[i]!=UINT32_MAX)continue;
-            uint32_t h=SparseHash(token)&(buckets-1);
-            for(uint32_t probe=0;probe<buckets;++probe){
-                uint32_t prev=asc_atomic_cas(keys+h,UINT32_MAX,token);
-                if(prev==UINT32_MAX || prev==token){
-                    uint32_t rank=ranks[h];
-                    if(rank==UINT32_MAX || !(rank&kStagedRankTag))asc_atomic_min(ranks+h,i);
-                    break;
-                }
-                h=(h+1)&(buckets-1);
+        uint32_t added, unresolved;
+        if constexpr(Phase == StagedPhase::ResumeWithPeerBitmap) {
+            added=ctl[kPendingAdded];
+            unresolved=ctl[kPendingUnresolved];
+        } else {
+            if constexpr(Phase == StagedPhase::UntilPeerBitmap) {
+                if(!tid)ctl[kPendingAdded]=0;
             }
-        }
-        asc_syncthreads();
-        uint32_t local=0,pending=0;
-        for(uint32_t i=begin+tid*4;i<begin+(tid+1)*4;++i){
-            if(loc[i]!=UINT32_MAX || selected[i]==UINT32_MAX)continue;
-            ++pending;
-            uint32_t h=SparseHash(selected[i])&(buckets-1);
-            uint32_t probes=0;
-            while(keys[h]!=selected[i] && probes<buckets){h=(h+1)&(buckets-1);++probes;}
-            if(probes==buckets){asc_atomic_or(ctl+1,8U);continue;}
-            if(ranks[h]==i){loc[i]=UINT32_MAX-1;++local;}
-        }
-        // Both counts fit in 16 bits: each query contains 2048 positions.
-        // Carrying them in one scan avoids another barrier just to know if
-        // there are any unresolved duplicate positions to translate.
-        uint32_t offset=StagedPrefix(local|(pending<<16),ctl)&0xffffU;
-        uint32_t totals=ctl[544+512/warpSize-1];
-        uint32_t added=totals&0xffffU,unresolved=totals>>16;
-        for(uint32_t i=begin+tid*4;i<begin+(tid+1)*4;++i){
-            if(loc[i]!=UINT32_MAX-1)continue;
-            uint32_t h=SparseHash(selected[i])&(buckets-1);
-            uint32_t probes=0;
-            while(keys[h]!=selected[i] && probes<buckets){h=(h+1)&(buckets-1);++probes;}
-            if(probes==buckets){asc_atomic_or(ctl+1,8U);continue;}
-            uint32_t rank=oldCount+offset++;ids[rank%kTop]=uint16_t(i);ranks[h]=kStagedRankTag|rank;
-        }
-        asc_syncthreads();
-        uint32_t allocated=0;
-        if(deferredProtection && added && !ctl[kProtectionState]){
-            const uint32_t cursor=used+oldCount;
-            const uint32_t left=cursor<kLruSlots?kLruSlots-cursor:0;
-            allocated=added<left?added:left;
-            for(uint32_t i=tid;i<allocated;i+=512){
-                const uint32_t slot=lru[cursor+i];
-                if(slot>=resident){asc_atomic_or(ctl+1,4U);continue;}
-                // Bindings without a complete inverse LRU reservation can
-                // retain an ordinary hit in this slot. Use protected allocation.
-                if(asc_ldcg(reserved+slot)!=int32_t(cursor+i))
-                    asc_atomic_or(ctl+kProtectionState,kReservationMismatch);
-                slots[oldCount+i]=slot;
+            for(uint32_t i=begin+tid;i<end;i+=512){
+                uint32_t token=selected[i];
+                if(token==UINT32_MAX){loc[i]=UINT32_MAX;continue;}
+                // Reuse the original resolver's Q3/Q1, Q4/Q2 same-position
+                // shortcut: the earlier query has already published its slot.
+                if(query>=2 && selected[i-2*kTop]==token){loc[i]=loc[i-2*kTop];continue;}
+                if(loc[i]!=UINT32_MAX)continue;
+                uint32_t h=SparseHash(token)&(buckets-1);
+                for(uint32_t probe=0;probe<buckets;++probe){
+                    uint32_t prev=asc_atomic_cas(keys+h,UINT32_MAX,token);
+                    if(prev==UINT32_MAX || prev==token){
+                        uint32_t rank=ranks[h];
+                        if(rank==UINT32_MAX || !(rank&kStagedRankTag))asc_atomic_min(ranks+h,i);
+                        break;
+                    }
+                    h=(h+1)&(buckets-1);
+                }
             }
             asc_syncthreads();
-            if(ctl[1])return;
-            if(ctl[kProtectionState]==kReservationMismatch)allocated=0;
+            uint32_t local=0,pending=0;
+            for(uint32_t i=begin+tid*4;i<begin+(tid+1)*4;++i){
+                if(loc[i]!=UINT32_MAX || selected[i]==UINT32_MAX)continue;
+                ++pending;
+                uint32_t h=SparseHash(selected[i])&(buckets-1);
+                uint32_t probes=0;
+                while(keys[h]!=selected[i] && probes<buckets){h=(h+1)&(buckets-1);++probes;}
+                if(probes==buckets){asc_atomic_or(ctl+1,8U);continue;}
+                if(ranks[h]==i){loc[i]=UINT32_MAX-1;++local;}
+            }
+            // Both counts fit in 16 bits: each query contains 2048 positions.
+            // Carrying them in one scan avoids another barrier just to know if
+            // there are any unresolved duplicate positions to translate.
+            uint32_t offset=StagedPrefix(local|(pending<<16),ctl)&0xffffU;
+            uint32_t totals=ctl[544+512/warpSize-1];
+            added=totals&0xffffU; unresolved=totals>>16;
+            for(uint32_t i=begin+tid*4;i<begin+(tid+1)*4;++i){
+                if(loc[i]!=UINT32_MAX-1)continue;
+                uint32_t h=SparseHash(selected[i])&(buckets-1);
+                uint32_t probes=0;
+                while(keys[h]!=selected[i] && probes<buckets){h=(h+1)&(buckets-1);++probes;}
+                if(probes==buckets){asc_atomic_or(ctl+1,8U);continue;}
+                uint32_t rank=oldCount+offset++;ids[rank%kTop]=uint16_t(i);ranks[h]=kStagedRankTag|rank;
+            }
+            asc_syncthreads();
+        }
+        uint32_t allocated=0;
+        // A lane may mark a reservation mismatch before another warp reaches
+        // this branch. Both the initial and mismatch states enter preflight.
+        if(deferredProtection && added && ctl[kProtectionState]!=kProtectionActive){
+            if constexpr(Phase == StagedPhase::ResumeWithPeerBitmap) {
+                allocated=ctl[kPendingAllocated];
+            } else {
+                const uint32_t cursor=used+oldCount;
+                const uint32_t left=cursor<kLruSlots?kLruSlots-cursor:0;
+                allocated=added<left?added:left;
+                for(uint32_t i=tid;i<allocated;i+=512){
+                    const uint32_t slot=lru[cursor+i];
+                    if(slot>=resident){asc_atomic_or(ctl+1,4U);continue;}
+                    // Bindings without a complete inverse LRU reservation can
+                    // retain an ordinary hit in this slot. Use protected allocation.
+                    if(asc_ldcg(reserved+slot)!=int32_t(cursor+i))
+                        asc_atomic_or(ctl+kProtectionState,kReservationMismatch);
+                    slots[oldCount+i]=slot;
+                }
+                asc_syncthreads();
+                if(ctl[1])return;
+                if(ctl[kProtectionState]==kReservationMismatch)allocated=0;
+            }
             if(allocated<added){
+                if constexpr(Phase == StagedPhase::UntilPeerBitmap) {
+                    if(!peerMapsReady){
+                        if(!tid){
+                            ctl[kPendingAdded]=added;
+                            ctl[kPendingUnresolved]=unresolved;
+                            ctl[kPendingAllocated]=allocated;
+                        }
+                        asc_syncthreads();
+                        return;
+                    }
+                }
                 const uint32_t words=(resident+31)/32;
                 for(uint32_t i=tid;i<words;i+=512){
                     bitmap[i]=asc_ldcg(deferredProtection+i)|asc_ldcg(deferredProtection+words+i)|
@@ -245,7 +277,10 @@ inline void StagedQuery(uint32_t query,uint32_t history,uint32_t resident,uint32
             if(!tid && ctl[544+512/warpSize-1]<added-allocated)ctl[1]=4;
             for(uint32_t i=tid*per;i<(tid+1)*per && i<words;++i){offsets[i]=off;off+=counts[i];}
             asc_syncthreads();
-            if(!ctl[1])kvip_hot_slots::WriteAvailableBitmapSlotsBody(bitmap,counts,offsets,
+            // On exhaustion there are no slots for the suffix. Every lane
+            // must exit before reading or marking those unassigned entries.
+            if(ctl[1])return;
+            kvip_hot_slots::WriteAvailableBitmapSlotsBody(bitmap,counts,offsets,
                 reinterpret_cast<__ubuf__ int32_t*>(slots),resident,0,words,0,added-allocated,oldCount+allocated);
             asc_syncthreads();
             for(uint32_t i=tid+allocated;i<added;i+=512){uint32_t slot=slots[oldCount+i];asc_atomic_or(bitmap+slot/32,1U<<(slot%32));}

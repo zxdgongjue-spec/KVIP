@@ -119,6 +119,7 @@ class StreamingLIFetchForward:
             row_bytes.argtypes, row_bytes.restype = [], ctypes.c_uint32
             self.query_owner_scratch = allocate("query_owner_scratch", (b, row_bytes()), torch.uint8, True)
             owner_scratch = self.query_owner_scratch.data_ptr()
+            self.function = getattr(rotating.library, "kvip_lifetch_streaming_owner_topk_forward", self.function)
         pointers = [
             self._context.data_ptr(),
             keys.data_ptr(),

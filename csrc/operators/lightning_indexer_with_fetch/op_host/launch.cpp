@@ -19,11 +19,11 @@ extern "C" uint32_t aclrtlaunch_v9_li_kernel(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_1(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_2(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_3(uint32_t,void*,void*);
-static uint32_t LaunchLi(void* bindings, void* stream, const rotating::RuntimeShape* shape) {
+static uint32_t LaunchLi(void* bindings, void* stream, const rotating::RuntimeShape* shape, bool includeFinal=true) {
 #define LI_LAUNCH_0(blocks,stream,bindings) aclrtlaunch_v9_li_kernel(blocks,stream,bindings)
 #define LI_LAUNCH_1 aclrtlaunch_v9_li_kernel_1
 #define LI_LAUNCH_2 aclrtlaunch_v9_li_kernel_2
-#define LI_LAUNCH_3 aclrtlaunch_v9_li_kernel_3
+#define LI_LAUNCH_3(blocks,stream,bindings) (includeFinal ? aclrtlaunch_v9_li_kernel_3(blocks,stream,bindings) : 0U)
 #include "../../common/lifetch/li_launch.h"
 #undef LI_LAUNCH_0
 #undef LI_LAUNCH_1
@@ -82,8 +82,9 @@ extern "C" uint32_t refactor_fetch_pack_args(void *output, uint32_t capacity,
 }
 
 extern "C" uint32_t aclrtlaunch_v9_streaming_resolve_update(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_owner_topk_resolve_update(uint32_t,void*,void*,void*);
 static uint32_t LaunchStreaming(void* bindings,void* update,void* workspace,void* stream,
-                                const rotating::RuntimeShape* shape,uint32_t workers,bool team) {
+                                const rotating::RuntimeShape* shape,uint32_t workers,bool team,bool ownerTopk=false) {
     if(!bindings||!update||!workspace||!stream||!shape||shape->resident>131072||shape->batch<1||shape->batch>16||shape->finalWorkers!=4)return 100000;
     if((workers!=1 && workers!=2 && workers!=4) || shape->batch*pipeline_ab::kResolveCores+4*workers>shape->aicCount*2)return 100000;
     uint32_t blocks=shape->batch*pipeline_ab::kResolveCores+4*workers;
@@ -91,9 +92,11 @@ static uint32_t LaunchStreaming(void* bindings,void* update,void* workspace,void
         if(!pipeline_ab::UseIndexTeam(shape->batch,shape->aicCount,shape->history))return 100000;
         blocks=2*shape->aicCount;
     }
-    uint32_t result=LaunchLi(bindings,stream,shape);
-    if(!result)result=aclrtlaunch_v9_streaming_resolve_update(blocks,stream,workspace);
-    return result;
+    const bool joined = ownerTopk && rotating::UseSequenceSplit(*shape) && blocks == 2*shape->liCores;
+    uint32_t result=LaunchLi(bindings,stream,shape,!joined);
+    if(result)return result;
+    if(joined)return aclrtlaunch_v9_owner_topk_resolve_update(blocks,stream,bindings,workspace);
+    return aclrtlaunch_v9_streaming_resolve_update(blocks,stream,workspace);
 }
 
 static_assert(offsetof(pipeline_ab::Args,queryOwnerScratch)==200 && sizeof(pipeline_ab::Args)==256,
@@ -108,6 +111,10 @@ extern "C" uint32_t kvip_lifetch_streaming_forward(void* bindings,void* update,v
 }
 extern "C" uint32_t kvip_lifetch_streaming_index_team_forward(void* bindings,void* update,void* workspace,void* stream,const rotating::RuntimeShape* shape,uint32_t workers) {
     return LaunchStreaming(bindings,update,workspace,stream,shape,workers,true);
+}
+
+extern "C" uint32_t kvip_lifetch_streaming_owner_topk_forward(void* bindings,void* update,void* workspace,void* stream,const rotating::RuntimeShape* shape,uint32_t workers) {
+    return LaunchStreaming(bindings,update,workspace,stream,shape,workers,true,true);
 }
 
 extern "C" uint32_t aclrtlaunch_kvip_transport_snapshot_kernel(uint32_t,void*,void*,void*,uint32_t);

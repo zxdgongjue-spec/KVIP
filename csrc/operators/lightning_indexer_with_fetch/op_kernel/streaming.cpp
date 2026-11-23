@@ -3,6 +3,9 @@
 #include "kernel_operator.h"
 #include <stddef.h>
 #if defined(__CCE_AICORE__)
+#if !V9_UBMEM
+#include "indexer_entry.h"
+#endif
 #include "resolver.h"
 #include "compact_misses.h"
 #include "resolver_staged_dma2.h"
@@ -1433,6 +1436,35 @@ extern "C" __global__ __aicore__ void v9_streaming_resolve_update(GM_ADDR arg) {
  }
 #endif
 }
+
+#if !V9_UBMEM
+extern "C" __global__ __aicore__ void v9_owner_topk_resolve_update(GM_ADDR bindings, GM_ADDR arg) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV {
+        auto a = reinterpret_cast<__gm__ Args *>(arg);
+        const uint32_t block = GetBlockIdx(), b = block / 4, q = block % 4;
+        lifetch_li::RunLi<QLIKernel::SequenceLiPhase::Final>(bindings);
+        PipeBarrier<PIPE_ALL>();
+        auto header = reinterpret_cast<__gm__ uint32_t *>(a->queryErrors) + block * 32;
+        auto ready = query_owner::ClassificationFlags(a, b) + q;
+        // Nonuniform rows can have been finalized by Hot on a different AIV.
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(header), 2 * sizeof(uint32_t));
+        query_owner::Signal(ready, header[1], header[0]);
+        // Publish even for Q4 before it awaits Q1's address-table handoff.
+        query_owner::Run<true>(a, b, q);
+        AscendC::SyncAll<true>();
+        ready->ready = 0;
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(ready), kBatchFlagPayloadBytes);
+        const uint32_t batch = reinterpret_cast<__gm__ Context *>(a->context)->shape.batch;
+        const uint32_t workers = (a->prefetchCount >> 16) & 0xffU;
+        if (block < batch) {
+            Simt::VF_CALL<RetireRoundControl>(Simt::Dim3{128, 1, 1}, a, batch, workers, block);
+        }
+    }
+#endif
+}
+#endif
 
 // Diagnostic calibration runs separately from all benchmark samples.
 extern "C" __global__ __aicore__ void v9_counter_calibration(GM_ADDR output) {

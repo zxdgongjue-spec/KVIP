@@ -903,15 +903,19 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
                     publish="kvop_direct_update_outputs_early_kernel",
                     apply="kvop_direct_apply_owned_kernel", fetch="v9_fetch_update_kernel")
                if full else {stage: f"v9_{stage}_kernel" for stage in DEVICE_STAGES})
-    if full and any(e.get("name", "").lower().startswith("v9_streaming_resolve_update") for e in events):
+    streaming_tails = ("v9_streaming_resolve_update", "v9_owner_topk_resolve_update")
+    if full and any(e.get("name", "").lower().startswith(streaming_tails) for e in events):
         # This kernel contains both resolver and index update; reporting separate
         # kernel durations would invent a boundary that does not exist.
         kernels = dict(init="v9_init_kernel", li="v9_li_kernel",
-                       resolve_update="v9_streaming_resolve_update")
+                       resolve_update=streaming_tails[0])
         if not fused_final:
             kernels["fetch"] = "v9_fetch_update_kernel"
     if any(e.get("name", "").lower().startswith("v9_early_fetch_kernel") for e in events):
         kernels["early_fetch"] = "v9_early_fetch_kernel"
+    names = list(kernels.items())
+    if 'resolve_update' in kernels:
+        names.append(('resolve_update', streaming_tails[1]))
     groups = {stage: [] for stage in kernels}
     for event in events:
         n = event.get("name", "").lower()
@@ -921,7 +925,7 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
         stage = next(
             (
                 key
-                for key, prefix in kernels.items()
+                for key, prefix in names
                 if n == prefix or (n.startswith(prefix + "_") and re.fullmatch(r"(?:_\d+)+", n[len(prefix) :]))
             ),
             None,

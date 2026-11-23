@@ -40,20 +40,36 @@ __aicore__ inline void Signal(__gm__ BatchFlag *f, uint32_t count, uint32_t erro
 }
 struct Slice {
     uint32_t begin = 0, count = 0, safe = 0, error = 0;
+    bool rowClassified = false;
 };
 __aicore__ inline __gm__ uint32_t *Scratch(__gm__ Args *a, uint32_t b) {
     return reinterpret_cast<__gm__ uint32_t *>(a->queryOwnerScratch) + b * kQueryOwnerRowWords;
 }
 
+// Each owner publishes after both the final IDs and the hit bitmap are visible.
+__aicore__ inline __gm__ BatchFlag *ClassificationFlags(__gm__ Args *a, uint32_t b) {
+    return reinterpret_cast<__gm__ BatchFlag *>(Scratch(a, b) + kOwnerTopkReadyOffset);
+}
+__aicore__ inline uint32_t AwaitRowClassifications(__gm__ Args *a, uint32_t b) {
+    auto flags = ClassificationFlags(a, b);
+    uint32_t error = 0;
+    for (uint32_t j = 0; j < 4; ++j) error |= AwaitPublication(flags + j);
+    return error;
+}
+
 // Keep the Index event order independent of the safe/conflict order in the private SQ input.
+template<StagedPhase Phase = StagedPhase::Complete>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void ResolveOwnerQuery(StagedContextPointer ctx,
     uint32_t history, uint32_t resident, uint32_t b, uint32_t q, uint32_t used,
     __gm__ uint32_t *src, __gm__ uint32_t *dst, __ubuf__ uint32_t *selected, __ubuf__ uint32_t *loc,
     __ubuf__ uint32_t *keys, __ubuf__ uint32_t *ranks, __ubuf__ uint16_t *ids, __ubuf__ uint32_t *slots,
-    __ubuf__ uint32_t *work, __ubuf__ uint32_t *ctl, __gm__ uint32_t *protect, __gm__ uint32_t *liveCount) {
-    StagedQuery(q, history, resident, ctx->shape.tokenBytes, b, used, ctx, selected, loc,
-                keys, ranks, ids, slots, work, ctl, protect);
+    __ubuf__ uint32_t *work, __ubuf__ uint32_t *ctl, __gm__ uint32_t *protect, __gm__ uint32_t *liveCount, bool peerMapsReady) {
+    StagedQuery<Phase>(q, history, resident, ctx->shape.tokenBytes, b, used, ctx, selected, loc,
+                keys, ranks, ids, slots, work, ctl, protect, peerMapsReady);
     if (ctl[1]) return;
+    if constexpr (Phase == StagedPhase::UntilPeerBitmap) {
+        if (ctl[kPendingAdded]) return;
+    }
     const uint32_t count = ctl[2 + q], begin = ctl[0] - count;
     if (count && (!protect || ctl[kProtectionState])) {
         // The protected allocator may have reused prefetch slots. Preserve the
@@ -86,8 +102,23 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void ResolveOwnerQuery(StagedCon
     asc_syncthreads();
 }
 
+template<StagedPhase Phase>
+__aicore__ inline void RunDense(__gm__ Args *a, StagedContextPointer staged,
+    uint32_t b, uint32_t q, uint32_t used, __gm__ uint32_t *src, __gm__ uint32_t *dst,
+    LocalTensor<uint32_t> ub, LocalTensor<uint32_t> loc, LocalTensor<uint32_t> keys,
+    LocalTensor<uint32_t> ranks, LocalTensor<uint16_t> ids, LocalTensor<uint32_t> slots,
+    LocalTensor<uint32_t> work, LocalTensor<uint32_t> ctl, __gm__ uint32_t *protect, bool peerMapsReady) {
+    Simt::VF_CALL<ResolveOwnerQuery<Phase>>(
+        Simt::Dim3{512, 1, 1}, staged, a->history, a->resident, b, q, used,
+        src, dst, FinalPtr(ub), FinalPtr(loc), FinalPtr(keys), FinalPtr(ranks),
+        reinterpret_cast<__ubuf__ uint16_t *>(ids.GetPhyAddr()), FinalPtr(slots), FinalPtr(work),
+        FinalPtr(ctl), protect, reinterpret_cast<__gm__ uint32_t *>(a->liveCount), peerMapsReady);
+    VectorDone();
+}
+
 // The first resolver's prefix and later query suffixes use the same protected
 // allocator as the fixed graph, including ordinary hits outside the LRU list.
+template<bool Joined>
 __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32_t b, uint32_t q) {
     auto ctx = reinterpret_cast<__gm__ Context *>(a->context);
     auto row = reinterpret_cast<__gm__ Row *>(ctx->rows) + b;
@@ -100,14 +131,29 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
     auto lru = reinterpret_cast<__gm__ uint32_t *>(ctx->lruSlots) + b * kLruSlots;
     auto headers = reinterpret_cast<__gm__ uint32_t *>(a->queryErrors) + 128 * b;
     uint32_t upper = 0, prefixUpper = 0;
+    bool peerMapsReady = true;
     Slice s;
     for (uint32_t j = 0; j < 4; ++j) {
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(headers + 32 * j), 64);
-        s.error |= headers[32 * j];
-        uint32_t n = headers[32 * j + 1];
-        upper += n && n <= kCompactMissLimit + 1 ? n - 1 : kTop;
+        uint32_t n;
+        if constexpr (Joined) {
+            // An unpublished query can still produce up to kTop misses. Only the
+            // first owner chooses a hash size; every successor inherits its mask.
+            auto f = ClassificationFlags(a, b) + j;
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(f), kBatchFlagPayloadBytes);
+            const bool published = f->ready != 0;
+            n = published ? f->count : 0;
+            if (published) s.error |= f->error;
+            peerMapsReady = peerMapsReady && published;
+        } else {
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t *>(headers + 32 * j), 64);
+            s.error |= headers[32 * j];
+            n = headers[32 * j + 1];
+        }
+        const uint32_t limit = Joined ? kTop : kCompactMissLimit;
+        upper += n && n <= limit + 1 ? n - 1 : kTop;
         if (j == q) prefixUpper = upper;
     }
+    if constexpr (Joined) s.rowClassified = peerMapsReady;
     if (row->slots > kPrefetch) {
         s.error |= 4;
     }
@@ -118,6 +164,7 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
         s.error |= AwaitPublication(prior);
         s.begin = prior->reserved[0];
         flags[kRawQueryFlag + q].reserved[1] = prior->reserved[1];
+        if constexpr (Joined) flags[kRawQueryFlag + q].reserved[2] = prior->reserved[2];
         return s;
     }
     uint32_t buckets = upper <= 256 ? 512U : (upper <= 1024 ? 2048U : (upper <= 2048 ? 4096U : kSlots));
@@ -163,6 +210,7 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
         s.error |= AwaitPublication(flags + kRawQueryFlag + q - 1);
         auto f = flags + kRawQueryFlag + q - 1;
         s.begin = f->reserved[0];
+        if constexpr (Joined) buckets = f->reserved[2];
         if (s.begin > kSlots - kTop) {
             s.error |= 4;
         }
@@ -205,12 +253,22 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
             }
             InputReady();
             auto protect = reinterpret_cast<__gm__ uint32_t *>(a->queryBitmaps) + b * 4 * ((a->resident + 31) / 32);
-            Simt::VF_CALL<ResolveOwnerQuery>(
-                Simt::Dim3{512, 1, 1}, staged, a->history, a->resident, b, q, row->slots,
-                src, dst, FinalPtr(ub), FinalPtr(loc),
-                FinalPtr(keys), FinalPtr(ranks), reinterpret_cast<__ubuf__ uint16_t *>(ids.GetPhyAddr()),
-                FinalPtr(slots), FinalPtr(work), FinalPtr(ctl), protect, reinterpret_cast<__gm__ uint32_t*>(a->liveCount));
-            VectorDone();
+            constexpr auto phase = Joined ? StagedPhase::UntilPeerBitmap : StagedPhase::Complete;
+            RunDense<phase>(a, staged, b, q, row->slots, src, dst, ub, loc, keys, ranks, ids, slots, work, ctl, protect, peerMapsReady);
+            if constexpr (Joined) {
+                if (!peerMapsReady && !ctl.GetValue(1) && ctl.GetValue(kPendingAdded)) {
+                    // The hash and candidate slots are already in UB. Only an
+                    // actual read of the row's four hit maps needs the join.
+                    s.error |= AwaitRowClassifications(a, b);
+                    s.rowClassified = true;
+                    if (s.error) {
+                        pipe.Destroy();
+                        return s;
+                    }
+                    RunDense<StagedPhase::ResumeWithPeerBitmap>(a, staged, b, q, row->slots, src, dst,
+                        ub, loc, keys, ranks, ids, slots, work, ctl, protect, true);
+                }
+            }
         }
         s.error = ctl.GetValue(1);
         if (!s.error) {
@@ -218,6 +276,7 @@ __aicore__ __attribute__((noinline)) inline Slice Resolve(__gm__ Args *a, uint32
             s.safe = ctl.GetValue(17);
             const uint32_t protection = ctl.GetValue(kProtectionState);
             flags[kRawQueryFlag + q].reserved[1] = protection;
+            if constexpr (Joined) flags[kRawQueryFlag + q].reserved[2] = buckets;
             BeforeStore();
             if (!compact) ToGm(locations + q * kTop, loc[q * kTop], kTop);
             if (q < 3) {
@@ -272,6 +331,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void Adapt(__gm__ Args *a, uint3
     asc_threadfence();
 }
 
+template<bool Joined>
 struct IndexTail {
     __gm__ Args *a;
     uint32_t b, q;
@@ -287,7 +347,23 @@ struct IndexTail {
             return;
         }
         ran = true;
+        // The first SQ can be posted as soon as its allocation is safe. Keep
+        // old residency/Index data readable until all four classifiers finish.
         auto ctx = reinterpret_cast<__gm__ Context *>(a->context);
+        if constexpr (Joined) {
+            if (!q) {
+                if (!s.rowClassified) s.error |= AwaitRowClassifications(a, b);
+                // Padding can map several batch rows to one physical owner.
+                // Wait for those readers too before changing their old Index.
+                if (ctx->rowOwners) {
+                    auto owners = reinterpret_cast<__gm__ uint32_t *>(ctx->rowOwners);
+                    const uint32_t owner = owners[b];
+                    for (uint32_t row = 0; row < ctx->shape.batch; ++row) {
+                        if (row != b && owners[row] == owner) s.error |= AwaitRowClassifications(a, row);
+                    }
+                }
+            }
+        }
         auto outputs = reinterpret_cast<__gm__ BatchFlag *>(a->flags) + b * kFlagCount + 1;
         const bool validOutput = !s.error;
         if (q && validOutput) {
@@ -396,6 +472,7 @@ struct IndexTail {
     }
 };
 
+template<bool Joined = false>
 __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args *a, uint32_t b, uint32_t q) {
     auto ctx = reinterpret_cast<__gm__ Context *>(a->context);
     const uint32_t batch = ctx->shape.batch;
@@ -408,7 +485,7 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args *a, uint32_t b,
         CompletePrefetch(ctx, b, true);
         Signal(flags + 7, 0, error | row->error);
     }
-    Slice s = Resolve(a, b, q);
+    Slice s = Resolve<Joined>(a, b, q);
     // The next allocator needs the slots and captured descriptor addresses;
     // this query alone owns its subsequent SQ post and CQ.
     auto raw = flags + kRawQueryFlag + q;
@@ -437,7 +514,7 @@ __aicore__ __attribute__((noinline)) inline void Run(__gm__ Args *a, uint32_t b,
         native.valid_table = ctx->fallbackValid;
         native.table_capacity = batch * kSlots;
     }
-    IndexTail tail{a, b, q, s};
+    IndexTail<Joined> tail{a, b, q, s};
     uint32_t completed = 0, processed = 0;
     if (!s.error && s.count) {
         SyncFetchDescriptors(ctx, first, s.count);

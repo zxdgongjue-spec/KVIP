@@ -7,5 +7,7 @@ namespace pipeline_ab {
 constexpr uint32_t kOwnerResolverWords=3*8192+32+4096;
 constexpr uint32_t kOwnerIndexWords=4*kMapSize+32;
 constexpr uint32_t kOwnerStatusWords=((sizeof(KvafBatchGetCoreStatus)+127)/128)*32;
-constexpr uint32_t kQueryOwnerRowWords=kOwnerResolverWords+kOwnerIndexWords+4*kOwnerStatusWords;
+constexpr uint32_t kOwnerTopkReadyOffset=kOwnerResolverWords+kOwnerIndexWords+4*kOwnerStatusWords;
+static_assert(kOwnerTopkReadyOffset%kFlagWords==0, "one writer per aligned classification flag");
+constexpr uint32_t kQueryOwnerRowWords=kOwnerTopkReadyOffset+4*kFlagWords;
 }
