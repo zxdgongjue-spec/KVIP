@@ -595,8 +595,7 @@ class BenchPool:
                 self.runtime = create_kvaf_runtime(
                     kvaf, build / 'bin/kvaf_execute_batch_get_kernels.o',
                     build / 'bin/kvaf_execute_batch_put_kernels.o', 656, 128,
-                    int(device.index or 0), self.workers, self.config.transport,
-                    max_batch=max(self.config.batches))
+                    int(device.index or 0), self.workers, self.config.transport)
                 self.runtime.link_to(self.config.kvaf_server)
             capacity = max(self.config.batches) * history // 128
             block_bytes = 128 * 656
@@ -736,10 +735,7 @@ def native_payload(torch: Any, batch: int, tokens: int) -> Any:
     return torch.stack(rows)
 
 
-def create_kvaf_runtime(sdk, get_kernel, put_kernel, token_bytes, block_size, device_id, workers, transport,
-                        *, max_batch):
-    # KVAF validates the descriptor tensor length even when miss_count is small.
-    get_capacity = max_batch * QUERIES * TOPK
+def create_kvaf_runtime(sdk, get_kernel, put_kernel, token_bytes, block_size, device_id, workers, transport):
     put = sdk.PutExecutionConfig(transport, "aiv")
     get = sdk.GetExecutionConfig(transport, "aiv", "direct")
     jets = {"jettys": 2} if transport == "urma" else {}
@@ -751,8 +747,7 @@ def create_kvaf_runtime(sdk, get_kernel, put_kernel, token_bytes, block_size, de
         default_put=put,
         default_get=get,
         put_resources=[(put, sdk.ExecutionResources(cores=workers, kernel_path=str(put_kernel), **jets))],
-        get_resources=[(get, sdk.ExecutionResources(
-            cores=workers, request_capacity=get_capacity, kernel_path=str(get_kernel), **jets))],
+        get_resources=[(get, sdk.ExecutionResources(cores=workers, kernel_path=str(get_kernel), **jets))],
     )
 
 
@@ -835,7 +830,7 @@ class NativeFetchSession:
             self.reference = borrowed.reference
         else:
             self.runtime = create_kvaf_runtime(
-                kvaf, get_kernel, put_kernel, TOKEN_BYTES, BLOCK_SIZE, int(device.index or 0), npu_core_count, "urma", max_batch=batch)
+                kvaf, get_kernel, put_kernel, TOKEN_BYTES, BLOCK_SIZE, int(device.index or 0), npu_core_count, "urma")
             self.runtime.link_to(server)
             capacity = batch * qcap
             block_bytes = BLOCK_SIZE * TOKEN_BYTES
@@ -2540,7 +2535,7 @@ def initialize_transport(transport, argv=None):
     for path in (get, put):
         if not path.is_file():
             raise FileNotFoundError(f'KVAF kernel missing: {path}')
-    runtime = create_kvaf_runtime(kvaf, get, put, 656, 128, args.device, 2, transport, max_batch=1)
+    runtime = create_kvaf_runtime(kvaf, get, put, 656, 128, args.device, 2, transport)
     lease = None
     table = None
     in_flight = False
@@ -2704,7 +2699,7 @@ def run_ubmem_case(
         source = torch.from_numpy(source_cpu).to(device)
         runtime = create_kvaf_runtime(kvaf, build / "bin/kvaf_execute_batch_get_kernels.o",
                                       build / "bin/kvaf_execute_batch_put_kernels.o",
-                                      token_bytes, 128, device_id, 2, "ubmem", max_batch=batch)
+                                      token_bytes, 128, device_id, 2, "ubmem")
     try:
         if shared_pool is None:
             runtime.link_to(args_server)
@@ -3944,7 +3939,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     borrowed = shared_pool.borrow(torch, device, g['batch'], g['history'], workers) if shared_pool else None
     runtime = borrowed.runtime if borrowed else create_kvaf_runtime(
         kvaf, build / 'bin/kvaf_execute_batch_get_kernels.o', build / 'bin/kvaf_execute_batch_put_kernels.o',
-        width, 128, config.device, workers, config.transport, max_batch=g['batch'])
+        width, 128, config.device, workers, config.transport)
     state = graph = table = resources = None
     batch_states = []
     pending = False
