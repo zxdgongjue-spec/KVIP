@@ -88,6 +88,12 @@ class GetLaunch:
             raise RuntimeError(f"Leased BatchGet launch failed: {code}")
 
 
+def _require_fused_runtime(runtime, transport, methods):
+    missing = [method for method in methods if not callable(getattr(runtime, method, None))]
+    if missing:
+        raise RuntimeError(f"KVIP {transport} fused Get requires KVAF bindings: {', '.join(missing)}")
+
+
 class KvafGetLease(StreamLease):
     """Setup/teardown owner, not a second Runtime or DDR allocation.
 
@@ -97,6 +103,7 @@ class KvafGetLease(StreamLease):
     """
 
     def __init__(self, torch, runtime, library, output, stream):
+        _require_fused_runtime(runtime, 'URMA', ('acquire_fused_batch_get_context', 'register_fused_batch_get_output', 'release_fused_batch_get_context'))
         self.torch, self.runtime, self.stream = torch, runtime, stream
         self.library = load_lifetch_library(library)
         self.sizes = {}
@@ -256,6 +263,7 @@ class UbmemLease(StreamLease):
     capture_scope_name = "UBmem"
 
     def __init__(self, torch, runtime, output, stream):
+        _require_fused_runtime(runtime, 'UBmem', ('acquire_ubmem_fused_context', 'register_ubmem_fused_output', 'release_ubmem_fused_context'))
         if runtime.transport != "ubmem":
             raise ValueError("UBmem fusion requires a UBmem KVAF runtime")
         self.torch, self.runtime, self.device, self.stream = torch, runtime, output.device, stream
