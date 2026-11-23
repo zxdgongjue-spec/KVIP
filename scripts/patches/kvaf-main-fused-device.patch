@@ -3,13 +3,14 @@ rename from access_operator/algorithms/get/direct/urma_aiv/kernel/execute_batch_
 rename to access_operator/algorithms/get/direct/urma_aiv/include/kvaf_batch_get_device.h
 --- a/access_operator/algorithms/get/direct/urma_aiv/kernel/execute_batch_get_aiv.asc
 +++ b/access_operator/algorithms/get/direct/urma_aiv/include/kvaf_batch_get_device.h
-@@ -1,3 +1,5 @@
+@@ -1,3 +1,6 @@
 +#pragma once
++#define KVIP_KVAF_URMA_REGISTERED_BASE 1
 +
  #include "kernel_operator.h"
  #include "batch_get_abi.h"
  #define KVAF_BATCH_GET_SCHEDULE_INLINE __aicore__ inline
-@@ -10,7 +12,7 @@
+@@ -10,7 +13,7 @@
  // consume indices/offsets/output_indices directly without mask compaction.
  using namespace AscendC;
  
@@ -18,7 +19,7 @@ rename to access_operator/algorithms/get/direct/urma_aiv/include/kvaf_batch_get_
  
  constexpr uint32_t kEntityMagic = 0x4b564155U;  // "KVAU"
  constexpr uint32_t kEntityVersion = 2U;
-@@ -576,11 +578,9 @@
+@@ -576,11 +579,9 @@
    return kCqTimeout;
  }
  
@@ -33,7 +34,7 @@ rename to access_operator/algorithms/get/direct/urma_aiv/include/kvaf_batch_get_
    const uint32_t jettys_per_core =
        args.jettys_per_core == 0U ? 1U : args.jettys_per_core;
    if (args.block_count == 0U || core >= args.block_count ||
-@@ -598,10 +598,13 @@
+@@ -598,10 +599,13 @@
  
    __gm__ const int32_t *const miss_count_input =
        reinterpret_cast<__gm__ const int32_t *>(args.miss_count);
@@ -49,7 +50,7 @@ rename to access_operator/algorithms/get/direct/urma_aiv/include/kvaf_batch_get_
    const uint32_t miss_count =
        miss_count_valid ? static_cast<uint32_t>(miss_count_value) : 0U;
  
-@@ -631,10 +634,10 @@
+@@ -631,10 +635,10 @@
    uint64_t completion_polls[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE] = {};
    ExecutionCounters counters;
    uint64_t completion_wait_cycles[KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE] = {};
@@ -62,7 +63,7 @@ rename to access_operator/algorithms/get/direct/urma_aiv/include/kvaf_batch_get_
        (static_cast<uint64_t>(miss_count) * (core + 1U)) /
        args.block_count);
  
-@@ -826,6 +829,4 @@
+@@ -826,6 +830,4 @@
    }
  }
  

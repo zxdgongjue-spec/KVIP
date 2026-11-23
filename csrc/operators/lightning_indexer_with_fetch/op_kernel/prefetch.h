@@ -158,6 +158,18 @@ __simd_vf__ inline void FinalBuild(uint32_t rt_tokenBytes,__ubuf__ uint32_t* rem
         RegTensor<uint32_t> slot;
         LoadAlign(slot, slots + begin + j);
         LoadAlign(remoteLo,remoteLow+begin+j);LoadAlign(remoteHi,remoteHigh+begin+j);
+#ifdef KVIP_KVAF_URMA_REGISTERED_BASE
+        RegTensor<uint32_t> remoteDeltaLo, remoteDeltaHi, translatedLo;
+        LoadAlign<uint32_t, LoadDist::DIST_BRC_B32>(remoteDeltaLo, config + 10);
+        LoadAlign<uint32_t, LoadDist::DIST_BRC_B32>(remoteDeltaHi, config + 11);
+        Add(translatedLo, remoteLo, remoteDeltaLo, mask);
+        MaskReg remoteOverflow;
+        Compare<uint32_t, CMPMODE::LT>(remoteOverflow, translatedLo, remoteLo, mask);
+        Select(carry, one, zero, remoteOverflow);
+        Add(remoteHi, remoteHi, remoteDeltaHi, mask);
+        Add(remoteHi, remoteHi, carry, mask);
+        Add(remoteLo, translatedLo, zero, mask);
+#endif
         Muls(delta, slot, uint32_t(rt_tokenBytes), mask);
         Add(localLo, baseLo, delta, mask);
         MaskReg overflow;
@@ -270,6 +282,10 @@ __aicore__ inline bool SubmitWqesAt(uint32_t rt_tokenBytes,uint64_t entityAddres
     cfg.SetValue(3,meta.GetValue(6)&0xfffffU);
     for(uint32_t j=0;j<4;++j)cfg.SetValue(4+j,meta.GetValue(22+j));
     cfg.SetValue(8,meta.GetValue(7));cfg.SetValue(9,0);
+#ifdef KVIP_KVAF_URMA_REGISTERED_BASE
+    const uint64_t remoteDelta=meta64.GetValue(17)-meta64.GetValue(1);
+    cfg.ReinterpretCast<uint64_t>().SetValue(5,remoteDelta);
+#endif
     cfg.SetValue(12,rt_tokenBytes);cfg.SetValue(13,meta.GetValue(12));
     cfg.SetValue(14,uint32_t(output));cfg.SetValue(15,uint32_t(output>>32));
     cfg.SetValue(16,uint32_t(head));cfg.SetValue(17,sqDepth);
@@ -324,6 +340,10 @@ __aicore__ inline bool WriteReservedWqes(uint32_t rt_tokenBytes,uint64_t entityA
     LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize,bool final,__gm__ Row* row,uint32_t offset,uint32_t total,__gm__ uint32_t* boundTemplate,uint64_t originalHead) {
     if(!count)return false;
     auto cfg64=cfg.ReinterpretCast<uint64_t>();uint64_t head=originalHead+offset;
+#ifdef KVIP_KVAF_URMA_REGISTERED_BASE
+    auto entity=reinterpret_cast<__gm__ const KvafBatchGetDirectUrmaEntity*>(entityAddress);
+    cfg64.SetValue(5,entity->registered_base-entity->remote_host_ddr_address);
+#endif
     uint32_t sqDepth=cfg.GetValue(17);uint64_t sqAddress=cfg64.GetValue(12);
     if(final && (head>UINT64_MAX-count || count>=sqDepth))return false;
     SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
@@ -403,6 +423,9 @@ inline void BatchBuild(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_residen
                 uint32_t slot=slotBase+begin+i;
                 uint32_t physical=PhysicalSlot(rt_resident,ctx,b,slot);
                 uint64_t address=asc_ldcg(addresses+token);
+#ifdef KVIP_KVAF_URMA_REGISTERED_BASE
+                address+=input64[17]-input64[1];
+#endif
                 if constexpr(BuildSimt)remote[g*rt_postBank+i]=address;
                 else {
                     auto fields=reinterpret_cast<__ubuf__ uint32_t*>(remote);
