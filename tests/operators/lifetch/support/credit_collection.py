@@ -72,6 +72,13 @@ def credits(details):
 def main(root, group):
     base = root/f'g{group}/paced-tail/results/mainline/cases/diagnose'
     round_dir = base/'fused/diagnose/round-1'
+    if group == 10:
+        from li_restore_archive import dp_capture_id
+        from ranked_integration_sets import INPUT_AND_RESULTS
+        inputs = json.loads((base/'replay_input.json').read_text())
+        digest = dp_capture_id(10, inputs)
+        if digest is not None and digest != INPUT_AND_RESULTS[10][0]:
+            raise ValueError('Prepared G10 inputs differ from the archived round-51 fingerprint')
     if group == 7:
         credits(json.loads((round_dir/'detail_samples.json').read_text()))
     files = [root/name for name in ('physical_npu.txt','candidate.txt','reader.txt','host.txt','machine_id.txt','boot_id.txt')

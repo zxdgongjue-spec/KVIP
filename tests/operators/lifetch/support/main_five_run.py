@@ -55,6 +55,10 @@ def worker(args):
     operand_hashes = {}
     for name in ('query', 'weights', 'query_scale', 'logical_keys', 'logical_scales', 'query_ends', 'captured_layout'):
         operand_hashes[name] = digest(getattr(inputs, name))
+    if args.group == 10 and os.environ.get('KVIP_CREDIT_G10_HASHES'):
+        reference = json.loads(Path(os.environ['KVIP_CREDIT_G10_HASHES']).read_text())
+        if operand_hashes != reference:
+            raise ValueError('Imported G10 operands differ from the measured B24 round-51 capture')
     if args.owner_archive:
         _, receipt = archived_oracle(args.owner_archive, args.group)
         if operand_hashes != receipt['native_reference']['identity']['inputs']:

@@ -152,7 +152,11 @@ run_group() (
     archive=$(archive_for "$group")
     arm="$out/g$group/$label"
     mkdir -p "$arm"
-    trace=$(bash "$reader_src/tests/operators/lifetch/peer_g2_input.sh" "$work" "$group")
+    if [[ $credit_group == 10 && -n ${KVIP_CREDIT_G10_INPUT:-} ]]; then
+        trace=$KVIP_CREDIT_G10_INPUT
+    else
+        trace=$(bash "$reader_src/tests/operators/lifetch/peer_g2_input.sh" "$work" "$group")
+    fi
     oracle_args=(--owner-archive "$archive")
     if [[ $peer_physical_npu != 4 ]]; then
         node=$("$PYTHON" -B "$support/paced_host20.py" node "$out" "$group")
