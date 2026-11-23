@@ -211,8 +211,28 @@ int main(int argc, char **argv) {
           std::fill_n(hdr.data() + query * 16, 8, 0);
         }
         restore(c.incremental, hdr.data(), hdr.size() * 8);
-        clear(c.incremental + B * 512,
-              B * (seeds + (H + 255) / 256 * 32 + 4 * 32 * 8));
+        // Clear seeds and coverage but retain the old helper offer/completion
+        // and assignment in words [8,24) of every Q's trailing rank row.
+        clear(c.incremental + B * 512, B * (seeds + (H + 255) / 256 * 32));
+        auto rankOffset = B * (512 + seeds + (H + 255) / 256 * 32);
+        std::array<uint64_t, Q * 32> previousRank{};
+        check(aclrtMemcpy(previousRank.data(), sizeof(previousRank),
+                          reinterpret_cast<void *>(c.incremental + rankOffset),
+                          sizeof(previousRank), ACL_MEMCPY_DEVICE_TO_HOST),
+              "read old helper state");
+        unsigned completedHelpers = 0;
+        for (unsigned query = 0; query < Q; ++query) {
+          auto *words = previousRank.data() + query * 32;
+          completedHelpers += words[8] == 1 && words[9] == 1 && words[16] == 1;
+          std::fill_n(words, 8, 0);
+          std::fill_n(words + 24, 8, 0);
+        }
+        if (std::getenv("EXPECT_IDLE_HELPERS") && completedHelpers == 0)
+          throw std::runtime_error("second replay has no stale helper "
+                                   "assignment and completion to exercise");
+        restore(c.incremental + rankOffset, previousRank.data(),
+                sizeof(previousRank));
+        std::cout << "STALE_FINISHED_HELPERS=" << completedHelpers << std::endl;
         restore(c.rows, rowmem.data(), rowmem.size());
         restore(c.mapping, mapping.data(), mapping.size() * 4);
         std::vector<uint32_t> reserved(B * R, UINT32_MAX);
@@ -254,6 +274,10 @@ int main(int argc, char **argv) {
       std::vector<uint64_t> meta(Q * 16);
       get(c.incremental, meta.data(), meta.size() * 8);
       dump(".meta", meta.data(), meta.size() * 8);
+      std::array<uint64_t, Q * 32> rankWords{};
+      auto rankOffset = B * (512 + seeds + (H + 255) / 256 * 32);
+      get(c.incremental + rankOffset, rankWords.data(), sizeof(rankWords));
+      dump(".rank", rankWords.data(), sizeof(rankWords));
       std::vector<Event> events(4 * B);
       get(c.events, events.data(), events.size() * sizeof(Event));
       dump(".events", events.data(), events.size() * sizeof(Event));

@@ -128,6 +128,14 @@ def inspect(folder):
         window = folder / (name + ".window")
         check(window.is_file() or not marker.exists(), f"Missing persistent window TopK in {folder}")
         checked_winners = validate_window_topk(window.read_bytes(), scores, meta) if window.exists() else None
+        helper_state = None
+        rank = folder / (name + ".rank")
+        if rank.exists():
+            words = np.fromfile(rank, "<u8").reshape(BATCH, QUERIES, 32)
+            available, done, assigned = (words[:, :, i] for i in (8, 9, 16))
+            check(np.all((assigned == 0) | ((assigned == 1) & (available == 1) & (done == 1))),
+                  "A penultimate-window helper did not finish its assigned query")
+            helper_state = dict(available=available.tolist(), assigned=assigned.tolist(), done=done.tolist())
         tokens_by_window = []
         for b in range(BATCH):
             row, head, total, buckets, last_q = rows[replay * BATCH + b]
@@ -149,7 +157,7 @@ def inspect(folder):
             hot, seed, cold = spans[3 * replay:3 * replay + 3]
             timing = dict(hot_cycles=hot[1] - hot[0], seed_cycles=seed[1] - seed[0],
                           cold_cycles=cold[1] - cold[0], three_li_cycles=cold[1] - hot[0])
-        results.append(dict(**timing, mode=mode, incremental_winners_checked=checked_winners,
+        results.append(dict(**timing, mode=mode, helpers=helper_state, incremental_winners_checked=checked_winners,
                             scores_sha=hashlib.sha256(scores.tobytes()).hexdigest(),
                             seed_sha=hashlib.sha256(seeds).hexdigest(),
                             frontier=meta[:, :, 4].tolist(), tokens=tokens_by_window))
@@ -180,7 +188,7 @@ def main():
                 timings["three_li_saved_pct"] = 100 * (1 - result["three_li_cycles"] / reference["three_li_cycles"])
             else:
                 timings["timing_comparison"] = "unavailable; fast mode has no per-core timing"
-            report.append(dict(**timings, mode=result["mode"], incremental_winners_checked=result["incremental_winners_checked"],
+            report.append(dict(**timings, mode=result["mode"], helpers=result["helpers"], incremental_winners_checked=result["incremental_winners_checked"],
                                posts_by_window=[[len(w) for w in row] for row in result["tokens"]],
                                same_frontiers=result["frontier"] == reference["frontier"],
                                same_prefetch_token_sets=membership, same_prefetch_order=order))
