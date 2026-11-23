@@ -137,5 +137,24 @@ run_group() (
     monitor=
     "$PYTHON" -B "$support/main_five_report.py" "$out" "$group" "$archive" | tee -a "$out/summary.txt"
 )
-for group in "${groups[@]}"; do run_group "$group"; done
+failed=()
+trap 'exit 130' INT
+trap 'exit 143' TERM
+for group in "${groups[@]}"; do
+    # Each case has its own local transport and worker. Keep errexit enabled
+    # inside the case while retaining independent results if another case fails.
+    set +e
+    run_group "$group"
+    rc=$?
+    set -e
+    case $rc in
+        0) ;;
+        130|143) exit "$rc" ;;
+        *) failed+=("G$group"); echo "CASE_FAILED G$group rc=$rc log=$out/g$group/mainline/worker.log" >&2 ;;
+    esac
+done
+if (( ${#failed[@]} )); then
+    echo "REPLAY_INCOMPLETE groups=${failed[*]} RESULT_ROOT=$out" >&2
+    exit 1
+fi
 echo "REPLAY_COMPLETE RESULT_ROOT=$out"
