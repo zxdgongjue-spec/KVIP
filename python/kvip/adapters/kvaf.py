@@ -103,12 +103,7 @@ class KvafGetLease(StreamLease):
     """
 
     def __init__(self, torch, runtime, library, output, stream):
-        self.unified = callable(getattr(type(runtime), "get_graph_urma_resources", None))
-        if not self.unified:
-            _require_fused_runtime(
-                runtime, "URMA",
-                ("acquire_fused_batch_get_context", "register_fused_batch_get_output", "release_fused_batch_get_context"),
-            )
+        _require_fused_runtime(runtime, "URMA", ("get_graph_urma_resources",))
         self.torch, self.runtime, self.stream = torch, runtime, stream
         self.library = load_lifetch_library(library)
         self.sizes = {}
@@ -120,10 +115,7 @@ class KvafGetLease(StreamLease):
         self.pack.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint32]
         self.pack.restype = ctypes.c_uint32
         self.native_library, self.get = load_native_get(runtime)
-        self.context = (
-            self._bind_unified_output(output)
-            if self.unified else runtime.acquire_fused_batch_get_context(output, stream)
-        )
+        self.context = self._bind_output(output)
         self.device = output.device
         self.outputs = {self.output_key(output): (output, self.context)}
         self.plans = []
@@ -131,7 +123,7 @@ class KvafGetLease(StreamLease):
         self.capturing_startup = False
         self.capture_fence_failed = False
 
-    def _bind_unified_output(self, output):
+    def _bind_output(self, output):
         import kvaf
 
         execution = kvaf.GetExecutionConfig("urma", "aiv", "direct")
@@ -160,10 +152,7 @@ class KvafGetLease(StreamLease):
         self.check_stream()
         key = self.output_key(output)
         if key not in self.outputs:
-            view = (
-                self._bind_unified_output(output) if self.unified
-                else self.runtime.register_fused_batch_get_output(self.context, output)
-            )
+            view = self._bind_output(output)
             self.outputs[key] = output, view
         return self.outputs[key][1]
 
@@ -221,15 +210,12 @@ class KvafGetLease(StreamLease):
                 raise RuntimeError("Fused capture stream completion failed; transport remains retained")
             # Native release fences this stream and validates persistent queue
             # status. On failure keep every tensor and registration alive.
-            if self.unified:
-                self.torch.npu.synchronize(self.device)
-                while self.outputs:
-                    key = next(reversed(self.outputs))
-                    _, context = self.outputs[key]
-                    self.runtime.end_get_graph(context["lease_id"], self.stream, discard_result=True)
-                    del self.outputs[key]
-            else:
-                self.runtime.release_fused_batch_get_context(self.context, self.stream)
+            self.torch.npu.synchronize(self.device)
+            while self.outputs:
+                key = next(reversed(self.outputs))
+                _, context = self.outputs[key]
+                self.runtime.end_get_graph(context["lease_id"], self.stream, discard_result=True)
+                del self.outputs[key]
             self.closed = True
             self.plans.clear()
             self.outputs.clear()
@@ -299,39 +285,30 @@ class UbmemLease(StreamLease):
     capture_scope_name = "UBmem"
 
     def __init__(self, torch, runtime, output, stream):
-        self.unified = callable(getattr(type(runtime), "get_graph_mapped_base", None))
+        _require_fused_runtime(runtime, "UBmem", ("get_graph_mapped_base",))
         self.torch, self.runtime, self.device, self.stream = torch, runtime, output.device, stream
-        if self.unified:
-            import kvaf
+        import kvaf
 
-            execution = kvaf.GetExecutionConfig("ubmem", "aiv", "direct")
-            region = runtime.remote_region
-            lease_id = runtime.begin_get_graph(execution, output, 1, stream)
-            try:
-                self.context = {
-                    "abi_version": 1,
-                    "device_id": runtime.device_id,
-                    "output_address": output.data_ptr(),
-                    "output_bytes": self.output_key(output)[1],
-                    "region_base": region["base"],
-                    "mapped_base": runtime.get_graph_mapped_base(lease_id),
-                    "region_bytes": region["length"],
-                    "slot_bytes": region["slot_size"],
-                    "token_bytes": runtime.batch_get_token_bytes,
-                    "tokens_per_block": runtime.batch_get_tokens_per_block,
-                    "lease_id": lease_id,
-                }
-            except Exception:
-                runtime.end_get_graph(lease_id, stream, discard_result=True)
-                raise
-        else:
-            _require_fused_runtime(
-                runtime, "UBmem",
-                ("acquire_ubmem_fused_context", "register_ubmem_fused_output", "release_ubmem_fused_context"),
-            )
-            if runtime.transport != "ubmem":
-                raise ValueError("UBmem fusion requires a UBmem KVAF runtime")
-            self.context = runtime.acquire_ubmem_fused_context(output, stream)
+        execution = kvaf.GetExecutionConfig("ubmem", "aiv", "direct")
+        region = runtime.remote_region
+        lease_id = runtime.begin_get_graph(execution, output, 1, stream)
+        try:
+            self.context = {
+                "abi_version": 1,
+                "device_id": runtime.device_id,
+                "output_address": output.data_ptr(),
+                "output_bytes": self.output_key(output)[1],
+                "region_base": region["base"],
+                "mapped_base": runtime.get_graph_mapped_base(lease_id),
+                "region_bytes": region["length"],
+                "slot_bytes": region["slot_size"],
+                "token_bytes": runtime.batch_get_token_bytes,
+                "tokens_per_block": runtime.batch_get_tokens_per_block,
+                "lease_id": lease_id,
+            }
+        except Exception:
+            runtime.end_get_graph(lease_id, stream, discard_result=True)
+            raise
         self.closed = self.capturing_startup = self.capture_fence_failed = False
         self.outputs = {self.output_key(output): (output, self.context)}
         self.bindings = []
@@ -347,12 +324,9 @@ class UbmemLease(StreamLease):
             raise
 
     def _release_context(self):
-        if self.unified:
-            # Fused kernels can replay on a different stream from setup.
-            self.torch.npu.synchronize(self.device)
-            self.runtime.end_get_graph(self.context["lease_id"], self.stream, discard_result=True)
-        else:
-            self.runtime.release_ubmem_fused_context(self.context, self.stream)
+        # Fused kernels can replay on a different stream from setup.
+        self.torch.npu.synchronize(self.device)
+        self.runtime.end_get_graph(self.context["lease_id"], self.stream, discard_result=True)
 
     def _validate(self, context, output):
         if context["abi_version"] != 1 or context["device_id"] != self.device.index:
@@ -386,32 +360,24 @@ class UbmemLease(StreamLease):
         self.check_stream()
         key = self.output_key(output)
         if key not in self.outputs:
-            if self.unified:
-                if output.device != self.device or not output.is_contiguous():
-                    raise ValueError("UBmem fused output must be contiguous on the lease device")
-                context = dict(self.context, output_address=key[0], output_bytes=key[1])
-            else:
-                context = self.runtime.register_ubmem_fused_output(self.context, output)
+            if output.device != self.device or not output.is_contiguous():
+                raise ValueError("UBmem fused output must be contiguous on the lease device")
+            context = dict(self.context, output_address=key[0], output_bytes=key[1])
             self._validate(context, output)
             self.outputs[key] = output, context
         return self.outputs[key][1]
 
     def register_table(self, table):
         self.check_stream()
-        if self.unified:
-            # The caller keeps the native access-table handle open until close.
-            # Retain both device tensor views used by the fused graph.
-            addresses, valid = table.addresses, table.valid
-            if addresses.device != self.device or valid.device != self.device:
-                raise ValueError("UBmem fused table must be on the lease device")
-            self.tables[id(table)] = (table, addresses, valid)
-        else:
-            self.runtime.register_ubmem_fused_access_table(self.context, table)
+        # The caller keeps the native access-table handle open until close.
+        # Retain both device tensor views used by the fused graph.
+        addresses, valid = table.addresses, table.valid
+        if addresses.device != self.device or valid.device != self.device:
+            raise ValueError("UBmem fused table must be on the lease device")
+        self.tables[id(table)] = (table, addresses, valid)
 
     def retain_graph(self, graph):
         self.check_stream()
-        if not self.unified:
-            self.runtime.retain_ubmem_fused_graph(self.context, graph)
         self.graphs.append(graph)
 
     def region(self, output):

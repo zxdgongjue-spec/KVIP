@@ -47,8 +47,15 @@ class TransportTest(unittest.TestCase):
             device_core_status=200,
             device_queue_state=300,
         )
-        self.runtime.acquire_fused_batch_get_context.return_value = self.context
-        self.npu = SimpleNamespace(current_stream=lambda device: self.stream)
+        self.runtime.get_graph_urma_resources.return_value = self.context
+        self.runtime.begin_get_graph.side_effect = iter(range(1, 100))
+        self.runtime.batch_get_token_bytes = 656
+        self.runtime.batch_get_tokens_per_block = 128
+        sdk = SimpleNamespace(GetExecutionConfig=Mock(return_value="urma-get"))
+        imports = patch.dict(sys.modules, {"kvaf": sdk})
+        imports.start()
+        self.addCleanup(imports.stop)
+        self.npu = SimpleNamespace(current_stream=lambda device: self.stream, synchronize=Mock())
         self.torch = SimpleNamespace(
             npu=self.npu,
             tensor=torch.tensor,
@@ -140,10 +147,9 @@ class TransportTest(unittest.TestCase):
             plan()
             plan()
         self.assertEqual(self.launches, [(plan.arguments, 123)] * 2)
-        self.runtime.register_fused_batch_get_output.assert_not_called()
         self.owner.close()
         self.owner.close()
-        self.runtime.release_fused_batch_get_context.assert_called_once_with(self.context, self.stream)
+        self.runtime.end_get_graph.assert_called_once_with(1, self.stream, discard_result=True)
         with self.assertRaisesRegex(RuntimeError, "released"):
             plan()
 
@@ -187,22 +193,13 @@ class TransportTest(unittest.TestCase):
         self.assertIs(launch.restype, ctypes.c_int32)
         self.owner.close()
 
-    def test_output_registration_is_cached_and_shares_owner(self):
-        other = torch.empty((256, 656), dtype=torch.uint8)
-        self.runtime.register_fused_batch_get_output.return_value = dict(self.context, output_address=other.data_ptr())
-        self.owner.register_output(other)
-        self.owner.register_output(other)
-        self.runtime.register_fused_batch_get_output.assert_called_once()
-        self.assertIs(self.runtime.register_fused_batch_get_output.call_args.args[0], self.context)
-        self.owner.close()
-
     def test_failed_release_keeps_storage_and_wrong_stream_is_rejected(self):
         plan = self.owner.prepare_get(*self.inputs())
         self.npu.current_stream = lambda device: SimpleNamespace(npu_stream=124)
         with self.assertRaisesRegex(RuntimeError, "lease stream"):
             plan()
         self.assertFalse(self.launches)
-        self.runtime.release_fused_batch_get_context.side_effect = RuntimeError("uncertain DMA")
+        self.runtime.end_get_graph.side_effect = RuntimeError("uncertain DMA")
         with self.assertRaisesRegex(RuntimeError, "uncertain DMA"):
             self.owner.close()
         self.assertFalse(self.owner.closed)
@@ -223,8 +220,7 @@ class TransportTest(unittest.TestCase):
             self.assertEqual(fields[10:], (8, 8192, 128, 656, 128, 1, 1, 0))
         with patch.object(self.torch, "tensor", side_effect=AssertionError("must reuse arguments")):
             self.assertIs(view.build_device_args("same ABI library"), arguments)
-        self.runtime.acquire_fused_batch_get_context.assert_called_once()
-        self.runtime.register_fused_batch_get_output.assert_not_called()
+        self.runtime.begin_get_graph.assert_called_once()
         self.owner.close()
 
     def test_descriptor_capacity_mismatch(self):
@@ -255,7 +251,7 @@ class TransportTest(unittest.TestCase):
             pass
         with self.assertRaisesRegex(RuntimeError, "remains retained"):
             self.owner.close()
-        self.runtime.release_fused_batch_get_context.assert_not_called()
+        self.runtime.end_get_graph.assert_not_called()
 
     def test_runtime_routes_table_and_tensor_views_without_new_upload(self):
         runtime = LeasedRuntime(self.owner)
@@ -275,7 +271,7 @@ class TransportTest(unittest.TestCase):
     def test_runtime_does_not_destroy_transport_after_failed_release(self):
         runtime = LeasedRuntime(self.owner)
         runtime.batch_get(*self.inputs())
-        self.runtime.release_fused_batch_get_context.side_effect = RuntimeError("outstanding DMA")
+        self.runtime.end_get_graph.side_effect = RuntimeError("outstanding DMA")
         with self.assertRaisesRegex(RuntimeError, "outstanding DMA"):
             runtime.shutdown()
         self.runtime.shutdown.assert_not_called()
