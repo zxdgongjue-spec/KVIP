@@ -3890,7 +3890,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused, n
             stream.synchronize()
             folder = directory / 'diagnose' / f'round-{inputs.source_round}'
             measured = profile_graph_batch(torch, TrackedGraph(), calls=len(states), folder=folder,
-                                           serial=not fused, transport=config.transport, stream=stream)
+                                           serial=not fused, transport=config.transport, stream=stream,
+                                           owner_topk=os.environ.get('KVIP_Q4_OWNER_TOPK') == '1')
             validate_all(inputs, 'measured')
             if native_reference is not None:
                 from native_li_reference import fused_li_output, write_comparison

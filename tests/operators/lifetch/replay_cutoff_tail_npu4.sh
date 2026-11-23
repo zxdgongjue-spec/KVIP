@@ -11,6 +11,10 @@ case "$mode" in
     early-index-handoff)
         native=${4:?expected full candidate revision}
         groups=(10 4 17 7) ;;
+    owner-topk)
+        native=${4:?expected full candidate revision}
+        groups=(4 10 17 7)
+        if (( $# > 4 )); then groups=("${@:5}"); fi ;;
     score-equivalence)
         native=1040d7133028ff4cd36904bef0393783be884877
         groups=(10 4 17 7)
@@ -20,6 +24,7 @@ esac
 work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold}
 ref="$work/peer-baseline/fused.m3IizR"
 if [[ $mode == score-equivalence ]]; then ref="$work/peer-baseline/fused.0SOIpe"; fi
+if [[ $mode == owner-topk ]]; then ref="$work/peer-baseline/fused.fmn5ww"; fi
 runner="$work/fused-scan-sources/reader-$reader"
 git -C "$repo" cat-file -e "$native^{commit}"
 test -r "$ref/logical-ties.txt"
@@ -36,7 +41,7 @@ export PATH="/usr/local/python3.12.13/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 PYTHO
 unset PEER_RANKED_INPUT PEER_RANKED_HASH_FILE KVIP_Q4_NATIVE_LI_CACHE
 log=$(mktemp "$work/host24-npu4-$mode.XXXXXX")
 echo "LOG=$log"
-if [[ $mode == score-equivalence ]]; then
+if [[ $mode == score-equivalence || $mode == owner-topk ]]; then
     rc=0
     bash "$runner/tests/operators/lifetch/peer_fused.sh" "--$mode" "$native" --reference "$ref" "${groups[@]}" 2>&1 |
         tee "$log" | while IFS= read -r line; do

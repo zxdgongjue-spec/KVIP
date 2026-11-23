@@ -36,10 +36,12 @@ candidate_only=false
 owner_tail=false
 early_handoff=false
 score_equivalence=false
+owner_topk=false
+performance_reference=
 exact_handoff_rev=67b49a2748fde8f8779c4551410416596b35cf76
 score_candidate_rev=1040d7133028ff4cd36904bef0393783be884877
 arm_iterations=20
-unset KVIP_Q4_OWNER_TAIL KVIP_Q4_TAIL_REFERENCE KVIP_Q4_EARLY_HANDOFF KVIP_Q4_SCORE_EQUIVALENCE
+unset KVIP_Q4_OWNER_TAIL KVIP_Q4_TAIL_REFERENCE KVIP_Q4_EARLY_HANDOFF KVIP_Q4_SCORE_EQUIVALENCE KVIP_Q4_OWNER_TOPK
 plan_candidate=
 packet_reference=
 plan_control=
@@ -82,13 +84,13 @@ if [[ ${1:-} == --ranked-help || ${1:-} == --ranked-joint ]]; then
     elif [[ -n "$joint_reference" ]]; then
         echo '--previous requires --ranked-joint' >&2; exit 2
     fi
-elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-packets || ${1:-} == --short-lru || ${1:-} == --owner-pack || ${1:-} == --li-restore || ${1:-} == --logical-ties || ${1:-} == --cutoff-tail || ${1:-} == --early-index-handoff || ${1:-} == --score-equivalence ]]; then
+elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-packets || ${1:-} == --short-lru || ${1:-} == --owner-pack || ${1:-} == --li-restore || ${1:-} == --logical-ties || ${1:-} == --cutoff-tail || ${1:-} == --early-index-handoff || ${1:-} == --score-equivalence || ${1:-} == --owner-topk ]]; then
     [[ $# -ge 2 && $2 =~ ^[0-9a-f]{40}$ ]] || { echo "Usage: peer_fused.sh $1 NATIVE_SHA [GROUP ...]" >&2; exit 2; }
     query_owner=true
     offset_resolver=true
     ranked_sha=f8b185e3d042a18b24fe695c0a49a7d969ca487d
     fixed_order_rev=7b60f0dddab91a4b154043e78088842d7856cba6
-    if [[ $1 == --short-lru || $1 == --owner-pack || $1 == --li-restore || $1 == --logical-ties || $1 == --cutoff-tail || $1 == --early-index-handoff || $1 == --score-equivalence ]]; then
+    if [[ $1 == --short-lru || $1 == --owner-pack || $1 == --li-restore || $1 == --logical-ties || $1 == --cutoff-tail || $1 == --early-index-handoff || $1 == --score-equivalence || ${1:-} == --owner-topk ]]; then
         candidate_only=true
         offset_resolver=false
         plan_candidate=${1#--}
@@ -96,8 +98,14 @@ elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-pa
             owner_tail=true
             arm_iterations=1
             plan_candidate=logical-ties
-        elif [[ $plan_candidate == score-equivalence ]]; then
-            [[ $2 == "$score_candidate_rev" ]] || { echo "Unexpected candidate: $2" >&2; exit 2; }
+        elif [[ $plan_candidate == score-equivalence || $plan_candidate == owner-topk ]]; then
+            if [[ $plan_candidate == owner-topk ]]; then
+                [[ $2 != "$score_candidate_rev" ]] || { echo 'Expected new native candidate, got its archive revision' >&2; exit 2; }
+                owner_topk=true
+                export KVIP_Q4_OWNER_TOPK=1
+            elif [[ $2 != "$score_candidate_rev" ]]; then
+                echo "Unexpected candidate: $2" >&2; exit 2
+            fi
             score_equivalence=true
             early_handoff=true
             plan_candidate=logical-ties
@@ -139,10 +147,20 @@ elif [[ ${1:-} == --offset-resolver || ${1:-} == --row-deps || ${1:-} == --li-pa
         [[ ${1:-} == --reference && -d ${2:-} ]] || { echo 'Supply --reference for the completed logical-ties run' >&2; exit 2; }
         KVIP_Q4_TAIL_REFERENCE=$(cd "$2" && pwd -P)
         shift 2
+        if "$owner_topk"; then
+            performance_reference=$KVIP_Q4_TAIL_REFERENCE
+            if [[ $(<"$performance_reference/logical-ties.txt") != "$score_candidate_rev" ||
+                  $(<"$performance_reference/physical_npu.txt") != "$peer_physical_npu" ]]; then
+                echo "Expected the score-equivalent Q1 archive on NPU$peer_physical_npu: $performance_reference" >&2
+                exit 1
+            fi
+            KVIP_Q4_TAIL_REFERENCE=$(<"$performance_reference/exact-handoff-reference.txt")
+        fi
         if [[ $(<"$KVIP_Q4_TAIL_REFERENCE/logical-ties.txt") != "$ranked_sha" ||
               $(<"$KVIP_Q4_TAIL_REFERENCE/physical_npu.txt") != "$peer_physical_npu" ]]; then
             echo "Expected revision $ranked_sha on NPU$peer_physical_npu at $KVIP_Q4_TAIL_REFERENCE" >&2; exit 1
         fi
+        if "$owner_topk"; then ranked_sha=$score_candidate_rev; fi
         export KVIP_Q4_TAIL_REFERENCE
         if "$early_handoff"; then export KVIP_Q4_EARLY_HANDOFF=1; else export KVIP_Q4_OWNER_TAIL=1; fi
     fi
@@ -373,6 +391,7 @@ if [[ -n "$ranked" ]]; then
     if "$query_owner"; then
         if ! git -C "$root" cat-file -e "$ranked^{commit}" 2>/dev/null; then
             if "$owner_tail"; then git -C "$root" fetch -q origin refs/heads/diag/urma-q4-cutoff-tail
+            elif "$owner_topk"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-owner-topk
             elif "$score_equivalence"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-native-score-ties
             elif "$early_handoff"; then git -C "$root" fetch -q origin refs/heads/perf/urma-q4-early-index-handoff
             elif "$row_deps" || "$candidate_only"; then git -C "$root" fetch -q origin "refs/heads/perf/urma-q4-$plan_candidate"
@@ -508,7 +527,10 @@ if "$query_owner"; then
     if "$row_deps"; then
         allowed+=(':(exclude)csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/indexer_vector.h')
     fi
-    if "$score_equivalence"; then
+    if "$owner_topk"; then
+        git -C "$ranked_candidate" merge-base --is-ancestor "$score_candidate_rev" HEAD ||
+            { echo 'Expected the owner TopK implementation based on Q1 handoff with free cutoff ties' >&2; exit 1; }
+    elif "$score_equivalence"; then
         [[ $(git -C "$ranked_candidate" rev-parse HEAD^) == "$exact_handoff_rev" ]] || { echo 'Expected original Q1 handoff parent' >&2; exit 1; }
         git -C "$ranked_candidate" diff --exit-code --quiet "$exact_handoff_rev" HEAD -- . \
             ':(exclude)csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/**'
@@ -534,7 +556,10 @@ if "$query_owner"; then
 fi
 if [[ -n "$ranked" ]]; then
     printf 'CONFIG URMA physical_NPU=%s logical_device=0 BS16 Q4 656B ranked=%.8s candidate=%.8s KVAF=%.8s\n' "$peer_physical_npu" "$ranked_sha" "$ranked" "$transport"
-    if "$score_equivalence"; then
+    if "$owner_topk"; then
+        printf '%s\n' "$performance_reference" >"$out/free-ties-reference.txt"
+        echo "CONFIG measured=owner-topk reference=$performance_reference serial_sets=archive level=1 warmup=4 calls=20"
+    elif "$score_equivalence"; then
         printf '%s\n' "$KVIP_Q4_TAIL_REFERENCE" >"$out/exact-handoff-reference.txt"
         echo "CONFIG measured=score-equivalence reference=$KVIP_Q4_TAIL_REFERENCE serial_sets=archive level=1 warmup=4 calls=20"
     elif "$early_handoff"; then
@@ -652,7 +677,8 @@ run_arm() (
         mode=(--fused-only --candidate-root "$src/auto-${candidate:0:8}" --candidate-snapshot "$snapshot")
     fi
     local display_label=$label
-    if "$score_equivalence"; then display_label=score-equivalence
+    if "$owner_topk"; then display_label=owner-topk
+    elif "$score_equivalence"; then display_label=score-equivalence
     elif "$early_handoff"; then display_label=early-index-handoff; fi
     printf 'CASE_BEGIN G%s %s\n' "$group" "$display_label"
     if ! "$PYTHON" -B "$tools/test_lifetch.py" diagnose "${mode[@]}" "${limits[@]}" \
@@ -805,7 +831,7 @@ if [[ -n "$ranked" ]]; then
         else trace=$(bash "$tools/peer_g2_input.sh" "$work" "$group"); fi
         if "$owner_tail" || "$early_handoff"; then
             # Preserve reference NUMA placement when the original was observable.
-            previous_node=$("$PYTHON" -B "$tools/support/owner_pack_tail.py" numa "$KVIP_Q4_TAIL_REFERENCE" "$group")
+            previous_node=$("$PYTHON" -B "$tools/support/owner_pack_tail.py" numa "${performance_reference:-$KVIP_Q4_TAIL_REFERENCE}" "$group")
             bind_cpu_service "${previous_node:-$node}"
         fi
         # The two historically ambiguous groups also check the fixed fused tail.
@@ -815,7 +841,9 @@ if [[ -n "$ranked" ]]; then
         for label in "${order[@]}"; do
             run_arm "$label" "$group" "$case_dir"
         done
-        if "$score_equivalence"; then
+        if "$owner_topk"; then
+            "$PYTHON" -B "$tools/support/owner_topk_report.py" "$out" "$group" "$performance_reference" | tee -a "$out/summary.txt"
+        elif "$score_equivalence"; then
             "$PYTHON" -B "$tools/support/score_equivalence_report.py" --root "$out" --group "$group" --reference "$KVIP_Q4_TAIL_REFERENCE" | tee -a "$out/summary.txt"
         elif "$early_handoff"; then
             "$PYTHON" -B "$tools/support/early_index_report.py" "$out" "$group" | tee -a "$out/summary.txt"

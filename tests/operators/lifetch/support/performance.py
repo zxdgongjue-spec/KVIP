@@ -15,7 +15,7 @@ TOKEN_BYTES = 656
 TOPK = 2048
 
 
-def profile_graph_batch(torch, graph, *, calls, folder, serial=False, transport='urma', stream=None):
+def profile_graph_batch(torch, graph, *, calls, folder, serial=False, transport='urma', stream=None, owner_topk=False):
     """Measure one already-warmed graph once, with events and profiler together.
 
     The caller owns independent mutable state for every captured invocation.
@@ -60,7 +60,7 @@ def profile_graph_batch(torch, graph, *, calls, folder, serial=False, transport=
     elif transport == 'ubmem':
         accounting = account_ubmem(events, name, elapsed)
     else:
-        accounting = account(events, name, elapsed, full=True, fused_final=True)
+        accounting = account(events, name, elapsed, full=True, fused_final=True, owner_topk=owner_topk)
     accounting['event_us'] = elapsed
     result = split_graph_invocations(accounting, calls, serial=serial)
     result['trace'] = str(trace_path)
@@ -110,6 +110,9 @@ def split_graph_invocations(accounting, calls, *, serial=False):
             required.add('init')
         if any(not intervals.get(stage) for stage in required):
             raise ValueError(f'Incomplete invocation {index}: {intervals}')
+        if accounting.get('owner_topk_kernel') and (set(intervals) != {'li', resolver}
+                or len(intervals['li']) != 3 or len(intervals[resolver]) != 1):
+            raise ValueError(f'Expected three LI phases and one owner TopK tail in invocation {index}: {intervals}')
         flat = sorted(pair for values in intervals.values() for pair in values)
         finish = max(b for _, b in flat)
         if finish > stop:
@@ -122,6 +125,8 @@ def split_graph_invocations(accounting, calls, *, serial=False):
         samples.append(dict(invocation=index, start_us=start, end_us=finish,
                             us=span, stages_us=stages, inter_kernel_gap_us=span-busy,
                             overlap_us=sum(stages.values())-busy, intervals_us=intervals))
+        if accounting.get('owner_topk_kernel'):
+            samples[-1]['owner_topk_kernel'] = accounting['owner_topk_kernel']
     event = accounting['event_us']
     if event < accounting['kernel_span_us'] - 2:
         raise ValueError('Profiler device span exceeds the same graph event')

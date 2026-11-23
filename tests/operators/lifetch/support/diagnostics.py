@@ -898,7 +898,7 @@ def union(intervals):
     return merged
 
 
-def account(events, name, elapsed, *, full=False, fused_final=False):
+def account(events, name, elapsed, *, full=False, fused_final=False, owner_topk=False):
     scopes = [e for e in events if e.get("name") == name and e.get("ph") == "X"]
     if len(scopes) != 1:
         return dict(error=f"Expected one CPU replay scope, found {len(scopes)}")
@@ -909,7 +909,12 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
                     publish="kvop_direct_update_outputs_early_kernel",
                     apply="kvop_direct_apply_owned_kernel", fetch="v9_fetch_update_kernel")
                if full else {stage: f"v9_{stage}_kernel" for stage in DEVICE_STAGES})
-    if full and any(e.get("name", "").lower().startswith("v9_streaming_resolve_update") for e in events):
+    if owner_topk:
+        # Both names are matched inside the measured CPU scope below. A partial
+        # fallback must not be silently omitted from the reported device span.
+        kernels = dict(li="v9_li_kernel", resolve_update="v9_owner_topk_resolve_update",
+                       legacy_tail="v9_streaming_resolve_update", init="v9_init_kernel")
+    elif full and any(e.get("name", "").lower().startswith("v9_streaming_resolve_update") for e in events):
         # This kernel contains both resolver and index update; reporting separate
         # kernel durations would invent a boundary that does not exist.
         kernels = dict(init="v9_init_kernel", li="v9_li_kernel",
@@ -939,6 +944,8 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
         if not start <= timestamp or finish > end:
             continue
         groups[stage].append((timestamp, finish))
+    if owner_topk and groups.pop('legacy_tail'):
+        return dict(error="Measured owner TopK graph used a separate legacy resolver")
     # Current URMA streaming starts with hot LI; older captures have Init.
     if fused_final and 'resolve_update' in groups and not groups.get('init'):
         groups.pop('init', None)
@@ -965,6 +972,7 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
         inter_kernel_gap_us=span - busy,
         boundary_residual_us=residual,
         note="Boundary residual includes event-to-kernel edges and clock measurement error; not proven CPU idle",
+        **({'owner_topk_kernel': kernels['resolve_update']} if owner_topk else {}),
     )
 
 
