@@ -46,6 +46,8 @@ def load_cases(samples, g):
     meta = json_read(prefix.with_suffix(".json"))
     if len(records) != len(meta) * IN_BYTES or len(expected) != len(meta) * OUT_BYTES or not meta:
         raise ValueError(f"Invalid G{g} input sizes")
+    if len({(row["window"], row["row"], row["q"]) for row in meta}) != len(meta):
+        raise ValueError(f"Duplicate window, row and Q in G{g}")
     for i, row in enumerate(meta):
         if row["group"] != g or row["posted"] != struct.unpack_from("<I", expected, i * OUT_BYTES)[0]:
             raise ValueError(f"G{g} index {i} has inconsistent identity or expected output")
@@ -312,9 +314,12 @@ def save_ledger(out, groups, ledger):
         rows.writerow(
             ["group", "index", "window", "row", "q", "variant", "ticks", "source", "first_in_launch"]
         )
-        for (g, i, v), (ticks, source, first) in sorted(ledger.items()):
-            m = groups[g][0][i]
-            rows.writerow((g, i, m["window"], m["row"], m["q"], v, ticks, source, int(first)))
+        for g, packed in groups.items():
+            for i, m in enumerate(packed[0]):
+                for v in (0, 1):
+                    if (g, i, v) in ledger:
+                        ticks, source, first = ledger[g, i, v]
+                        rows.writerow((g, i, m["window"], m["row"], m["q"], v, ticks, source, int(first)))
     temp.replace(prefix)
 
 

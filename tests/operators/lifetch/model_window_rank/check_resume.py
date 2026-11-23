@@ -116,6 +116,9 @@ def exercise(root):
     assert any(json.loads(job.read_text())["mode"] == "--only-new" for job in jobs)
     rows = list(csv.DictReader((out / "per-query.csv").open()))
     assert len(rows) == len({(r["group"], r["index"], r["variant"]) for r in rows}) == 24
+    assert [(int(r["group"]), int(r["index"]), int(r["variant"])) for r in rows] == [
+        (g, i, v) for g in (10, 4) for i in range(6) for v in (0, 1)
+    ]
     for row in rows:
         g, i, v = (int(row[k]) for k in ("group", "index", "variant"))
         assert float(row["ticks"]) == 1000 * g + 10 * i + v
