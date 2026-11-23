@@ -212,8 +212,9 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  if(profile)ts[14]=GetSystemCycle();
  // Logical IDs are emitted with slots after all admissions are visible.
  if(profile)ts[15]=GetSystemCycle();
+ rotating::CreditStamp credits[4]{};
  rotating::CommitTerminalPost(args,originalHead,firstPostCount,post);
- if(profile)ts[4]=GetSystemCycle();
+ if(profile){ts[4]=GetSystemCycle();if(own){credits[0].postBegin=ts[15];credits[0].postEnd=ts[4];rotating::SampleCredit(args,credits);}}
 
  op.FreeEventID();
  if(profile)ts[5]=GetSystemCycle();
@@ -236,7 +237,10 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  if(profile)ts[26]=GetSystemCycle();
  uint32_t indexError=0;
  Simt::VF_CALL<UpdateIndex>(Simt::Dim3{512,1,1},src,dst,n,s.resident,s.history,(reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*s.history*16),(reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*s.history),(reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride),(reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history),work,ctx,total,q,first,reinterpret_cast<__gm__ uint32_t*>(rotating::TopKHeader(ctx))+query*32,reinterpret_cast<__gm__ uint32_t*>(ctx->progress)+query*32,priorJournalCount,b,flags+(12+q)*32,false);
- SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ SetFlag<HardEvent::V_S>(EVENT_ID0);
+  if(profile && own)rotating::SampleCredit(args,credits);
+  WaitFlag<HardEvent::V_S>(EVENT_ID0);
+  if(profile && own)rotating::SampleCredit(args,credits);
  indexError=total>rotating::kChangeCapacity?1U:local.GetValue(TAIL_CONTROL);
 
  bool residentUpdate=(indexError&0x80000000U)!=0;
@@ -256,7 +260,10 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
    reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history,
    reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*s.resident,
    flags,ctx->reservedHot?reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+uint64_t(b)*s.resident:nullptr,work);
-  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+  SetFlag<HardEvent::V_S>(EVENT_ID0);
+  if(profile && own)rotating::SampleCredit(args,credits);
+  WaitFlag<HardEvent::V_S>(EVENT_ID0);
+  if(profile && own)rotating::SampleCredit(args,credits);
   indexError=parallelLocal.GetValue(0);
   // Retirement is shared with the normal path; skip the already applied swap.
   Simt::VF_CALL<UpdateIndex>(Simt::Dim3{512,1,1},src,dst,n,s.resident,s.history,
@@ -264,16 +271,19 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
    reinterpret_cast<__gm__ uint64_t*>(a->addresses),reinterpret_cast<__gm__ uint64_t*>(a->logical),
    work,ctx,total,q,first,reinterpret_cast<__gm__ uint32_t*>(rotating::TopKHeader(ctx))+query*32,
    reinterpret_cast<__gm__ uint32_t*>(ctx->progress)+query*32,priorJournalCount,b,flags+(12+q)*32,true);
-  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+  SetFlag<HardEvent::V_S>(EVENT_ID0);
+  if(profile && own)rotating::SampleCredit(args,credits);
+  WaitFlag<HardEvent::V_S>(EVENT_ID0);
+  if(profile && own)rotating::SampleCredit(args,credits);
  }
  ownError|=(indexError<<4);
  if(profile)ts[16]=GetSystemCycle();
  uint64_t cqError;
  if(paced){
   const auto batches=terminal_batches::MakePlan(own,total,priorSlots);
-  cqError=rotating::CompleteTerminalBatches(args,post,batches,originalHead);
+  cqError=rotating::CompleteTerminalBatches(args,post,batches,originalHead,profile?credits:nullptr);
  }else{
-  cqError=rotating::CompleteTerminalPost(args,post);
+  cqError=rotating::CompleteTerminalPost(args,post,profile?credits:nullptr);
  }
  if(profile)ts[24]=GetSystemCycle();
  if(q==1)rotating::CompleteTerminalPrefetch(ctx,b);
@@ -294,7 +304,16 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  Simt::VF_CALL<FinishTerminalRow>(Simt::Dim3{512,1,1},a,ctx,runtime,b,q,owner,total,first,n,flags,generation,work);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  if(profile)ts[10]=GetSystemCycle();
- pipe.Destroy();if(profile)kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ts),256);
+ pipe.Destroy();
+ if(profile){
+  for(uint32_t i=0;i<4;++i){
+   const auto& c=credits[i];auto dst=ts+32+6*i;
+   dst[0]=c.postBegin;dst[1]=c.postEnd;dst[2]=c.lastAbsent;dst[3]=c.firstVisible;
+   dst[4]=c.drainBegin;dst[5]=c.drainEnd;
+  }
+  ts[56]=0x43514531U;
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ts),512);
+ }
  } // ASCEND_IS_AIV
 #endif
 }

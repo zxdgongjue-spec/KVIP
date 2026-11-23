@@ -2160,6 +2160,31 @@ def decode_terminal_timeline(rows, clock_mhz):
                 observed_span_us=last['end_us'])
 
 
+def terminal_credit_bounds(stamp, count, final_count):
+    if len(stamp) != 64 or stamp[56] != 0x43514531:
+        raise ValueError('Missing B20 terminal credit trace')
+    ends = [count] if count else []
+    if count > 1 and final_count >= 256:
+        ends = sorted({(count * n + 15) // 16 for n in (1, 6, 11, 16)})
+    records = []
+    previous = stamp[15]
+    offset = 0
+    for i in range(4):
+        pb, pe, absent, visible, begin, end = stamp[32+6*i:38+6*i]
+        if i >= len(ends):
+            if any((pb, pe, absent, visible, begin, end)):
+                raise ValueError('Unexpected records for an empty credit batch')
+            continue
+        if not (0 < previous <= pb <= pe <= begin <= end <= stamp[24]
+                and pe <= visible <= end and (not absent or pe <= absent <= visible)):
+            raise ValueError(f'Inconsistent terminal credit clocks for batch {i+1}')
+        records.append(dict(batch=i+1, entries=ends[i]-offset, post_begin=pb, post_end=pe,
+                            last_absent=absent, first_visible=visible, drain_begin=begin, drain_end=end))
+        previous = end
+        offset = ends[i]
+    return records
+
+
 def terminal_diagnostics(stamps, rows, posts, events, destinations, service_lanes, token_bytes, clock_mhz):
     """All counts and scopes here belong to this instrumented replay only."""
     timeline = decode_terminal_timeline(stamps, clock_mhz)
@@ -2177,7 +2202,8 @@ def terminal_diagnostics(stamps, rows, posts, events, destinations, service_lane
             conflict = sum(int(slot) in prefix_slots for slot in slots)
             if conflict:
                 raise ValueError('Terminal final allocations overlap prior prefetch destinations')
-            counts.append(dict(total=count, safe=count, conflict=conflict))
+            counts.append(dict(total=count, safe=count, conflict=conflict,
+                               credits=terminal_credit_bounds(t, count, total-prior)))
             if count:
                 if not 0 < t[15] <= t[4] <= t[24]:
                     raise ValueError('Missing terminal submission/CQ timestamps')

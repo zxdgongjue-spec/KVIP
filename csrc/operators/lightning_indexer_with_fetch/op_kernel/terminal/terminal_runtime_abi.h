@@ -7,7 +7,7 @@ constexpr uint32_t kVersion=1;
 constexpr uint32_t kQueries=4;
 constexpr uint32_t kTop=2048;
 constexpr uint32_t kFlagWordsPerRow=32*32;
-constexpr uint32_t kTraceWordsPerQuery=32;
+constexpr uint32_t kTraceWordsPerQuery=64;
 
 // Keep the production Args and Context ABIs intact. This allocation belongs to
 // a single forward binding, survives graph replay and is never host-refreshed

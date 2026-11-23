@@ -90,7 +90,7 @@ class TerminalLeaseBinding:
             raise ValueError("Four concurrent AIVs per request are required")
         torch, device = self.rotating.torch, self.rotating.device
         self.flags = torch.zeros((shape.batch, 32, 32), dtype=torch.int32, device=device)
-        self.times = torch.zeros((shape.batch, 4, 32), dtype=torch.int64, device=device)
+        self.times = torch.zeros((shape.batch, 4, 64), dtype=torch.int64, device=device)
         self.logical = torch.empty((shape.batch, 4, 2048), dtype=torch.int32, device=device)
         # Private extension list and four per-Q protection masks. Lifetime
         # matches the captured binding; allocation is outside the graph.
