@@ -3851,6 +3851,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
         overall.update(profiler_mean_us=overall['mean_us'], mean_us=event_mean,
                        event_mean_us=event_mean, measured_graphs=len(rounds),
                        graph_calls=len(states), timing_protocol='one_profiled_graph',
+                       stage_samples_us={stage: [v for t in rounds.values() for v in t.get('stage_samples_us', {}).get(stage, [])]
+                                         for stage in dict.fromkeys(s for t in rounds.values() for s in t.get('stage_samples_us', {}))},
                        stage_mean_us={stage: sum(t['stage_mean_us'].get(stage, 0.) for t in rounds.values())/len(rounds)
                                       for stage in dict.fromkeys(s for t in rounds.values() for s in t['stage_mean_us'])},
                        inter_kernel_gap_mean_us=sum(t['inter_kernel_gap_mean_us'] for t in rounds.values())/len(rounds),

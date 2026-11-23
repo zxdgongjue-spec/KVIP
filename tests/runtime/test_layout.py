@@ -345,3 +345,176 @@ def test_terminal_transfer_scopes_use_separate_final_and_prefetch_completion():
     empty = terminal_diagnostics(stamps, rows, posts, event.view(np.uint8), dest, 1, 656, 1000)[0]
     for scope in ("prefetch_bandwidth", "final_get_bandwidth", "combined_observed_bandwidth"):
         assert empty[scope]["bytes"] == 0 and empty[scope]["GBps"] is None
+
+
+def test_diagnostic_levels_share_order_statistics_and_keep_raw_records():
+    import copy
+    from diagnostics import level_one_tables, level_two_tables, metric_distribution
+
+    assert metric_distribution([1, None, 3]) == [2, 2, 2.8, 2.98, 1, 3, 2, 3]
+    assert metric_distribution([None]) == [None] * 6 + [0, 1]
+    assert metric_distribution([5])[1:4] == [None] * 3
+    accounting = dict(
+        stages_us={"li": 10, "topk_resolve_update": 20},
+        inter_kernel_gap_us=1,
+        boundary_residual_us=2,
+        overlap_us=0,
+        kernel_span_us=31,
+        event_us=33,
+    )
+    request = dict(
+        request=0,
+        initial_hot_valid=100,
+        selected_unique=2048,
+        initial_cold=5,
+        prefetch=4,
+        final=2,
+        KV_read_bytes=3936,
+        unused_prefetch=None,
+        windows=[dict(window=1, posted=4, bytes=2624, unused=None, cumulative_posted=4, cumulative_unused=None)],
+        queries=[dict(query=1, unique=2048, cross_q_duplicate=0, new_unique=2048, initial_local=2043, final_posted=2)],
+    )
+    samples = []
+    for i, duration in enumerate((10, 30)):
+        phase = dict(
+            name="TopK",
+            start_us=0,
+            end_us=duration,
+            duration_us=duration,
+            start_cycles=1000,
+            end_cycles=1000 + duration * 1000,
+        )
+        samples.append(
+            dict(
+                repeat=i,
+                accounting=copy.deepcopy(accounting),
+                algorithm=dict(requests=[copy.deepcopy(request)]),
+                timeline=dict(
+                    last_block=0,
+                    observed_span_us=duration,
+                    clock_mhz=1000,
+                    cores=[
+                        dict(
+                            block=0,
+                            role="terminal b0 Q1",
+                            start_us=0,
+                            end_us=duration,
+                            duration_us=duration,
+                            stages=[phase],
+                        )
+                    ],
+                ),
+                rank_progress=[[0, 1, 1, 50, 80, 1024]],
+                final_get_bandwidth=dict(bytes=656, span_us=duration, GBps=656 / duration / 1000),
+            )
+        )
+    result = dict(
+        level=3,
+        transport="urma",
+        trace="COMPLETE",
+        captures=[
+            dict(path="fused", source="fixture.json", samples=samples, graph_accounting=accounting, graph_calls=2)
+        ],
+        unavailable=[],
+        missing=[],
+    )
+    original = copy.deepcopy(result)
+    outputs = [level_two_tables(dict(result, level=level)) for level in (1, 2, 3)]
+    assert level_one_tables(result) == outputs[0]
+    assert result == original
+    for output in outputs:
+        assert output.count("\nDemand and actual reads\n") == 1
+        assert "Per-request counts" not in output and "repeat=" not in output
+        assert "p90" in output and "p99" in output
+        assert (
+            output.index("Demand and actual reads")
+            < output.index("\nStage distribution\n")
+            < output.index("\nEffective bandwidth\n")
+        )
+        unused = next(line for line in output.splitlines() if "| Unused " in line)
+        assert "| -" in unused and unused.rstrip().endswith("2")
+    for output in outputs[1:]:
+        assert (
+            output.index("Demand and actual reads")
+            < output.index("Window prefetch / unused")
+            < output.index("Per-Q demand / repair")
+        )
+        assert "\nResolver phase breakdown\n" not in output
+        assert "\nTerminal phase breakdown\n" in output
+        assert "empty phase" in output
+    assert "\nCore work / wait intervals\n" not in outputs[1]
+    assert outputs[2].count("\nCore work / wait intervals\n") == 1
+    assert outputs[2].index("Per-Q demand / repair") < outputs[2].index("Per-Q prefetch rank / progress")
+
+
+def test_common_performance_report_keeps_event_and_profiler_separate(tmp_path):
+    from reporting import timing_summary, comparison_row, save_summary
+
+    timing = timing_summary([10, 30])
+    timing.update(
+        mean_us=25,
+        profiler_mean_us=20,
+        timing_protocol="one_profiled_graph",
+        stage_mean_us={"li": 20},
+        stage_samples_us={"li": [10, 30]},
+        outside_invocations_mean_us=5,
+    )
+    row = comparison_row("bench/.", timing, timing, "PASS")
+    save_summary(tmp_path, [row])
+    text = (tmp_path / "summary.log").read_text()
+    assert "Serial event mean" in text and "25.00" in text
+    assert "Profiler invocation distribution" in text and "p90" in text and "28.00" in text
+    assert "Profiler stages" in text and "between calls + event edges (graph average)" in text
+    assert row["serial_p90_us"] == 28
+
+
+def test_diagnostic_legacy_tables_and_source_rounds_remain_separate():
+    from diagnostics import level_two_tables
+
+    samples = []
+    for source_round, duration in ((1, 10), (2, 90)):
+        phase = dict(name="Q1.resolve", start_us=0, end_us=duration, duration_us=duration)
+        samples.append(
+            dict(
+                source_round=source_round,
+                accounting={},
+                timeline=dict(
+                    last_block=0,
+                    observed_span_us=duration,
+                    clock_mhz=1000,
+                    cores=[
+                        dict(
+                            block=0,
+                            role="resolver b0",
+                            start_us=0,
+                            end_us=duration,
+                            duration_us=duration,
+                            stages=[phase],
+                        )
+                    ],
+                ),
+                requests=[
+                    dict(
+                        batch=0,
+                        producer=[dict(resolve=duration * 1000)],
+                        core_timeline_raw=dict(clock_mhz=1000),
+                        update=[0, 2000],
+                        update_wait=[0, 0],
+                    )
+                ],
+            )
+        )
+    result = dict(
+        level=3,
+        transport="urma",
+        trace="COMPLETE",
+        captures=[dict(path="fused", source="legacy.json", samples=samples)],
+    )
+    text = level_two_tables(result)
+    assert text.count("\nResolver phase breakdown\n") == 1
+    assert text.count("\nPer-Q resolver / update\n") == 1
+    assert "\nLI TopK classification\n" not in text
+    rows = [r for r in text.splitlines() if "| Q1-Q4 resolve us " in r]
+    assert len(rows) == 2
+    assert "10.00" in rows[0] and "90.00" in rows[1]
+    assert all("| -" in r for r in rows)  # One sample per source round; no fabricated quantiles.
