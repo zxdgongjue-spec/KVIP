@@ -47,7 +47,12 @@ def describe(events, records, clock, first_terminal):
                e['incremental_cycles']/clock,e['posted_count']] for b,e in enumerate(final)]
     halves = [[mean(v[index] for v in half) for index in range(3)] for half in (values[:8],values[8:])]
     delta, duration, _ = zip(*values)
-    return by_epoch, halves, correlation(delta,duration), rank_counts
+    final_end = max(e['end_cycles'] for e in final)
+    # Independent releases, instantaneous teams, and zero coordination overhead.
+    ideal_64 = [(final_end-max(e['end_cycles']-fraction*e['incremental_cycles'] for e in final))/clock
+                for fraction in (0.5,0.75)]
+    ready = [pct for _,_,epoch,pct,_,_ in records if epoch == 3]
+    return by_epoch, halves, correlation(delta,duration), rank_counts, ideal_64, ready
 
 
 def window_report(profile, details):
@@ -61,15 +66,24 @@ def window_report(profile, details):
             raise ValueError(f'Expected three LI launches, saw {len(stages)}')
         lo,hi = sorted(stages)[2]
         li3.append(hi-lo)
-    windows, halves, correlations, counts = [], [], [], []
+    windows, halves, correlations, counts, ideal, readiness = [], [], [], [], [], []
     for detail in details:
         head = detail['streaming_cycles'][0]
         timeline = head['terminal_timeline']
         first = min(s['start_cycles'] for c in timeline['cores'] for s in c['stages'] if 'start_cycles' in s)
-        w,h,c,r = describe(head['prefetch_services'],detail['rank_progress'],timeline['clock_mhz'],first)
+        w,h,c,r,upper,ready = describe(head['prefetch_services'],detail['rank_progress'],timeline['clock_mhz'],first)
         windows.append(w); halves.append(h); correlations.append(c); counts.append(r)
+        ideal.append(upper); readiness.extend(ready)
     return dict(
+        timed_graph_mean_us=profile['timing']['event_mean_us'],
         timed_LI3_mean_us=mean(li3),
+        last_window_min_median_max_ready_pct=[min(readiness), median(readiness), max(readiness)],
+        last_window_queries_with_all_scores_reported_ready=len([x for x in readiness if x >= 100.0]),
+        last_window_zero_helper_delay_end_advance_us={
+            'half_aggregate_time_removed':mean(v[0] for v in ideal),
+            'three_quarters_removed':mean(v[1] for v in ideal),
+            'three_quarters_spare_above_graph_10pct':mean(v[1] for v in ideal)-0.1*profile['timing']['event_mean_us'],
+        },
         separate_diagnostic_calls=len(details),
         diagnostic_mean_Q_with_rank_per_window=list(map(mean,zip(*counts))),
         diagnostic_windows=[{k:mean(v[epoch][k] for v in windows) for k in windows[0][epoch]} for epoch in range(4)],
