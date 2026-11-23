@@ -132,12 +132,15 @@ def prepare_main_device_sources(root, transport):
     patches = [(ROOT / "scripts/patches/kvaf-main-fused-device.patch", ())]
     if transport == "ubmem":
         patches.append((patch_path(UBMEM_DEVICE_PATCH), ("--include=access_operator/include/ubmem/*",)))
+    pending = []
     for path, options in patches:
         command = ["git", "-C", str(root), "apply", *options]
         reverse = subprocess.run([*command, "--reverse", "--check", path], capture_output=True)
         if reverse.returncode != 0:
             call([*command, "--check", path])
-            call([*command, path])
+            pending.append([*command, path])
+    for command in pending:
+        call(command)
 
 
 
