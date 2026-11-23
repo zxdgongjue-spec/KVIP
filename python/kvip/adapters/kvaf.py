@@ -336,6 +336,7 @@ class UbmemLease(StreamLease):
         self.outputs = {self.output_key(output): (output, self.context)}
         self.bindings = []
         self.graphs = []
+        self.tables = {}
         try:
             self._validate(self.context, output)
         except Exception:
@@ -397,7 +398,15 @@ class UbmemLease(StreamLease):
 
     def register_table(self, table):
         self.check_stream()
-        self.runtime.register_ubmem_fused_access_table(self.context, table)
+        if self.unified:
+            # The caller keeps the native access-table handle open until close.
+            # Retain both device tensor views used by the fused graph.
+            addresses, valid = table.addresses, table.valid
+            if addresses.device != self.device or valid.device != self.device:
+                raise ValueError("UBmem fused table must be on the lease device")
+            self.tables[id(table)] = (table, addresses, valid)
+        else:
+            self.runtime.register_ubmem_fused_access_table(self.context, table)
 
     def retain_graph(self, graph):
         self.check_stream()
@@ -439,6 +448,7 @@ class UbmemLease(StreamLease):
             self.bindings.clear()
             self.outputs.clear()
             self.graphs.clear()
+            self.tables.clear()
 
 
 class UbmemLeasedRuntime:

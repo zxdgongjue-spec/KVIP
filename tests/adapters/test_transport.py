@@ -111,9 +111,13 @@ class TransportTest(unittest.TestCase):
             view = owner.register_output(other)
             self.assertEqual(view["output_address"], other.data_ptr())
             self.assertEqual(view["mapped_base"], 8192)
+            table = SimpleNamespace(addresses=torch.zeros(4, dtype=torch.int64), valid=torch.zeros(4, dtype=torch.uint8))
+            owner.register_table(table)
+            self.assertIs(owner.tables[id(table)][0], table)
         runtime.begin_get_graph.assert_called_once_with("ubmem-get", self.output, 1, self.stream)
         owner.close()
         runtime.end_get_graph.assert_called_once_with(17, self.stream, discard_result=True)
+        self.assertFalse(owner.tables)
 
     def inputs(self):
         return (
