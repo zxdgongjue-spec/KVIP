@@ -816,8 +816,15 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         publish.blockLen = 32;
         publish.srcStride = 0;
         publish.dstStride = 96;
+#if KVIP_WINDOW_READY_TRACE
+        const bool capture = SamplePublication(info.s2Idx + 1);
+        const uint64_t issued = capture ? GetSystemCycle() : 0;
+#endif
         DataCopyPad(rotationProgressGm_[(info.bIdx * SIM_Q + curAivS1Idx) * 32 + progressShard * 16],
             rotationProgress_[(info.s2Idx % 64) * 16], publish);
+#if KVIP_WINDOW_READY_TRACE
+        if (capture) FinishPublication(info.s2Idx + 1, issued);
+#endif
     }
     SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
     CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB

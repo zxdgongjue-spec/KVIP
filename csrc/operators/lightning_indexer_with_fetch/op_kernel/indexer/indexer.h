@@ -825,11 +825,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
             for (uint32_t epoch = 1; epoch < runtimeShape_.rounds; ++epoch, begin += 2 * half) {
                 uint32_t end = begin + half;
                 if (end > runtimeShape_.history / S2_BASE_SIZE) end = runtimeShape_.history / S2_BASE_SIZE;
+#if KVIP_WINDOW_READY_TRACE
+                if ASCEND_IS_AIV { vectorService.BeginColdSegment(epoch, begin, end); }
+#endif
                 ScanSequenceHalf(begin, end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
                 if ASCEND_IS_AIV {
-#if KVIP_WINDOW_READY_TRACE
-                    if (epoch + 1 == runtimeShape_.rounds) vectorService.MarkColdScoreEnd();
-#endif
                     if (serviceEpoch == epoch) vectorService.RotateFetch(epoch, halfTokens);
                 }
             }

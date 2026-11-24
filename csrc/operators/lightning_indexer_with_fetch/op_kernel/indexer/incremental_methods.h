@@ -583,18 +583,30 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     // added calculation so private per-lane state cannot have two writers.
     if(epoch) {
         auto previous=reinterpret_cast<__gm__ volatile rotating::Event*>(ctx->events)+(epoch-1)*runtimeShape_.serviceLanes+lane;
-        do {kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ rotating::Event*>(previous)),64);}while(!previous->complete);
+#if KVIP_WINDOW_READY_TRACE
+        if (readyTrace_) {
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ rotating::Event*>(previous)),64);
+            const bool alreadyDone = previous->complete;
+            firstPoll_ = GetSystemCycle() | (uint64_t(alreadyDone) << 63);
+            if (!alreadyDone) {
+                do {kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ rotating::Event*>(previous)),64);}while(!previous->complete);
+            }
+        } else
+#endif
+        {
+            do {kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ rotating::Event*>(previous)),64);}while(!previous->complete);
+        }
     }
     uint64_t begin=trace?GetSystemCycle():0;
     exportWindowCold_=true;rankedEpoch_=epoch;rankTrace_=trace;
     incrementalCalls_=0;incrementalScanned_=0;incrementalCandidates_=0;
     incrementalMetadataActive_=(runtimeShape_.batch+runtimeShape_.serviceLanes-1)/runtimeShape_.serviceLanes<=2;
 #if KVIP_WINDOW_READY_TRACE
-    const bool traceLastWindow = readyTrace_ && incrementalMetadataActive_ && epoch + 1 == runtimeShape_.rounds;
+    const bool traceSnapshot = readyTrace_ && incrementalMetadataActive_;
 #endif
     if(incrementalMetadataActive_) {
 #if KVIP_WINDOW_READY_TRACE
-    if (traceLastWindow) readyFreezeBegin_ = GetSystemCycle();
+    if (traceSnapshot) readyFreezeBegin_ = GetSystemCycle();
 #endif
     GlobalTensor<uint32_t> progressSource;progressSource.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
     for(uint32_t b=lane,i=0;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes,i+=128)
@@ -613,7 +625,7 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
         SetFlag<HardEvent::MTE2_S>(EVENT_ID5);WaitFlag<HardEvent::MTE2_S>(EVENT_ID5);
     }
 #if KVIP_WINDOW_READY_TRACE
-    if (traceLastWindow) readyFreezeEnd_ = GetSystemCycle();
+    if (traceSnapshot) readyFreezeEnd_ = GetSystemCycle();
 #endif
     uint32_t ownedQueries=lane<runtimeShape_.batch?((runtimeShape_.batch-1-lane)/runtimeShape_.serviceLanes+1)*4:0;
     uint32_t requests0=0,requests1=0;
@@ -649,16 +661,7 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
             incrementalNextEnd0_=Min(uint32_t(nextReady),cap);
             incrementalNextEnd1_=half?Min(uint32_t(nextReady>>32),cap):0;
         }
-#if KVIP_WINDOW_READY_TRACE
-        if (traceLastWindow) {
-            readyQuery_[q][2] = ready;
-            readyQuery_[q][0] = GetSystemCycle();
-        }
-#endif
         AdvanceIncremental(b*4+q,end0,end1,half);
-#if KVIP_WINDOW_READY_TRACE
-        if (traceLastWindow) readyQuery_[q][1] = GetSystemCycle();
-#endif
     }
     JoinColdOutput();
     if(incrementalInputPending_) {
