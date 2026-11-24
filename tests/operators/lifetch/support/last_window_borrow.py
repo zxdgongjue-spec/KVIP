@@ -7,6 +7,7 @@ import numpy as np
 
 DUAL = 'aa6889e773c57ff737fd5ddec75307613d8949dc'
 CANDIDATE = 'e308c913d10a77117665cb53ad7b56412ee6dc00'
+COMBINED = '20915a78b682378ea60889afbcd14b9a21123913'
 # CANN 9.2 linked images of the full-length five-case CPU model.
 EXPECTED_TEXT = {
     'v9_kernel/0': '9bc6c3db01bd17dbf758f9bb470259bae4ab3e0755d1686a81dbe1903cf07ac1',
@@ -15,14 +16,23 @@ EXPECTED_TEXT = {
 }
 
 
-def check_device(path):
+def expected_text(revision):
+    if revision == CANDIDATE:
+        return EXPECTED_TEXT
+    if revision == COMBINED:
+        return {**EXPECTED_TEXT, 'parallel_terminal_kernel/1':
+                'de52cef7c9d29ff76d06aa7b8168ff0dbb992f1870368bc7674dcd034e314553'}
+    raise ValueError(f'Unknown native revision for the last-window audit: {revision}')
+
+
+def check_device(path, revision=CANDIDATE):
     from check_isolated_device import extract
     hashes = {}
     for name, sections in extract(path).items():
         for key, instructions in sections.items():
             if key[4] == '.text':
                 hashes[f'{name}/{key[1]}'] = hashlib.sha256(instructions).hexdigest()
-    if hashes != EXPECTED_TEXT:
+    if hashes != expected_text(revision):
         raise ValueError(f'Loaded LI/terminal code differs from the verified window-borrow build: {hashes}')
     return hashes
 

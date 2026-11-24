@@ -113,7 +113,9 @@ def compare(root, group, owner, ref):
           f'exact_ID_sets={int(exact.sum())}/1280 KV_and_Index_state=PASS measured_rows=320/320 '
           f'ordered_Index=PASS separate_diagnostic_rows=320/320')
     print(f'G{group} mainline_archive', *(f'{k}_mean/P50_us={stats(v)}' for k, v in old.items()))
-    print(f'G{group} LI_candidate', *(f'{k}_mean/P50_us={stats(v)}' for k, v in new.items()))
+    from last_window_borrow import COMBINED
+    label = 'li_borrow_four_batch' if revision == COMBINED else 'LI_candidate'
+    print(f'G{group} {label}', *(f'{k}_mean/P50_us={stats(v)}' for k, v in new.items()))
     print(f'G{group} LI_kernels_mean_us mainline=' + '/'.join(f'{v:.2f}' for v in old_li)
           + ' candidate=' + '/'.join(f'{v:.2f}' for v in new_li))
     if len(old_fetches) == len(new_fetches) == 20:

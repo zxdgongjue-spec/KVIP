@@ -44,7 +44,22 @@ borrow_audit=${PEER_BORROW_AUDIT:-0}
 dual=aa6889e773c57ff737fd5ddec75307613d8949dc
 dual_archive="$area/li-window-five.gv5LRE"
 extra=()
-if [[ $borrow_audit == 1 ]]; then
+li_only=e308c913d10a77117665cb53ad7b56412ee6dc00
+combined=20915a78b682378ea60889afbcd14b9a21123913
+borrow_reference="$dual_archive"
+if [[ $native == "$combined" ]]; then
+    borrow_reference="$area/li-last-window-borrow.Y6UxRP"
+    if [[ $availability != 0 || ! -r "$borrow_reference/candidate.txt" ||
+          $(<"$borrow_reference/candidate.txt") != "$li_only" ||
+          ! -r "$borrow_reference/physical_npu.txt" || $(<"$borrow_reference/physical_npu.txt") != 4 ]]; then
+        echo "Expected B24 NPU4 measured LI-only archive at $borrow_reference" >&2
+        exit 1
+    fi
+    borrow_audit=1
+    extra=(--borrow-audit)
+    prefix=li-borrow-four-batch
+    arm_label=li_borrow_four_batch
+elif [[ $borrow_audit == 1 ]]; then
     if [[ $availability != 0 || $native != e308c913d10a77117665cb53ad7b56412ee6dc00 ||
           ! -r "$dual_archive/candidate.txt" || $(<"$dual_archive/candidate.txt") != "$dual" ||
           ! -r "$dual_archive/physical_npu.txt" || $(<"$dual_archive/physical_npu.txt") != 4 ]]; then
@@ -128,8 +143,8 @@ archive_for() {
 }
 for group in "${groups[@]}"; do
     archive=$(archive_for "$group")
-    if [[ $borrow_audit == 1 && ! -s "$dual_archive/g$group/li-window/thp.json" ]]; then
-        echo "Missing dual-cut G$group archive at $dual_archive" >&2
+    if [[ $borrow_audit == 1 && ! -s "$borrow_reference/g$group/li-window/thp.json" ]]; then
+        echo "Missing G$group comparison archive at $borrow_reference" >&2
         exit 1
     fi
     if [[ $native != "$main_rev" && ! -s "$reference/g$group/mainline/thp.json" ]]; then
@@ -232,7 +247,7 @@ run_group() (
     else
         "$PYTHON" -B "$support/li_window_report.py" group "$out" "$group" "$archive" "$reference" | tee -a "$out/summary.txt"
         if [[ $borrow_audit == 1 ]]; then
-            "$PYTHON" -B "$support/borrow_report.py" "$out" "$group" "$archive" "$dual_archive" | tee -a "$out/summary.txt"
+            "$PYTHON" -B "$support/borrow_report.py" "$out" "$group" "$archive" "$borrow_reference" | tee -a "$out/summary.txt"
         fi
     fi
 )
@@ -276,7 +291,14 @@ if [[ $borrow_audit == 1 ]]; then
                 "$path/mainline_checks.json" "$path/score_topk_check.json" "$path/terminal_only/score_topk_check.json"
                 "$path/diagnose/round-1/full_attribution.json" "g$g/li-window/thp.json")
     done
-    tar -C "$out" -czf "$out/last-window-borrow.tar.gz" "${files[@]}"
-    echo "RETURN_FILE=$out/last-window-borrow.tar.gz"
+    package=last-window-borrow
+    if [[ $native == "$combined" ]]; then
+        package=li-borrow-four-batch
+        for g in "${groups[@]}"; do
+            files+=("g$g/li-window/results/mainline/cases/diagnose/fused/final_cq_checks.json")
+        done
+    fi
+    tar -C "$out" -czf "$out/$package.tar.gz" "${files[@]}"
+    echo "RETURN_FILE=$out/$package.tar.gz"
 fi
 echo "REPLAY_COMPLETE RESULT_ROOT=$out"

@@ -114,10 +114,12 @@ def worker(args):
     label_pattern = re.compile(r'(measured|detail)/input(\d+)/round1$')
 
     borrow_calls = {'measured': {}, 'detail': {}}
+    cq_calls = {'measured': {}, 'detail': {}}
     detail_ids = {}
     mailboxes = set()
     if args.borrow_audit:
         import last_window_borrow as borrow
+        from terminal_batch_checks import audit_queues
 
         class BorrowForward(ex.StreamingForward):
             def set_diagnostics(self, enabled):
@@ -152,7 +154,7 @@ def worker(args):
                     raise ValueError('The independent calls unexpectedly share a window mailbox')
                 mailboxes.add(address)
                 if lib not in library_paths:
-                    borrow.check_device(lib)
+                    borrow.check_device(lib, args.revision)
             library_paths.add(lib)
 
         def validate_index(self, sample, output):
@@ -164,6 +166,8 @@ def worker(args):
                     raise ValueError(f'Repeated normal LI mailbox: {phase}/{call}')
                 borrow_calls[phase][call] = borrow.decode_mailbox(
                     self.rotating.rank_progress.cpu().numpy(), self.resident, self.history)
+                if args.revision == borrow.COMBINED:
+                    cq_calls[phase][call] = audit_queues(self.forward.terminal, self.rotating)
             if current and current[1] == 'detail':
                 call = int(current[2])
                 if call in ordered:
@@ -263,10 +267,15 @@ def worker(args):
         if len(mailboxes) < CALLS:
             raise ValueError('Missing independent window mailbox storage')
         atomic_json(fused/'borrow_checks.json', dict(
-            device_text_sha256=borrow.check_device(library),
+            device_text_sha256=borrow.check_device(library, args.revision),
             measured=borrow.summarize(borrow_calls['measured']),
             terminal_only=borrow.summarize(borrow_calls['detail']),
             calls={phase: [values[i] for i in range(CALLS)] for phase, values in borrow_calls.items()}))
+        if args.revision == borrow.COMBINED:
+            if any(set(calls) != set(range(CALLS)) for calls in cq_calls.values()):
+                raise ValueError('Incomplete per-query final CQ receipts')
+            atomic_json(fused/'final_cq_checks.json',
+                        {phase: [calls[i] for i in range(CALLS)] for phase, calls in cq_calls.items()})
         if set(detail_ids) != set(range(CALLS)):
             raise ValueError('Incomplete terminal-only TopK results')
         np.save(fused/'terminal_only_ids.npy', np.stack([detail_ids[i] for i in range(CALLS)]), allow_pickle=False)
