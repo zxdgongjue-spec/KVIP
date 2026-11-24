@@ -11,6 +11,11 @@ if(NOT EXISTS "${KVAF_INCLUDE}/kvaf_batch_get_device.h")
 endif()
 set(KVIP_FUSE_QUERY_WORK ON)
 option(KVIP_SERVICE_LOCAL_COUNTS "Reuse same-core TopK counts in the rotating Service" OFF)
+option(KVIP_SERVICE_UB_CANDIDATES "Keep a native P2 Service row's compact candidates in its AIV UB" OFF)
+set(KVIP_SERVICE_POST_CHUNK 0 CACHE STRING "Service WQEs per early doorbell (0 or 64)")
+if(NOT KVIP_SERVICE_POST_CHUNK MATCHES "^(0|64)$")
+  message(FATAL_ERROR "KVIP_SERVICE_POST_CHUNK must be 0 or 64")
+endif()
 option(KVIP_STAGE_TRACE "Enable A5 LIFetch profiling markers" OFF)
 option(KVIP_HOT_SCORE_PARTITION "Build the experimental dense Hot Score entry" OFF)
 include(${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
@@ -27,6 +32,8 @@ ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WO
   -mllvm -user-reserved-ub-size=223232 -DV9_USER_UB_BYTES=223232
   -DV9_PARTIAL_SCAN_SIMD=1 -DV9_PROBE_EPOCH=0 -DV9_INTERMEDIATE_PROFILING=0
   -DKVIP_STAGE_TRACE=$<BOOL:${KVIP_STAGE_TRACE}>
+  -DKVIP_SERVICE_UB_CANDIDATES=$<BOOL:${KVIP_SERVICE_UB_CANDIDATES}>
+  -DKVIP_SERVICE_POST_CHUNK=${KVIP_SERVICE_POST_CHUNK}
   -DKVIP_SERVICE_LOCAL_COUNTS=$<BOOL:${KVIP_SERVICE_LOCAL_COUNTS}>
   -DKVIP_HOT_SCORE_PARTITION=$<BOOL:${KVIP_HOT_SCORE_PARTITION}>
   -DV9_BATCH_POST=2 -DSIM_Q=4 -DSIM_CAPTURE_HITS=1 -DV9_SIMULATION=0 -DROTATION_PUBLISH_TILES=1)

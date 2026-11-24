@@ -71,6 +71,12 @@ __aicore__ inline kvip_trace::ScanSample RankSample(uint32_t query) const {
         kvip_trace::PipeDetail(query / 4, query % 4)};
 }
 #endif
+#if KVIP_SERVICE_UB_CANDIDATES
+TBuf<TPosition::VECCALC> windowCandidatesBuf_;
+LocalTensor<uint32_t> windowCandidates_;
+bool windowCandidatesAllocated_ = false;
+bool windowCandidatesActive_ = false;
+#endif
 __aicore__ inline void ExportWindowCold(uint32_t query) {
     // Even a window with zero newly compacted scores exports the saved TopK.
     // Its output bank may still feed the preceding Q's asynchronous DMA.
@@ -134,6 +140,16 @@ __aicore__ inline void ExportWindowCold(uint32_t query) {
 #else
     if(count) {
         GlobalTensor<uint32_t> jobs;jobs.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048);
+#endif
+#if KVIP_SERVICE_UB_CANDIDATES
+        if (windowCandidatesActive_) {
+            // Keep the original per-Q candidates and their enumeration order.
+            // Only this AIV consumes the compact IDs, before leaving the window.
+            DataCopy(windowCandidates_[(query % 4) * rotating::kWindowCandidatePitch],
+                compact, (count + 7) / 8 * 8);
+            PipeBarrier<PIPE_V>();
+            return;
+        }
 #endif
         KVIP_RANK_SAMPLE(outputScope, pipeSample, WindowOutputMte3, TerminalTopKMte3);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
@@ -604,6 +620,19 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     }
     uint32_t cap=half?rotating::SequenceWindowEnd(runtimeShape_.history,runtimeShape_.resident,half,epoch):
         rotating::Trigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,epoch)*128;
+#if KVIP_SERVICE_UB_CANDIDATES
+    // Fall back for a sparse/not-yet-ready row. The GM path can legitimately
+    // retain a skipped Q's old count and IDs, which the private arena lacks.
+    windowCandidatesActive_ = windowCandidatesAllocated_ && half != 0
+        && ownedQueries == 4 && stagedMetadata && ctx->windowLimit <= 4 * rotating::kWindowCandidatePitch;
+    if (windowCandidatesActive_) {
+        for (uint32_t q = 0; q < 4; ++q) {
+            if (!incrementalMetadata_.GetValue(q * 16) ||
+                Min(uint32_t(incrementalMetadata_.GetValue(q * 16 + 4)), cap) < runtimeShape_.resident)
+                windowCandidatesActive_ = false;
+        }
+    }
+#endif
     for(uint32_t b=lane;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes) for(uint32_t q=0;q<4;++q) {
         // Init clears covered; the posting path records every admission in
         // requests. The predecessor fence makes the row and bitmap visible.

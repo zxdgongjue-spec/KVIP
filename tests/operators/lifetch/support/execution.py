@@ -3859,7 +3859,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                                   streaming_cycles=state.forward.diagnostic_cycles())
                     if getattr(state.forward, 'terminal', None) is not None:
                         sample['algorithm'] = algorithm_after(state.rotating, detail_before[i],
-                            admissions=state.forward.events_src.cpu().numpy())
+                            admissions=state.forward.events_src.cpu().numpy(),
+                            audit_posts=hasattr(config, 'service_post_chunk'))
                     if hasattr(state.rotating, 'rank_progress'):
                         records = state.rotating.rank_progress.cpu().tolist()
                         bounds = state.rotating.query_ends.cpu().tolist()
@@ -3949,6 +3950,10 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     hot_partition = getattr(config, 'mr25_hot_partition', None)
     cold_partition = getattr(config, 'mr25_cold_partition', None)
     unified_score = getattr(config, 'mr28_unified_score', None)
+    prefetch_trial = handoff in ('baseline', 'ub', 'batch') and hasattr(config, 'service_post_chunk')
+    ub_candidates = getattr(config, 'service_ub_candidates', False)
+    post_chunk = getattr(config, 'service_post_chunk', 0)
+
     baseline_trace = getattr(config, 'msprof_baseline', False)
     instruction_replay = getattr(config, 'msprof_instruction_replay', False)
     profile_replay = baseline_trace or instruction_replay
@@ -4039,7 +4044,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
 
                     library = build_library(config.handoff_build_dir, cann, headers, soc,
                                             local_counts=handoff == 'local_counts' or partition_trial,
-                                            hot_partition=score_trial)
+                                            hot_partition=score_trial, ub_candidates=ub_candidates,
+                                            post_chunk=post_chunk)
                 else:
                     (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers, soc=soc)
             else:
@@ -4182,10 +4188,13 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 result['handoff_route'] = dict(mode=handoff, library=str(library), soc=soc, effective_aic=aics,
                                               score_parts=2, score_blocks=shape.liCores, windows=shape.rounds,
                                               service_lanes=shape.serviceLanes, terminal_tasks=4 * g['batch'])
-                if score_trial:
+                if score_trial or prefetch_trial:
                     with Path(library).open('rb') as binary:
                         binary_sha = hashlib.file_digest(binary, 'sha256').hexdigest()
                     result['handoff_route'].update(library_sha256=binary_sha, local_counts=partition_trial)
+                if prefetch_trial:
+                    result['handoff_route'].update(service_ub_candidates=ub_candidates,
+                                                   service_post_chunk=post_chunk)
                 if partition_trial:
                     hot_parts, cold_parts = score_parts
                     result['handoff_route'].update(hot_score_parts=hot_parts,
@@ -4589,7 +4598,8 @@ class StreamingForward(LIFetchForward):
                     incremental_cycles=(int(event[14])-int(event[13])
                         if not ubmem and int(event[13]) and int(event[14]) >= int(event[13]) else None),
                     scan_cycles=int(event[5]), candidate_cycles=int(event[6]), post_cycles=int(event[7]),
-                    bitmap_bytes=int(event[8]), candidate_count=int(event[9]), posted_count=int(event[10])))
+                    bitmap_bytes=int(event[8]) if ubmem else int(event[8]) & 0xffffffff,
+                    candidate_count=int(event[9]), posted_count=int(event[10])))
             result[0]['prefetch_services'] = services
             first = events[:, 0 if ubmem else 11]
             last = events[:, 1 if ubmem else 12]

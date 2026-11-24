@@ -161,10 +161,16 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
 #else
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow,
             streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U)
-#if !V9_UBMEM && KVIP_SERVICE_LOCAL_COUNTS
+#if !V9_UBMEM
+#if KVIP_SERVICE_LOCAL_COUNTS
             , windowMetadata
-#elif KVIP_STAGE_TRACE && !V9_UBMEM
+#else
             , nullptr
+#endif
+#if KVIP_SERVICE_UB_CANDIDATES
+            , windowCandidatesActive_
+                ? reinterpret_cast<const __ubuf__ uint32_t*>(windowCandidates_.GetPhyAddr()) : nullptr
+#endif
 #endif
 #if KVIP_STAGE_TRACE && !V9_UBMEM
             , stageTrace
@@ -590,6 +596,15 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe, bool topkOnly)
         uint32_t used=2*CeilDiv(constInfo_.mBaseSize,2)*s2BaseSize_*sizeof(QK_T)+1536+6*CeilDiv(s1BaseSize_,2)*UB_BANK_DEPTH_STRIDE+2*s2BaseSize_*QLICommon::KScaleTiles*sizeof(SCALE_T)+2*CeilDiv(s1BaseSize_,2)*s2BaseSize_*sizeof(SCORE_T)+(topkCountAlign256_+trunkLen_)*sizeof(SCORE_T)+(topkCountAlign256_+64)*4+topkCountAlign256_*sizeof(SCORE_T)+topkSharedTmpSize+trunkLen_*2+8192+1024;
         incrementalPipeline_=used+kIncrementalInputBytes<=223232;
         if(incrementalPipeline_){pipe->InitBuffer(incrementalInputBuf_,kIncrementalInputBytes);incrementalInput_=incrementalInputBuf_.Get<uint16_t>();}
+#if KVIP_SERVICE_UB_CANDIDATES
+        constexpr uint32_t candidateBytes = 4 * rotating::kWindowCandidatePitch * sizeof(uint32_t);
+        if (used + (incrementalPipeline_ ? kIncrementalInputBytes : 0) +
+                candidateBytes <= 223232) {
+            pipe->InitBuffer(windowCandidatesBuf_, candidateBytes);
+            windowCandidates_ = windowCandidatesBuf_.Get<uint32_t>();
+            windowCandidatesAllocated_ = true;
+        }
+#endif
     }
 #endif
     if (!topkOnly) Duplicate(kScaleUB_, static_cast<SCALE_T>(0), 2 * s2BaseSize_ * QLICommon::KScaleTiles);

@@ -1,0 +1,4 @@
+arm,epochs_verified,rows_per_epoch,posted_per_row,duplicate_wqe,repeat_window_posted,doorbells_per_row,pending_cqe_per_row,first_from_service_ticks_mean,last_from_service_ticks_mean,service_ticks_mean,process_exit,first_from_service_ticks_delta_pct,last_from_service_ticks_delta_pct,service_ticks_delta_pct
+base,2,2,88,0,0,1,1,19372.5,19406.5,20895.5,124,0.0,0.0,0.0
+ub,2,2,88,0,0,1,1,18338.5,18761.5,19175.5,134,-5.34,-3.32,-8.23
+batch,2,2,88,0,0,2,1,18285,22496,23170.5,134,-5.61,15.92,10.89
