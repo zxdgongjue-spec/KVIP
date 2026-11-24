@@ -18,19 +18,16 @@ __aicore__ inline void CommitTerminalPost(
     post->head=initialHead;
     if(!count)return;
     auto entity=reinterpret_cast<const __gm__ KvafBatchGetDirectUrmaEntity*>(args->channel_entity);
-    // FinalBuild requests a completion only on the last WQE. One posted batch
-    // therefore consumes one CQE, not count CQEs.
+    // The last WQE in each published prefix requests its one completion.
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
     kvaf_device::PendingPost pending{entity->sq_db_va,args->queue_state,initialHead+count,0U};
     kvaf_device::CommitPostScalarStage(&pending);
     post->pending=1;
 }
 
-__aicore__ inline uint64_t CompleteTerminalPost(
-    const __gm__ KvafExecuteBatchGetKernelArgs* args, __gm__ FinalPost* post) {
-    auto entity=reinterpret_cast<const __gm__ KvafBatchGetDirectUrmaEntity*>(args->channel_entity);
-    auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args->queue_state);
-    auto result=DrainQueue(entity,queue,post->pending);
+__aicore__ inline uint64_t FinishTerminalCompletion(
+    const __gm__ KvafExecuteBatchGetKernelArgs* args, __gm__ FinalPost* post,
+    __gm__ KvafBatchGetQueueState* queue, CqDrainResult result) {
     post->error=uint32_t(result.error);
     if(!result.error)post->pending=0;
     if(result.error)queue->last_error=result.error;
@@ -41,5 +38,38 @@ __aicore__ inline uint64_t CompleteTerminalPost(
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
     return result.error;
+}
+
+__aicore__ inline uint64_t CompleteTerminalPost(
+    const __gm__ KvafExecuteBatchGetKernelArgs* args, __gm__ FinalPost* post) {
+    auto entity=reinterpret_cast<const __gm__ KvafBatchGetDirectUrmaEntity*>(args->channel_entity);
+    auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args->queue_state);
+    auto result=DrainQueue(entity,queue,post->pending);
+    return FinishTerminalCompletion(args,post,queue,result);
+}
+
+// Every Q is the sole producer and consumer of its private queues. Grant the
+// next prefix only after a successful CQE for the preceding prefix.
+__aicore__ inline uint64_t CompleteTerminalBatches(
+    const __gm__ KvafExecuteBatchGetKernelArgs* args, __gm__ FinalPost* post,
+    const terminal_batches::Plan& plan, uint64_t initialHead) {
+    auto entity=reinterpret_cast<const __gm__ KvafBatchGetDirectUrmaEntity*>(args->channel_entity);
+    auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args->queue_state);
+    uint32_t completed=0;
+    for(uint32_t batch=0;batch<plan.count;++batch){
+        auto result=DrainQueue(entity,queue,1);
+        completed+=result.completed;
+        if(result.error || batch+1==plan.count){
+            result.completed=completed;
+            return FinishTerminalCompletion(args,post,queue,result);
+        }
+        uint32_t next=plan.ends[batch+1];
+        // SQ descriptors and checkpoint bits were written before the first post.
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        kvaf_device::PendingPost pending{entity->sq_db_va,args->queue_state,initialHead+next,0U};
+        kvaf_device::CommitPostScalarStage(&pending);
+        post->count=next;
+    }
+    return kvaf_device::kInvalidArgs;
 }
 #endif
