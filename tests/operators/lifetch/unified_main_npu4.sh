@@ -118,7 +118,20 @@ run_group() (
     arm="$out/g$g/mainline"
     mkdir -p "$arm"
     trace=$(bash "$entry/peer_g2_input.sh" "$work" "$g")
-    node=$("$PYTHON" -B "$support/li_window_report.py" numa "$area/main-five.hF6qQ8/g$g/mainline/thp.json")
+    placement="$area/main-five.hF6qQ8/g$g/mainline/thp.json"
+    node=$("$PYTHON" -B "$support/li_window_report.py" numa "$placement")
+    # The new SDK opens separate Put and Get sessions over one allocation.
+    # Select the actual archive HCA for both before measuring that allocation.
+    ub_device=$("$PYTHON" -B - "$placement" <<'PY_DEVICE'
+import json, sys
+with open(sys.argv[1]) as src:
+    info = json.load(src)
+name = info.get('ub_device')
+if info.get('status') != 'measured' or not isinstance(name, str) or not name:
+    raise SystemExit(f'Archive lacks a measured CPU URMA device: {sys.argv[1]}')
+print(name)
+PY_DEVICE
+    )
     command=("$cpu")
     if [[ -n "$node" ]]; then
         if command -v numactl >/dev/null && numactl "--membind=$node" true >/dev/null 2>&1; then
@@ -129,7 +142,7 @@ run_group() (
         fi
     fi
     port=$("$PYTHON" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
-    "${command[@]}" --listen 127.0.0.1 --port "$port" --memory-page-mode thp >"$arm/cpu.log" 2>&1 &
+    "${command[@]}" --listen 127.0.0.1 --port "$port" --ub-device "$ub_device" --memory-page-mode thp >"$arm/cpu.log" 2>&1 &
     server=$!
     monitor=
     cleanup() {
