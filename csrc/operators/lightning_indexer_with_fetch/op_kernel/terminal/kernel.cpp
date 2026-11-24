@@ -223,14 +223,28 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
   pipe.InitBuffer(parallelScratch,kParallelIndexWords*sizeof(uint32_t));
   auto parallelLocal=parallelScratch.Get<uint32_t>();
   work=reinterpret_cast<__ubuf__ uint32_t*>(parallelLocal.GetPhyAddr());
-  Simt::VF_CALL<ApplyParallelIndex>(Simt::Dim3{512,1,1},allSources,dst-first,total,
+  if(total>kSmallIndexChanges){
+  const uint64_t snapshotChanges=s.resident<rotating::kChangeCapacity?s.resident:rotating::kChangeCapacity;
+  const uint64_t snapshotWords=snapshotChanges*2*kSnapshotWordsPerRow;
+  const uint64_t snapshotStride=uint64_t(s.history)*3>snapshotWords?uint64_t(s.history)*3:snapshotWords;
+  Simt::VF_CALL<ApplyParallelIndex<true>>(Simt::Dim3{512,1,1},allSources,dst-first,total,
    s.resident,s.history,q,1U,
    reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*s.history*16,
    reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*s.history,
    reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride,
    reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history,
    reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*s.resident,
-   flags,ctx->reservedHot?reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+uint64_t(b)*s.resident:nullptr,work);
+   flags,ctx->reservedHot?reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+uint64_t(b)*s.resident:nullptr,work,reinterpret_cast<__gm__ uint64_t*>(a->denseShadow)+uint64_t(b)*snapshotStride);
+  }else{
+  Simt::VF_CALL<ApplyParallelIndex<false>>(Simt::Dim3{512,1,1},allSources,dst-first,total,
+   s.resident,s.history,q,1U,
+   reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*s.history*16,
+   reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*s.history,
+   reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride,
+   reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history,
+   reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*s.resident,
+   flags,ctx->reservedHot?reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+uint64_t(b)*s.resident:nullptr,work,static_cast<__gm__ uint64_t*>(nullptr));
+  }
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   indexError=parallelLocal.GetValue(0);
   // Retirement is shared with the normal path; skip the already applied swap.

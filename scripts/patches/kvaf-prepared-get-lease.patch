@@ -1,0 +1,57 @@
+diff --git a/runtime/execution/execution_dispatcher.cc b/runtime/execution/execution_dispatcher.cc
+index afba4115..5e2bba16 100644
+--- a/runtime/execution/execution_dispatcher.cc
++++ b/runtime/execution/execution_dispatcher.cc
+@@ -871,23 +871,24 @@ Status ExecutionDispatcher::BeginGetGraph(GetExecutionConfig c, const GetGraphOp
+ Status ExecutionDispatcher::GetGraphUrmaResources(std::uint64_t id, std::uint64_t* out) {
+   std::shared_lock<std::shared_mutex> life(lifecycle_);
+   std::lock_guard<std::mutex> lock(get_mutex_);
+-  GetGraphNode* node = nullptr;
+-  auto status = FindGraphNode(nullptr, id, &node);
+-  if (!status.ok()) return status;
+-  if (!node || node->ending)
+-    return Status::InvalidArgument("a live Get graph lease is required");
+-  return WithGraphNode(*node, [&](GetResourceView view) {
++  const auto it = graph_nodes_.find(id);
++  if (it == graph_nodes_.end()) return Status::NotFound("Get graph lease not found");
++  auto& node = it->second;
++  if (node.ending || node.instance->graph_recovery_required)
++    return Status::InvalidState("Get graph resources are being retired");
++  return WithGraphNode(node, [&](GetResourceView view) {
+     return view.operation()->GetPreparedGraphUrmaResources(out);
+   });
+ }
+ Status ExecutionDispatcher::GetGraphMappedBase(std::uint64_t id, std::uint64_t* base) {
+   std::shared_lock<std::shared_mutex> life(lifecycle_);
+   std::lock_guard<std::mutex> lock(get_mutex_);
+-  GetGraphNode* node = nullptr;
+-  auto status = FindGraphNode(nullptr, id, &node);
+-  if (!status.ok()) return status;
+-  if (!node || node->ending) return Status::InvalidArgument("a live Get graph lease is required");
+-  return WithGraphNode(*node, [&](GetResourceView view) {
++  const auto it = graph_nodes_.find(id);
++  if (it == graph_nodes_.end()) return Status::NotFound("Get graph lease not found");
++  auto& node = it->second;
++  if (node.ending || node.instance->graph_recovery_required)
++    return Status::InvalidState("Get graph resources are being retired");
++  return WithGraphNode(node, [&](GetResourceView view) {
+     return view.operation()->GetPreparedGraphMappedBase(base);
+   });
+ }
+diff --git a/runtime/include/session_access_operator.h b/runtime/include/session_access_operator.h
+index 602ab1bd..570a1cd3 100644
+--- a/runtime/include/session_access_operator.h
++++ b/runtime/include/session_access_operator.h
+@@ -38,6 +38,12 @@ class SessionAccessOperator final : public AccessOperator {
+     if (!r.request_capacity) return Status::InvalidArgument("graph capacity must be positive");
+     return s.ok() ? resources_->operation()->PrepareGetGraph(r) : s;
+   }
++  Status GetPreparedGraphUrmaResources(std::uint64_t* out) override {
++    return resources_->operation()->GetPreparedGraphUrmaResources(out);
++  }
++  Status GetPreparedGraphMappedBase(std::uint64_t* base) override {
++    return resources_->operation()->GetPreparedGraphMappedBase(base);
++  }
+   Status FinishGetGraph(void* stream, bool discard) override {
+     return resources_->operation()->FinishGetGraph(stream, discard);
+   }

@@ -70,7 +70,10 @@ class StreamingLIFetchForward:
         self.times = allocate("times", (b * 256 + (self.resolver_cores * b + 4 * q_workers) * 32,), torch.int64, True)
         self.query_bitmaps = allocate("query_bitmaps", (b, 4, (self.resident + 31) // 32), torch.int32)
         self.query_errors = allocate("query_errors", (b, 4, 32), torch.int32, True)
-        self.dense_shadow = allocate("dense_shadow", (b, 3 * self.history), torch.int64)
+        # Large overlapping Index updates snapshot at most two rows per change.
+        # Each row holds 16 key words, one scale, one address and one logical ID.
+        index_snapshot_words = 2 * min(self.resident, 10240) * 19
+        self.dense_shadow = allocate("dense_shadow", (b, max(3 * self.history, index_snapshot_words)), torch.int64)
         self.packed_fetch = allocate(
             "packed_fetch", (4 * q_workers, 9 * b * 2048 + ((3 * b + 31) // 32) * 32 + 64), torch.int32
         )

@@ -1334,18 +1334,28 @@ def account_native(events, name, elapsed):
     aliases = {
         'li': ('quantlightningindexer',),
         'lidu_prepare': ('a5lidufusedbatchgetpreparemtp',),
-        'fetch': ('kvafexecutebatchgetaivkernelv2',),
+        'fetch': (
+            'kvafexecutebatchgetaivkernelv3',
+            'kvafexecutebatchgetubmemkernelv2',
+            'kvafexecutebatchgetaivkernelv2',
+        ),
     }
     for event in events:
-        if event.get('ph') != 'X' or (event.get('cat') and 'kernel' not in event['cat'].lower()):
+        if event.get('ph') != 'X':
             continue
+        category = (event.get('cat') or '').lower()
+        normalized = re.sub('[^a-z0-9]', '', event.get('name', '').lower())
+        stage = next((stage for stage, names in aliases.items()
+                      if any(normalized.startswith(prefix) for prefix in names)), None)
+        if category and 'kernel' not in category:
+            # The dynamically loaded Get can appear under the device task
+            # category instead of the kernel category used by torch ops.
+            if stage != 'fetch' or any(tag in category for tag in ('cpu', 'python', 'runtime')):
+                continue
         begin = float(Decimal(str(event['ts'])) - origin)
         end = begin + float(event.get('dur', 0))
         if begin < 0 or end > float(scope['dur']):
             continue
-        normalized = re.sub('[^a-z0-9]', '', event.get('name', '').lower())
-        stage = next((stage for stage, names in aliases.items()
-                      if any(normalized.startswith(prefix) for prefix in names)), None)
         if stage is None:
             if not event.get('cat'):
                 continue  # Untagged CPU scopes are not evidence of device execution.

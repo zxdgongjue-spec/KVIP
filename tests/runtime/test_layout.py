@@ -594,3 +594,48 @@ def test_diagnostic_legacy_tables_and_source_rounds_remain_separate():
     assert len(rows) == 2
     assert "10.00" in rows[0] and "90.00" in rows[1]
     assert all("| -" in r for r in rows)  # One sample per source round; no fabricated quantiles.
+
+
+def test_large_index_snapshot_workspace_is_sized_and_bound_per_request(monkeypatch):
+    from types import SimpleNamespace
+
+    import torch
+
+    from kvip.operators.lifetch.streaming import StreamingLIFetchForward
+    from kvip.operators.lifetch.tiling import RuntimeShape
+
+    # Older CPU-only PyTorch lacks uint64; host pointers fit signed int64 here.
+    if not hasattr(torch, "uint64"):
+        monkeypatch.setattr(torch, "uint64", torch.int64, raising=False)
+
+    library = SimpleNamespace(
+        kvip_streaming_resolver_cores=lambda: 3,
+        kvip_streaming_flag_count=lambda: 16,
+        kvip_lifetch_streaming_forward=lambda *args: 0,
+    )
+    # Short histories previously reserved too little space for a full snapshot;
+    # 128K must reuse the already larger allocation without growing it.
+    for history, resident in ((8192, 4096), (131328, 16384)):
+        device = torch.device("cpu")
+        dummy = torch.zeros(1, dtype=torch.int64)
+        rotating = SimpleNamespace(
+            device=device,
+            runtime_shape=RuntimeShape(
+                batch=2, history=history, resident=resident, indexHeads=32, aicCount=32, finalWorkers=4
+            ),
+            library=library,
+            context=torch.zeros(352, dtype=torch.uint8),
+            hot_valid=torch.zeros((2, resident), dtype=torch.int32),
+            arguments=[dummy] * 15,
+            lease=object(),
+        )
+        update = SimpleNamespace(device=device, bindings=torch.zeros(28, dtype=torch.int64), storage=[dummy] * 4)
+        forward = StreamingLIFetchForward(rotating, update, torch, 1024, fused_final=True, q_workers=1)
+        scratch = forward.dense_shadow
+        assert scratch.shape == (2, max(history * 3, min(resident, 10240) * 2 * 19))
+        assert scratch.stride(0) >= min(resident, 10240) * 2 * 19
+        assert forward.workspace.view(torch.int64)[16].item() == scratch.data_ptr()
+        scratch[0].fill_(11)
+        scratch[1].fill_(22)
+        assert scratch[0, -1].item() == 11
+        assert scratch[1, 0].item() == 22

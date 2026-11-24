@@ -88,6 +88,12 @@ class GetLaunch:
             raise RuntimeError(f"Leased BatchGet launch failed: {code}")
 
 
+def _require_fused_runtime(runtime, transport, methods):
+    missing = [method for method in methods if not callable(getattr(runtime, method, None))]
+    if missing:
+        raise RuntimeError(f"KVIP {transport} fused Get requires KVAF bindings: {', '.join(missing)}")
+
+
 class KvafGetLease(StreamLease):
     """Setup/teardown owner, not a second Runtime or DDR allocation.
 
@@ -97,6 +103,7 @@ class KvafGetLease(StreamLease):
     """
 
     def __init__(self, torch, runtime, library, output, stream):
+        _require_fused_runtime(runtime, "URMA", ("get_graph_urma_resources",))
         self.torch, self.runtime, self.stream = torch, runtime, stream
         self.library = load_lifetch_library(library)
         self.sizes = {}
@@ -108,13 +115,30 @@ class KvafGetLease(StreamLease):
         self.pack.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint32]
         self.pack.restype = ctypes.c_uint32
         self.native_library, self.get = load_native_get(runtime)
-        self.context = runtime.acquire_fused_batch_get_context(output, stream)
+        self.context = self._bind_output(output)
         self.device = output.device
         self.outputs = {self.output_key(output): (output, self.context)}
         self.plans = []
         self.closed = False
         self.capturing_startup = False
         self.capture_fence_failed = False
+
+    def _bind_output(self, output):
+        import kvaf
+
+        execution = kvaf.GetExecutionConfig("urma", "aiv", "direct")
+        lease_id = self.runtime.begin_get_graph(execution, output, 1, self.stream)
+        try:
+            view = self.runtime.get_graph_urma_resources(lease_id)
+            return dict(
+                view, lease_id=lease_id,
+                output_bytes=self.output_key(output)[1],
+                token_bytes=self.runtime.batch_get_token_bytes,
+                tokens_per_block=self.runtime.batch_get_tokens_per_block,
+            )
+        except Exception:
+            self.runtime.end_get_graph(lease_id, self.stream, discard_result=True)
+            raise
 
     def check_stream(self):
         if self.closed:
@@ -128,7 +152,7 @@ class KvafGetLease(StreamLease):
         self.check_stream()
         key = self.output_key(output)
         if key not in self.outputs:
-            view = self.runtime.register_fused_batch_get_output(self.context, output)
+            view = self._bind_output(output)
             self.outputs[key] = output, view
         return self.outputs[key][1]
 
@@ -186,7 +210,12 @@ class KvafGetLease(StreamLease):
                 raise RuntimeError("Fused capture stream completion failed; transport remains retained")
             # Native release fences this stream and validates persistent queue
             # status. On failure keep every tensor and registration alive.
-            self.runtime.release_fused_batch_get_context(self.context, self.stream)
+            self.torch.npu.synchronize(self.device)
+            while self.outputs:
+                key = next(reversed(self.outputs))
+                _, context = self.outputs[key]
+                self.runtime.end_get_graph(context["lease_id"], self.stream, discard_result=True)
+                del self.outputs[key]
             self.closed = True
             self.plans.clear()
             self.outputs.clear()
@@ -256,22 +285,48 @@ class UbmemLease(StreamLease):
     capture_scope_name = "UBmem"
 
     def __init__(self, torch, runtime, output, stream):
-        if runtime.transport != "ubmem":
-            raise ValueError("UBmem fusion requires a UBmem KVAF runtime")
+        _require_fused_runtime(runtime, "UBmem", ("get_graph_mapped_base",))
         self.torch, self.runtime, self.device, self.stream = torch, runtime, output.device, stream
-        self.context = runtime.acquire_ubmem_fused_context(output, stream)
+        import kvaf
+
+        execution = kvaf.GetExecutionConfig("ubmem", "aiv", "direct")
+        region = runtime.remote_region
+        lease_id = runtime.begin_get_graph(execution, output, 1, stream)
+        try:
+            self.context = {
+                "abi_version": 1,
+                "device_id": runtime.device_id,
+                "output_address": output.data_ptr(),
+                "output_bytes": self.output_key(output)[1],
+                "region_base": region["base"],
+                "mapped_base": runtime.get_graph_mapped_base(lease_id),
+                "region_bytes": region["length"],
+                "slot_bytes": region["slot_size"],
+                "token_bytes": runtime.batch_get_token_bytes,
+                "tokens_per_block": runtime.batch_get_tokens_per_block,
+                "lease_id": lease_id,
+            }
+        except Exception:
+            runtime.end_get_graph(lease_id, stream, discard_result=True)
+            raise
         self.closed = self.capturing_startup = self.capture_fence_failed = False
         self.outputs = {self.output_key(output): (output, self.context)}
         self.bindings = []
         self.graphs = []
+        self.tables = {}
         try:
             self._validate(self.context, output)
         except Exception:
             # No work has been submitted. Release the native lease even if
             # the returned descriptor is incompatible with this adapter.
-            self.runtime.release_ubmem_fused_context(self.context, self.stream)
+            self._release_context()
             self.closed = True
             raise
+
+    def _release_context(self):
+        # Fused kernels can replay on a different stream from setup.
+        self.torch.npu.synchronize(self.device)
+        self.runtime.end_get_graph(self.context["lease_id"], self.stream, discard_result=True)
 
     def _validate(self, context, output):
         if context["abi_version"] != 1 or context["device_id"] != self.device.index:
@@ -305,18 +360,24 @@ class UbmemLease(StreamLease):
         self.check_stream()
         key = self.output_key(output)
         if key not in self.outputs:
-            context = self.runtime.register_ubmem_fused_output(self.context, output)
+            if output.device != self.device or not output.is_contiguous():
+                raise ValueError("UBmem fused output must be contiguous on the lease device")
+            context = dict(self.context, output_address=key[0], output_bytes=key[1])
             self._validate(context, output)
             self.outputs[key] = output, context
         return self.outputs[key][1]
 
     def register_table(self, table):
         self.check_stream()
-        self.runtime.register_ubmem_fused_access_table(self.context, table)
+        # The caller keeps the native access-table handle open until close.
+        # Retain both device tensor views used by the fused graph.
+        addresses, valid = table.addresses, table.valid
+        if addresses.device != self.device or valid.device != self.device:
+            raise ValueError("UBmem fused table must be on the lease device")
+        self.tables[id(table)] = (table, addresses, valid)
 
     def retain_graph(self, graph):
         self.check_stream()
-        self.runtime.retain_ubmem_fused_graph(self.context, graph)
         self.graphs.append(graph)
 
     def region(self, output):
@@ -348,11 +409,12 @@ class UbmemLease(StreamLease):
         if not self.closed:
             if self.capture_fence_failed:
                 raise RuntimeError("UBmem completion is unknown; retain the lease until process exit")
-            self.runtime.release_ubmem_fused_context(self.context, self.stream)
+            self._release_context()
             self.closed = True
             self.bindings.clear()
             self.outputs.clear()
             self.graphs.clear()
+            self.tables.clear()
 
 
 class UbmemLeasedRuntime:

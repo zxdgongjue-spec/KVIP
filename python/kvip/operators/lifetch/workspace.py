@@ -34,7 +34,7 @@ def rotation_spec(batch, history, resident, final, rounds, lanes, status_bytes):
     return spec
 
 class LIFetchWorkspace:
-    def __init__(self, torch, *, batch, history, aics, windows, device, pin_memory=True, index_heads=64):
+    def __init__(self, torch, *, batch, history, aics, windows, device, pin_memory=True, index_heads=64, compute=None):
         if history % 256:
             raise ValueError("Original LIFetch history must align to 256 tokens")
         geometry = tiling_geometry.li_geometry(batch, "auto", windows, aics)
@@ -45,7 +45,7 @@ class LIFetchWorkspace:
         self.dummy = torch.zeros(1, dtype=torch.uint8, device=device)
         self.tail_bounds = torch.zeros((batch, 2), dtype=torch.int32, device=device)
         # These sizes follow the original batch_inputs / prefix-storage ABI.
-        self.compute = torch.empty(
+        self.compute = compute if compute is not None else torch.empty(
             max(16 * 1024 * 1024, geometry["rotating_aic"] * 4 * history * 4 + 1024 * 1024),
             dtype=torch.uint8,
             device=device,
@@ -158,9 +158,9 @@ def ubmem_rotation_spec(batch, history, resident, aics, windows):
     return spec
 
 class UbmemWorkspace(LIFetchWorkspace):
-    def __init__(self, torch, *, batch, history, resident, aics, windows, device, index_heads=64, pin_memory=True):
+    def __init__(self, torch, *, batch, history, resident, aics, windows, device, index_heads=64, pin_memory=True, compute=None):
         super().__init__(torch, batch=batch, history=history, aics=aics, windows=windows,
-                         device=device, index_heads=index_heads, pin_memory=pin_memory)
+                         device=device, index_heads=index_heads, pin_memory=pin_memory, compute=compute)
         self.scratch = {
             name: torch.zeros(size, dtype=getattr(torch, dtype), device=device)
             for name, (size, dtype) in ubmem_rotation_spec(batch, history, resident, aics, windows).items()

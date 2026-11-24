@@ -18,7 +18,10 @@ def kvaf_build_paths(build_dir):
         name, value = line.split("=", 1)
         values[name.split(":", 1)[0]] = value
     cann = Path(values["ASCEND_CANN_PACKAGE_PATH"])
-    headers = Path(values["CMAKE_HOME_DIRECTORY"]) / "access_operator/demo/aiv_batch_get/include"
+    source = Path(values["CMAKE_HOME_DIRECTORY"])
+    headers = source / "access_operator/algorithms/get/direct/urma_aiv/include"
+    if not headers.is_dir():
+        headers = source / "access_operator/demo/aiv_batch_get/include"
     for path in (cann / "compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake", headers / "kvaf_batch_get_device.h"):
         if not path.is_file():
             raise FileNotFoundError(f"LIFetch build dependency unavailable: {path}")
