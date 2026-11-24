@@ -7,8 +7,10 @@ main_rev=609fa26fd715f9409bbe74e1b2d3685c58dfb0cf
 native=${3-$main_rev}
 post_before_output=c26c39e27730c10d33c82bf996807c4ef9d4952b
 credit_group=
+site=
 if [[ $# == 4 ]]; then
     case "${PEER_PHYSICAL_NPU:-4}/$4/$native" in
+        5/host16-local/"$post_before_output") site=host16 ;;
         5/g7-credit/957f59ace1520d3da8ef839a4d341902f62f8f66) credit_group=7 ;;
         5/g10-four-batch/6d7f257b3d664a8b4991cfd3ebd12da4f2038d04) credit_group=10 ;;
         *) echo 'Unknown device, revision or data collection case' >&2; exit 2 ;;
@@ -62,14 +64,15 @@ if [[ $native != "$main_rev" ]]; then
     fi
 fi
 if [[ $native == "$post_before_output" ]]; then
-    [[ $peer_physical_npu == 5 ]] || { echo 'This experiment requires physical NPU5 on B20' >&2; exit 2; }
+    [[ $peer_physical_npu == 5 ]] || { echo 'This experiment requires physical NPU5' >&2; exit 2; }
     label=post-before-output
     arm_label=$label
-    prefix=host20-npu5-post-before-output
+    prefix="${site:-host20}-npu5-post-before-output"
     unset KVIP_CREDIT_G10_INPUT KVIP_CREDIT_G10_HASHES
 fi
 if [[ $credit_group == 7 ]]; then prefix=host20-npu5-credit-g7; fi
 out=$(mktemp -d "$area/$prefix.XXXXXX")
+if [[ -n "$site" ]]; then printf '%s\n' "$site" >"$out/site.txt"; fi
 echo "RESULT_ROOT=$out"
 if [[ $peer_physical_npu != 4 ]]; then echo "LOG=$out/run.log"; fi
 exec > >(tee "$out/run.log") 2>&1
@@ -160,7 +163,14 @@ run_group() (
     archive=$(archive_for "$group")
     arm="$out/g$group/$label"
     mkdir -p "$arm"
-    if [[ $label == post-before-output ]]; then
+    if [[ $site == host16 ]]; then
+        if ! trace=$(bash "$reader_src/tests/operators/lifetch/peer_g2_input.sh" "$work" "$group" 2>"$arm/input.log"); then
+            cat "$arm/input.log" >&2
+            echo "FAILED_INPUT=G$group INPUT_LOG=$arm/input.log" >&2
+            exit 1
+        fi
+        cat "$arm/input.log"
+    elif [[ $label == post-before-output ]]; then
         trace=$("$PYTHON" -B "$support/paced_host20.py" trace "$out" "$group")
     elif [[ $credit_group == 10 && -n ${KVIP_CREDIT_G10_INPUT:-} ]]; then
         trace=$KVIP_CREDIT_G10_INPUT
@@ -239,7 +249,10 @@ for group in "${groups[@]}"; do
     case $rc in
         0) ;;
         130|143) exit "$rc" ;;
-        *) failed+=("G$group"); echo "CASE_FAILED G$group rc=$rc log=$out/g$group/$label/worker.log" >&2 ;;
+        *) failed+=("G$group")
+           problem_log="$out/g$group/$label/worker.log"
+           if [[ ! -s "$problem_log" ]]; then problem_log="$out/run.log"; fi
+           echo "CASE_FAILED G$group rc=$rc log=$problem_log" >&2 ;;
     esac
 done
 if (( ${#failed[@]} )); then

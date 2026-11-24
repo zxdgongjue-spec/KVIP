@@ -66,8 +66,27 @@ def four_batch_trace(root, group):
     return trace
 
 
-def compare_four_batch(root, group, times, thp, inputs, proof, cfg):
-    archive = four_batch_archive(root, group)
+def host16_run(root):
+    marker = root / 'site.txt'
+    return marker.is_file() and marker.read_text().strip() == 'host16'
+
+
+def host16_four_batch_archives(root, group):
+    # Containers on different machines can share a hostname and machine ID.
+    # Accept a legacy archive with no site marker only when the boot UUID matches.
+    boot = (root / 'boot_id.txt').read_text().strip()
+    for archive, thp in local_archives(root.parent, group, 'paced-tail', '5'):
+        try:
+            if ((archive/'candidate.txt').read_text().strip() == PACED
+                    and (host16_run(archive) or (boot and (archive/'boot_id.txt').read_text().strip() == boot))
+                    and thp['status'] == 'measured' and thp['page_mode'] == 'thp'
+                    and 'numa_pages_overlapping_vmas' in thp):
+                yield archive, thp
+        except ARCHIVE_ERRORS:
+            continue
+
+
+def four_batch_times(archive, group, thp, inputs, proof, cfg):
     folder = case_folder(archive, group, 'paced-tail')
     old_proof = read(folder/'mainline_checks.json')
     old_cfg = read(folder.parent/'config.json')
@@ -85,6 +104,29 @@ def compare_four_batch(root, group, times, thp, inputs, proof, cfg):
     placement = pair_placement(old_thp, thp, local_baseline=True)
     if old_thp['bytes'] != thp['bytes'] or old_thp['page_mode'] != thp['page_mode']:
         placement = 'different_memory'
+    return old, placement
+
+
+def compare_four_batch(root, group, times, thp, inputs, proof, cfg):
+    if host16_run(root):
+        reason = 'no_matching_host16_npu5_four_batch_archive'
+        for archive, _ in host16_four_batch_archives(root, group):
+            try:
+                old, placement = four_batch_times(archive, group, thp, inputs, proof, cfg)
+            except ARCHIVE_ERRORS as exc:
+                reason = f'{archive.name}: {exc}'
+                continue
+            if placement == 'matched':
+                break
+            reason = f'{archive.name}: {placement}'
+        else:
+            print(f'G{group} vs_four_batch UNAVAILABLE reason={reason}')
+            atomic_json(root/f'g{group}/four_batch_comparison.json',
+                        dict(archive=None, new=times, reason=reason, passed=[None, None]))
+            return
+    else:
+        archive = four_batch_archive(root, group)
+        old, placement = four_batch_times(archive, group, thp, inputs, proof, cfg)
     print(f'G{group} vs_four_batch graph_saved_mean/P50_us={saved(old["graph"], times["graph"])} '
           f'tail_saved_mean/P50_us={saved(old["final_topk_through_tail"], times["final_topk_through_tail"])} '
           f'gain_mean/P50_pct={percent(old["graph"], times["graph"])} placement={placement} archive={archive.name}')
@@ -96,7 +138,12 @@ def compare_four_batch(root, group, times, thp, inputs, proof, cfg):
 
 def target_node(root, group):
     physical = run_device(root)
-    if (root/'candidate.txt').read_text().strip() == POST_BEFORE_OUTPUT:
+    if host16_run(root):
+        for _, thp in host16_four_batch_archives(root, group):
+            node = single_numa_node(thp)
+            if node is not None:
+                return node
+    elif (root/'candidate.txt').read_text().strip() == POST_BEFORE_OUTPUT:
         archive = four_batch_archive(root, group)
         node = single_numa_node(read(archive/f'g{group}/paced-tail/thp.json'))
         if node is not None:
