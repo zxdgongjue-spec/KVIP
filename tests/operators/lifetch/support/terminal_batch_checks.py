@@ -28,6 +28,29 @@ def check_receipts(counts, pending_error, status):
     return histogram
 
 
+def check_status_binding(terminal, live_ranges):
+    """Inspect captured argument pointers once, before the hardware graph is created."""
+    status = terminal.owner.core_status
+    size = terminal.owner.abi_sizes['status']
+    base = status.data_ptr()
+    end = base + 80*size
+    views = np.asarray(terminal.queue_views)
+    rows, qs = np.indices((16, 4))
+    expected_views = np.where(qs == 0, 2*rows+1, 32+3*rows+qs-1).reshape(-1)
+    args = terminal.args.cpu().numpy()
+    if (tuple(status.shape) != (80, size) or size < 32 or status.element_size() != 1
+            or not status.is_contiguous() or args.shape != (16, 4, 112) or args.dtype != np.uint8
+            or not np.array_equal(views, expected_views)):
+        raise ValueError('Invalid private terminal status binding')
+    # In the pinned KVAF ABI, core_status is the eighth u64 in each argument.
+    actual = args.reshape(64, 112).view('<u8')[:, 7]
+    if not np.array_equal(actual, base + views * size):
+        raise ValueError('Captured terminal writes to a different status allocation')
+    if any(a < end and base < b for a, b in live_ranges):
+        raise ValueError('Live replay states share a terminal status allocation')
+    live_ranges.append((base, end))
+
+
 def audit_queues(terminal, rotating):
     # The row-summary status and the live private KVAF queue status are distinct.
     # Each replay state owns its status allocation even when its lease is reused.

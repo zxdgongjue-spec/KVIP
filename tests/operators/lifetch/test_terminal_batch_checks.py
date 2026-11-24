@@ -47,3 +47,23 @@ def test_read_private_queue_views():
     views[-1] = views[0]
     with pytest.raises(ValueError, match='queue views'):
         audit_queues(terminal, rotating)
+
+
+def test_captured_status_must_be_private_to_each_replay_state():
+    from types import SimpleNamespace as Object
+    from terminal_batch_checks import check_status_binding
+
+    base, size = 0x100000, 1216
+    views = [r*2 + 1 if q == 0 else 32+r*3+q-1 for r in range(16) for q in range(4)]
+    args = np.zeros((16, 4, 14), dtype='<u8')
+    args[:, :, 7] = base + np.array(views).reshape(16, 4)*size
+    status = Object(shape=(80, size), element_size=lambda: 1, is_contiguous=lambda: True, data_ptr=lambda: base)
+    terminal = Object(owner=Object(core_status=status, abi_sizes={'status': size}), queue_views=views,
+                      args=Object(cpu=lambda: Object(numpy=lambda: args.view('u1'))))
+    live = []
+    check_status_binding(terminal, live)
+    with pytest.raises(ValueError, match='share a terminal status'):
+        check_status_binding(terminal, live)
+    args[0, 0, 7] += size
+    with pytest.raises(ValueError, match='different status allocation'):
+        check_status_binding(terminal, [])

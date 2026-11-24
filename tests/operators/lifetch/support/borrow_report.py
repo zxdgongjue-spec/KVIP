@@ -51,6 +51,8 @@ def report(root, group, owner, reference):
         if old_evidence['device_text_sha256'] != expected_text(old_revision):
             raise ValueError('Archived LI-only operator is missing its verified instruction hashes')
         q_cq = read(folder/'final_cq_checks.json')
+        if q_cq['independent_status_allocations'] != 20:
+            raise ValueError('Final CQ evidence must use 20 independently bound status allocations')
         for phase in ('measured', 'detail'):
             histogram = totals(q_cq[phase])
             print(f'G{group} {phase}_private_final_CQ batches_0/1/2/3/4='

@@ -117,9 +117,10 @@ def worker(args):
     cq_calls = {'measured': {}, 'detail': {}}
     detail_ids = {}
     mailboxes = set()
+    cq_status_ranges = []
     if args.borrow_audit:
         import last_window_borrow as borrow
-        from terminal_batch_checks import audit_queues
+        from terminal_batch_checks import audit_queues, check_status_binding
 
         class BorrowForward(ex.StreamingForward):
             def set_diagnostics(self, enabled):
@@ -149,6 +150,8 @@ def worker(args):
             lib = Path(self.rotating.library._name).resolve()
             if args.borrow_audit:
                 borrow.check_workspace(self.forward)
+                if args.revision == borrow.COMBINED:
+                    check_status_binding(self.forward.terminal, cq_status_ranges)
                 address = self.rotating.rank_progress.data_ptr()
                 if address in mailboxes:
                     raise ValueError('The independent calls unexpectedly share a window mailbox')
@@ -253,11 +256,15 @@ def worker(args):
     if len(samples) != CALLS:
         raise ValueError('Incomplete mainline profiler capture')
     library, = library_paths
+    device_proof = {}
+    if args.revision == 'd6cfd392f722dd3f96ef6e05175f503aac511dbb':
+        from unified_main_device import check
+        device_proof['device_text_sha256'] = check(library)
     runtime = dict(host=platform.node(), visible=os.environ['ASCEND_RT_VISIBLE_DEVICES'],
                    npu=torch.npu.get_device_name(torch.device('npu:0')), torch=str(torch.__version__),
                    torch_npu=str(torch_npu.__version__), cann=str(getattr(torch.version, 'cann', '')))
     atomic_json(fused / 'mainline_checks.json', dict(
-        runtime=runtime, capture_operand_hashes=operand_hashes, production_revision=args.revision,
+        runtime=runtime, **device_proof, capture_operand_hashes=operand_hashes, production_revision=args.revision,
         production_python=str(Path(kvip.__file__).resolve()),
         loaded_library=str(library), library_sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
         production_terminal=True, profiled_terminal_kernel='v9_parallel_terminal',
@@ -272,10 +279,11 @@ def worker(args):
             terminal_only=borrow.summarize(borrow_calls['detail']),
             calls={phase: [values[i] for i in range(CALLS)] for phase, values in borrow_calls.items()}))
         if args.revision == borrow.COMBINED:
-            if any(set(calls) != set(range(CALLS)) for calls in cq_calls.values()):
+            if len(cq_status_ranges) != CALLS or any(set(calls) != set(range(CALLS)) for calls in cq_calls.values()):
                 raise ValueError('Incomplete per-query final CQ receipts')
-            atomic_json(fused/'final_cq_checks.json',
-                        {phase: [calls[i] for i in range(CALLS)] for phase, calls in cq_calls.items()})
+            atomic_json(fused/'final_cq_checks.json', dict(
+                independent_status_allocations=len(cq_status_ranges),
+                **{phase: [calls[i] for i in range(CALLS)] for phase, calls in cq_calls.items()}))
         if set(detail_ids) != set(range(CALLS)):
             raise ValueError('Incomplete terminal-only TopK results')
         np.save(fused/'terminal_only_ids.npy', np.stack([detail_ids[i] for i in range(CALLS)]), allow_pickle=False)
