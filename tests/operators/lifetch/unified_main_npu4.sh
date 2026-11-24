@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Five captured BS16/Q4 groups on one physical NPU4 with the unified KVAF SDK.
 set -eo pipefail
-if (( $# < 3 || $# > 4 )) || [[ ! $2 =~ ^[a-f0-9]{40}$ || ! $3 =~ ^[a-f0-9]{40}$ || ( $# == 4 && $4 != cap-pair ) ]]; then
-    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA [cap-pair]" >&2
+if (( $# < 3 || $# > 5 )) || [[ ! $2 =~ ^[a-f0-9]{40}$ || ! $3 =~ ^[a-f0-9]{40}$ ||
+    ( $# == 4 && $4 != cap-pair ) || ( $# == 5 && $4 != active-history ) ]]; then
+    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA [cap-pair | active-history ARCHIVED_CAP_PAIR]" >&2
     exit 2
 fi
 repo=$1
@@ -26,6 +27,15 @@ if [[ $mode == cap-pair ]]; then
         exit 2
     fi
     prefix=cap-pair-five
+elif [[ $mode == active-history ]]; then
+    archive=$(cd "$5" && pwd)
+    prior=cfe2b52f6403d5edd612c314bc7110525a5f5789
+    if [[ $(<"$archive/main.txt") != "$prior" || $(<"$archive/physical_npu.txt") != 4 || $prior == "$main" ]] ||
+       ! git -C "$repo" merge-base --is-ancestor "$prior" "$main"; then
+        echo "Expected a newer 512K candidate and the completed NPU4 capacity pair" >&2
+        exit 2
+    fi
+    prefix=active-history-five
 fi
 sdk=813f1750a50b7e6c92d5f5397f2fbc05befef6da
 patched_tree=1de18e8315137d7a0227c3ae4c82afd45b5fe743
@@ -74,6 +84,15 @@ printf '4\n' >"$out/physical_npu.txt"
 cat /proc/sys/kernel/hostname >"$out/host.txt"
 cat /proc/sys/kernel/random/boot_id >"$out/boot_id.txt"
 if [[ -r /etc/machine-id ]]; then cat /etc/machine-id >"$out/machine_id.txt"; fi
+if [[ $mode == active-history ]]; then
+    printf '%s\n' "$archive" >"$out/reference.txt"
+    for field in host machine_id; do
+        if [[ -f "$archive/$field.txt" ]] && ! cmp -s "$archive/$field.txt" "$out/$field.txt"; then
+            echo "Capacity archive belongs to a different host ($field): $archive" >&2
+            exit 1
+        fi
+    done
+fi
 
 # Reuse this machine's production Python, LIDU and URMA toolchain. The old SDK
 # is only the local Git object source and supplies no runtime objects to this arm.
@@ -133,7 +152,9 @@ for method in ('begin_get_graph', 'end_get_graph', 'get_graph_urma_resources'):
 PY
 flock -u 8
 exec 8>&-
-if [[ $mode == cap-pair ]]; then
+if [[ $mode == active-history ]]; then
+    echo "CONFIG measured=active_512k archive=$archive native=$main sdk=$sdk NPU=4 BS=16 Q=4 warmup=4 calls=20"
+elif [[ $mode == cap-pair ]]; then
     echo "CONFIG measured=capacity_pair model_limit=131072/524288 bound_history=131328/524544 input=original_capture native=$main sdk=$sdk NPU=4 BS=16 Q=4 warmup=4 measured_per_arm=20"
 else
     echo "CONFIG measured=$name native=$main sdk=$sdk NPU=4 BS=16 Q=4 token_bytes=656 warmup=4 calls=20"
@@ -176,7 +197,7 @@ run_arm() (
             [[ $(<"$p/host.txt") == "$here" && $(<"$p/physical_npu.txt") == 4 ]] &&
             [[ ! -s "$out/machine_id.txt" || ! -s "$p/machine_id.txt" || $(<"$out/machine_id.txt") == $(<"$p/machine_id.txt") ]]
     }
-    if [[ $mode == cap-pair && -n $paired_placement ]]; then
+    if [[ -n $paired_placement ]]; then
         placement=$paired_placement
         [[ -f $placement ]]
     elif [[ $mode == cap-pair ]] && ! on_this_card "${PEER_MAIN_PLACEMENT_ROOT:-$area/main-five.hF6qQ8}"; then
@@ -260,7 +281,7 @@ PY_DEVICE
     }
     if ! wait "$monitor"; then cat "$arm/thp.log" >&2; exit 1; fi
     monitor=
-    if [[ $mode == cap-pair ]]; then exit 0; fi
+    if [[ $mode != single ]]; then exit 0; fi
     PYTHONPATH="$support:$PYTHONPATH" "$PYTHON" -B - "$out" "$owner" "$g" "$main" "$name" <<'PY_REPORT'
 import sys
 from pathlib import Path
@@ -285,6 +306,11 @@ run_group() (
     owner=$(select_owner "$g")
     if [[ $mode == single ]]; then
         run_arm "$g" mainline "$trace" "$owner"
+        exit
+    fi
+    if [[ $mode == active-history ]]; then
+        run_arm "$g" cap512k "$trace" "$owner" "$archive/g$g/cap512k/thp.json"
+        "$PYTHON" -B "$support/cap_pair_report.py" "$out" "$g" "$owner" --reference "$archive"
         exit
     fi
     # Both shapes use the same binary, input, native score oracle, fresh
@@ -313,5 +339,7 @@ done
 if ((${#failed[@]})); then echo "REPLAY_FAILED groups=${failed[*]} RESULT_ROOT=$out" >&2; exit 1; fi
 if [[ $mode == cap-pair ]]; then
     "$PYTHON" -B "$support/cap_pair_report.py" "$out" --summary
+elif [[ $mode == active-history ]]; then
+    "$PYTHON" -B "$support/cap_pair_report.py" "$out" --reference "$archive" --summary
 fi
 echo "REPLAY_COMPLETE RESULT_ROOT=$out"

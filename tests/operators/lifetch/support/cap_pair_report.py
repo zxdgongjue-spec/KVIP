@@ -85,39 +85,52 @@ def fmt_times(data, signed=False):
     return ' '.join(f'{key}_mean/P50_us={format(a, f)}/{format(b, f)}' for key, (a, b) in data.items())
 
 
-def report(root, group, owner):
-    for file, value in [('main', NATIVE), ('kvaf', SDK), ('kvaf_tree', SDK_TREE), ('physical_npu', '4')]:
+def verify_root(root, revision):
+    for file, value in [('main', revision), ('kvaf', SDK), ('kvaf_tree', SDK_TREE), ('physical_npu', '4')]:
         if (root / (file + '.txt')).read_text().strip() != value:
             raise ValueError(f'Unexpected {file} for capacity comparison')
-    host = (root/'host.txt').read_text().strip()
+    return (root/'host.txt').read_text().strip()
+
+
+def read_arm(root, group, arm, revision, owner, oracle, *, verify_library):
+    serial, receipt, archived = oracle
+    folder = case_folder(root, group, arm)
+    times, match, thp, proof, cfg = measured_parallel(
+        root, group, arm, revision, owner, serial, receipt, archived,
+        verify_library=verify_library, timing_reader=cap_times, capture_meta_name='capture_input.json')
+    capture = read(folder.parent / 'capture_input.json')
+    actual = read(folder.parent / 'replay_input.json')
+    cap = proof['history_cap']
+    inspect_cap(arm, capture, actual, cap, receipt['native_reference'])
+    if cfg['history'] != CAPS[arm]:
+        raise ValueError(f'G{group} {arm}: replay config and measured capacity disagree')
+    runtime = proof['runtime']
+    if runtime['host'] != (root/'host.txt').read_text().strip() or runtime['visible'] != '4':
+        raise ValueError(f'G{group} {arm}: runtime used a different host or NPU')
+    controls = dict(capture=capture, runtime=runtime, library=proof['library_sha256'],
+                    operand_hashes=proof['capture_operand_hashes'], state_hashes=cap['capture_state_sha256'],
+                    page_hash=cap['capture_page_table_sha256'], sdk_root=str(Path(cfg['kvaf_root']).resolve()),
+                    cpu_registered_bytes=thp['bytes'])
+    return times, thp, controls, {k: mean(v) for k, v in cap['measured_requests'].items()}, int(match.sum())
+
+
+def oracle_for(owner, group):
+    serial, receipt = archived_oracle(owner, group)
+    archived = read(case_folder(owner, group, 'logical-ties').parent / 'replay_input.json')
+    return serial, receipt, archived
+
+
+def report(root, group, owner):
+    host = verify_root(root, NATIVE)
     order = (root / f'g{group}/order.txt').read_text().split()
     if sorted(order) != sorted(CAPS):
         raise ValueError(f'G{group}: expected one measured block per capacity')
-
-    serial, receipt = archived_oracle(owner, group)
-    source = receipt['native_reference']
-    archived = read(case_folder(owner, group, 'logical-ties').parent / 'replay_input.json')
+    oracle = oracle_for(owner, group)
+    source = oracle[1]['native_reference']
     times, thps, controls, traffic, exact = {}, {}, {}, {}, {}
     for arm in CAPS:
-        folder = case_folder(root, group, arm)
-        times[arm], match, thps[arm], proof, cfg = measured_parallel(
-            root, group, arm, NATIVE, owner, serial, receipt, archived,
-            verify_library=True, timing_reader=cap_times, capture_meta_name='capture_input.json')
-        capture = read(folder.parent / 'capture_input.json')
-        actual = read(folder.parent / 'replay_input.json')
-        cap = proof['history_cap']
-        inspect_cap(arm, capture, actual, cap, source)
-        if cfg['history'] != CAPS[arm]:
-            raise ValueError(f'G{group} {arm}: replay config and measured capacity disagree')
-        runtime = proof['runtime']
-        if runtime['host'] != host or runtime['visible'] != '4':
-            raise ValueError(f'G{group} {arm}: runtime used a different host or NPU')
-        controls[arm] = dict(capture=capture, runtime=runtime, library=proof['library_sha256'],
-                             operand_hashes=proof['capture_operand_hashes'], state_hashes=cap['capture_state_sha256'],
-                             page_hash=cap['capture_page_table_sha256'], sdk_root=str(Path(cfg['kvaf_root']).resolve()),
-                             cpu_registered_bytes=thps[arm]['bytes'])
-        traffic[arm] = {k: mean(v) for k, v in cap['measured_requests'].items()}
-        exact[arm] = int(match.sum())
+        times[arm], thps[arm], controls[arm], traffic[arm], exact[arm] = read_arm(
+            root, group, arm, NATIVE, owner, oracle, verify_library=True)
     left, right = CAPS
     changed = [key for key in controls[left] if controls[left][key] != controls[right][key]]
     if changed:
@@ -158,16 +171,85 @@ def summary(root):
           f'groups_slower={sum(row["delta"]["graph"][0]>0 for row in rows)}/5')
 
 
+def compare_active(root, archive, group, owner):
+    revision = (root/'main.txt').read_text().strip()
+    if revision == NATIVE or verify_root(root, revision) != verify_root(archive, NATIVE):
+        raise ValueError("Expected a new candidate measured on the archive host")
+    if (root/'reference.txt').read_text().strip() != str(archive.resolve()):
+        raise ValueError("Candidate reference differs from the selected archive")
+    oracle = oracle_for(owner, group)
+    times, thps, controls, traffic, exact = {}, {}, {}, {}, {}
+    phases = {}
+    for label, folder, arm, rev in (('cap128k', archive, 'cap128k', NATIVE),
+                                    ('cap512k', archive, 'cap512k', NATIVE),
+                                    ('candidate', root, 'cap512k', revision)):
+        times[label], thps[label], controls[label], traffic[label], exact[label] = read_arm(
+            folder, group, arm, rev, owner, oracle, verify_library=label == 'candidate')
+        attr = read(case_folder(folder, group, arm) / 'diagnose/round-1/full_attribution.json')
+        durations = [[b-a for a,b in sorted(s['accounting']['intervals_us']['li'])] for s in attr['samples']]
+        phases[label] = {f"LI{i}": (mean(values), median(values)) for i, values in enumerate(zip(*durations), 1)}
+    if controls['cap128k']['library'] != controls['cap512k']['library']:
+        raise ValueError(f"G{group}: archived capacities used different binaries")
+    for label in CAPS:
+        different = [key for key in controls[label] if key != 'library' and controls[label][key] != controls['candidate'][key]]
+        if different:
+            raise ValueError(f"G{group}: archived input or runtime differs: {different}")
+        placement = pair_placement(thps[label], thps['candidate'], local_baseline=True)
+        if placement != 'matched':
+            raise ValueError(f"G{group}: candidate vs archived {label} placement: {placement}")
+    prior = read(archive/f'g{group}/capacity_comparison.json')
+    if (prior['group'] != group or prior['timing'] != {
+            label: {k:list(v) for k,v in times[label].items()} for label in CAPS}):
+        raise ValueError(f"G{group}: recorded capacity comparison differs from its measured files")
+    proof = controls['candidate']
+    atomic_json(root/f'g{group}/active_comparison.json', dict(group=group, reference=str(archive.resolve()),
+        timing=times, li_phases=phases, traffic=traffic, runtime=proof['runtime'], native=revision, binary=proof['library'],
+        exact_id_sets=exact))
+    print(f'G{group} CHECK active_512k TopK_score_vs_strong_serial=PASS calls=20/20 queries=1280/1280 KV=PASS '
+          f'ordered_Index=PASS rows=320/320 placement=matched numa={single_numa_node(thps["candidate"])} '
+          f'exact_ID_sets={exact["candidate"]}/1280')
+    print(f'G{group} active_512k {fmt_times(times["candidate"])} prefetch/final_tokens_per_call_mean='
+          f'{traffic["candidate"]["prefetch"]:.2f}/{traffic["candidate"]["final"]:.2f}')
+    for label in (*CAPS, 'candidate'):
+        print(f'G{group} {label}_li_phases {fmt_times(phases[label])}')
+    for label in CAPS:
+        delta = compare(times[label], times['candidate'])
+        print(f'G{group} candidate_minus_archived_{label} {fmt_times(delta, signed=True)} '
+              f'graph_mean_change_pct={100*delta["graph"][0]/times[label]["graph"][0]:+.2f}')
+
+
+def summary_active(root, archive):
+    rows = [read(root/f'g{group}/active_comparison.json') for group in GROUPS]
+    if tuple(r['group'] for r in rows) != GROUPS or any(
+            r['reference'] != str(archive.resolve()) or
+            any(r[k] != rows[0][k] for k in ('runtime', 'native', 'binary')) for r in rows):
+        raise ValueError("Five groups must use the same runtime, candidate and reference")
+    means = {label: mean(r['timing'][label]['graph'][0] for r in rows) for label in (*CAPS, 'candidate')}
+    gap = means['candidate'] - means['cap128k']
+    print(f'FIVE_GROUP_EQUAL_WEIGHT graph_mean_us archive_cap128k={means["cap128k"]:.3f} '
+          f'archive_cap512k={means["cap512k"]:.3f} active_512k={means["candidate"]:.3f} '
+          f'candidate_minus_archived_cap128k_us={gap:+.3f} '
+          f'candidate_minus_archived_cap128k_pct={100*gap/means["cap128k"]:+.2f} '
+          f'saved_vs_archived_cap512k_us={means["cap512k"]-means["candidate"]:+.3f}')
+
+
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('root', type=Path)
     p.add_argument('group', type=int, choices=GROUPS, nargs='?')
     p.add_argument('owner', type=Path, nargs='?')
     p.add_argument('--summary', action='store_true')
+    p.add_argument('--reference', type=Path, help='Reuse the measured cap pair and compare one fresh 512K candidate')
     args = p.parse_args()
     if args.summary and args.group is None and args.owner is None:
-        summary(args.root)
+        if args.reference:
+            summary_active(args.root, args.reference)
+        else:
+            summary(args.root)
     elif not args.summary and args.group is not None and args.owner is not None:
-        report(args.root, args.group, args.owner)
+        if args.reference:
+            compare_active(args.root, args.reference, args.group, args.owner)
+        else:
+            report(args.root, args.group, args.owner)
     else:
         p.error('Use ROOT GROUP OWNER or ROOT --summary')

@@ -103,3 +103,62 @@ def test_summary_requires_all_five_groups(tmp_path, capsys):
     atomic_json(tmp_path/f'g{g}/capacity_comparison.json', {**obj, 'group': g})
     report.summary(tmp_path)
     assert 'cap512k_minus_cap128k_us=+5.000' in capsys.readouterr().out
+
+
+def test_active_uses_archived_arms_and_rejects_partial_comparison(tmp_path, monkeypatch, capsys):
+    import shutil
+
+    archive, fresh = tmp_path/'archived', tmp_path/'fresh'
+    archive.mkdir()
+    fresh.mkdir()
+    owner, group, caps, _ = make_cap_case(archive, monkeypatch)
+    report.report(archive, group, owner)
+    for name in ('kvaf', 'kvaf_tree', 'physical_npu', 'host'):
+        shutil.copyfile(archive / f'{name}.txt', fresh / f'{name}.txt')
+    revision = '1'*40
+    (fresh/'main.txt').write_text(revision)
+    (fresh/'reference.txt').write_text(str(archive))
+    shutil.copytree(archive/'g2/cap512k', fresh/'g2/cap512k')
+    for root, names in ((archive, tuple(report.CAPS)), (fresh, ('cap512k',))):
+        for arm in names:
+            folder = report.case_folder(root, group, arm)
+            atomic_json(folder/'diagnose/round-1/full_attribution.json', dict(samples=[
+                dict(accounting=dict(intervals_us=dict(li=[[0, 1], [2, 3], [5, 8]])))]*20))
+    previous = report.measured_parallel
+    calls = []
+
+    def measure(root, group, arm, revision_, *args, **kw):
+        times, exact, thp, proof, cfg = previous(root, group, arm, revision_, *args, **kw)
+        calls.append((root, arm, revision_, kw['verify_library']))
+        if root == fresh:
+            times = {k: tuple(v*.85 for v in row) for k, row in times.items()}
+            proof = dict(proof, library_sha256='candidate')
+        return times, exact, thp, proof, cfg
+    monkeypatch.setattr(report, 'measured_parallel', measure)
+    report.compare_active(fresh, archive, group, owner)
+    assert calls == [(archive, 'cap128k', report.NATIVE, False), (archive, 'cap512k', report.NATIVE, False),
+                     (fresh, 'cap512k', revision, True)]
+    text = capsys.readouterr().out
+    assert 'candidate_minus_archived_cap128k graph_mean/P50_us=+2.00/+2.00' in text
+    assert 'candidate_minus_archived_cap512k graph_mean/P50_us=-18.00/-18.00' in text
+    saved = report.read(fresh/'g2/active_comparison.json')
+    assert saved['li_phases']['candidate']['LI3'] == [3., 3.]
+    # The stored verified comparison must agree with the historical raw results.
+    prior = report.read(archive/'g2/capacity_comparison.json')
+    prior['timing']['cap512k']['graph'][0] += 10
+    atomic_json(archive/'g2/capacity_comparison.json', prior)
+    with pytest.raises(ValueError, match='recorded capacity comparison'):
+        report.compare_active(fresh, archive, group, owner)
+
+
+def test_summary_active_preserves_slow_groups(tmp_path, capsys):
+    archive = tmp_path/'archive'
+    for g in report.GROUPS:
+        atomic_json(tmp_path/f'g{g}/active_comparison.json',
+                    dict(group=g, reference=str(archive), runtime={}, native='X', binary='Y',
+                         timing={k:{'graph':[v, v]} for k,v in
+                                 (('cap128k', 10.), ('cap512k', 20.), ('candidate', 10.25))}))
+    report.summary_active(tmp_path, archive)
+    output = capsys.readouterr().out
+    assert 'candidate_minus_archived_cap128k_us=+0.250' in output
+    assert 'saved_vs_archived_cap512k_us=+9.750' in output
