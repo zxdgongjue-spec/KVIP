@@ -51,6 +51,8 @@ def find_arm(root, role, repo=None, group=10):
             continue
         cfg = read(configs[0])
         revision = cfg['production_revision']
+        if revision not in {marker(root, 'main'), marker(root, 'candidate')}:
+            continue
         if role == 'candidate':
             if arm == 'cap128k':
                 continue
@@ -123,7 +125,7 @@ def measure_arm(root, arm, revision, group, *, verify_library=False):
     comparable_cfg = {k: v for k, v in cfg.items() if k not in {
         'history', 'kvaf_server', 'output', 'trace_root', 'kvaf_root', 'production_root', 'production_revision'}}
     return dict(stats=stats, geometry=replay['geometry'], config=comparable_cfg, capture=proof['capture_operand_hashes'],
-                cap_state=cap_state, protocol=protocol, runtime=runtime, thp=thp, oracle=receipt['identity'])
+                binary=proof['library_sha256'], cap_state=cap_state, protocol=protocol, runtime=runtime, thp=thp, oracle=receipt['identity'])
 
 
 def print_arm(role, group, arm):
@@ -227,11 +229,15 @@ def run(candidate, args):
     if (marker(candidate, 'kvaf'), marker(candidate, 'kvaf_tree')) != (SDK, SDK_TREE):
         raise ValueError('Unexpected candidate KVAF source')
     new = {}
+    builds = set()
     for g in GROUPS:
         arm = find_arm(candidate, 'candidate', args.repo, g)
         if not arm:
             raise ValueError(f'No completed NPU4 G{g} candidate under {candidate}')
         new[g] = measure_arm(candidate, *arm, g)
+        builds.add((arm[1], new[g]['binary'], new[g]['protocol']))
+        if len(builds) != 1:
+            raise ValueError('Five candidate arms must share one revision, binary and timing protocol')
         if new[g]['geometry']['history'] != CAPS['cap512k']:
             raise ValueError('Candidate must bind the actual 512K capacity')
         print(f'G{g} CANDIDATE archive={candidate} native={arm[1]} SDK={SDK}')

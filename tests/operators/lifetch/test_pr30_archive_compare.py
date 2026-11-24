@@ -48,7 +48,7 @@ def archive(root, revision, arm, group, stats):
 
 
 def row(protocol, history, outside, numa='3'):
-    return dict(protocol=protocol, runtime=dict(host='node24', visible='4'), config=dict(test='real'),
+    return dict(protocol=protocol, binary='digest', runtime=dict(host='node24', visible='4'), config=dict(test='real'),
                 geometry=dict(history=history, batch=16), oracle='oracle', capture='input', cap_state=['pages', 'state'],
                 stats=dict(event_mean=90+outside, event_outside_span_mean=outside,
                            LI1_to_LI3=[30,30], final_topk_through_tail=[50,50],
