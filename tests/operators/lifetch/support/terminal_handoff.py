@@ -13,7 +13,7 @@ COUNT_COLUMNS = ('prefetch_requests', 'final_get_requests', 'total_get_requests'
 
 
 def build_library(directory, cann, headers, soc, *, local_counts, hot_partition=False, stage_trace=False,
-                  ub_candidates=False, post_chunk=0):
+                  ub_candidates=False, post_chunk=0, dedicated_drain_aiv1=True):
     from kvip.runtime.build import build_failure
 
     directory = Path(directory)
@@ -31,6 +31,7 @@ def build_library(directory, cann, headers, soc, *, local_counts, hot_partition=
          f'-DKVIP_HOT_SCORE_PARTITION={"ON" if hot_partition else "OFF"}',
          f'-DKVIP_SERVICE_UB_CANDIDATES={"ON" if ub_candidates else "OFF"}',
          f'-DKVIP_SERVICE_POST_CHUNK={post_chunk}',
+         f'-DKVIP_DEDICATED_DRAIN_AIV1={"ON" if dedicated_drain_aiv1 else "OFF"}',
          f'-DKVIP_STAGE_TRACE={"ON" if stage_trace else "OFF"}'],
         ['cmake', '--build', str(directory), '--target', 'v9_bridge', '--parallel', '2'],
     ]
@@ -144,6 +145,40 @@ def bind_dedicated_service(state, mode):
     function = library.kvip_parallel_tail_dedicated_service_forward
     function.argtypes, function.restype = [ctypes.c_void_p] * 4, ctypes.c_uint32
     forward.terminal_function = function
+
+
+def run_staged_eager(state, mode, progress):
+    """Synchronize the four existing launches to localize an eager failure."""
+    forward = state.forward
+    rotating = forward.rotating
+    stream = rotating.owner.lease.check_stream()
+    shape = rotating.runtime_shape
+    bindings = forward.bindings.data_ptr()
+    terminal = forward.terminal.workspace.data_ptr()
+    suffixes = {
+        'p2': ('_1', '_2'),
+        'dedicated': ('_threshold_dedicated_service', '_cold_dedicated_service'),
+    }
+    threshold, cold = suffixes[mode]
+    stages = (
+        ('Hot', 'v9_li_kernel', shape.liCores, bindings),
+        ('Threshold', 'v9_li_kernel' + threshold, shape.liCores, bindings),
+        ('Cold+Service', 'v9_li_kernel' + cold, shape.liCores, bindings),
+        ('Terminal', 'v9_parallel_terminal', shape.batch * 4, terminal),
+    )
+    progress('staged eager binding synchronization')
+    stream.synchronize()
+    progress('staged eager binding synchronized')
+    for label, symbol, blocks, workspace in stages:
+        launch = getattr(rotating.library, f'aclrtlaunch_{symbol}')
+        launch.argtypes, launch.restype = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p], ctypes.c_uint32
+        progress(f'staged eager {label} launch ({symbol})')
+        result = launch(blocks, stream.npu_stream, workspace)
+        if result:
+            raise RuntimeError(f'{symbol} launch failed: {result}')
+        progress(f'staged eager {label} synchronization')
+        stream.synchronize()
+        progress(f'staged eager {label} completed')
 
 
 def fixture_hash(path):

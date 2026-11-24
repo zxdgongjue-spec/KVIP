@@ -4077,7 +4077,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                     library = build_library(config.handoff_build_dir, cann, headers, soc,
                                             local_counts=handoff == 'local_counts' or partition_trial,
                                             hot_partition=score_trial, ub_candidates=ub_candidates,
-                                            post_chunk=post_chunk)
+                                            post_chunk=post_chunk,
+                                            dedicated_drain_aiv1=getattr(config, 'mr28_dedicated_drain_aiv1', True))
                 else:
                     (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers, soc=soc)
             else:
@@ -4205,8 +4206,18 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                                  cold_parts=cold_parts, score_parts=score_parts)
         pending = True
         replay_stage('first eager forward and device completion')
-        state.forward()
-        stream.synchronize()
+        if dedicated_service is not None and getattr(config, 'mr28_staged_eager', False):
+            from terminal_handoff import run_staged_eager
+
+            try:
+                run_staged_eager(state, dedicated_service, replay_stage)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    (directory / 'eager_failure.log').write_text(traceback.format_exc())
+                raise
+        else:
+            state.forward()
+            stream.synchronize()
         replay_stage('first eager completed; correctness check')
         checks.check('eager', lambda: validate(initial))
         if dedicated_service is not None:

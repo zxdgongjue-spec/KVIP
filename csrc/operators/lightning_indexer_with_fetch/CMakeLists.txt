@@ -18,6 +18,7 @@ if(NOT KVIP_SERVICE_POST_CHUNK MATCHES "^(0|64)$")
 endif()
 option(KVIP_STAGE_TRACE "Enable A5 LIFetch profiling markers" OFF)
 option(KVIP_HOT_SCORE_PARTITION "Build the experimental dense Hot Score entry" OFF)
+option(KVIP_DEDICATED_DRAIN_AIV1 "Drain both peer score credit banks in Dedicated Cold" ON)
 include(${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
 set(KVIP_OUTPUT_WORKER ON)
 if(KVIP_OUTPUT_WORKER AND NOT KVIP_FUSE_QUERY_WORK)
@@ -36,6 +37,7 @@ ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WO
   -DKVIP_SERVICE_POST_CHUNK=${KVIP_SERVICE_POST_CHUNK}
   -DKVIP_SERVICE_LOCAL_COUNTS=$<BOOL:${KVIP_SERVICE_LOCAL_COUNTS}>
   -DKVIP_HOT_SCORE_PARTITION=$<BOOL:${KVIP_HOT_SCORE_PARTITION}>
+  -DKVIP_DEDICATED_DRAIN_AIV1=$<BOOL:${KVIP_DEDICATED_DRAIN_AIV1}>
   -DV9_BATCH_POST=2 -DSIM_Q=4 -DSIM_CAPTURE_HITS=1 -DV9_SIMULATION=0 -DROTATION_PUBLISH_TILES=1)
 add_library(v9_bridge SHARED op_host/launch.cpp)
 target_include_directories(v9_bridge PRIVATE ${KVAF_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/include ${_base}/include)

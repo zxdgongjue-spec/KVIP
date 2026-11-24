@@ -105,11 +105,17 @@ def main():
     parser.add_argument('--timeout-seconds', type=int, default=1800)
     parser.add_argument('--route', choices=('both', *MODES), default='both',
                         help='run a single checked route for diagnosis or both routes for comparison')
+    parser.add_argument('--staged-eager', action='store_true',
+                        help='synchronize Hot, Threshold, Cold and Terminal separately on the first eager forward')
+    parser.add_argument('--legacy-credit-tail', action='store_true',
+                        help='diagnostic control that omits only the last two Dedicated AIV1 credit waits')
     parser.add_argument('--prefetch-trace', action='store_true',
                         help='record a separate diagnostic replay for actual prefetch timestamps')
     args = parser.parse_args()
     if args.warmup < 0 or args.iterations < 1 or args.timeout_seconds < 1:
         parser.error('warmup must be nonnegative, iterations and timeout must be positive')
+    if args.legacy_credit_tail and args.route != 'dedicated':
+        parser.error('--legacy-credit-tail requires --route dedicated for the diagnostic control')
 
     a5_root = Path(os.environ.get('KVIP_A5_ROOT', '/home/w00568585/li-aligned-a5'))
     kvaf = Path(os.environ.get('KVIP_KVAF_ROOT', a5_root / 'KVAF-unified-813f1750')).resolve()
@@ -126,7 +132,9 @@ def main():
     completed = {}
     manifest = dict(status='NOT_RUN', commit=git(ROOT, 'rev-parse', 'HEAD'), main_base=MAIN,
                     expected_kvaf=KVAF, arguments=arguments, variants=modes, cold_roles=COLD_ROLES,
-                    local_counts=False, prefetch_trace=args.prefetch_trace, worker_exit_codes=completed)
+                    local_counts=False, prefetch_trace=args.prefetch_trace, staged_eager=args.staged_eager,
+                    dedicated_drain_aiv1=not args.legacy_credit_tail,
+                    worker_exit_codes=completed)
     if args.dry_run:
         print(json.dumps(manifest, indent=2), flush=True)
         return 0
@@ -147,6 +155,8 @@ def main():
             config = configuration(arguments)
             config.mr25_handoff = mode
             config.mr28_dedicated_service = mode
+            config.mr28_staged_eager = args.staged_eager
+            config.mr28_dedicated_drain_aiv1 = not args.legacy_credit_tail
             config.handoff_build_dir = output / 'build'
             print(f'Running BS16 {mode}, local_counts OFF', flush=True)
             completed[mode] = launch(config, output / mode)

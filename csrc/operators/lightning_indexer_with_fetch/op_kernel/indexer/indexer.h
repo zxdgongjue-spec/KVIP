@@ -1003,10 +1003,12 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessDedicatedCold(G
         // Each bank receives one final credit from each of the two AIVs.
         CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT);
         CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT + 1);
+#if !defined(KVIP_DEDICATED_DRAIN_AIV1) || KVIP_DEDICATED_DRAIN_AIV1
         CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
             QLICommon::ConstInfo::CROSS_VC_EVENT + QLICommon::ConstInfo::AIV0_AIV1_OFFSET);
         CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
             QLICommon::ConstInfo::CROSS_VC_EVENT + QLICommon::ConstInfo::AIV0_AIV1_OFFSET + 1);
+#endif
     }
 }
 #endif

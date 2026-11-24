@@ -294,6 +294,16 @@ For a quick graph check of the candidate on its own, use
 `--route dedicated --iterations 1 --warmup 0`. The worker reports
 pre-capture eager, capture, warmup and measured replay separately. If
 synchronization fails, see `graph_failure.log` in the case's fused directory.
+For a failure during the first eager forward, add `--staged-eager` to log
+completion of each of the original four launches on the same stream.
+See `eager_failure.log` in the fused directory. If the stages and eager
+correctness check pass, the runner continues to the usual graph measurement.
+Use ordinary dispatch for performance comparison, since the extra host
+fences alter scheduling.
+If the first incomplete stage is Cold, repeat the same diagnostic with
+`--route dedicated --legacy-credit-tail`. This build changes only the two
+AIV1 credit waits at Cold exit. It keeps the W0 readiness fix and prefetch
+configuration and is a diagnostic control.
 
 Use `--dry-run` to inspect the plan. Run `--prepare-deps` on the host
 if the existing unified KVAF sources are absent, and `--build-deps`
