@@ -6,9 +6,8 @@ import ctypes
 from types import SimpleNamespace
 
 import numpy as np
+from correctness import FETCH_AB_MAGIC
 from reporting import CorrectnessRecorder, timing_summary
-
-FETCH_AB_MAGIC = 0x4B5641464247444F
 
 TOKEN_BYTES = 656
 
