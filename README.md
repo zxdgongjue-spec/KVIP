@@ -31,8 +31,6 @@ python/kvip/
   runtime/                          # build cache, library loader, hardware query, integrity
   _compat.py                        # centralized lazy aliases for legacy kvip imports
 scripts/                            # existing build/environment entry points and common KVAF patches
-patches/kvaf-background-put.patch    # shared background Put binding compatibility
-patches/kvaf-ubmem-fused-lease.patch # optional mapped-region fused lease for KVAF UBmem
 tests/
   operators/lidu/
   operators/lifetch/                 # unified CLI, correctness/performance tests and diagnostics
@@ -108,14 +106,9 @@ For another A5 SKU, pass its concrete CANN target with `--soc`; `Ascend950` alon
 is not a valid target for this CANN build API. The NPU test discovers the device
 SoC through ACL unless `--soc` is specified.
 
-The supported KVAF base is `1c1310387ebfb6776a07316874e924265b209ada`.
-Preparation retains the existing three common patches in `scripts/patches` and
-applies `patches/kvaf-background-put.patch` for background Put's GIL release and
-capability flag. `--transport ubmem` additionally
-applies `patches/kvaf-ubmem-fused-lease.patch` and `patches/kvaf-ubmem-device-get.patch`
-to that checkout. Preparation recognizes an
-already patched tree and preserves unrelated edits; conflicting changes fail
-without a forced reset. A separate KVAF checkout/build is recommended per transport.
+The build pins KVAF `main` at `813f1750a50b7e6c92d5f5397f2fbc05befef6da`.
+KVIP applies its unified Runtime LIFetch patches and the UBmem device headers
+when selected. Preparation can reuse an already patched checkout.
 `--prepare-only` prepares the dependency without replacing the active build selection;
 `--skip-kvaf-build` requires matching existing build products.
 
