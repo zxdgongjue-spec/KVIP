@@ -1,20 +1,31 @@
 #!/usr/bin/env bash
 # Fresh five-case replay of the unified-KVAF KVIP main branch on physical NPU4.
 set -eo pipefail
-if (( $# != 3 )) || [[ ! $2 =~ ^[a-f0-9]{40}$ || $3 != d6cfd392f722dd3f96ef6e05175f503aac511dbb ]]; then
-    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA d6cfd392f722dd3f96ef6e05175f503aac511dbb" >&2
+if (( $# != 3 )) || [[ ! $2 =~ ^[a-f0-9]{40}$ || ! $3 =~ ^[a-f0-9]{40}$ ]]; then
+    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA" >&2
     exit 2
 fi
 repo=$1
 reader=$2
 main=$3
+upstream=d6cfd392f722dd3f96ef6e05175f503aac511dbb
+name=unified_main
+prefix=unified-main-five
+if [[ $main != "$upstream" ]]; then
+    git -C "$repo" merge-base --is-ancestor 54acdb9c54853441d08898a2623407f4492a83a4 "$main" || {
+        echo "Expected a native build containing the window-rank and paced-GET PR" >&2
+        exit 2
+    }
+    name=long_history_candidate
+    prefix=long-history-five
+fi
 sdk=813f1750a50b7e6c92d5f5397f2fbc05befef6da
 patched_tree=1de18e8315137d7a0227c3ae4c82afd45b5fe743
 work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold}
 area="$work/peer-baseline"
 sources="$work/fused-scan-sources"
 mkdir -p "$area" "$sources"
-out=$(mktemp -d "$area/unified-main-five.XXXXXX")
+out=$(mktemp -d "$area/$prefix.XXXXXX")
 echo "RESULT_ROOT=$out"
 exec > >(tee "$out/run.log") 2>&1
 export PEER_PHYSICAL_NPU=4 ASCEND_RT_VISIBLE_DEVICES=4 PEER_LOCAL_ONLY=1
@@ -29,7 +40,7 @@ fi
 if [[ -r /usr/local/Ascend/nnal/atb/set_env.sh ]]; then source /usr/local/Ascend/nnal/atb/set_env.sh; fi
 set -euo pipefail
 # Serialize checkout/preparation of the shared build cache, but not NPU replay.
-exec 8>"$sources/unified-sdk-$main.lock"
+exec 8>"$sources/unified-sdk-${sdk:0:8}-${upstream:0:8}.lock"
 flock 8
 checkout() {
     local rev=$1 dest="$sources/unified-$1"
@@ -62,8 +73,10 @@ clean="$area/KVAF-de4fd37e"
 baseline="$work/adaptive-sources/peer-serial-da318bdb"
 peer_physical_npu=4
 source "$support/peer_node_prepare.sh"
-peer_prepare_node "$repo" "$baseline" "$clean" "$work" "$out" full
-sdk_src="$sources/unified-sdk-${sdk:0:8}-${main:0:8}"
+dependency_mode=full
+if [[ $name == long_history_candidate ]]; then dependency_mode=fused-only; fi
+peer_prepare_node "$repo" "$baseline" "$clean" "$work" "$out" "$dependency_mode"
+sdk_src="$sources/unified-sdk-${sdk:0:8}-${upstream:0:8}"
 if ! git -C "$clean" cat-file -e "$sdk^{commit}" 2>/dev/null; then
     git -C "$clean" fetch -q --no-tags https://gitcode.com/CacheOS/KVAF.git refs/heads/main
 fi
@@ -91,11 +104,14 @@ echo "BUILDING_UNIFIED_SDK revision=$sdk patched_tree=$actual_tree jobs=$jobs lo
 peer_node_logged "$out/build-sdk-cpu.log" bash "$sdk_src/build.sh" cpu --jobs "$jobs"
 peer_node_logged "$out/build-sdk-npu.log" bash "$sdk_src/build.sh" npu --without-aicpu --jobs "$jobs"
 cpu="$sdk_src/build-cpu/runtime/kvaf_cpu_service"
-lidu="$baseline/csrc/operators/lidu"
-vendors=("$lidu"/_custom_opp/vendors/*/op_api/lib/libcust_opapi.so)
-[[ ${#vendors[@]} == 1 && -s ${vendors[0]} ]]
-export ASCEND_CUSTOM_OPP_PATH="${vendors[0]%/op_api/lib/libcust_opapi.so}${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
-export PYTHONPATH="$main_src/python:$sdk_src/build-npu/python:$lidu/torch_extension${PYTHONPATH:+:$PYTHONPATH}"
+if [[ $dependency_mode == full ]]; then
+    lidu="$baseline/csrc/operators/lidu"
+    vendors=("$lidu"/_custom_opp/vendors/*/op_api/lib/libcust_opapi.so)
+    [[ ${#vendors[@]} == 1 && -s ${vendors[0]} ]]
+    export ASCEND_CUSTOM_OPP_PATH="${vendors[0]%/op_api/lib/libcust_opapi.so}${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
+    export PYTHONPATH="$lidu/torch_extension${PYTHONPATH:+:$PYTHONPATH}"
+fi
+export PYTHONPATH="$main_src/python:$sdk_src/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 export KVAF_BATCH_GET_KERNEL="$sdk_src/build-npu/bin/kvaf_execute_batch_get_kernels.o"
 export KVAF_BATCH_PUT_KERNEL="$sdk_src/build-npu/bin/kvaf_execute_batch_put_kernels.o"
 [[ -x $cpu && -s $KVAF_BATCH_GET_KERNEL && -s $KVAF_BATCH_PUT_KERNEL ]]
@@ -109,20 +125,50 @@ for method in ('begin_get_graph', 'end_get_graph', 'get_graph_urma_resources'):
 PY
 flock -u 8
 exec 8>&-
-echo "CONFIG measured=unified_main native=$main sdk=$sdk NPU=4 BS=16 Q=4 token_bytes=656 warmup=4 calls=20"
+echo "CONFIG measured=$name native=$main sdk=$sdk NPU=4 BS=16 Q=4 token_bytes=656 warmup=4 calls=20"
 run_group() (
     set -euo pipefail
     g=$1
-    owner="$area/fused.N7n8ZP"
-    if [[ $g == 2 ]]; then owner="$area/fused.gbxKC9"; fi
+    owner=${PEER_OWNER_REFERENCE:-$area/fused.N7n8ZP}
+    if [[ $g == 2 ]]; then owner=${PEER_G2_OWNER_REFERENCE:-$area/fused.gbxKC9}; fi
+    if [[ ! -f "$owner/logical-ties.txt" && $name == long_history_candidate ]]; then
+        shopt -s nullglob
+        for existing in "$area"/fused.*/g"$g"/logical-ties; do
+            candidate_root=${existing%/g"$g"/logical-ties}
+            if [[ -f "$candidate_root/logical-ties.txt" && -f "$candidate_root/physical_npu.txt" ]] &&
+               [[ $(<"$candidate_root/logical-ties.txt") == 888db6b1603d22f4142bd2ccffe0518611856a31 && $(<"$candidate_root/physical_npu.txt") == 4 ]] &&
+               compgen -G "$existing/results/*/cases/diagnose/fused/score_topk_check.json" >/dev/null; then
+                owner=$candidate_root
+                break
+            fi
+        done
+    fi
+    if [[ ! -f "$owner/logical-ties.txt" ]]; then
+        echo "Missing archived strong-serial oracle for G$g under $area" >&2
+        exit 1
+    fi
     arm="$out/g$g/mainline"
     mkdir -p "$arm"
     trace=$(bash "$entry/peer_g2_input.sh" "$work" "$g")
-    placement="$area/main-five.hF6qQ8/g$g/mainline/thp.json"
-    node=$("$PYTHON" -B "$support/li_window_report.py" numa "$placement")
+    placement="${PEER_MAIN_PLACEMENT_ROOT:-$area/main-five.hF6qQ8}/g$g/mainline/thp.json"
+    if [[ ! -f "$placement" && $name == long_history_candidate ]]; then
+        for previous in "$area"/unified-main-five.* "$area"/main-five.*; do
+            if [[ -f "$previous/host.txt" && -f "$previous/physical_npu.txt" ]] &&
+               [[ $(<"$previous/host.txt") == "$(cat /proc/sys/kernel/hostname)" && $(<"$previous/physical_npu.txt") == 4 ]] &&
+               [[ -f "$previous/g$g/mainline/thp.json" ]]; then
+                placement="$previous/g$g/mainline/thp.json"
+                break
+            fi
+        done
+    fi
     # The new SDK opens separate Put and Get sessions over one allocation.
     # Select the actual archive HCA for both before measuring that allocation.
-    ub_device=$("$PYTHON" -B - "$placement" <<'PY_DEVICE'
+    node=
+    ub_device=${KVAF_CPU_UB_DEVICE:-}
+    if [[ -f "$placement" ]]; then
+        node=$("$PYTHON" -B "$support/li_window_report.py" numa "$placement")
+        if [[ -z "$ub_device" ]]; then
+            ub_device=$("$PYTHON" -B - "$placement" <<'PY_DEVICE'
 import json, sys
 with open(sys.argv[1]) as src:
     info = json.load(src)
@@ -132,6 +178,11 @@ if info.get('status') != 'measured' or not isinstance(name, str) or not name:
 print(name)
 PY_DEVICE
     )
+        fi
+    elif [[ $name == unified_main ]]; then
+        echo "Missing verified mainline CPU placement: $placement" >&2
+        exit 1
+    fi
     command=("$cpu")
     if [[ -n "$node" ]]; then
         if command -v numactl >/dev/null && numactl "--membind=$node" true >/dev/null 2>&1; then
@@ -142,7 +193,9 @@ PY_DEVICE
         fi
     fi
     port=$("$PYTHON" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
-    "${command[@]}" --listen 127.0.0.1 --port "$port" --ub-device "$ub_device" --memory-page-mode thp >"$arm/cpu.log" 2>&1 &
+    hca=()
+    if [[ -n "$ub_device" ]]; then hca+=(--ub-device "$ub_device"); fi
+    "${command[@]}" --listen 127.0.0.1 --port "$port" "${hca[@]}" --memory-page-mode thp >"$arm/cpu.log" 2>&1 &
     server=$!
     monitor=
     cleanup() {
@@ -161,30 +214,30 @@ PY_DEVICE
     if ! grep -Fq "LISTEN address=127.0.0.1 port=$port" "$arm/cpu.log"; then tail -20 "$arm/cpu.log" >&2; exit 1; fi
     "$PYTHON" -B "$support/peer_thp.py" --unified-sdk --pid "$server" --log "$arm/cpu.log" --output "$arm/thp.json" --timeout 1800 >"$arm/thp.log" 2>&1 &
     monitor=$!
-    echo "CASE_BEGIN G$g unified_main"
+    echo "CASE_BEGIN G$g $name"
     (cd "$arm" && timeout 1800 "$PYTHON" -B "$support/main_five_run.py" --main "$main_src" --revision "$main" \
          --trace "$trace" --group "$g" --owner-archive "$owner" --kvaf-root "$sdk_src" \
          --kvaf-server "127.0.0.1:$port" --output "$arm") >"$arm/worker.log" 2>&1 || {
-        echo "FAILED_ARM=G$g/unified_main WORKER_LOG=$arm/worker.log" >&2
+        echo "FAILED_ARM=G$g/$name WORKER_LOG=$arm/worker.log" >&2
         tail -30 "$arm/worker.log" >&2
         exit 1
     }
     if ! wait "$monitor"; then cat "$arm/thp.log" >&2; exit 1; fi
     monitor=
-    PYTHONPATH="$support:$PYTHONPATH" "$PYTHON" -B - "$out" "$owner" "$g" "$main" <<'PY_REPORT'
+    PYTHONPATH="$support:$PYTHONPATH" "$PYTHON" -B - "$out" "$owner" "$g" "$main" "$name" <<'PY_REPORT'
 import sys
 from pathlib import Path
 from main_five_report import archived_oracle, case_folder, measured_parallel, read
 
 root, owner = map(Path, sys.argv[1:3])
-group, revision = int(sys.argv[3]), sys.argv[4]
+group, revision, name = int(sys.argv[3]), sys.argv[4], sys.argv[5]
 ids, receipt = archived_oracle(owner, group)
 source = read(case_folder(owner, group, 'logical-ties').parent / 'replay_input.json')
 timing, exact, _, _, _ = measured_parallel(root, group, 'mainline', revision, owner,
                                           ids, receipt, source, verify_library=True)
-print(f'G{group} CHECK arm=unified_main TopK_score_vs_strong_serial=PASS calls=20/20 '
+print(f'G{group} CHECK arm={name} TopK_score_vs_strong_serial=PASS calls=20/20 '
       f'queries=1280/1280 exact_ID_sets={exact.sum()}/1280 KV=PASS ordered_Index=PASS rows=320/320')
-print(f'G{group} unified_main', *(f'{key}_mean/P50_us={value[0]:.2f}/{value[1]:.2f}'
+print(f'G{group} {name}', *(f'{key}_mean/P50_us={value[0]:.2f}/{value[1]:.2f}'
                                   for key, value in timing.items()))
 PY_REPORT
 )
