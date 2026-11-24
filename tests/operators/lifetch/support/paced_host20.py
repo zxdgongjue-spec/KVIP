@@ -18,6 +18,7 @@ from strong_serial_g10 import from_this_host, serial_measurement
 MAIN = '609fa26fd715f9409bbe74e1b2d3685c58dfb0cf'
 PACED = '6d7f257b3d664a8b4991cfd3ebd12da4f2038d04'
 CREDIT_TRACE = '957f59ace1520d3da8ef839a4d341902f62f8f66'
+POST_BEFORE_OUTPUT = 'c26c39e27730c10d33c82bf996807c4ef9d4952b'
 GROUPS = (10, 4, 17, 7, 2)
 B24_MAIN = {10: (297.10, 289.57), 4: (315.79, 304.59), 17: (327.49, 314.24),
             7: (580.87, 587.58), 2: (284.11, 276.89)}
@@ -47,8 +48,59 @@ def local_archives(area, group, arm, physical):
             continue
 
 
+def four_batch_archive(root, group):
+    name = 'host20-npu5-paced-tail.usoCcG' if group == 10 else 'host20-npu5-paced-tail.eGdWHC'
+    archive = root.parent / name
+    if ((archive/'candidate.txt').read_text().strip() != PACED or run_device(archive) != '5'
+            or not from_this_host(archive, '5')):
+        raise ValueError(f'G{group}: expected the completed four-batch archive on this host and NPU5 at {archive}')
+    return archive
+
+
+def four_batch_trace(root, group):
+    archive = four_batch_archive(root, group)
+    folder = case_folder(archive, group, 'paced-tail')
+    trace = Path(read(folder.parent/'config.json')['trace_root'])
+    if not trace.is_dir():
+        raise FileNotFoundError(f'G{group}: archived replay input directory {trace}')
+    return trace
+
+
+def compare_four_batch(root, group, times, thp, inputs, proof, cfg):
+    archive = four_batch_archive(root, group)
+    folder = case_folder(archive, group, 'paced-tail')
+    old_proof = read(folder/'mainline_checks.json')
+    old_cfg = read(folder.parent/'config.json')
+    old_result = read(folder/'path_result.json')
+    old_thp = read(archive/f'g{group}/paced-tail/thp.json')
+    if (old_proof['production_revision'] != PACED or old_cfg['production_revision'] != PACED
+            or old_cfg['physical_npu'] != cfg['physical_npu'] or old_cfg['kvaf_root'] != cfg['kvaf_root']
+            or old_proof['runtime'] != proof['runtime']
+            or old_proof['capture_operand_hashes'] != proof['capture_operand_hashes']
+            or not verified_input(group, read(folder.parent/'replay_input.json'), inputs)
+            or not old_proof['production_terminal'] or old_result['correctness'] != 'PASS' or old_result['failures']
+            or [old_proof[k] for k in ('measured_calls', 'measured_kv_index_rows', 'ordered_diagnostic_rows')] != [20, 320, 320]):
+        raise ValueError(f'G{group}: archive inputs, runtime or four-batch correctness differs at {folder}')
+    old = main_times(folder, old_result['all_rounds'])
+    placement = pair_placement(old_thp, thp, local_baseline=True)
+    if old_thp['bytes'] != thp['bytes'] or old_thp['page_mode'] != thp['page_mode']:
+        placement = 'different_memory'
+    print(f'G{group} vs_four_batch graph_saved_mean/P50_us={saved(old["graph"], times["graph"])} '
+          f'tail_saved_mean/P50_us={saved(old["final_topk_through_tail"], times["final_topk_through_tail"])} '
+          f'gain_mean/P50_pct={percent(old["graph"], times["graph"])} placement={placement} archive={archive.name}')
+    passed = [new <= 0.97 * ref if placement == 'matched' else None
+              for ref, new in zip(old['graph'], times['graph'])]
+    atomic_json(root/f'g{group}/four_batch_comparison.json', dict(archive=str(archive), old=old, new=times,
+                                                                  placement=placement, passed=passed))
+
+
 def target_node(root, group):
     physical = run_device(root)
+    if (root/'candidate.txt').read_text().strip() == POST_BEFORE_OUTPUT:
+        archive = four_batch_archive(root, group)
+        node = single_numa_node(read(archive/f'g{group}/paced-tail/thp.json'))
+        if node is not None:
+            return node
     for arm in ('mainline', 'serial2'):
         for _, thp in local_archives(root.parent, group, arm, physical):
             if thp.get('status') != 'measured' or 'numa_pages_overlapping_vmas' not in thp:
@@ -115,14 +167,17 @@ def percent(old, new):
 
 def report(root, group):
     physical = run_device(root)
-    folder = case_folder(root, group, 'paced-tail')
+    expected = (root/'candidate.txt').read_text().strip()
+    arm = 'post-before-output' if expected == POST_BEFORE_OUTPUT else 'paced-tail'
+    folder = case_folder(root, group, arm)
     proof = read(folder/'mainline_checks.json')
     cfg = read(folder.parent/'config.json')
     receipt = read(folder/'score_topk_check.json')
     result = read(folder/'path_result.json')
     inputs = read(folder.parent/'replay_input.json')
-    expected = (root/'candidate.txt').read_text().strip()
     allowed = (PACED, CREDIT_TRACE) if group == 7 and physical == '5' else (PACED,)
+    if physical == '5':
+        allowed += (POST_BEFORE_OUTPUT,)
     if (expected not in allowed or cfg['production_revision'] != expected
             or proof['production_revision'] != expected or cfg['physical_npu'] != int(physical) or cfg['device'] != 0
             or proof['runtime']['visible'] != physical or result['correctness'] != 'PASS' or result['failures']
@@ -142,15 +197,18 @@ def report(root, group):
             serial = ids['strong_serial']
     exact = measured_sets(folder, group, (inputs, result['topk_set_digests']), serial, receipt)
     times = main_times(folder, result['all_rounds'])
-    thp = read(root/f'g{group}/paced-tail/thp.json')
+    thp = read(root/f'g{group}/{arm}/thp.json')
     if thp['status'] != 'measured' or thp['page_mode'] != 'thp' or thp['bytes'] <= 0:
         raise ValueError('missing measured DDR placement')
     print(f'G{group} CHECK TopK_score_vs_strong_serial=PASS calls=20/20 queries=1280/1280 '
           f'exact_ID_sets={int(exact.sum())}/1280 KV=PASS ordered_Index=PASS rows=320/320 oracle={source["origin"]}')
     if expected == CREDIT_TRACE:
         return
-    print(f'G{group} paced-tail graph_mean/P50_us={stats(times["graph"])} '
+    print(f'G{group} {arm} graph_mean/P50_us={stats(times["graph"])} '
           f'LI_mean/P50_us={stats(times["LI1_to_LI3"])} tail_mean/P50_us={stats(times["final_topk_through_tail"])}')
+    if expected == POST_BEFORE_OUTPUT:
+        compare_four_batch(root, group, times, thp, inputs, proof, cfg)
+        return
     local = {}
     for arm, historical in [('mainline', B24_MAIN), ('serial2', B24_SERIAL)]:
         local[arm] = compare_local(root.parent,group,arm,times['graph'],thp,inputs,proof,cfg)
@@ -172,6 +230,10 @@ def gate(values):
 
 def summary(root):
     physical = run_device(root)
+    if (root/'candidate.txt').read_text().strip() == POST_BEFORE_OUTPUT:
+        rows = [read(root/f'g{g}/four_batch_comparison.json')['passed'] for g in GROUPS]
+        print('ALL_FIVE_3PCT graph_mean/P50=' + '/'.join(gate([r[i] for r in rows]) for i in range(2)))
+        return
     rows = {g: read(root/f'g{g}/paced_comparison.json') for g in GROUPS}
     def compare(groups, arm, i, factor):
         ok = []
@@ -191,7 +253,7 @@ def summary(root):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('action',choices=('oracle','node','report','summary'))
+    parser.add_argument('action',choices=('oracle','node','report','summary','trace'))
     parser.add_argument('root',type=Path)
     parser.add_argument('group',nargs='?',type=int,choices=GROUPS)
     args = parser.parse_args()
@@ -200,6 +262,8 @@ if __name__ == '__main__':
             archived_oracle(args.root,args.group)
         except ARCHIVE_ERRORS:
             raise SystemExit(1)
+    elif args.action == 'trace':
+        print(four_batch_trace(args.root,args.group))
     elif args.action == 'node':
         print(target_node(args.root,args.group))
     elif args.action == 'report':

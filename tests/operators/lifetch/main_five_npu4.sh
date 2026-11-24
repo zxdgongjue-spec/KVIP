@@ -5,6 +5,7 @@ repo=${1:?supply the local KVIP repository}
 reader=${2:?supply the full replay reader revision}
 main_rev=609fa26fd715f9409bbe74e1b2d3685c58dfb0cf
 native=${3-$main_rev}
+post_before_output=c26c39e27730c10d33c82bf996807c4ef9d4952b
 credit_group=
 if [[ $# == 4 ]]; then
     case "${PEER_PHYSICAL_NPU:-4}/$4/$native" in
@@ -25,7 +26,7 @@ serial=da318bdb81344672b5d9013e04d517669d3eb142
 # Existing mainline/LI readers default to B24. NPU0 and NPU5 use the B20 paced-tail candidate.
 peer_physical_npu=${PEER_PHYSICAL_NPU:-4}
 case "$peer_physical_npu" in
-    0|5) [[ -n "$credit_group" || "$native" == 6d7f257b3d664a8b4991cfd3ebd12da4f2038d04 ]] || { echo "Expected the paced-tail candidate on NPU$peer_physical_npu" >&2; exit 2; } ;;
+    0|5) [[ ( "$peer_physical_npu" == 5 && "$native" == "$post_before_output" ) || -n "$credit_group" || "$native" == 6d7f257b3d664a8b4991cfd3ebd12da4f2038d04 ]] || { echo "Expected the paced-tail candidate on NPU$peer_physical_npu" >&2; exit 2; } ;;
     4) ;;
     *) echo "Unsupported physical NPU: $peer_physical_npu" >&2; exit 2 ;;
 esac
@@ -59,6 +60,13 @@ if [[ $native != "$main_rev" ]]; then
             exit 1
         }
     fi
+fi
+if [[ $native == "$post_before_output" ]]; then
+    [[ $peer_physical_npu == 5 ]] || { echo 'This experiment requires physical NPU5 on B20' >&2; exit 2; }
+    label=post-before-output
+    arm_label=$label
+    prefix=host20-npu5-post-before-output
+    unset KVIP_CREDIT_G10_INPUT KVIP_CREDIT_G10_HASHES
 fi
 if [[ $credit_group == 7 ]]; then prefix=host20-npu5-credit-g7; fi
 out=$(mktemp -d "$area/$prefix.XXXXXX")
@@ -152,7 +160,9 @@ run_group() (
     archive=$(archive_for "$group")
     arm="$out/g$group/$label"
     mkdir -p "$arm"
-    if [[ $credit_group == 10 && -n ${KVIP_CREDIT_G10_INPUT:-} ]]; then
+    if [[ $label == post-before-output ]]; then
+        trace=$("$PYTHON" -B "$support/paced_host20.py" trace "$out" "$group")
+    elif [[ $credit_group == 10 && -n ${KVIP_CREDIT_G10_INPUT:-} ]]; then
         trace=$KVIP_CREDIT_G10_INPUT
     else
         trace=$(bash "$reader_src/tests/operators/lifetch/peer_g2_input.sh" "$work" "$group")
