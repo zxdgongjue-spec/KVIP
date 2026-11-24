@@ -68,13 +68,15 @@ public:
     __aicore__ inline LocalTensor<uint32_t> TerminalScratch() { return topkSharedTmpLocal_; }
     __aicore__ inline LocalTensor<uint32_t> TerminalIds() { return indicesOutLocal_; }
     __aicore__ inline LocalTensor<uint32_t> TerminalWork() { return mrgValueLocal_.template ReinterpretCast<uint32_t>(); }
-    __aicore__ inline void TerminalQuery(uint32_t query) {
+    __aicore__ inline void TerminalQuery(uint32_t query, uint32_t scanHistory) {
         exportWindowCold_=true;rankTrace_=false;rankedEpoch_=runtimeShape_.rounds;
         incrementalMetadataActive_=false;incrementalHasNext_=false;
         windowCoveredEmpty_=false;
-        uint32_t half=rotating::SequenceHalfWindow(runtimeShape_);
-        rankHalf_=half;rankReady_=uint64_t(runtimeShape_.history)|(uint64_t(runtimeShape_.history)<<32);
-        AdvanceIncremental(query,runtimeShape_.history,half?runtimeShape_.history:0,half);
+        // Replay the same shard boundaries as the LI producers. Score, mask
+        // and covered-row addresses still use the bound physical history.
+        uint32_t half=rotating::SequenceHalfWindow(runtimeShape_,scanHistory);
+        rankHalf_=half;rankReady_=uint64_t(scanHistory)|(uint64_t(scanHistory)<<32);
+        AdvanceIncremental(query,scanHistory,half?scanHistory:0,half);
         JoinColdOutput();
         if(incrementalOutputPending_){WaitFlag<HardEvent::MTE3_V>(EVENT_ID6);incrementalOutputPending_=false;}
         PipeBarrier<PIPE_ALL>();
@@ -82,7 +84,7 @@ public:
     }
 // Included inside the private terminal QLIVector class only.
 // The production hot/cold/window QLIVector is not changed.
-__aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
+__aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query, uint32_t scanHistory) {
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     const uint32_t valid=ctx->queryEnds?
         reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)[query]:runtimeShape_.history;
@@ -99,7 +101,7 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
         PipeBarrier<PIPE_ALL>();
         return missing?1U:0U;
     }
-    TerminalQuery(query);
+    TerminalQuery(query,scanHistory);
     return 0;
 }
 

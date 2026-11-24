@@ -116,7 +116,8 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  QLIKernel::QLIVector<Type> op;QLICommon::ConstInfo ci{};ci.gSize=32;ci.qHeadNum=32;ci.kHeadNum=1;ci.headDim=128;ci.mBaseSize=64;ci.s1BaseSize=2;ci.s2BaseSize=128;ci.sparseCount=2048;ci.kSeqSize=s.history;ci.kCacheBlockSize=128;ci.maxBlockNumPerBatch=s.history/128;
  QLITilingData tiling{};op.SetStreamingWorkspace(arg);op.InitParams(ci,&tiling,false);op.InitBuffers(&pipe,false);op.SetRotationContext(reinterpret_cast<GM_ADDR>(ctx));
  GlobalTensor<uint16_t> scores;op.InitVecWorkspaceTensor(scores);GlobalTensor<bfloat16_t> weights;GlobalTensor<float> qs,ks;GlobalTensor<int32_t> out,blocks;out.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(ctx->selected));op.InitVecInputTensor(weights,qs,ks,out,blocks);
- op.AllocEventID();if(profile)ts[1]=GetSystemCycle();uint32_t topkError=op.TerminalQueryRuntime(query);
+ uint32_t scanHistory=rotating::ActiveScanHistory(s,reinterpret_cast<__gm__ const uint32_t*>(ctx->queryEnds),b);
+ op.AllocEventID();if(profile)ts[1]=GetSystemCycle();uint32_t topkError=op.TerminalQueryRuntime(query,scanHistory);
  uint32_t ownError=topkError;if(profile)ts[2]=GetSystemCycle();Signal(flags,q,generation);
  auto postWork=op.TerminalWork(),postIds=op.TerminalCompact(),postScratch=op.TerminalScratch();
  auto compact=reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048;
@@ -283,7 +284,7 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  }
  flags[(28+q)*32]=uint32_t(cqError)|ownError;
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+(28+q)*32),4);
- Simt::VF_CALL<FinishTerminalRow>(Simt::Dim3{512,1,1},a,ctx,runtime,b,q,owner,total,first,n,flags,generation,work);
+ Simt::VF_CALL<FinishTerminalRow>(Simt::Dim3{512,1,1},a,ctx,runtime,b,q,owner,total,first,n,flags,generation,scanHistory,work);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  if(profile)ts[10]=GetSystemCycle();
  pipe.Destroy();if(profile)kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ts),256);

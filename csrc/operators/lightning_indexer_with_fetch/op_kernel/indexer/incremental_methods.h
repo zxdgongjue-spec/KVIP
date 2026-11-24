@@ -101,6 +101,8 @@ __aicore__ inline void ExportWindowCold(uint32_t query) {
     uint32_t bitmapLength=runtimeShape_.history, limit=ctx->windowLimit/4, minimum=limit/2, rankCut=UINT32_MAX;
 #if KVIP_PARALLEL_TERMINAL
     if (rankedEpoch_==runtimeShape_.rounds) {
+        // PackUncovered masks all IDs >= valid before consulting this row.
+        bitmapLength=valid;
         rank=2048;
         limit=2048;
         minimum=0;

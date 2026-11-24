@@ -6,7 +6,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void FinishTerminalRow(
     __gm__ pipeline_ab::Args* a, __gm__ rotating::Context* ctx,
     __gm__ terminal_runtime::Binding* runtime, uint32_t b,uint32_t q,
     uint32_t owner,uint32_t total,uint32_t first,uint32_t count,
-    __gm__ uint32_t* flags,uint32_t generation,__ubuf__ uint32_t* control) {
+    __gm__ uint32_t* flags,uint32_t generation,uint32_t scanHistory,__ubuf__ uint32_t* control) {
     uint32_t t=threadIdx.x,history=ctx->shape.history,resident=ctx->shape.resident;
     if(!t)control[4]=total>2048?asc_ldcg(flags+9*32):0U;
     if(t<32){
@@ -37,7 +37,9 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void FinishTerminalRow(
         if(!t){control[0]=error;control[1]=reads;control[2]=pending;control[3]=completed;}
     }else{
         constexpr uint32_t clearThreads=480;
-        uint32_t words=(history+255)/256*8;
+        // Every admitted source is below its Q's valid end. Clear this
+        // round's complete written prefix before the next replay can grow.
+        uint32_t words=(scanHistory+255)/256*8;
         auto covered=reinterpret_cast<__gm__ uint32_t*>(
             kvip_prefetch_rank::CoveredAddress(ctx->incremental,ctx->shape.batch,history,b));
         for(uint32_t i=q*clearThreads+t-32;i<words;i+=4*clearThreads)asc_stcg(covered+i,0U);
