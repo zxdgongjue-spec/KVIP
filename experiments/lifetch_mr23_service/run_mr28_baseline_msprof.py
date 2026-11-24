@@ -10,17 +10,8 @@ import shutil
 import subprocess
 import sys
 
-from run_mr25_handoff import KVAF, MAIN, ROOT, git, save
-
-
-def has_task_events(path):
-    document = json.loads(path.read_text())
-    events = document.get('traceEvents', []) if isinstance(document, dict) else document
-    return isinstance(events, list) and any(
-        isinstance(event, dict) and event.get('ph') == 'X'
-        and isinstance(event.get('dur'), (int, float)) and event['dur'] > 0
-        for event in events
-    )
+from lifetch_msprof_timeline import publish_business_views, verified_vendor_timeline
+from run_mr25_handoff import KVAF, MAIN, ROOT, git, read, save
 
 
 def parse_args(argv=None):
@@ -51,7 +42,7 @@ def bench_args(args, kvaf):
 
 
 def msprof_timelines(profiler, directory, log):
-    """Keep the vendor's raw export and its capture clock unmodified."""
+    """Export each scoped pyACL collection with the CANN tools."""
     profiles = sorted(path for path in directory.glob('PROF_*') if path.is_dir())
     with log.open('w') as stream:
         for profile in profiles:
@@ -60,14 +51,11 @@ def msprof_timelines(profiler, directory, log):
                     [profiler, '--export=on', '--output=' + str(profile)],
                     check=True, timeout=300, stdout=stream, stderr=subprocess.STDOUT,
                 )
-    timelines = sorted(path for profile in profiles for path in profile.rglob('msprof_*.json'))
-    return [path for path in timelines if has_task_events(path)]
+    return sorted(path for profile in profiles for path in profile.rglob('msprof_*.json'))
 
 
 def capture(args, output, kvaf, arguments, manifest):
-    # The CLI owns the actual workload process. Its log must contain the
-    # existing checked-completion marker for the trace to be accepted.
-    from execution import supervise, worker_environment
+    from execution import launch
     from workloads import configuration
 
     profiler = shutil.which(os.environ.get('KVIP_MSPROF', 'msprof'))
@@ -79,21 +67,11 @@ def capture(args, output, kvaf, arguments, manifest):
     config.msprof_baseline = True
     worker = output / 'worker'
     raw = output / 'msprof'
-    worker.mkdir()
     raw.mkdir()
-    job_file = worker / 'config.json'
-    save(job_file, {key: str(value) if isinstance(value, Path) else value for key, value in vars(config).items()})
-    command = [
-        profiler, '--output=' + str(raw), '--task-time=l1', '--runtime-api=on',
-        sys.executable, '-B', '-u', '-X', 'faulthandler',
-        str(ROOT / 'tests/operators/lifetch/support/execution.py'), str(job_file),
-    ]
-    manifest['command'] = command
+    config.msprof_output = str(raw)
+    manifest['msprof_output'] = str(raw)
     save(output / 'manifest.json', manifest)
-    manifest['worker_exit_code'] = supervise(
-        command, worker, timeout_seconds=config.timeout_seconds, environment=worker_environment(kvaf),
-        show_case_details=False,
-    )
+    manifest['worker_exit_code'] = launch(config, worker)
     case = worker / f'miss{args.miss_percent}' / f'case-b{args.batch}'
     stage_trace = case / 'baseline_stage_trace.json'
     stage_report = case / 'baseline_stage_report.json'
@@ -102,12 +80,26 @@ def capture(args, output, kvaf, arguments, manifest):
         raise RuntimeError(f'Checked stage replay incomplete. See {worker / "summary.log"}')
     print(f'Stage timeline: {stage_trace}', flush=True)
     print(f'Stage summary: {stage_report}', flush=True)
+    report = read(stage_report)
+    if report.get('correctness') != 'PASS' or report.get('execution') != 'COMPLETED':
+        raise ValueError('Source trace lacks checked fusion output')
+    capture_status = report.get('msprof_capture', {}).get('status', {})
+    if capture_status != dict(init=0, start=0, stop=0, destroy_config=0, finalize=0):
+        raise ValueError(f'Scoped CANN profiling did not complete: {capture_status}')
+    manifest['msprof_capture'] = report['msprof_capture']
     timelines = msprof_timelines(profiler, raw, output / 'msprof-export.log')
     if not timelines:
         raise RuntimeError(f'No vendor timeline was exported. See {raw} and {output / "msprof-export.log"}')
     manifest['msprof_timelines'] = [str(path) for path in timelines]
-    for path in timelines:
-        print(f'msprof timeline: {path}', flush=True)
+    native_path, vendor, intervals = verified_vendor_timeline(timelines)
+    business, device = publish_business_views(output, vendor, read(stage_trace), intervals, save)
+    manifest.update(msprof_timeline=str(native_path), business_trace=str(business),
+                    msprof_business_trace=str(device), kernel_intervals=intervals)
+    print(f'Open fused stages: {business}', flush=True)
+    print(f'Open msprof with fusion phase labels: {device}', flush=True)
+    for row in intervals:
+        print(f'  {row["name"]}: {row["duration_us"]:.2f} us', flush=True)
+    print(f'Early prefetch / final Get: {report["total_prefetch"]} / {report["total_final_get"]}', flush=True)
 
 
 def main(argv=None):
@@ -119,6 +111,7 @@ def main(argv=None):
         status='NOT_RUN', commit=git(ROOT, 'rev-parse', 'HEAD'), main_commit=MAIN,
         kvaf_commit=KVAF, route='main_p2_parallel_terminal', local_counts=False,
         arguments=arguments, requested_stage_replays=1,
+        collection='pyACL_prof_start_stop_around_fused_forward_only',
         clocks='independent: msprof device task clock and calibrated source counter',
     )
     if args.dry_run:

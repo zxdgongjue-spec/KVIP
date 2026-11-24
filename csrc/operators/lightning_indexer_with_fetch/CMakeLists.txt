@@ -36,6 +36,9 @@ target_compile_definitions(v9_bridge PRIVATE KVIP_OUTPUT_WORKER=$<BOOL:${KVIP_OU
   KVIP_HOT_SCORE_PARTITION=$<BOOL:${KVIP_HOT_SCORE_PARTITION}>
   KVIP_STAGE_TRACE=$<BOOL:${KVIP_STAGE_TRACE}>)
 target_link_libraries(v9_bridge PRIVATE v9_kernel host_intf_pub ascendcl)
+if(KVIP_STAGE_TRACE)
+  target_link_libraries(v9_bridge PRIVATE msprofiler)
+endif()
 
 # Independent compile options preserve the retained four-AIV terminal code.
 ascendc_library(parallel_terminal_kernel STATIC op_kernel/terminal/kernel.cpp)

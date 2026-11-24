@@ -2,6 +2,7 @@
 #include "api.h"
 #include "context.h"
 #if KVIP_STAGE_TRACE
+#include <acl/acl_prof.h>
 extern "C" uint32_t kvip_stage_trace_supported() { return 1; }
 #endif
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
@@ -137,6 +138,32 @@ extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_partitioned(uint32_t,void*,voi
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_score_t2(uint32_t,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_t2(uint32_t,void*,void*);
 #endif
+enum class ParallelTailStage { Hot, Threshold, ColdService, Terminal };
+
+template<bool Profile, typename Launch>
+static uint32_t LaunchTailStage(void* stream, ParallelTailStage stage, Launch launch) {
+#if KVIP_STAGE_TRACE
+    if constexpr (Profile) {
+        static constexpr const char* markers[][2] = {
+            {"KVIP_LIFETCH_HOT_BEGIN", "KVIP_LIFETCH_HOT_END"},
+            {"KVIP_LIFETCH_THRESHOLD_BEGIN", "KVIP_LIFETCH_THRESHOLD_END"},
+            {"KVIP_LIFETCH_COLD_SERVICE_BEGIN", "KVIP_LIFETCH_COLD_SERVICE_END"},
+            {"KVIP_LIFETCH_TERMINAL_BEGIN", "KVIP_LIFETCH_TERMINAL_END"},
+        };
+        const auto& [begin, end] = markers[static_cast<uint32_t>(stage)];
+        // The markers are submitted to the same stream as the kernel so
+        // msprof can show the device boundaries as well as host submission.
+        uint32_t result = aclprofMarkEx(begin, std::strlen(begin), stream);
+        if (result) return result;
+        result = launch();
+        if (result) return result;
+        return aclprofMarkEx(end, std::strlen(end), stream);
+    }
+#endif
+    return launch();
+}
+
+template<bool Profile = false>
 static uint32_t LaunchParallelTail(void* bindings,void* terminal,
     void* stream,const rotating::RuntimeShape* shape,uint32_t hotParts,uint32_t coldParts=2) {
     if(!bindings || !terminal || !stream || !kvip_parallel_tail_supported(shape))return 100000;
@@ -145,7 +172,9 @@ static uint32_t LaunchParallelTail(void* bindings,void* terminal,
     if(hotParts>2)result=aclrtlaunch_v9_li_kernel_hot_partitioned(shape->batch*hotParts,stream,bindings,hotParts);
     else
 #endif
-    result=aclrtlaunch_v9_li_kernel(shape->liCores,stream,bindings);
+    result=LaunchTailStage<Profile>(stream,ParallelTailStage::Hot,[&] {
+        return aclrtlaunch_v9_li_kernel(shape->liCores,stream,bindings);
+    });
 #if KVIP_HOT_SCORE_PARTITION
     if(coldParts>2){
         if(!result)result=aclrtlaunch_v9_li_kernel_threshold_cold_partitioned(
@@ -155,16 +184,29 @@ static uint32_t LaunchParallelTail(void* bindings,void* terminal,
     } else
 #endif
     {
-        if(!result)result=aclrtlaunch_v9_li_kernel_1(shape->liCores,stream,bindings);
-        if(!result)result=aclrtlaunch_v9_li_kernel_2(shape->liCores,stream,bindings);
+        if(!result)result=LaunchTailStage<Profile>(stream,ParallelTailStage::Threshold,[&] {
+            return aclrtlaunch_v9_li_kernel_1(shape->liCores,stream,bindings);
+        });
+        if(!result)result=LaunchTailStage<Profile>(stream,ParallelTailStage::ColdService,[&] {
+            return aclrtlaunch_v9_li_kernel_2(shape->liCores,stream,bindings);
+        });
     }
-    if(!result)result=aclrtlaunch_v9_parallel_terminal(shape->batch*4,stream,terminal);
+    if(!result)result=LaunchTailStage<Profile>(stream,ParallelTailStage::Terminal,[&] {
+        return aclrtlaunch_v9_parallel_terminal(shape->batch*4,stream,terminal);
+    });
     return result;
 }
 extern "C" uint32_t kvip_parallel_tail_forward(void* bindings,void* terminal,
     void* stream,const rotating::RuntimeShape* shape) {
     return LaunchParallelTail(bindings,terminal,stream,shape,2);
 }
+
+#if KVIP_STAGE_TRACE
+extern "C" uint32_t kvip_parallel_tail_profile_forward(void* bindings,void* terminal,
+    void* stream,const rotating::RuntimeShape* shape) {
+    return LaunchParallelTail<true>(bindings,terminal,stream,shape,2);
+}
+#endif
 
 #if KVIP_HOT_SCORE_PARTITION
 extern "C" uint32_t kvip_partitioned_hot_score_parts(const rotating::RuntimeShape* shape) {

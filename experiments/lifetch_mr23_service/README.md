@@ -149,16 +149,17 @@ bash experiments/lifetch_mr23_service/run_mr28_baseline_msprof.sh
 
 The default case is BS16, Q4, H128K, R16K, 32 index heads, miss 10%, requested W4, and the existing prefetch threshold with budget 512 and rank start 1024. The launcher accepts `--batch 1|2|4|8|16`, `--miss-percent N`, and optional `--warmup N`. The stock P2 planner reduces BS1 to two effective windows. Use `--dry-run` to see the plan. It uses the same container-visible `KVIP_A5_DEVICE` and unified KVAF service as the unified Score runner above. If the pinned dependencies are already built, start with the capture command. Otherwise use `--prepare-deps` on the networked host and `--build-deps` in the container. Both paths use the existing shared directory.
 
-The worker compiles an isolated diagnostic bridge and executes Hot Score, resident Threshold, Cold Score with rotating Service, then the current four-AIV-per-request Terminal. The instrumentation follows MR12's source-cycle scopes and leaves the default build flag off. Hot and Cold keep their original MIX partition. Threshold, candidate deduplication, prefetch, final Get, and Index publication retain the baseline ordering.
+The worker compiles an isolated diagnostic bridge and finishes KVAF BatchPut, counter calibration, and any warmups before starting CANN profiling. On the original lease stream, it wraps each of the four native launches with CANN device markers and stops profiling after stream completion. Export succeeds only after the kernel tasks and all eight device marker endpoints are verified. The original four launches are Hot Score, resident Threshold, Cold Score with rotating Service, then the current four-AIV-per-request Terminal. The instrumentation follows MR12's source-cycle scopes and leaves the default build flag off. Hot and Cold keep their original MIX partition. Threshold, candidate deduplication, prefetch, final Get, and Index publication retain the baseline ordering.
 
-Under the printed `Run output` directory, open these files in Perfetto or MindStudio Insight as appropriate:
+Under the printed `Run output` directory, open `lifetch_business_trace.json` first for the detailed fused stages. Open `lifetch_msprof_trace.json` for the CANN time domain and native task intervals.
 
 | Output | Contents |
 | --- | --- |
-| `msprof/PROF_*/mindstudio_profiler_output/msprof_*.json` | CANN's native timeline of actual kernel launches and task intervals |
-| `worker/miss*/case-b*/baseline_stage_trace.json` | Source stage scopes grouped by kernel and logical AIC/AIV lane, with window and request/query tags |
+| `lifetch_business_trace.json` | Detailed kernel scopes grouped by logical AIC/AIV lane, with window and request/query tags |
+| `lifetch_msprof_trace.json` | CANN trace with a `KVIP fused LIFetch` track for its four marker-verified device kernel phases |
+| `msprof/PROF_*/mindstudio_profiler_output/msprof_*.json` | Unmodified native CANN export with the original `KVIP_LIFETCH_*_BEGIN/END` markers |
 | `worker/miss*/case-b*/baseline_stage_report.json` | Coverage, stage timing summary, Top2048/KV/Index verification and prefetch/final Get counts |
 | `worker/miss*/case-b*/baseline_stage_trace.bin` | Original source-cycle records used for the stage timeline |
 | `manifest.json` | Revisions, fixture, command, exit status and paths |
 
-The two timelines describe the same capture and use separate clocks. The source view uses a measured device-counter frequency. Scope spans include existing waits and marker overhead, so use uninstrumented runs for latency comparisons.
+The two views describe the same capture and retain their measured clocks. The source view uses a measured device-counter frequency. `manifest.json` records whether CANN reports each task by kernel name or whether it was identified as the unique compute task between that stage’s device markers. Scope spans include existing waits and marker overhead.

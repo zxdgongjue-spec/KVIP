@@ -3945,6 +3945,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     cold_partition = getattr(config, 'mr25_cold_partition', None)
     unified_score = getattr(config, 'mr28_unified_score', None)
     baseline_trace = getattr(config, 'msprof_baseline', False)
+    msprof_output = getattr(config, 'msprof_output', None)
     partition_trial = hot_partition is not None or cold_partition is not None
     score_trial = partition_trial or unified_score is not None
     if score_trial and not (fused and handoff and config.transport == 'urma'
@@ -3952,11 +3953,11 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         raise ValueError('The Score trial uses the dense synthetic URMA Terminal comparison')
     if partition_trial and unified_score is not None:
         raise ValueError('Windowed partition and unified Score are separate trials')
-    if baseline_trace and (not fused or handoff or score_trial or config.transport != 'urma'
+    if baseline_trace and (not msprof_output or not fused or handoff or score_trial or config.transport != 'urma'
                            or config.input != 'synthetic' or config.mode != 'bench'
                            or config.iterations != 1 or len(config.batches) != 1
                            or config.intermediate_fetches != 4 or config.prefetch_tokens <= 0):
-        raise ValueError('Baseline stage trace requires one synthetic P2 URMA case with W4 and prefetch enabled')
+        raise ValueError('Baseline stage trace requires a profile output and one synthetic P2 URMA case with W4 and prefetch enabled')
     torch.npu.set_device(config.device)
     device = torch.device(f'npu:{config.device}')
     stream = torch.npu.current_stream(device)
@@ -4079,7 +4080,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             else:
                 pending = False
         if baseline_trace:
-            from baseline_stage_trace import StageBuffer, write_capture
+            from baseline_stage_trace import StageBuffer, scoped_msprof, write_capture
 
             shape = state.rotating.runtime_shape
             if (state.forward.terminal is None or shape.liCores != 2 * g['batch']
@@ -4099,14 +4100,24 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             pending = True
             state.reset()
             trace.attach()
-            replay_stage('capturing one marked P2/Terminal invocation')
-            state.forward()
             stream.synchronize()
+            pending = False
+            replay_stage('initialization and warmup finished; collecting only marked P2/Terminal')
+            with scoped_msprof(acl.prof, msprof_output, config.device) as capture:
+                pending = True
+                try:
+                    trace.submit_marked(stream)
+                finally:
+                    try:
+                        stream.synchronize()
+                    except BaseException as error:
+                        NativeFetchSession.quarantine('profiled_replay_stream_completion_uncertain', error)
+            replay_stage('msprof stopped and finalized; validating Top2048, KV and Index')
             trace.detach()
             raw = trace.read()
             (directory / 'baseline_stage_trace.bin').write_bytes(raw)
             validate(initial)
-            return write_capture(directory, raw, counter_mhz, state, library, config, soc)
+            return write_capture(directory, raw, counter_mhz, state, library, config, soc, capture)
         pending = True
         replay_stage('first eager forward and device completion')
         state.forward()

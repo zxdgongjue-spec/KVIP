@@ -4,12 +4,14 @@
 from pathlib import Path
 import struct
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent / 'support'))
 from baseline_stage_trace import (  # noqa: E402
-    decode, render, verify_route, CAPACITY, EVENT, HEADER_BYTES, LANE_BYTES, LANES, MAGIC, REQUIRED, VERSION,
+    decode, render, scoped_msprof, verify_route, CAPACITY, EVENT, HEADER_BYTES, LANE_BYTES, LANES, MAGIC,
+    REQUIRED, VERSION,
 )
 
 
@@ -82,3 +84,44 @@ def test_missing_stage_duplicate_capture_or_underfilled_lane_fails():
         verify_route([*events, events[0]], batch=1)
     with pytest.raises(ValueError, match='marked lanes'):
         verify_route([event for event in events if event['lane'] != 64], batch=1)
+
+
+def fake_profiler(calls, *, failed=None):
+    def operation(name, result=0):
+        def call(*arguments):
+            calls.append((name, *arguments))
+            return 99 if failed == name else result
+        return call
+
+    return SimpleNamespace(
+        init=operation('init'), create_config=operation('create_config', 17),
+        start=operation('start'), stop=operation('stop'),
+        destroy_config=operation('destroy_config'), finalize=operation('finalize'),
+    )
+
+
+def test_msprof_wraps_only_the_requested_device_replay(tmp_path):
+    calls = [('KVAF BatchPut',), ('setup stream fence',)]
+    output = tmp_path / 'raw'
+    with scoped_msprof(fake_profiler(calls), output, device_id=5) as report:
+        calls.extend([('marked P2 forward',), ('terminal stream fence',)])
+    calls.append(('source trace readback',))
+    assert calls == [
+        ('KVAF BatchPut',), ('setup stream fence',), ('init', str(output)),
+        ('create_config', [5], 0, 0, 0x0183), ('start', 17),
+        ('marked P2 forward',), ('terminal stream fence',),
+        ('stop', 17), ('destroy_config', 17), ('finalize',), ('source trace readback',),
+    ]
+    assert report['status'] == dict(init=0, start=0, stop=0, destroy_config=0, finalize=0)
+
+
+@pytest.mark.parametrize('failed, expected', [
+    ('start', ['init', 'create_config', 'start', 'destroy_config', 'finalize']),
+    ('stop', ['init', 'create_config', 'start', 'replay', 'stop', 'destroy_config', 'finalize']),
+])
+def test_msprof_cleans_up_acquired_resources_before_returning_errors(tmp_path, failed, expected):
+    calls = []
+    with pytest.raises(RuntimeError, match=rf'acl\.prof\.{failed} failed with status 99'):
+        with scoped_msprof(fake_profiler(calls, failed=failed), tmp_path, device_id=5):
+            calls.append(('replay',))
+    assert [call[0] for call in calls] == expected

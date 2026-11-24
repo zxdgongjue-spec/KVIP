@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from contextlib import ExitStack, contextmanager
 import ctypes
 import hashlib
 import math
@@ -21,6 +22,13 @@ CAPACITY = 256
 HEADER_BYTES = LANE_BYTES = 128
 EVENT = struct.Struct('<3Q8IQ')
 BINDING_OFFSET = 192
+# AscendCL acl/acl_prof.h. Collect task timing, msproftx stream marks,
+# Runtime API calls and ACL API calls for the business replay only.
+ACL_PROF_TASK_TIME = 0x0002
+ACL_PROF_MSPROFTX = 0x0080
+ACL_PROF_RUNTIME_API = 0x0100
+ACL_PROF_ACL_API = 0x0001
+MSPROF_DATA_TYPES = ACL_PROF_TASK_TIME | ACL_PROF_MSPROFTX | ACL_PROF_RUNTIME_API | ACL_PROF_ACL_API
 
 KERNELS = {
     20: ('Hot Score', 'v9_li_kernel'),
@@ -67,18 +75,48 @@ CLOCK = ('Device GetSystemCycle relative to the first recorded scope, scaled by 
          'NPU Event calibration. msprof host and device task timestamps are separate.')
 
 
+@contextmanager
+def scoped_msprof(prof, output, device_id):
+    """Collect a single replay using the existing ACL context and lease stream."""
+    output = Path(output).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    report = dict(api='acl.prof', output=str(output), device_id=device_id, data_types=MSPROF_DATA_TYPES,
+                  scope='one marked P2/Terminal forward through lease stream completion', status={})
+
+    def checked(operation, *arguments):
+        code = getattr(prof, operation)(*arguments)
+        report['status'][operation] = code
+        if code != 0:
+            raise RuntimeError(f'acl.prof.{operation} failed with status {code}')
+
+    with ExitStack() as cleanup:
+        checked('init', str(output))
+        cleanup.callback(checked, 'finalize')
+        handle = prof.create_config([device_id], 0, 0, MSPROF_DATA_TYPES)
+        if not handle:
+            raise RuntimeError('acl.prof.create_config did not return a configuration handle')
+        cleanup.callback(checked, 'destroy_config', handle)
+        checked('start', handle)
+        cleanup.callback(checked, 'stop', handle)
+        yield report
+
+
 class StageBuffer:
     """Attach a private trace buffer only for one already-bound native call."""
 
     def __init__(self, state):
-        library = state.forward.rotating.library
+        self.forward = state.forward
+        library = self.forward.rotating.library
         probe = getattr(library, 'kvip_stage_trace_supported', None)
         if probe is None:
             raise RuntimeError('LIFetch library has no KVIP_STAGE_TRACE entry point')
         probe.argtypes, probe.restype = [], ctypes.c_uint32
         if probe() != VERSION:
             raise RuntimeError('LIFetch stage trace ABI version mismatch')
-        self.workspace = state.forward.workspace
+        self.profile_forward = library.kvip_parallel_tail_profile_forward
+        self.profile_forward.argtypes = [ctypes.c_void_p] * 4
+        self.profile_forward.restype = ctypes.c_uint32
+        self.workspace = self.forward.workspace
         if self.workspace.numel() != 256:
             raise RuntimeError('LIFetch streaming binding must be exactly 256 bytes')
         self.buffer = state.torch.zeros(HEADER_BYTES + LANES * (LANE_BYTES + CAPACITY * EVENT.size),
@@ -96,6 +134,15 @@ class StageBuffer:
 
     def read(self):
         return self.buffer.cpu().numpy().tobytes()
+
+    def submit_marked(self, stream):
+        owner_stream = self.forward.rotating.owner.lease.check_stream()
+        if stream.npu_stream != owner_stream.npu_stream:
+            raise RuntimeError('LIFetch profiling must execute on the active URMA lease stream')
+        code = self.profile_forward(self.forward.bindings.data_ptr(), self.forward.terminal.workspace.data_ptr(),
+                                    stream.npu_stream, self.forward.shape_pointer)
+        if code:
+            raise RuntimeError(f'Marked LIFetch forward failed with status {code}')
 
 
 def decode(raw):
@@ -223,7 +270,7 @@ def render(events, counter_mhz):
     return document, summaries
 
 
-def write_capture(directory, raw, counter_mhz, state, library, config, soc):
+def write_capture(directory, raw, counter_mhz, state, library, config, soc, msprof_capture):
     events = decode(raw)
     verify_route(events, state.batch)
     document, stages = render(events, counter_mhz)
@@ -245,6 +292,7 @@ def write_capture(directory, raw, counter_mhz, state, library, config, soc):
         total_prefetch=total_prefetch, total_final_get=total_final_get, requests=requests,
         fixture_sha256=fixture_hash(fixture), library_sha256=hashlib.sha256(Path(library).read_bytes()).hexdigest(),
         clock=CLOCK, counter_mhz=counter_mhz, events=len(events), stages=stages,
+        msprof_capture=msprof_capture,
         raw_trace='baseline_stage_trace.bin', visual_trace='baseline_stage_trace.json',
         observer_cost='Measured source scopes include marker overhead and existing synchronization',
     )
