@@ -84,3 +84,31 @@ def test_mismatched_event_and_profiler_time_is_rejected(tmp_path):
     timing['event_mean_us'] = timing['mean_us'] = 34.5
     with pytest.raises(ValueError, match='Graph event mean'):
         main.main_times(tmp_path, timing)
+
+
+def test_b20_archive_reads_saved_serial_ids_and_rejects_mixed_runtime(tmp_path):
+    root = tmp_path / 'b20'
+    root.mkdir()
+    markers = dict(physical_npu='4', site='host20', candidate=main.B20_ORACLE_RUN,
+                   reader=main.B20_ORACLE_READER, host='host20', boot_id='archive-boot')
+    for k, v in markers.items():
+        (root / f'{k}.txt').write_text(v)
+    folder = root / 'g10/post-before-output/results/mainline/cases/diagnose/fused'
+    put(folder / 'path_result.json', dict(correctness='PASS', failures=[]))
+    runtime = dict(visible='4', host='host20', npu='test', torch='torch', torch_npu='torch_npu', cann='cann')
+    identity = dict(**runtime, operator='torch_npu.npu_quant_lightning_indexer', inputs={'query':'digest'},
+                    boot='archive-boot')
+    source = dict(identity=identity, origin='fresh', effective_native_ends=np.full((16,4), 2049).tolist())
+    ids = np.broadcast_to(np.arange(2048, dtype=np.int32), (16,4,2048))
+    receipt = dict(group=10, calls=20, queries=1280, serial_set_digest=topk_fingerprint(ids), native_reference=source)
+    put(folder / 'score_topk_check.json', receipt)
+    put(folder / 'mainline_checks.json', dict(runtime=runtime, capture_operand_hashes=identity['inputs'],
+        measured_calls=20, measured_kv_index_rows=320, ordered_diagnostic_calls=20, ordered_diagnostic_rows=320,
+        production_terminal=True, production_revision=main.B20_ORACLE_RUN))
+    np.savez_compressed(folder / 'score_topk_ids.npz', strong_serial=ids, fused=ids+1)
+    assert main.oracle_case_folder(root, 10) == folder
+    assert np.array_equal(main.archived_oracle(root, 10)[0], ids)
+    source['identity']['host'] = 'other-host'
+    put(folder / 'score_topk_check.json', receipt)
+    with pytest.raises(ValueError, match='B20 archived native LI'):
+        main.archived_oracle(root, 10)

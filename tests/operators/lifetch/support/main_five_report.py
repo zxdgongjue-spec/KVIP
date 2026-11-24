@@ -10,6 +10,8 @@ import numpy as np
 
 MAIN = '609fa26fd715f9409bbe74e1b2d3685c58dfb0cf'
 OWNER = '888db6b1603d22f4142bd2ccffe0518611856a31'
+B20_ORACLE_RUN = 'c26c39e27730c10d33c82bf996807c4ef9d4952b'
+B20_ORACLE_READER = '502d130b5e4d6a6795ea94a5b7d27aa1f3ce102d'
 GROUPS = (4, 10, 17, 7, 2)
 
 
@@ -24,22 +26,49 @@ def case_folder(root, group, arm):
     return paths[0].parent
 
 
+def oracle_case_folder(root, group):
+    """Resolve the B20 self-contained native LI capture or the original B24 receipt."""
+    root = Path(root)
+    if (root / 'physical_npu.txt').read_text().strip() != '4':
+        raise ValueError('Expected native TopK evidence captured on physical NPU4')
+    if (root / 'site.txt').is_file() and (root / 'site.txt').read_text().strip() == 'host20':
+        if ((root / 'candidate.txt').read_text().strip() != B20_ORACLE_RUN
+                or (root / 'reader.txt').read_text().strip() != B20_ORACLE_READER):
+            raise ValueError('Expected the verified B20 post-before-output capture')
+        return case_folder(root, group, 'post-before-output')
+    if (root / 'logical-ties.txt').read_text().strip() != OWNER:
+        raise ValueError('Expected the archived per-Q final TopK version')
+    return case_folder(root, group, 'logical-ties')
+
+
 def archived_oracle(owner_root, group):
-    """Load the saved native IDs, including G2's self-contained serial reference."""
+    """Load IDs produced by the native strong-serial LI on the original operands."""
     owner_root = Path(owner_root)
-    if ((owner_root / 'logical-ties.txt').read_text().strip() != OWNER
-            or (owner_root / 'physical_npu.txt').read_text().strip() != '4'):
-        raise ValueError('Expected the archived per-Q final TopK version measured on physical NPU4')
-    folder = case_folder(owner_root, group, 'logical-ties')
+    folder = oracle_case_folder(owner_root, group)
     receipt = read(folder / 'score_topk_check.json')
     src = receipt['native_reference']
     if ((receipt['group'], receipt['calls'], receipt['queries']) != (group, 20, 1280)
             or src['identity']['visible'] != '4'
             or src['identity']['operator'] != 'torch_npu.npu_quant_lightning_indexer'):
         raise ValueError(f'G{group}: wrong native TopK oracle or incomplete owner archive')
-    if group == 2:
+    b20 = (owner_root / f'g{group}' / 'post-before-output') in folder.parents
+    if b20:
+        checks = read(folder / 'mainline_checks.json')
+        path_result = read(folder / 'path_result.json')
+        identity = src['identity']
+        if (checks['production_revision'] != B20_ORACLE_RUN or not checks['production_terminal']
+                or (checks['measured_calls'], checks['measured_kv_index_rows'],
+                    checks['ordered_diagnostic_calls'], checks['ordered_diagnostic_rows']) != (20, 320, 20, 320)
+                or checks['capture_operand_hashes'] != identity['inputs']
+                or identity['host'] != (owner_root / 'host.txt').read_text().strip()
+                or identity['boot'] != (owner_root / 'boot_id.txt').read_text().strip()
+                or any(checks['runtime'][key] != identity[key]
+                       for key in ('host', 'visible', 'npu', 'torch', 'torch_npu', 'cann'))
+                or path_result['correctness'] != 'PASS' or path_result['failures']):
+            raise ValueError(f'G{group}: B20 archived native LI identity or capture validation mismatch')
+    if b20 or group == 2:
         if src['origin'] not in ('fresh', 'validated-cache'):
-            raise ValueError('G2: missing captured native reference')
+            raise ValueError(f'G{group}: missing self-contained native reference')
         ids_path = folder / 'score_topk_ids.npz'
     else:
         path = Path(src['archive_path'])
