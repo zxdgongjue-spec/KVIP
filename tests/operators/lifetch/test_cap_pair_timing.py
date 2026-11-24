@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from contextlib import nullcontext
 import json
+from functools import partial
+import pytest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -9,7 +11,8 @@ import performance
 from reporting import CorrectnessRecorder
 
 
-def test_one_state_is_restored_before_each_graph_event(tmp_path, monkeypatch):
+@pytest.mark.parametrize('calls,details', [(20, 20), (10, 1)])
+def test_one_state_is_restored_before_each_graph_event(tmp_path, monkeypatch, calls, details):
     state = Mock()
     state.lease.capture_scope.side_effect = nullcontext
     device = Mock()
@@ -43,15 +46,19 @@ def test_one_state_is_restored_before_each_graph_event(tmp_path, monkeypatch):
         def __iter__(self):
             yield inputs
 
-    cap_pair_timing.install(ex, config)
+    if calls == 20:
+        cap_pair_timing.install(ex, config)
+    else:
+        config.iterations = 1
+        ex.measure_replay_batch = partial(cap_pair_timing.measure, ex, calls, detail_calls=details)
     assert config.iterations == 1
     result = ex.measure_replay_batch(SimpleNamespace(npu=device), [state], Sequence(), config, tmp_path, fused=True)
     assert result["correctness"] == "PASS"
-    assert profile_calls == [f"call-{i:02d}" for i in range(20)]
+    assert profile_calls == [f"call-{i:02d}" for i in range(calls)]
     assert trace == (["diag-off", "reset", "capture"] + ["reset", "replay", "check"] * 4 +
-                     ["reset", "event-start", "replay", "event-end", "check"] * 20 +
-                     ["diag-on"] + ["reset", "replay", "check"] * 20 + ["diag-off"])
+                     ["reset", "event-start", "replay", "event-end", "check"] * calls +
+                     ["diag-on"] + ["reset", "replay", "check"] * details + ["diag-off"])
     archived = json.loads((tmp_path / "diagnose/round-1/full_attribution.json").read_text())
-    assert [r["accounting"]["invocation"] for r in archived["samples"]] == list(range(20))
-    assert result["all_rounds"]["mean_us"] == result["all_rounds"]["p50_us"] == 57.5
+    assert [r["accounting"]["invocation"] for r in archived["samples"]] == list(range(calls))
+    assert result["all_rounds"]["mean_us"] == result["all_rounds"]["p50_us"] == 47 + (calls + 1) / 2
     native_graph.reset.assert_called_once()

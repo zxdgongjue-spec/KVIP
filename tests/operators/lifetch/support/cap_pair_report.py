@@ -16,13 +16,13 @@ SDK = '813f1750a50b7e6c92d5f5397f2fbc05befef6da'
 SDK_TREE = '1de18e8315137d7a0227c3ae4c82afd45b5fe743'
 
 
-def cap_times(folder, timing):
+def cap_times(folder, timing, *, calls=20, source_round=1):
     """Graph statistics use per-call NPU events; only stages use profiler kernel spans."""
-    profile = read(folder / 'diagnose/round-1/full_attribution.json')
+    profile = read(folder / 'diagnose' / f'round-{source_round}' / 'full_attribution.json')
     samples = profile['samples']
     if ((timing['timing_protocol'], timing['measured_graphs'], timing['graph_calls']) !=
-            ('one_state_individual_graphs', 20, 20) or len(samples) != 20 or profile['graph_calls'] != 20):
-        raise ValueError('Expected 20 reset-and-replay samples on one reusable state')
+            ('one_state_individual_graphs', calls, calls) or len(samples) != calls or profile['graph_calls'] != calls):
+        raise ValueError(f'Expected {calls} reset-and-replay samples on one reusable state')
     events, li, tail = [], [], []
     for i, sample in enumerate(samples):
         acc = sample['accounting']

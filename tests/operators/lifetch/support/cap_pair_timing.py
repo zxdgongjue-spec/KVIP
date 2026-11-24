@@ -14,7 +14,7 @@ def install(execution, config):
     config.iterations = 1
 
 
-def measure(execution, calls, torch, states, sequence, config, directory, *, fused):
+def measure(execution, calls, torch, states, sequence, config, directory, *, fused, detail_calls=None):
     from performance import profile_graph_batch
     from reporting import atomic_json, timing_summary
 
@@ -82,7 +82,7 @@ def measure(execution, calls, torch, states, sequence, config, directory, *, fus
                                 accounting=dict(item, invocation=i, event_us=profile["accounting"]["event_us"])))
 
         state.forward.set_diagnostics(True)
-        for i in range(calls):
+        for i in range(calls if detail_calls is None else detail_calls):
             restore()
             state.forward.times.zero_()
             state.rotating.rank_progress.zero_()
