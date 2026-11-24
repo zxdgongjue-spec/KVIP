@@ -73,7 +73,8 @@ __simd_vf__ inline void Emit(__ubuf__ uint32_t* ids,__ubuf__ uint16_t* scores,
 __aicore__ inline uint32_t Select(LocalTensor<uint32_t> ids,LocalTensor<uint16_t> scores,
     LocalTensor<uint32_t> output,LocalTensor<uint32_t> scratch,
     uint32_t resident,uint32_t valid,uint32_t rank,uint32_t quota,bool compact=true,
-    uint64_t* clocks=nullptr,uint32_t minimum=0,uint32_t packedOffset=0) {
+    uint64_t* clocks=nullptr,uint32_t minimum=0,uint32_t packedOffset=0,
+    uint32_t knownRankCut=UINT32_MAX) {
     auto p=reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr());
     auto full=reinterpret_cast<__ubuf__ uint16_t*>(p+3072);
     auto cold=reinterpret_cast<__ubuf__ uint16_t*>(p+2048);
@@ -90,9 +91,13 @@ __aicore__ inline uint32_t Select(LocalTensor<uint32_t> ids,LocalTensor<uint16_t
     uint32_t threshold=0;
     // Last window accepts the full Top2048; its minimum cannot reject any input.
     if(rank<2048 && !(minimum && n<=minimum)) {
-        RegisterThreshold(score,full,8,2048-rank+1);
-        SetFlag<HardEvent::V_S>(EVENT_ID4);WaitFlag<HardEvent::V_S>(EVENT_ID4);
-        threshold=scratch.template ReinterpretCast<uint16_t>().GetValue(6144);
+        if (knownRankCut != UINT32_MAX) {
+            threshold=knownRankCut;
+        } else {
+            RegisterThreshold(score,full,8,2048-rank+1);
+            SetFlag<HardEvent::V_S>(EVENT_ID4);WaitFlag<HardEvent::V_S>(EVENT_ID4);
+            threshold=scratch.template ReinterpretCast<uint16_t>().GetValue(6144);
+        }
     }
     if(clocks)clocks[2]=GetSystemCycle();
     uint32_t capThreshold=0;
@@ -151,7 +156,8 @@ __simd_vf__ inline void GatherCoveredChunk(__ubuf__ uint32_t* ids,__ubuf__ uint3
 __aicore__ inline uint32_t SelectBitmap(LocalTensor<uint32_t> ids,LocalTensor<uint16_t> scores,
     LocalTensor<uint32_t> output,LocalTensor<uint32_t> scratch,
     __gm__ uint32_t* covered,uint32_t history,uint32_t valid,uint32_t rank,uint32_t quota,
-    uint64_t* clocks=nullptr,uint32_t minimum=0,bool coveredEmpty=false) {
+    uint64_t* clocks=nullptr,uint32_t minimum=0,bool coveredEmpty=false,
+    uint32_t knownRankCut=UINT32_MAX) {
     uint64_t begin=clocks?GetSystemCycle():0;
     auto p=reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr());
     auto eligible=output[2048];
@@ -189,7 +195,7 @@ __aicore__ inline uint32_t SelectBitmap(LocalTensor<uint32_t> ids,LocalTensor<ui
     SetFlag<HardEvent::V_S>(EVENT_ID4);WaitFlag<HardEvent::V_S>(EVENT_ID4);
     uint32_t n=scratch.GetValue(6144);scratch.SetValue(3200,n);
     SetFlag<HardEvent::S_V>(EVENT_ID4);WaitFlag<HardEvent::S_V>(EVENT_ID4);
-    uint32_t count=Select(eligible,scores,output,scratch,0,valid,rank,quota,true,clocks,minimum,4096);
+    uint32_t count=Select(eligible,scores,output,scratch,0,valid,rank,quota,true,clocks,minimum,4096,knownRankCut);
     if(clocks)clocks[0]=begin;
     return count;
 }

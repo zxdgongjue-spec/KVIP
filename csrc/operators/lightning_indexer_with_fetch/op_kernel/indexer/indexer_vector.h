@@ -32,6 +32,9 @@
 #include "recent_seed.h"
 #include "incremental_vector_helpers.h"
 #include "window_fast_vector.h"
+#if KVIP_URMA_WINDOW_LI
+#include "window_rank_pair.h"
+#endif
 #endif
 
 namespace QLIKernel {
@@ -100,6 +103,9 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
     return 0;
 }
 
+#endif
+#if KVIP_URMA_WINDOW_LI
+#include "last_window_row.h"
 #endif
     __aicore__ inline void RotateFetch(uint32_t epoch, uint32_t sequenceHalfWindow = 0) {
 #if !V9_UBMEM
