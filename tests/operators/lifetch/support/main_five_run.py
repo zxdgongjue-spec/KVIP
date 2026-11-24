@@ -234,17 +234,24 @@ def main(args):
     ids_file.unlink()
 
 
-if __name__ == '__main__':
+def run_cli():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('main', 'trace', 'kvaf-root', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
-    parser.add_argument('--owner-archive', type=Path)
+    reference = parser.add_mutually_exclusive_group()
+    reference.add_argument('--owner-archive', type=Path)
+    reference.add_argument('--native-topk-reference', action='store_true',
+                           help='Use the device-native LI TopK reference outside the timed worker.')
     parser.add_argument('--physical-npu', type=int, choices=(0, 4, 5), default=4)
     parser.add_argument('--revision', default=REVISION)
     parser.add_argument('--kvaf-server', required=True)
     parser.add_argument('--group', type=int, choices=(2, 4, 7, 10, 17), required=True)
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parsed = parser.parse_args()
-    if parsed.physical_npu == 4 and not parsed.owner_archive:
-        parser.error('--owner-archive is required for the NPU4 archive comparison')
+    if parsed.physical_npu == 4 and not (parsed.owner_archive or parsed.native_topk_reference):
+        parser.error('select --owner-archive or --native-topk-reference for physical NPU4')
     (worker if parsed.worker else main)(parsed)
+
+
+if __name__ == '__main__':
+    run_cli()

@@ -184,7 +184,7 @@ run_group() (
     if (( local_replay )); then
         node=$("$PYTHON" -B "$support/paced_host20.py" node "$out" "$group")
         if ! "$PYTHON" -B "$support/paced_host20.py" oracle "$archive" "$group"; then
-            oracle_args=()
+            oracle_args=(--native-topk-reference)
             export KVIP_Q4_NATIVE_LI_CACHE="${KVIP_Q4_NATIVE_LI_CACHE:-$work/native-li-reference}"
         fi
     elif [[ $native == "$main_rev" ]]; then
