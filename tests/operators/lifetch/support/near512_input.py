@@ -267,8 +267,10 @@ def _verified_donor(seq, source, group, proof_path):
                 field_sha256=hashes, archive_proof=str(proof_path))
 
 
-def make_input(work, group, fallback_trace, report_dir, *, stitch_source=False, source_proof=None):
+def make_input(work, group, fallback_trace, report_dir, *, stitch_source=False, source_proof=None, preserve_workload=False):
     """Return a cached one-round sequence, its ReplayRound and a printable provenance receipt."""
+    if preserve_workload:
+        stitch_source = True
     if stitch_source and (group not in TRACE_ROUNDS or source_proof is None):
         raise ValueError("Five-trace stitching requires a supported group and its archived 128K input proof")
     seq, root = (None, None) if stitch_source else _find_long_input(work, group)
@@ -303,13 +305,25 @@ def make_input(work, group, fallback_trace, report_dir, *, stitch_source=False, 
         ) != (16, 32, 131328, 16384, 656):
             raise ValueError(f"G{group}: expected a captured BS16/Q4 128K donor with 32 heads and 656B tokens")
         donor = _verified_donor(src_seq, source, group, source_proof) if stitch_source else None
-        ends = 524280 - 17 * np.arange(16, dtype=np.int32)[:, None] + np.arange(4, dtype=np.int32)
-        inputs, proof = _stitched(source, ends, CAPACITY)
+        if preserve_workload:
+            from near512_locality_input import expand_locality
+            from near512_profile import archive_profile, bind_source_check
+
+            archived_state = json.loads(Path(source_proof).read_text())["history_cap"]["capture_state_sha256"]
+            for name in ("logical_score_keys", "logical_score_valid"):
+                if digest(getattr(source, name)) != archived_state[name]:
+                    raise ValueError(f"G{group}: captured {name} differs from the archived short input")
+            inputs, proof = expand_locality(source, CAPACITY)
+            bind_source_check(source, inputs, proof["source_page_to_long_page"])
+            proof["short_profile"] = archive_profile(source, group, source_proof)
+        else:
+            ends = 524280 - 17 * np.arange(16, dtype=np.int32)[:, None] + np.arange(4, dtype=np.int32)
+            inputs, proof = _stitched(source, ends, CAPACITY)
         seq = copy(src_seq)
         seq.cached_ranked_round = inputs
         provenance = dict(
-            kind="stitched",
-            source_kind="stitched_short_capture_pages",
+            kind="workload_preserved" if preserve_workload else "stitched",
+            source_kind="rank_preserving_short_capture" if preserve_workload else "stitched_short_capture_pages",
             source_root=str(fallback_trace),
             **proof,
         )

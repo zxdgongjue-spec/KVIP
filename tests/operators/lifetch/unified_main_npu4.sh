@@ -2,8 +2,8 @@
 # Five captured BS16/Q4 groups on one physical NPU4 with the unified KVAF SDK.
 set -eo pipefail
 if (( $# < 3 || $# > 5 )) || [[ ! $2 =~ ^[a-f0-9]{40}$ || ! $3 =~ ^[a-f0-9]{40}$ ||
-    ( $# == 4 && $4 != cap-pair ) || ( $# == 5 && $4 != active-history && $4 != pr30-parity && $4 != near512 && $4 != near512-five ) ]]; then
-    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA [cap-pair | active-history ARCHIVED_CAP_PAIR | pr30-parity ARCHIVED_ACTIVE_HISTORY | {near512,near512-five} ARCHIVED_PR30_PARITY]" >&2
+    ( $# == 4 && $4 != cap-pair ) || ( $# == 5 && $4 != active-history && $4 != pr30-parity && $4 != near512 && $4 != near512-five && $4 != near512-locality ) ]]; then
+    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA [cap-pair | active-history ARCHIVED_CAP_PAIR | pr30-parity ARCHIVED_ACTIVE_HISTORY | {near512,near512-five} ARCHIVED_PR30_PARITY | near512-locality ARCHIVED_ACTIVE_HISTORY]" >&2
     exit 2
 fi
 repo=$1
@@ -50,7 +50,8 @@ elif [[ $mode == near512* ]]; then
         echo "Expected the local NPU4 parity archive for the same native build" >&2
         exit 2
     fi
-    if [[ $mode == near512-five ]]; then prefix=near512-five; else prefix=near512-ten; fi
+    prefix=$mode
+    if [[ $mode == near512 ]]; then prefix=near512-ten; fi
 fi
 sdk=813f1750a50b7e6c92d5f5397f2fbc05befef6da
 patched_tree=1de18e8315137d7a0227c3ae4c82afd45b5fe743
@@ -196,6 +197,8 @@ elif [[ $mode == active-history ]]; then
     echo "CONFIG measured=active_512k archive=$archive native=$main sdk=$sdk NPU=4 BS=16 Q=4 warmup=4 calls=20"
 elif [[ $mode == cap-pair ]]; then
     echo "CONFIG measured=capacity_pair model_limit=131072/524288 bound_history=131328/524544 input=original_capture native=$main sdk=$sdk NPU=4 BS=16 Q=4 warmup=4 measured_per_arm=20"
+elif [[ $mode == near512-locality ]]; then
+    echo "CONFIG groups=10,4,17,7,2 input=rank_preserving_short_capture model_limit=524288 BS=16 Q=4 physical_NPU=4 measured_calls_per_group=10"
 elif [[ $mode == near512-five ]]; then
     echo "CONFIG model_limit=524288 physical_slots=524544 groups=10,4,17,7,2 input=stitched_per_group NPU=4 BS=16 Q=4 measured_calls_per_group=10"
 elif [[ $mode == near512 ]]; then
@@ -325,8 +328,9 @@ PY_DEVICE
     if [[ $mode == near512* ]]; then
         worker="$support/near512_worker.py"
         args+=(--work "$work")
-        if [[ $mode == near512-five ]]; then
+        if [[ $mode == near512-five || $mode == near512-locality ]]; then
             args+=(--stitch-source --source-proof "$archive/g$g/cap512k/results/mainline/cases/diagnose/fused/mainline_checks.json")
+            if [[ $mode == near512-locality ]]; then args+=(--preserve-workload); fi
         fi
     else
         args+=(--trace "$trace" --owner-archive "$owner")
@@ -341,7 +345,7 @@ PY_DEVICE
     if ! wait "$monitor"; then cat "$arm/thp.log" >&2; exit 1; fi
     monitor=
     if [[ $mode == near512* ]]; then
-        grep -E '^(INPUT|CONFIG|CHECK|TIMING|TRAFFIC|REPLAY_COMPLETE)( |$)' "$arm/worker.log"
+        grep -E '^(INPUT|CONFIG|WORKLOAD|CHECK|TIMING|LI_DETAIL|ARCHIVE_DELTA|TRAFFIC|REPLAY_COMPLETE)( |$)' "$arm/worker.log"
         exit 0
     fi
     if [[ $mode != single ]]; then exit 0; fi
@@ -365,7 +369,7 @@ PY_REPORT
 run_group() (
     set -euo pipefail
     g=$1
-    if [[ $mode == near512-five ]]; then
+    if [[ $mode == near512-five || $mode == near512-locality ]]; then
         run_arm "$g" near512 "" "" "$archive/g$g/cap512k/thp.json"
         exit
     fi
@@ -446,20 +450,21 @@ refs = {g: (root/f'g{g}/pr30_reference.txt').read_text().strip() for g in (10, 4
 (root/'pr30_references.json').write_text(json.dumps(refs, indent=2))
 PY_MAP
     "$PYTHON" -B "$compare" --candidate "$out" --reference-map "$out/pr30_references.json" --repo "$repo"
-elif [[ $mode == near512-five ]]; then
-    "$PYTHON" -B - "$out" <<'PY_NEAR512'
+elif [[ $mode == near512-five || $mode == near512-locality ]]; then
+    "$PYTHON" -B - "$out" "$mode" <<'PY_NEAR512'
 import json
 from pathlib import Path
 from statistics import mean
 import sys
 
 root = Path(sys.argv[1])
+kind = 'rank_preserving_short_capture' if sys.argv[2] == 'near512-locality' else 'stitched_short_capture_pages'
 groups = (10, 4, 17, 7, 2)
 rows = []
 for group in groups:
     path = root / f'g{group}/near512/near512_result.json'
     row = json.loads(path.read_text())
-    if ((row['group'], row['donor']['group'], row['source_kind']) != (group, group, 'stitched_short_capture_pages')
+    if ((row['group'], row['donor']['group'], row['source_kind']) != (group, group, kind)
             or row['measured_calls'] != 10 or row['scores']['queries'] != 640):
         raise ValueError(f'G{group}: incomplete or wrong-trace result in {path}')
     rows.append(row)

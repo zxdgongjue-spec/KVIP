@@ -59,10 +59,11 @@ def test_worker_rejects_wrong_stitch_before_device(tmp_path, monkeypatch, actual
             yield sample
 
     args = SimpleNamespace(main=tmp_path, output=tmp_path/'out', trace=None, group=17,
-                           revision='x'*40, work=tmp_path, stitch_source=True,
+                           revision='x'*40, work=tmp_path, stitch_source=True, preserve_workload=False,
                            source_proof=tmp_path/'g17'/'mainline_checks.json')
 
-    def make_input(work, group, trace, output, *, stitch_source, source_proof):
+    def make_input(work, group, trace, output, *, stitch_source, source_proof, preserve_workload):
+        assert not preserve_workload
         assert (group, stitch_source, source_proof) == (17, True, args.source_proof)
         return Sequence(), sample, dict(actual_group=actual, kind=kind, donor=dict(group=donor))
 

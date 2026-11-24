@@ -11,7 +11,9 @@ import sys
 
 import numpy as np
 
-from cap_pair_report import cap_times, fmt_times
+from cap_pair_report import cap_times, compare, fmt_times
+from li_window_report import details
+from near512_profile import compare_profiles, traffic_comparison
 from main_five_report import read
 from cap_pair_timing import measure
 from main_five_run import verify_assignments
@@ -77,19 +79,25 @@ def worker(args):
             ['git', '-C', main, 'status', '--porcelain', '-uno'], text=True).strip():
         raise ValueError('The production checkout differs from the specified clean native revision')
     args.output.mkdir(parents=True, exist_ok=True)
+    preserve = args.preserve_workload
     sequence, inputs, provenance = make_input(
         args.work, args.group, args.trace, args.output, stitch_source=args.stitch_source,
-        source_proof=args.source_proof,
+        source_proof=args.source_proof, preserve_workload=preserve,
     )
     if len(sequence.rounds) != 1 or next(iter(sequence)) is not inputs:
         raise ValueError('The reference and all replays must share the same frozen round')
     if provenance['actual_group'] != args.group:
         raise ValueError(f"Expected G{args.group} input, received G{provenance['actual_group']}")
     donor = provenance.get('donor')
-    if args.stitch_source and (provenance['kind'] != 'stitched' or not donor or donor['group'] != args.group):
+    expected_kind = 'workload_preserved' if preserve else 'stitched'
+    if (args.stitch_source or preserve) and (provenance['kind'] != expected_kind or not donor or donor['group'] != args.group):
         raise ValueError(f'Expected a stitched input made from the selected G{args.group} trace')
     geometry_check(inputs)
     ends = inputs.query_ends
+    if preserve:
+        short_dir = args.source_proof.parent
+        short_times = cap_times(short_dir, read(short_dir / 'path_result.json')['all_rounds'])
+        short_li, _ = details(short_dir)
     support = activate_production(main)
     import execution as ex
     import kvaf
@@ -114,18 +122,28 @@ def worker(args):
     torch.npu.set_device(0)
     device = torch.device('npu:0')
     serial = serial_reference(inputs, torch, torch_npu, device)
-    captured_oracle = inputs.validate_topk if provenance['kind'] == 'capture' else None
+    captured_oracle = inputs.validate_topk if provenance['kind'] in ('capture', 'workload_preserved') else None
+    comparison = {}
+    if preserve:
+        workload = compare_profiles(provenance['short_profile'], inputs, serial)
+        comparison['winner_locality'] = workload
+        def counts(side):
+            return '/'.join(str(workload[side][k]) for k in ('unique', 'hot', 'abc', 'cold'))
+        print(f"WORKLOAD{group_label} mapped_native_queries={workload['checked_queries']}/64 added_winners=0 "
+              f"short128_unique/hot/ABC/cold={counts('short')} long_unique/hot/ABC/cold={counts('long')}", flush=True)
     verified = {}
     expected_sets = np.sort(serial, axis=-1)
 
     def native_score_check(selected):
         if captured_oracle is not None:
             captured_oracle(selected)
+        if preserve:
+            inputs.check_donor_topk(selected)
         validate_native_sets(inputs, selected, serial, torch, torch_npu, device, verified)
 
     native_score_check(serial)
     # The production replay checks scores through this input method, outside the
-    # timed graph. The stitched case has no captured scores for its new Q/K pairs.
+    # timed graph. Cross-request stitching has no captured scores for its new Q/K pairs.
     inputs.validate_topk = native_score_check
     torch.npu.empty_cache()
     cfg = configuration([
@@ -201,19 +219,36 @@ def worker(args):
         sha = hashlib.file_digest(stream, 'sha256').hexdigest()
     np.savez_compressed(args.output / 'near512_topk_ids.npz', serial=serial, measured=np.stack(selected))
     values = [traffic[label] for label in labels]
+    if preserve:
+        long_li, _ = details(fused)
+        comparison.update(archive=str(short_dir), archived_mean_p50_us=short_times,
+                          near512_minus_128k_us=compare(short_times, times),
+                          li_kernels_mean_us=dict(short=short_li, long=long_li),
+                          request_traffic=traffic_comparison(provenance['short_profile'], values))
     detail, = diagnostic.values()
     atomic_json(args.output / 'near512_result.json', dict(
         native=actual, physical_npu=4, group=args.group, donor=donor,
         source_kind=provenance['source_kind'], bound_history=CAPACITY,
         scores=score_check, measured_calls=CALLS, measured_complete_KV_Index_rows=16*CALLS, diagnostic=detail,
         measured_requests=values, mean_p50_us=times, timing_protocol='restored_single_call_graph_events',
-        source_root=provenance['source_root'], native_library=str(lib), library_sha256=sha))
+        source_root=provenance['source_root'], native_library=str(lib), library_sha256=sha, **comparison))
     print(f"CHECK{group_label} TopK_score_vs_native=PASS calls={CALLS}/{CALLS} queries={score_check['queries']}/640 "
           f"KV_and_Index=PASS rows=160/160 ordered_Index_diagnostic={detail['ordered_rows']}/16 private_CQ=PASS")
     print(f'TIMING{group_label} ' + fmt_times(times))
     print(f"TRAFFIC{group_label} prefetch/final_tokens_per_call_mean={mean(v['prefetch'] for v in values):.2f}/"
           f"{mean(v['final'] for v in values):.2f} "
           f"diagnostic_events_at_or_above_256K_prefetch/final={detail['prefetch_above_256k']}/{detail['final_above_256k']}")
+    if preserve:
+        phases = comparison['li_kernels_mean_us']
+        traffic_diff = comparison['request_traffic']
+        def joined(row):
+            return '/'.join(f'{v:.2f}' for v in row)
+        print(f"LI_DETAIL{group_label} short128_LI1/LI2/LI3_mean_us={joined(phases['short'])} "
+              f"near512_LI1/LI2/LI3_mean_us={joined(phases['long'])}")
+        print(f"ARCHIVE_DELTA{group_label} near512_minus_128k " + fmt_times(comparison['near512_minus_128k_us'], signed=True))
+        for side, name in (('short', 'short128'), ('long', 'near512'), ('delta', 'near512_minus_128k')):
+            pair = traffic_diff[side]
+            print(f"TRAFFIC{group_label} {name} prefetch/final_tokens_per_call_mean={pair['prefetch']:.2f}/{pair['final']:.2f}")
     print(f'REPLAY_COMPLETE{group_label} measured_calls={CALLS} result={args.output / "near512_result.json"}')
 
 
@@ -227,5 +262,6 @@ if __name__ == '__main__':
     parser.add_argument('--group', type=int, default=4)
     parser.add_argument('--stitch-source', action='store_true',
                         help='Construct the long input from the selected 128K trace, even if a native long capture exists')
+    parser.add_argument('--preserve-workload', action='store_true', help='Keep original winner pools and residency when extending the scan')
     parser.add_argument('--source-proof', type=Path, help='Archived PR30 parity capture operand hashes for this group')
     worker(parser.parse_args())
