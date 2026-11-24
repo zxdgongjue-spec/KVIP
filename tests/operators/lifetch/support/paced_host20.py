@@ -28,7 +28,7 @@ ARCHIVE_ERRORS = (OSError, KeyError, ValueError, TypeError, IndexError, Assertio
 
 def run_device(root):
     physical = (root/'physical_npu.txt').read_text().strip()
-    if physical not in ('0', '5'):
+    if physical not in ('0', '5') and not (physical == '4' and replay_site(root) == 'host20'):
         raise ValueError(f'Unexpected B20 physical device {physical}')
     return physical
 
@@ -66,19 +66,20 @@ def four_batch_trace(root, group):
     return trace
 
 
-def host16_run(root):
+def replay_site(root):
     marker = root / 'site.txt'
-    return marker.is_file() and marker.read_text().strip() == 'host16'
+    return marker.read_text().strip() if marker.is_file() else None
 
 
-def host16_four_batch_archives(root, group):
+def site_four_batch_archives(root, group):
     # Containers on different machines can share a hostname and machine ID.
     # Accept a legacy archive with no site marker only when the boot UUID matches.
     boot = (root / 'boot_id.txt').read_text().strip()
-    for archive, thp in local_archives(root.parent, group, 'paced-tail', '5'):
+    for archive, thp in local_archives(root.parent, group, 'paced-tail', run_device(root)):
         try:
             if ((archive/'candidate.txt').read_text().strip() == PACED
-                    and (host16_run(archive) or (boot and (archive/'boot_id.txt').read_text().strip() == boot))
+                    and (replay_site(archive) == replay_site(root)
+                         or (replay_site(archive) is None and boot and (archive/'boot_id.txt').read_text().strip() == boot))
                     and thp['status'] == 'measured' and thp['page_mode'] == 'thp'
                     and 'numa_pages_overlapping_vmas' in thp):
                 yield archive, thp
@@ -108,9 +109,9 @@ def four_batch_times(archive, group, thp, inputs, proof, cfg):
 
 
 def compare_four_batch(root, group, times, thp, inputs, proof, cfg):
-    if host16_run(root):
-        reason = 'no_matching_host16_npu5_four_batch_archive'
-        for archive, _ in host16_four_batch_archives(root, group):
+    if replay_site(root):
+        reason = f'no_matching_{replay_site(root)}_npu{run_device(root)}_four_batch_archive'
+        for archive, _ in site_four_batch_archives(root, group):
             try:
                 old, placement = four_batch_times(archive, group, thp, inputs, proof, cfg)
             except ARCHIVE_ERRORS as exc:
@@ -138,8 +139,8 @@ def compare_four_batch(root, group, times, thp, inputs, proof, cfg):
 
 def target_node(root, group):
     physical = run_device(root)
-    if host16_run(root):
-        for _, thp in host16_four_batch_archives(root, group):
+    if replay_site(root):
+        for _, thp in site_four_batch_archives(root, group):
             node = single_numa_node(thp)
             if node is not None:
                 return node
@@ -223,7 +224,7 @@ def report(root, group):
     result = read(folder/'path_result.json')
     inputs = read(folder.parent/'replay_input.json')
     allowed = (PACED, CREDIT_TRACE) if group == 7 and physical == '5' else (PACED,)
-    if physical == '5':
+    if physical == '5' or (physical == '4' and replay_site(root) == 'host20'):
         allowed += (POST_BEFORE_OUTPUT,)
     if (expected not in allowed or cfg['production_revision'] != expected
             or proof['production_revision'] != expected or cfg['physical_npu'] != int(physical) or cfg['device'] != 0

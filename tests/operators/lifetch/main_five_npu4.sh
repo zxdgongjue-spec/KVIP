@@ -10,6 +10,7 @@ credit_group=
 site=
 if [[ $# == 4 ]]; then
     case "${PEER_PHYSICAL_NPU:-4}/$4/$native" in
+        4/host20-local/"$post_before_output") site=host20 ;;
         5/host16-local/"$post_before_output") site=host16 ;;
         5/g7-credit/957f59ace1520d3da8ef839a4d341902f62f8f66) credit_group=7 ;;
         5/g10-four-batch/6d7f257b3d664a8b4991cfd3ebd12da4f2038d04) credit_group=10 ;;
@@ -27,6 +28,8 @@ transport=a2857b460a74704114fd30a849ae38666cc2c372
 serial=da318bdb81344672b5d9013e04d517669d3eb142
 # Existing mainline/LI readers default to B24. NPU0 and NPU5 use the B20 paced-tail candidate.
 peer_physical_npu=${PEER_PHYSICAL_NPU:-4}
+local_replay=0
+if [[ $peer_physical_npu != 4 || -n "$site" ]]; then local_replay=1; fi
 case "$peer_physical_npu" in
     0|5) [[ ( "$peer_physical_npu" == 5 && "$native" == "$post_before_output" ) || -n "$credit_group" || "$native" == 6d7f257b3d664a8b4991cfd3ebd12da4f2038d04 ]] || { echo "Expected the paced-tail candidate on NPU$peer_physical_npu" >&2; exit 2; } ;;
     4) ;;
@@ -47,7 +50,7 @@ if [[ $native != "$main_rev" ]]; then
         echo "Expected a full candidate SHA based on the tested parallel terminal" >&2
         exit 2
     }
-    if [[ $peer_physical_npu != 4 ]]; then
+    if (( local_replay )); then
         label=paced-tail
         arm_label=paced-tail
         prefix="host20-npu${peer_physical_npu}-paced-tail"
@@ -64,17 +67,17 @@ if [[ $native != "$main_rev" ]]; then
     fi
 fi
 if [[ $native == "$post_before_output" ]]; then
-    [[ $peer_physical_npu == 5 ]] || { echo 'This experiment requires physical NPU5' >&2; exit 2; }
+    [[ $peer_physical_npu == 5 || $site == host20 ]] || { echo 'Expected NPU5 or B20 NPU4 with host20-local' >&2; exit 2; }
     label=post-before-output
     arm_label=$label
-    prefix="${site:-host20}-npu5-post-before-output"
+    prefix="${site:-host20}-npu${peer_physical_npu}-post-before-output"
     unset KVIP_CREDIT_G10_INPUT KVIP_CREDIT_G10_HASHES
 fi
 if [[ $credit_group == 7 ]]; then prefix=host20-npu5-credit-g7; fi
 out=$(mktemp -d "$area/$prefix.XXXXXX")
 if [[ -n "$site" ]]; then printf '%s\n' "$site" >"$out/site.txt"; fi
 echo "RESULT_ROOT=$out"
-if [[ $peer_physical_npu != 4 ]]; then echo "LOG=$out/run.log"; fi
+if (( local_replay )); then echo "LOG=$out/run.log"; fi
 exec > >(tee "$out/run.log") 2>&1
 
 checkout() {
@@ -115,7 +118,7 @@ archive_for() {
     else printf '%s\n' "$area/fused.N7n8ZP"; fi
 }
 for group in "${groups[@]}"; do
-    if [[ $peer_physical_npu != 4 ]]; then continue; fi
+    if (( local_replay )); then continue; fi
     archive=$(archive_for "$group")
     if [[ $native != "$main_rev" && ! -s "$reference/g$group/mainline/thp.json" ]]; then
         echo "Missing upstream G$group archive at $reference" >&2
@@ -163,7 +166,7 @@ run_group() (
     archive=$(archive_for "$group")
     arm="$out/g$group/$label"
     mkdir -p "$arm"
-    if [[ $site == host16 ]]; then
+    if [[ -n "$site" ]]; then
         if ! trace=$(bash "$reader_src/tests/operators/lifetch/peer_g2_input.sh" "$work" "$group" 2>"$arm/input.log"); then
             cat "$arm/input.log" >&2
             echo "FAILED_INPUT=G$group INPUT_LOG=$arm/input.log" >&2
@@ -178,7 +181,7 @@ run_group() (
         trace=$(bash "$reader_src/tests/operators/lifetch/peer_g2_input.sh" "$work" "$group")
     fi
     oracle_args=(--owner-archive "$archive")
-    if [[ $peer_physical_npu != 4 ]]; then
+    if (( local_replay )); then
         node=$("$PYTHON" -B "$support/paced_host20.py" node "$out" "$group")
         if ! "$PYTHON" -B "$support/paced_host20.py" oracle "$archive" "$group"; then
             oracle_args=()
@@ -228,7 +231,7 @@ run_group() (
     fi
     if ! wait "$monitor"; then cat "$arm/thp.log" >&2; exit 1; fi
     monitor=
-    if [[ $peer_physical_npu != 4 ]]; then
+    if (( local_replay )); then
         "$PYTHON" -B "$support/paced_host20.py" report "$out" "$group" | tee -a "$out/summary.txt"
     elif [[ $native == "$main_rev" ]]; then
         "$PYTHON" -B "$support/main_five_report.py" "$out" "$group" "$archive" | tee -a "$out/summary.txt"
@@ -261,7 +264,7 @@ if (( ${#failed[@]} )); then
 fi
 if [[ -n "$credit_group" ]]; then
     "$PYTHON" -B "$support/credit_collection.py" "$out" "$credit_group" | tee -a "$out/summary.txt"
-elif [[ $peer_physical_npu != 4 ]]; then
+elif (( local_replay )); then
     "$PYTHON" -B "$support/paced_host20.py" summary "$out" | tee -a "$out/summary.txt"
 elif [[ $native != "$main_rev" ]]; then
     "$PYTHON" -B "$support/li_window_report.py" summary "$out" | tee -a "$out/summary.txt"
