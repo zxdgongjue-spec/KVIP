@@ -616,7 +616,15 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     }
     uint32_t cap=half?rotating::SequenceWindowEnd(runtimeShape_.history,runtimeShape_.resident,half,epoch):
         rotating::Trigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,epoch)*128;
+#if KVIP_LAST_ROW_PAIR
+    const bool lastPair = lastRowTeam_ && epoch + 1 == runtimeShape_.rounds;
+    bool delegated = false;
+#endif
     for(uint32_t b=lane;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes) for(uint32_t q=0;q<4;++q) {
+#if KVIP_LAST_ROW_PAIR
+        if (lastPair && !delegated && q < 2) delegated = OfferLastPair(b, q, requests0 == 0);
+        if (delegated && q >= 2) break;
+#endif
         // Init clears covered; the posting path records every admission in
         // requests. The predecessor fence makes the row and bitmap visible.
         windowCoveredEmpty_=incrementalMetadataActive_ && (((b-lane)/runtimeShape_.serviceLanes)==0 ? requests0==0 : requests1==0);
@@ -634,6 +642,9 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
         incrementalMetadataIndex_=((b-lane)/runtimeShape_.serviceLanes)*4+q;
         uint32_t nextB=q==3?b+runtimeShape_.serviceLanes:b,nextQ=(q+1)%4;
         incrementalHasNext_=incrementalPipeline_ && incrementalMetadataActive_ && nextB<runtimeShape_.batch;
+#if KVIP_LAST_ROW_PAIR
+        if (delegated && q == 1) incrementalHasNext_ = false;
+#endif
         if(incrementalHasNext_) {
             incrementalNextQuery_=nextB*4+nextQ;incrementalNextIndex_=incrementalMetadataIndex_+1;
             uint64_t nextReady=incrementalMetadata_.GetValue(progressIndex+16);
@@ -653,10 +664,19 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     if(incrementalMetadataActive_) {
         SetFlag<HardEvent::S_MTE3>(EVENT_ID5);WaitFlag<HardEvent::S_MTE3>(EVENT_ID5);
         for(uint32_t b=lane,i=0;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes,i+=64)
-            DataCopy(metadata[b*64],incrementalMetadata_[i],64);
+            DataCopy(metadata[b*64],incrementalMetadata_[i],
+#if KVIP_LAST_ROW_PAIR
+                delegated ? 32U : 64U
+#else
+                64U
+#endif
+            );
         SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
         incrementalMetadataActive_=false;
     }
+#if KVIP_LAST_ROW_PAIR
+    if (delegated) JoinLastPair(lane);
+#endif
     exportWindowCold_=false;
     // The producer's progress lookup table shares the TopK score buffer.
     // Rebuild it before LI resumes; otherwise score bytes become fake progress.

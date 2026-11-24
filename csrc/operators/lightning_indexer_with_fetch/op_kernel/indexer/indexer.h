@@ -762,6 +762,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
             QLICommon::RunInfo info;
             CalcRunInfo(0, 0, info, 0, 0);
             if constexpr (Phase == SequenceLiPhase::Threshold) {
+#if KVIP_LAST_ROW_PAIR
+                if (tmpBlockIdx % SIM_Q == 0) vectorService.ResetLastRow(batch);
+#endif
                 vectorService.ProcessResidentTopK(info, tmpBlockIdx % SIM_Q);
             } else {
                 vectorService.ProcessTopK(info, tmpBlockIdx % SIM_Q);
@@ -814,6 +817,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
             uint32_t serviceEpoch = rotating::ServiceRank(runtimeShape_.batch, runtimeShape_.splitQ,
                                                           aiCoreIdx) / runtimeShape_.serviceAics;
             if ASCEND_IS_AIV {
+#if KVIP_LAST_ROW_PAIR
+                vectorService.lastRowTeam_ = vectorService.HasLastRowTeam();
+#endif
                 vectorService.LoadSequenceSplitThresholds(batch);
                 vectorService.PrepareRotationProgress();
                 if (serviceEpoch == 0) vectorService.RotateFetch(0, halfTokens);
@@ -825,6 +831,13 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
                 ScanSequenceHalf(begin, end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
                 if ASCEND_IS_AIV {
                     if (serviceEpoch == epoch) vectorService.RotateFetch(epoch, halfTokens);
+#if KVIP_LAST_ROW_PAIR
+                    if (epoch + 1 == runtimeShape_.rounds && serviceEpoch == 0 && vectorService.lastRowTeam_) {
+                        uint32_t row = rotating::ServiceLane(runtimeShape_.batch, runtimeShape_.splitQ,
+                            runtimeShape_.serviceAics, aiCoreIdx, tmpBlockIdx % 2);
+                        vectorService.HelpLastPair(row, halfTokens);
+                    }
+#endif
                 }
             }
         }
