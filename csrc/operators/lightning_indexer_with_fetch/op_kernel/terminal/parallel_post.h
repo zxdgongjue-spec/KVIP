@@ -28,7 +28,10 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PackUniqueLocal(
    upper+=asc_shfl_down(upper,2);upper+=asc_shfl_down(upper,1);
    upper+=priorSlots;
   }
-  if(!lane)counter[14]=capacityProbe && upper>2048;
+  if(!lane){
+    counter[14]=capacityProbe && upper>2048;
+    counter[15]=capacityProbe && upper>=priorSlots && upper-priorSlots<256;
+  }
  }
 
  asc_syncthreads();
@@ -108,26 +111,26 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PackUniqueLocal(
    if(f!=16 && f!=18 && f!=19)cfg[f]=asc_ldcg(boundTemplate+f);
    if(f==0){auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(asc_ldcg(&qArgs->queue_state));uint64_t head=asc_ldcg(&queue->sq_producer_index);cfg[16]=uint32_t(head);cfg[18]=uint32_t(head);cfg[19]=uint32_t(head>>32);}
   }
-  if(tid>=128)for(uint32_t i=tid-128;i<2048;i+=384){uint32_t tagged=fullIds[i],token=tagged&0x3fffffffU,slot=UINT32_MAX;
-   outputSlots[i]=UINT32_MAX;
-   asc_stcg(selected+i,tagged==UINT32_MAX?UINT32_MAX:token);
-   if(tagged==UINT32_MAX)continue;
-   if(token>=history){asc_atomic_or(error,1U);fullIds[i]=UINT32_MAX;continue;}
-   if((tagged&0x80000000U)&&token<resident)slot=token;
-   else slot=rotating::DirectTailSlot(token,resident,tailBegin,tailEnd,tailCapacity);
-   if(slot!=UINT32_MAX){outputSlots[i]=slot;fullIds[i]=asc_ldcg(reinterpret_cast<__gm__ uint32_t*>(logical)+2*token);}
-  }
  }
  asc_syncthreads();
- // Emit begins with the producer-warp wait and its own block rendezvous.
- Emit(fullIds,outputSlots,error,mapping,lru,logical,history,resident,history-512,256,512,nullptr,nullptr,flags,generation,q+1);
- if(tid<32){uint32_t ready;
-  do{ready=asc_ballot(lane>=4 || asc_ldcg(flags+24*32+lane)>=generation);}while(ready!=UINT32_MAX);
-  if(!lane)counter[13]=asc_ldcg(&row->slots);
+ // If even the unfiltered count is below the four-batch threshold, this Q
+ // can post its exact list now. Read the actual row total after the post.
+ if(tid<32){
+   uint32_t total=UINT32_MAX;
+   if(!counter[15] && counter[0]>1){
+     // Reservations only increase. Once 256 final transfers are reserved,
+     // later reservations cannot change this owner's four batch boundaries.
+     uint32_t ready;
+     do{
+       uint32_t partial=lane?0:asc_ldcg(&row->slots);
+       partial=asc_shfl(partial,0);
+       if(partial>=priorSlots && partial-priorSlots>=256){total=partial;break;}
+       ready=asc_ballot(lane>=4 || asc_ldcg(flags+24*32+lane)>=generation);
+       if(ready==UINT32_MAX){if(!lane)total=asc_ldcg(&row->slots);break;}
+     }while(true);
+   }
+   if(!lane)counter[13]=total;
  }
-
-
-
 }
 // Payload precedes release publication; readers bypass scalar cache.
 // One full warp; no inter-warp state or payload reads. Callers publish separately.

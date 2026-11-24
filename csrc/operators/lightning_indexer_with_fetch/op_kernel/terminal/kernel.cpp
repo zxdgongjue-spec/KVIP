@@ -12,6 +12,7 @@ constexpr uint32_t TAIL_SRCSET=0, TAIL_DSTSET=2048, TAIL_PLAN_SRC=4096,
 #include "capacity.h"
 #include "emit.h"
 #include "parallel_post.h"
+#include "format_after_post.h"
 #include "terminal_output_routes.h"
 #include "terminal_finish.h"
 #include "staged_fetch_worker.h"
@@ -171,7 +172,7 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  if(profile)ts[19]=GetSystemCycle();
  }
  // Consume the original compact UB result directly; compact destinations use postWork.
- // MERGED_OUTPUT_BEFORE_WQE
+ // Build the per-Q address list before publishing its first WQE.
  if(profile)ts[6]=GetSystemCycle();
  Simt::VF_CALL<PackUniqueLocal>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(postIds.GetPhyAddr()),width,counts[0],counts[1],counts[2],counts[3],q,mapping,reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch[bitmapWords].GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch.GetPhyAddr()),(reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+uint64_t(b)*1),reinterpret_cast<__gm__ uint64_t*>(rotating::RequestAddressTable(ctx,b,owner,s.history)),reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postWork[2048].GetPhyAddr()),s.resident,reinterpret_cast<__ubuf__ uint32_t*>(postWork[4096].GetPhyAddr()),activeLru,slotCapacity,capacityCounted,capacityPass==0,headers,priorSlots,(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity),(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+uint64_t(b)*rotating::kChangeCapacity),(uint64_t(tailEnd)<<32)|tailBegin,tailCapacity,reinterpret_cast<__gm__ uint32_t*>(runtime->templates)+query*32,args,reinterpret_cast<__ubuf__ uint32_t*>(op.TerminalIds().GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch[bitmapWords+8].GetPhyAddr()),(reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history),flags,generation,s.history,reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+query*2048,owner*uint32_t(ctx->outputStride),update,s.batch,query);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
@@ -181,16 +182,13 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  uint32_t own=postScratch.GetValue(bitmapWords);
  uint32_t slotBase=postScratch.GetValue(bitmapWords+1),all=own,offset=0;
  uint32_t total=postScratch.GetValue(bitmapWords+13);
- const bool paced=terminal_batches::ShouldPace(own,total,priorSlots);
+ const bool paced=total!=UINT32_MAX && terminal_batches::ShouldPace(own,total,priorSlots);
  uint32_t firstPostCount=own;
  if(profile){ts[20]=own;ts[21]=all;ts[22]=slotBase;}
  if(profile)ts[12]=GetSystemCycle();
  auto ids=op.TerminalIds();
- GlobalTensor<uint32_t> output,slots;
- output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(runtime->logical)+query*2048);slots.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048);
- SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
- DataCopy(slots,postScratch,2048);
- PublishTerminalOutputs(update,s.batch,query,ids,postScratch,postScratch[bitmapWords+9],ctx->locations+uint64_t(query)*2048*4);
+ uint32_t routes[4];
+ for(uint32_t w=0;w<4;++w)routes[w]=postScratch.GetValue(bitmapWords+9+w);
  uint32_t packError=postScratch.GetValue(bitmapWords+8);ownError|=packError;
  if(profile)ts[7]=GetSystemCycle();
  auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args->queue_state);
@@ -210,11 +208,25 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  }
  if(profile)ts[14]=GetSystemCycle();
- // Logical IDs are emitted with slots after all admissions are visible.
+ // The first doorbell is independent of public output formatting.
  if(profile)ts[15]=GetSystemCycle();
  rotating::CommitTerminalPost(args,originalHead,firstPostCount,post);
  if(profile)ts[4]=GetSystemCycle();
 
+ Simt::VF_CALL<FinishOutputAfterPost>(Simt::Dim3{512,1,1},
+   reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
+   reinterpret_cast<__ubuf__ uint32_t*>(postScratch.GetPhyAddr()),
+   reinterpret_cast<__ubuf__ uint32_t*>(postScratch[2048].GetPhyAddr()),
+   mapping,activeLru,reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history,
+   reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+query*2048,s.history,s.resident,
+   tailBegin,tailEnd,tailCapacity,flags,generation,reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+b);
+ SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ packError|=postScratch.GetValue(2048);ownError|=packError;
+ total=postScratch.GetValue(2049);
+ GlobalTensor<uint32_t> slots;slots.SetGlobalBuffer(compact);
+ SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+ DataCopy(slots,postScratch,2048);
+ PublishTerminalOutputs(update,s.batch,query,ids,postScratch,routes,ctx->locations+uint64_t(query)*2048*4);
  op.FreeEventID();
  if(profile)ts[5]=GetSystemCycle();
  auto local=op.TerminalScratch();auto work=reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr());
