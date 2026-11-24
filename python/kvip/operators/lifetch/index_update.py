@@ -85,14 +85,13 @@ class DirectIndexUpdate:
         if query_inputs is not None:
             if outputs is None:
                 outputs = torch.zeros((2, self.batch * 4, 1, 2048), dtype=torch.int32, device=self.device)
-            if (
-                tuple(outputs.shape) != (2, self.batch * 4, 1, 2048)
-                or outputs.dtype != torch.int32
-                or outputs.device != self.device
-                or not outputs.is_contiguous()
+            self.logical_output, self.slot_output = outputs
+            if any(
+                tuple(output.shape) != (self.batch * 4, 1, 2048)
+                or output.dtype != torch.int32 or output.device != self.device or not output.is_contiguous()
+                for output in (self.logical_output, self.slot_output)
             ):
-                raise ValueError("Service outputs must be contiguous int32 [2, B*4, 1, 2048]")
-            self.logical_output, self.slot_output = outputs.unbind(0)
+                raise ValueError("Service outputs must each be contiguous int32 [B*4, 1, 2048]")
         pointers = _update_pointers(
             keys, scales, addresses, logical_ids, row_owners, rotating, self.status, self.plan_buffer,
             rotating.prefetch_status, rotating.final_status, rotating.owner.abi_sizes["status"],
@@ -126,7 +125,8 @@ class UbmemIndexUpdate:
             ("logical_ids", logical_ids, keys.shape[:2], torch.int64),
             ("row_owners", row_owners, (batch,), torch.int32),
             ("status", status, (batch,), torch.int32),
-            ("outputs", outputs, (2, batch * 4, 1, 2048), torch.int32),
+            ("logical output", outputs[0], (batch * 4, 1, 2048), torch.int32),
+            ("slot output", outputs[1], (batch * 4, 1, 2048), torch.int32),
         ):
             if (
                 tensor.device != self.device
@@ -139,7 +139,7 @@ class UbmemIndexUpdate:
             raise ValueError("UBmem Index keys must be contiguous bytes [owner, history, 128]")
         self.plan_buffer = self.extended_work = None
         self.status = status
-        self.logical_output, self.slot_output = outputs.unbind(0)
+        self.logical_output, self.slot_output = outputs
         pointers = _update_pointers(
             keys, scales, addresses, logical_ids, row_owners, rotating, status, self.plan_buffer,
             rotating.ubmem_status, rotating.region, 128, self.extended_work, query_inputs,

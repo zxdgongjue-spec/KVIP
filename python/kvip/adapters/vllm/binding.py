@@ -2,6 +2,7 @@
 """Startup binding of service storage to the original LIFetch launcher."""
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,29 +14,50 @@ from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, LeasedRuntime, Ubmem
 from kvip.operators.lifetch_ubmem.binding import UbmemBinding
 from kvip.operators.lifetch.index_update import UbmemIndexUpdate
 from kvip.operators.lifetch_ubmem.build import UbmemGeometry, build_ubmem_library, kvaf_cann
-from kvip.operators.lifetch.workspace import UbmemWorkspace
+from kvip.operators.lifetch.workspace import LIFetchWorkspace, UbmemWorkspace
 from kvip.runtime.device import query_device_resources
 
 
-def bind_selectors(torch, policy, config):
-    # Profiling allocates inference tensors; startup must initialize their
-    # shared views under the same mode, without cloning graph-bound storage.
+def bind_selectors(torch, policy, config, *, batch=None):
+    """Bind one graph geometry, sharing the backing KV and Index storage."""
     with torch.inference_mode():
-        transport = getattr(config, "transport", "urma")
-        if transport == "ubmem":
-            _bind_ubmem_selectors(torch, policy, config)
-        elif transport == "urma":
-            _bind_selectors(torch, policy, config)
+        setup, workspace = policy.fused_setup, policy.fused_workspace
+        if setup is None or workspace is None or policy.writer is None:
+            raise RuntimeError("LIFetch requires profiled workspace and bound service caches")
+        if batch is not None and batch != setup.batch:
+            setup = SimpleNamespace(**{**vars(setup), "batch": batch})
+            shape_args = dict(
+                batch=batch, history=workspace.block_history, aics=setup.aics,
+                windows=setup.windows, device=policy.pool.device,
+                index_heads=workspace.inputs.index_heads, compute=workspace.compute,
+            )
+            if config.transport == "urma":
+                workspace = LIFetchWorkspace(torch, **shape_args)
+                workspace.allocate_rotation(torch, batch=batch, history=workspace.block_history,
+                                            resident=policy.history_capacity, aics=setup.aics, windows=setup.windows)
+            else:
+                workspace = UbmemWorkspace(torch, resident=policy.history_capacity, **shape_args)
+                setup.shapes = {width: replace(shape, batch=batch) for width, shape in setup.shapes.items()}
+        if config.transport == "ubmem":
+            selectors = _bind_ubmem_selectors(torch, policy, config, setup, workspace)
+        elif config.transport == "urma":
+            selectors = _bind_selectors(torch, policy, config, setup, workspace)
         else:
-            raise ValueError(f"Unsupported LIFetch transport: {transport}")
+            raise ValueError(f"Unsupported LIFetch transport: {config.transport}")
+        if getattr(config, "lifetch_snapshot_dir", ""):
+            from kvip.adapters.vllm.snapshot import LIFetchSnapshot
+
+            group = config.lifetch_snapshot_group
+            if group not in selectors:
+                raise ValueError(f"LIFetch snapshot group {group} is out of range")
+            selectors[group].snapshot = LIFetchSnapshot(selectors[group], config)
+        if batch is None:
+            policy.indexer_selectors = selectors
+        return selectors
 
 
-def _bind_selectors(torch, policy, config):
-    setup, workspace, writer = policy.fused_setup, policy.fused_workspace, policy.writer
-    if setup is None or workspace is None or writer is None:
-        raise RuntimeError("LIFetch requires profiled workspace and bound service caches")
-    if policy.indexer_selectors:
-        raise RuntimeError("LIFetch selectors are already bound")
+def _bind_selectors(torch, policy, config, setup, workspace):
+    writer = policy.writer
     launch_type = LIFetchBinding
     libraries = {}
     selectors = {}
@@ -89,7 +111,6 @@ def _bind_selectors(torch, policy, config):
             **index_update_arguments(policy, workspace, storage, rotating, group),
         )
         selectors[group] = bind_group_selector(torch, policy, workspace, setup, group, storage, rotating, update)
-    policy.indexer_selectors = selectors
     logging.getLogger("vllm").info(
         "KVAF decode backend=li_fetch groups=%s batch_capacity=%s history_capacity=%s hot_tokens=%s "
         "requested_windows=%s; shared Runtime queues and original LRU candidates",
@@ -99,6 +120,7 @@ def _bind_selectors(torch, policy, config):
         policy.history_capacity,
         setup.windows,
     )
+    return selectors
 
 
 def prepare_workspace(torch, policy, config, device_id, soc, index_heads=64):
@@ -148,12 +170,8 @@ def prepare_workspace(torch, policy, config, device_id, soc, index_heads=64):
     )
 
 
-def _bind_ubmem_selectors(torch, policy, config):
-    setup, workspace, writer = policy.fused_setup, policy.fused_workspace, policy.writer
-    if config.transport != "ubmem" or setup is None or workspace is None or writer is None:
-        raise RuntimeError("UBmem binding requires a profiled workspace and service caches")
-    if policy.indexer_selectors:
-        raise RuntimeError("UBmem selectors are already bound")
+def _bind_ubmem_selectors(torch, policy, config, setup, workspace):
+    writer = policy.writer
     selectors = {}
     for group, layer in enumerate(writer.groups):
         storage, output = policy.fused_index_storage[group], policy.bytes_outputs[group]
@@ -188,7 +206,6 @@ def _bind_ubmem_selectors(torch, policy, config):
         selectors[group] = bind_group_selector(
             torch, policy, workspace, setup, group, storage, rotating, update, ubmem=True
         )
-    policy.indexer_selectors = selectors
     logging.getLogger("vllm").info(
         "KVAF transport=ubmem decode_backend=li_fetch groups=%s batch_capacity=%s history_capacity=%s "
         "hot_tokens=%s requested_windows=%s device=%s; CPU-service Host DDR mapping",
@@ -199,3 +216,4 @@ def _bind_ubmem_selectors(torch, policy, config):
         setup.windows,
         policy.pool.device,
     )
+    return selectors

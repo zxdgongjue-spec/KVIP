@@ -13,7 +13,7 @@ from kvip.operators.lifetch.forward import LIFetchForward
 def group_scratch(policy, workspace, batch, group):
     """Bind shared scratch and the existing per-group candidate buffers."""
     scratch = dict(workspace.scratch)
-    scratch["rows"] = policy.fused_fetch_rows[group]
+    scratch["rows"] = policy.fused_fetch_rows[group, :batch]
     scratch["lru_slots"] = policy.spare_slots[group, :batch]
     scratch["reserved_hot"] = policy.fused_reserved_hot[group, :batch]
     return scratch
@@ -21,11 +21,13 @@ def group_scratch(policy, workspace, batch, group):
 
 def index_update_arguments(policy, workspace, storage, rotating, group):
     """Bind persistent Index and output buffers shared by both transports."""
+    batch = workspace.inputs.batch
+    outputs = tuple(output[:batch * 4] for output in policy.fused_outputs[group].unbind(0))
     return dict(
         keys=storage.keys, scales=storage.scales, addresses=storage.addresses,
         logical_ids=storage.logical_ids, row_owners=workspace.inputs.row_owners,
-        rotating=rotating, status=policy.fused_errors[group], query_inputs=workspace.inputs,
-        outputs=policy.fused_outputs[group],
+        rotating=rotating, status=policy.fused_errors[group, :batch], query_inputs=workspace.inputs,
+        outputs=outputs,
     )
 
 
@@ -83,6 +85,7 @@ class VllmIndexSelector:
         self.attention_indices = None
         self.plans = None
         self.tail_source = None
+        self.snapshot = None
 
     def prepare(self, plans, *, prepare_inputs=True):
         """CPU request layout, once per forward; no device readback."""
@@ -114,6 +117,8 @@ class VllmIndexSelector:
         self.inputs.pack(query, weights, query_scale)
         if self.tail_source is not None:
             self.rotating.tail_bounds.copy_(self.tail_source)
+        if self.snapshot is not None:
+            self.snapshot.capture()
         # v9_init owns round-local initialization inside the captured launch.
         self.forward()
 

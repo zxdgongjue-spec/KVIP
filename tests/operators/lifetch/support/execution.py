@@ -3281,7 +3281,12 @@ class FusedReplayState:
         self.output = torch.zeros((self.batch + 1, self.stride, self.token_bytes), dtype=torch.uint8, device=device)
         output_rows = self.output.view(-1, self.token_bytes)
         stream = torch.npu.current_stream(device)
-        self.workspace.inputs.prepare([4] * self.batch, query_owners=list(range(1, self.batch + 1)))
+        self.active_batch = g.get("active_batch", self.batch)
+        padded = self.batch - self.active_batch
+        self.workspace.inputs.prepare(
+            [4] * self.active_batch + [0] * padded,
+            query_owners=list(range(1, self.active_batch + 1)) + [0] * padded,
+        )
         self.owns_lease = lease is None
         self.lease = lease or (UbmemLease(torch, runtime, output_rows, stream) if ubmem
                               else KvafGetLease(torch, runtime, library, output_rows, stream))
@@ -3365,6 +3370,9 @@ class FusedReplayState:
         keys, scales, valid = inputs.index_for_layout(layout)
         self.upload(self.storage.keys[1:], keys)
         self.upload(self.storage.scales[1:], scales)
+        if self.active_batch < self.batch:
+            self.upload(self.storage.keys[0], keys[self.active_batch])
+            self.upload(self.storage.scales[0], scales[self.active_batch])
         rows = np.arange(self.batch)[:, None]
         addresses = self.logical_addresses[rows, layout].copy()
         addresses[valid == 0] = 0
@@ -3390,8 +3398,8 @@ class FusedReplayState:
         for row, slots in enumerate(candidates):
             good = slots >= 0
             reserved[row, slots[good]] = np.arange(len(slots), dtype=np.int32)[good]
-        self.upload(self.rotating.lru_slots, candidates)
-        self.upload(self.rotating.reserved_hot, reserved)
+        self.upload(self.rotating.lru_slots, getattr(inputs, 'packed_lru_slots', candidates))
+        self.upload(self.rotating.reserved_hot, getattr(inputs, 'packed_reserved_hot', reserved))
 
     def validate_index(self, inputs, output):
         """Reject damaged persistent state before the next prepare can overwrite it."""
@@ -3461,8 +3469,8 @@ class FusedReplayState:
 
     def validate(self, inputs):
         self.check_completion()
-        ids = self.update.logical_output.cpu().numpy().reshape(self.batch, 4, 2048)
-        slots = self.update.slot_output.cpu().numpy().reshape(self.batch, 4, 2048)
+        ids = self.update.logical_output.cpu().numpy().reshape(self.batch, 4, 2048)[:self.active_batch]
+        slots = self.update.slot_output.cpu().numpy().reshape(self.batch, 4, 2048)[:self.active_batch]
         invalid = (ids < 0) | (ids >= self.history) | (slots < 0) | (slots >= self.stride)
         if invalid.any():
             row, query, position = np.unravel_index(invalid.argmax(), invalid.shape)
@@ -3480,7 +3488,7 @@ class FusedReplayState:
                 f'source={source} selected={selected} resolver_slot={raw_slot}')
         output = self.output[1:].cpu().numpy()
         layout, hot_valid = self.validate_index(inputs, output)
-        for row in range(self.batch):
+        for row in range(self.active_batch):
             mask = slots[row] < self.resident
             selected_slots = slots[row][mask]
             selected_ids = ids[row][mask]
@@ -3518,7 +3526,7 @@ class FusedReplayState:
                 raw = self.workspace.compute.cpu().numpy().view(np.uint16)
                 base = self.workspace.compute.data_ptr()
                 audit = []
-                for row in range(self.batch):
+                for row in range(self.active_batch):
                     layout = self.input_layout[row]
                     inverse = np.argsort(layout)
                     for q in range(4):
@@ -3543,7 +3551,7 @@ class FusedReplayState:
                 print('REPLAY SCORE AUDIT: ' + json.dumps(audit), flush=True)
                 if getattr(self, 'failure_directory', None):
                     atomic_json(self.failure_directory / 'score_failure.json', audit)
-        for row in range(self.batch):
+        for row in range(self.active_batch):
             expected = self.pages.token_payload(row, ids[row].reshape(-1))
             actual = output[row, slots[row].reshape(-1)]
             if not np.array_equal(actual, expected):
@@ -3930,9 +3938,10 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     stream = torch.npu.current_stream(device)
     cann, headers = kvaf_build_paths(build)
     soc = acl.get_soc_name()
-    aics = query_device_resources(cann, config.device)['effective_aic']
-    _, registration, _ = _load_native_operators('c8_offload')
-    registration.require_a5_dsa_registration(('lidu_fused_batch_get_prepare_mtp_out',))
+    aics = query_device_resources(cann, config.device, requested=getattr(config, 'snapshot_aics', 0))['effective_aic']
+    if not fused:
+        _, registration, _ = _load_native_operators('c8_offload')
+        registration.require_a5_dsa_registration(('lidu_fused_batch_get_prepare_mtp_out',))
     g = initial.geometry
     width = g['token_bytes']
     workers = 40 if fused and config.transport == 'urma' else 2
