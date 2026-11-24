@@ -33,7 +33,12 @@ using AscendC::CacheMode;
 using AscendC::CrossCoreSetFlag;
 using AscendC::CrossCoreWaitFlag;
 
-enum class SequenceLiPhase { Hot, Threshold, Cold, Final };
+enum class SequenceLiPhase {
+    Hot, Threshold, Cold, Final,
+#if KVIP_BATCH_PIPELINE
+    PipelineWindow,
+#endif
+};
 
 // 由于S2循环前，RunInfo还没有赋值，使用TempLoopInfo临时存放B、N、S1轴相关的信息；同时减少重复计算
 struct TempLoopInfo {
@@ -65,7 +70,7 @@ public:
                                 __gm__ uint8_t *workspace, const QLITilingData *__restrict tiling, TPipe *tPipe);
     __aicore__ inline void Process();
     template <SequenceLiPhase Phase>
-    __aicore__ inline void ProcessSequenceSplit();
+    __aicore__ inline void ProcessSequenceSplit(uint32_t epoch = 0);
 
     // =================================类型定义区=================================
     using Q_T = typename QLIT::queryType;
@@ -145,6 +150,7 @@ protected:
     __aicore__ inline uint32_t GetS2BaseBlockNumOnMask(uint32_t s1gIdx, uint32_t actS1Size, uint32_t actS2SizeOrig);
     // ================================Process functions================================
     __aicore__ inline void ProcessMain();
+    template <bool PublishProgress = true>
     __aicore__ inline void ScanSequenceHalf(uint32_t begin, uint32_t end, uint32_t shard,
 #if !V9_UBMEM
                                            uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery = false);
@@ -669,6 +675,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessInvalid()
 }
 
 template <typename QLIT>
+template <bool PublishProgress>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
 #if !V9_UBMEM
     uint32_t begin, uint32_t end, uint32_t shard, uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery)
@@ -695,7 +702,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
         if ASCEND_IS_AIC {
             matmulService.ComputeMm1(info);
         } else {
-            vectorService.ProcessVec1(info, shard, tile + 1 == end);
+            vectorService.template ProcessVec1<PublishProgress>(info, shard, tile + 1 == end);
         }
     }
 #if !V9_UBMEM
@@ -749,7 +756,7 @@ __aicore__ inline bool QuantLightningIndexerKernel<QLIT>::ScoreRecent(
 
 template <typename QLIT>
 template <SequenceLiPhase Phase>
-__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(uint32_t epoch)
 {
     uint32_t batch = splitCoreInfo.bN2Start;
     uint32_t shard = aiCoreIdx % 2;
@@ -807,6 +814,17 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
             if (hasRecent) ScoreRecent(loop, 0, shard, 2, true);
 #else
             ScanSequenceHalf(shard * half, (shard + 1) * half, shard, loop, scaleLoop, true);
+#endif
+#if KVIP_BATCH_PIPELINE
+        } else if constexpr (Phase == SequenceLiPhase::PipelineWindow) {
+            // The event after this kernel covers both shards. Let the AIV
+            // consumer alone own the window's replay progress in GM.
+            const uint32_t half = rotating::SequenceHalfWindow(runtimeShape_) / S2_BASE_SIZE;
+            const uint32_t begin = resident_ / S2_BASE_SIZE + (2 * (epoch - 1) + shard) * half;
+            const uint32_t history = runtimeShape_.history / S2_BASE_SIZE;
+            const uint32_t end = begin + half < history ? begin + half : history;
+            if ASCEND_IS_AIV { vectorService.LoadSequenceSplitThresholds(batch); }
+            ScanSequenceHalf<false>(begin, end, shard, loop, scaleLoop, true);
 #endif
         } else {
             uint32_t halfTokens = rotating::SequenceHalfWindow(runtimeShape_);

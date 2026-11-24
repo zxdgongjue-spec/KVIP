@@ -23,7 +23,7 @@ __aicore__ inline bool HasUniformLengths(const rotating::RuntimeShape& shape, GM
 }
 
 template <SequenceLiPhase Phase>
-__aicore__ inline void RunLi(GM_ADDR bindings) {
+__aicore__ inline void RunLi(GM_ADDR bindings, uint32_t epoch = 0) {
     using namespace AscendC; using namespace QLICommon;
     auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
@@ -55,7 +55,7 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
         if (splitSequence) op.template ProcessSequenceSplit<Phase>();
         else op.Process();
     } else {
-        op.template ProcessSequenceSplit<Phase>();
+        op.template ProcessSequenceSplit<Phase>(epoch);
     }
     pipe.Destroy();
 #undef P
@@ -90,3 +90,12 @@ extern "C" __global__ __aicore__ void v9_li_kernel_3(GM_ADDR bindings) {
     if ASCEND_IS_AIV { RunLi<SequenceLiPhase::Final>(bindings); }
 #endif
 }
+
+#if KVIP_BATCH_PIPELINE
+extern "C" __global__ __aicore__ void v9_li_batch_pipeline_score(GM_ADDR bindings, uint32_t epoch) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    RunLi<SequenceLiPhase::PipelineWindow>(bindings, epoch);
+#endif
+}
+#endif

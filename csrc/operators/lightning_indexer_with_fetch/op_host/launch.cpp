@@ -133,3 +133,39 @@ extern "C" uint32_t kvip_parallel_tail_forward(void* bindings,void* terminal,
     if(!result)result=aclrtlaunch_v9_parallel_terminal(shape->batch*4,stream,terminal);
     return result;
 }
+
+#if KVIP_BATCH_PIPELINE
+extern "C" uint32_t aclrtlaunch_v9_li_batch_pipeline_score(uint32_t, void*, void*, uint32_t);
+extern "C" uint32_t aclrtlaunch_v9_li_batch_pipeline_service(uint32_t, void*, void*, uint32_t, uint32_t, uint32_t);
+
+extern "C" uint32_t kvip_lifetch_batch_pipeline_supported(const rotating::RuntimeShape* shape) {
+    return kvip_parallel_tail_supported(shape) && shape->batch == 4 && shape->liCores == 8 &&
+        shape->rounds == 4 && shape->serviceAics == 2 && shape->serviceLanes == 4;
+}
+
+extern "C" uint32_t kvip_lifetch_batch_pipeline_score(void* bindings, void* stream,
+    const rotating::RuntimeShape* shape, uint32_t epoch) {
+    if (!bindings || !stream || !kvip_lifetch_batch_pipeline_supported(shape) ||
+        epoch >= shape->rounds) return 100000;
+    if (epoch) return aclrtlaunch_v9_li_batch_pipeline_score(shape->liCores, stream, bindings, epoch);
+    const auto result = aclrtlaunch_v9_li_kernel(shape->liCores, stream, bindings);
+    return result ? result : aclrtlaunch_v9_li_kernel_1(shape->liCores, stream, bindings);
+}
+
+extern "C" uint32_t kvip_lifetch_batch_pipeline_service(void* bindings, void* stream,
+    const rotating::RuntimeShape* shape, uint32_t epoch) {
+    if (!bindings || !stream || !kvip_lifetch_batch_pipeline_supported(shape) ||
+        epoch >= shape->rounds) return 100000;
+    const uint32_t half = rotating::SequenceHalfWindow(*shape);
+    const uint32_t end1 = rotating::SequenceWindowEnd(shape->history, shape->resident, half, epoch);
+    // UseSequenceSplit guarantees that both cold halves have at least one page.
+    const uint32_t end0 = epoch ? shape->resident + (2 * epoch - 1) * half : shape->resident;
+    return aclrtlaunch_v9_li_batch_pipeline_service(shape->serviceLanes, stream, bindings, epoch, end0, end1);
+}
+
+extern "C" uint32_t kvip_lifetch_batch_pipeline_terminal(void* terminal, void* stream,
+    const rotating::RuntimeShape* shape) {
+    if (!terminal || !stream || !kvip_lifetch_batch_pipeline_supported(shape)) return 100000;
+    return aclrtlaunch_v9_parallel_terminal(shape->batch * 4, stream, terminal);
+}
+#endif

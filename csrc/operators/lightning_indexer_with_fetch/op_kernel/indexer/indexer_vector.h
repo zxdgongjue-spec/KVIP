@@ -42,6 +42,9 @@ template <typename QLIT>
 class QLIVector {
 public:
     rotating::RuntimeShape runtimeShape_;
+#if KVIP_BATCH_PIPELINE
+    __aicore__ inline void SetServiceBlock(uint32_t block) { blockId_ = block; }
+#endif
 #if !V9_UBMEM
 #include "incremental_methods.h"
 #endif
@@ -140,6 +143,7 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
     using SCORE_T = typename QLIT::scoreType;
 
     __aicore__ inline QLIVector(){};
+    template <bool PublishProgress = true>
     __aicore__ inline void ProcessVec1(const QLICommon::RunInfo &info, uint32_t progressShard = 0,
 #if !V9_UBMEM
                                      bool publishShardEnd = false, bool scoreOnly = false);
@@ -645,6 +649,7 @@ __aicore__ inline void QLIVector<QLIT>::GetKeyScale(const QLICommon::RunInfo &ru
 }
 
 template <typename QLIT>
+template <bool PublishProgress>
 __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &info, uint32_t progressShard,
 #if !V9_UBMEM
                                                    bool publishShardEnd, bool scoreOnly)
@@ -791,9 +796,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 #endif
 
 #if !V9_UBMEM
-    if (!scoreOnly && curS2Idx >= runtimeShape_.resident && (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
+    if (PublishProgress && !scoreOnly && curS2Idx >= runtimeShape_.resident && (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
 #else
-    if (curS2Idx >= runtimeShape_.resident && (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
+    if (PublishProgress && curS2Idx >= runtimeShape_.resident && (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
 #endif
         rotating::IsTrigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,info.s2Idx + 1))) {
         const uint32_t tableBase = (info.s2Idx / 64) * 64;

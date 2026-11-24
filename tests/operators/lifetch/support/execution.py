@@ -3258,7 +3258,8 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None):
+                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None,
+                 queue_view_factory=None):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3305,7 +3306,8 @@ class FusedReplayState:
                                               self.lease, output_rows, shape=shape,
                                               prefetch_limit=prefetch_tokens, **binding)
             else:
-                owner = KvafQueueView(self.lease, output_rows, table.addresses, table.valid)
+                owner = (queue_view_factory or KvafQueueView)(
+                    self.lease, output_rows, table.addresses, table.valid)
                 self.rotating = LIFetchBinding(
                     torch, library, self.workspace.arguments(self.storage), owner,
                     batch=self.batch, history=self.history, resident=self.resident,
@@ -3931,8 +3933,10 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     cann, headers = kvaf_build_paths(build)
     soc = acl.get_soc_name()
     aics = query_device_resources(cann, config.device)['effective_aic']
-    _, registration, _ = _load_native_operators('c8_offload')
-    registration.require_a5_dsa_registration(('lidu_fused_batch_get_prepare_mtp_out',))
+    batch_pipeline = getattr(config, 'batch_pipeline_mode', None)
+    if not batch_pipeline:
+        _, registration, _ = _load_native_operators('c8_offload')
+        registration.require_a5_dsa_registration(('lidu_fused_batch_get_prepare_mtp_out',))
     g = initial.geometry
     width = g['token_bytes']
     workers = 40 if fused and config.transport == 'urma' else 2
@@ -3974,6 +3978,12 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                                    valid=view.valid[indices].contiguous())
         page_addresses = expanded.addresses.cpu().numpy().view(np.uint64).reshape(g['batch'], -1)
         logical_addresses = (page_addresses[:, :, None] + np.arange(128) * width).reshape(g['batch'], -1)
+        if batch_pipeline:
+            from batch_pipeline import run_batch_pipeline
+
+            return run_batch_pipeline(config, directory, torch, torch_npu, runtime, view,
+                                      initial, pages, logical_addresses, device=device, aics=aics,
+                                      cann=cann, headers=headers, soc=soc)
         if fused:
             if config.transport == 'urma':
                 (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers, soc=soc)
@@ -4183,6 +4193,10 @@ def run_synthetic_batch(config, directory, *, shared_pool=None):
             from workloads import payload
             pages.token_payload = lambda row, ids: payload(row, np.asarray(ids))
             folder = directory / f'case-b{batch}'
+            if getattr(config, 'batch_pipeline_mode', None):
+                report = run_path(config, folder, sequence, pages, fused=True, shared_pool=pool)
+                failed |= report['correctness'] != 'PASS'
+                continue
             results = {}
             for name in ('serial', 'fused'):
                 results[name] = run_path(config, folder / name, sequence, pages,
