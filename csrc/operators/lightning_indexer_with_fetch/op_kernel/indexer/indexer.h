@@ -1000,8 +1000,13 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessDedicatedCold(G
     } else {
         matmulService.FreeEventID();
         KVIP_TRACE_BEGIN(cubeTailScope, stageTrace_, Cold, LiCubeWait, runtimeShape_.rounds, tempLoopInfo.bIdx);
+        // Each bank receives one final credit from each of the two AIVs.
         CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT);
         CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT + 1);
+        CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
+            QLICommon::ConstInfo::CROSS_VC_EVENT + QLICommon::ConstInfo::AIV0_AIV1_OFFSET);
+        CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
+            QLICommon::ConstInfo::CROSS_VC_EVENT + QLICommon::ConstInfo::AIV0_AIV1_OFFSET + 1);
     }
 }
 #endif

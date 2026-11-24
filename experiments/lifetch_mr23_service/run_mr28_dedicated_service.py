@@ -26,8 +26,8 @@ COLD_ROLES = {
 MATCH_FIELDS = (*PAIRED_KEYS, 'available_aiv', 'cold_mixed_groups', 'cold_service_aiv')
 
 
-def summarize(output, completed, trace_prefetch):
-    rows = [collect(output, mode, BATCH) for mode in MODES]
+def summarize(output, completed, trace_prefetch, modes=MODES):
+    rows = [collect(output, mode, BATCH) for mode in modes]
     counts = {}
     for row in rows:
         mode = row['variant']
@@ -44,9 +44,12 @@ def summarize(output, completed, trace_prefetch):
         row.update(get_comparison='unavailable', paired=False, timing_eligible=False,
                    observed_kv_ready_ratio=None, get_vector_differences=None)
 
-    baseline, candidate = rows
-    mismatches = [key for key in MATCH_FIELDS if baseline.get(key) != candidate.get(key)]
-    comparable = len(counts) == len(MODES) and not mismatches
+    mismatches = []
+    comparable = len(rows) == len(counts) == 2
+    if comparable:
+        baseline, candidate = rows
+        mismatches = [key for key in MATCH_FIELDS if baseline.get(key) != candidate.get(key)]
+        comparable = not mismatches
     if comparable:
         status, changed = compare_reads(counts['p2'], counts['dedicated'])
         baseline.update(get_comparison='exact', paired=True, timing_eligible=True,
@@ -91,7 +94,7 @@ def summarize(output, completed, trace_prefetch):
                     writer.writerow((mode, *identity, sum(early), sum(final), sum(early) + sum(final),
                                      *early, *final))
     print(f'Summary: {output / "summary.csv"}', flush=True)
-    return comparable
+    return comparable if len(rows) == 2 else len(counts) == 1
 
 
 def main():
@@ -100,6 +103,8 @@ def main():
     parser.add_argument('--warmup', type=int, default=2)
     parser.add_argument('--iterations', type=int, default=10)
     parser.add_argument('--timeout-seconds', type=int, default=1800)
+    parser.add_argument('--route', choices=('both', *MODES), default='both',
+                        help='run a single checked route for diagnosis or both routes for comparison')
     parser.add_argument('--prefetch-trace', action='store_true',
                         help='record a separate diagnostic replay for actual prefetch timestamps')
     args = parser.parse_args()
@@ -117,9 +122,10 @@ def main():
     if args.prefetch_trace:
         arguments[0] = 'diagnose'
         arguments.extend(('--level', '2'))
+    modes = MODES if args.route == 'both' else (args.route,)
     completed = {}
     manifest = dict(status='NOT_RUN', commit=git(ROOT, 'rev-parse', 'HEAD'), main_base=MAIN,
-                    expected_kvaf=KVAF, arguments=arguments, variants=MODES, cold_roles=COLD_ROLES,
+                    expected_kvaf=KVAF, arguments=arguments, variants=modes, cold_roles=COLD_ROLES,
                     local_counts=False, prefetch_trace=args.prefetch_trace, worker_exit_codes=completed)
     if args.dry_run:
         print(json.dumps(manifest, indent=2), flush=True)
@@ -137,7 +143,7 @@ def main():
     try:
         manifest['status'] = 'RUNNING'
         save(output / 'manifest.json', manifest)
-        for mode in MODES:
+        for mode in modes:
             config = configuration(arguments)
             config.mr25_handoff = mode
             config.mr28_dedicated_service = mode
@@ -147,7 +153,7 @@ def main():
             save(output / 'manifest.json', manifest)
             if completed[mode]:
                 break
-        passed = summarize(output, completed, args.prefetch_trace)
+        passed = summarize(output, completed, args.prefetch_trace, modes)
         manifest['status'] = 'PASS' if passed else 'FAILED'
         return int(not passed)
     except BaseException:

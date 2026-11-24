@@ -290,6 +290,11 @@ prefetch budget 512, and rank start 1024. The default miss rate is 10%.
 bash experiments/lifetch_mr23_service/run_mr28_dedicated_service.sh
 ```
 
+For a quick graph check of the candidate on its own, use
+`--route dedicated --iterations 1 --warmup 0`. The worker reports
+pre-capture eager, capture, warmup and measured replay separately. If
+synchronization fails, see `graph_failure.log` in the case's fused directory.
+
 Use `--dry-run` to inspect the plan. Run `--prepare-deps` on the host
 if the existing unified KVAF sources are absent, and `--build-deps`
 in the container if that checkout is unbuilt. All runs use the existing
@@ -314,8 +319,8 @@ publication. Readiness has one independent cursor per query, window
 and fragment. Service can advance only through contiguous ready ranges,
 so a faster upper tail cannot make an unfinished prefix readable. Each
 request keeps a single Service owner for incremental TopK, Q4 dedup,
-prefetch budget, and SQ updates. W0 can use the resident results while
-Cold scoring starts. In W1–W3, Service waits for the corresponding native
+prefetch budget, and SQ updates. W0 uses the native empty Cold cursor
+while Cold scoring starts. In W1–W3, Service waits for the corresponding native
 rotating driver's logical half window to be visible in GM, then consumes
 the target request's current ready ranges. The gate preserves the logical
 trigger, and publication timing can change the prefetch and final Get

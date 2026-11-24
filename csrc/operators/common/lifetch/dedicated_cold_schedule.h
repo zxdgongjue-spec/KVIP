@@ -52,7 +52,9 @@ KVIP_DEDICATED_COLD_DEVICE inline uint32_t ProgressBytes() {
 KVIP_DEDICATED_COLD_DEVICE inline uint32_t Prefix(
     uint32_t history, uint32_t resident, uint32_t half, uint32_t epoch, uint32_t shard,
     const uint32_t* ends) {
-    uint32_t ready = resident;
+    // Threshold builds resident TopK without publishing a Cold cursor.
+    // Keep the native zero sentinel until this half has produced a tile.
+    uint32_t ready = 0;
     const uint32_t first = shard == 0 ? 0 : 1;
     const uint32_t limit = shard == 0 ? 1 : kFragments;
     for (uint32_t e = 1; e <= epoch; ++e) {

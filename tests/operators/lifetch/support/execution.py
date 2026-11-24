@@ -417,8 +417,11 @@ def dispatch(config):
 
 def progress(run, stage):
     (run / "stage.log").write_text(stage + "\n")
-    if run.name.startswith('miss') and (run.parent / 'config.json').is_file():
-        (run.parent / 'stage.log').write_text(f'{run.name}: {stage}\n')
+    case = run if run.name.startswith('case-b') else None
+    miss_run = case.parent if case is not None else run
+    if miss_run.name.startswith('miss') and (miss_run.parent / 'config.json').is_file():
+        detail = f'{case.name}: {stage}' if case is not None else stage
+        (miss_run.parent / 'stage.log').write_text(f'{miss_run.name}: {detail}\n')
     print(stage, flush=True)
 
 
@@ -3734,6 +3737,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
         pending = False
     resources = None
     try:
+        progress(directory.parent, 'REPLAY resetting graph inputs')
         for state in states:
             state.reset()
             if fused:
@@ -3744,6 +3748,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
         # capture nor measurement inherits a warmed cache from this setup.
         initial = next(iter(sequence))
         for i, state in enumerate(states):
+            progress(directory.parent, f'REPLAY pre-capture eager input {i + 1}/{len(states)}')
             pending = True
             state.forward()
             stream.synchronize()
@@ -3758,6 +3763,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             for state in states:
                 state.forward()
 
+        progress(directory.parent, 'REPLAY graph capture and capture-stream completion')
         with ExitStack() as scopes:
             pending = True
             if fused:
@@ -3784,6 +3790,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 for state in states:
                     state.prepare(inputs)
                 stream.synchronize()
+                progress(directory.parent, f'REPLAY graph warmup {warmup + 1}/{config.warmup}')
                 replay()
                 stream.synchronize()
                 validate_all(inputs, f'warmup{warmup}')
@@ -3800,8 +3807,10 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                     before.append(initial)
             stream.synchronize()
             folder = directory / 'diagnose' / f'round-{inputs.source_round}'
+            progress(directory.parent, f'REPLAY profiled graph replay round {inputs.source_round}')
             measured = profile_graph_batch(torch, TrackedGraph(), calls=len(states), folder=folder,
                                            serial=not fused, transport=config.transport, stream=stream)
+            progress(directory.parent, f'REPLAY profiled graph completed round {inputs.source_round}; checking outputs')
             validate_all(inputs, 'measured')
             if handoff:
                 from terminal_handoff import request_counts, terminal_stages
@@ -3921,6 +3930,10 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
         return result
     except BaseException as error:
         if pending:
+            # Quarantine exits without unwinding. Preserve the full device
+            # diagnostic before the one-line transport status truncates it.
+            with contextlib.suppress(OSError):
+                (directory / 'graph_failure.log').write_text(traceback.format_exc())
             NativeFetchSession.quarantine('batched_replay_completion_uncertain', error)
         raise
     finally:
@@ -4196,6 +4209,10 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         stream.synchronize()
         replay_stage('first eager completed; correctness check')
         checks.check('eager', lambda: validate(initial))
+        if dedicated_service is not None:
+            if checks.failures:
+                raise AssertionError(f"First eager output mismatch: {checks.failures[0]['error']}")
+            replay_stage('first eager correctness PASS')
         if config.mode in ('bench', 'diagnose'):
             batch_states.append(state)
             for _ in range(1, config.iterations):
