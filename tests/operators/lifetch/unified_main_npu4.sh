@@ -2,8 +2,8 @@
 # Five captured BS16/Q4 groups on one physical NPU4 with the unified KVAF SDK.
 set -eo pipefail
 if (( $# < 3 || $# > 5 )) || [[ ! $2 =~ ^[a-f0-9]{40}$ || ! $3 =~ ^[a-f0-9]{40}$ ||
-    ( $# == 4 && $4 != cap-pair ) || ( $# == 5 && $4 != active-history ) ]]; then
-    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA [cap-pair | active-history ARCHIVED_CAP_PAIR]" >&2
+    ( $# == 4 && $4 != cap-pair ) || ( $# == 5 && $4 != active-history && $4 != pr30-parity ) ]]; then
+    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA [cap-pair | active-history ARCHIVED_CAP_PAIR | pr30-parity ARCHIVED_ACTIVE_HISTORY]" >&2
     exit 2
 fi
 repo=$1
@@ -36,6 +36,14 @@ elif [[ $mode == active-history ]]; then
         exit 2
     fi
     prefix=active-history-five
+elif [[ $mode == pr30-parity ]]; then
+    archive=$(cd "$5" && pwd)
+    pr30=54acdb9c54853441d08898a2623407f4492a83a4
+    if [[ $(<"$archive/main.txt") != "$main" || $(<"$archive/physical_npu.txt") != 4 || $pr30 == "$main" ]]; then
+        echo "Expected the completed single-call capacity archive for this candidate on NPU4" >&2
+        exit 2
+    fi
+    prefix=pr30-parity-five
 fi
 sdk=813f1750a50b7e6c92d5f5397f2fbc05befef6da
 patched_tree=1de18e8315137d7a0227c3ae4c82afd45b5fe743
@@ -84,7 +92,7 @@ printf '4\n' >"$out/physical_npu.txt"
 cat /proc/sys/kernel/hostname >"$out/host.txt"
 cat /proc/sys/kernel/random/boot_id >"$out/boot_id.txt"
 if [[ -r /etc/machine-id ]]; then cat /etc/machine-id >"$out/machine_id.txt"; fi
-if [[ $mode == active-history ]]; then
+if [[ $mode == active-history || $mode == pr30-parity ]]; then
     printf '%s\n' "$archive" >"$out/reference.txt"
     for field in host machine_id; do
         if [[ -f "$archive/$field.txt" ]] && ! cmp -s "$archive/$field.txt" "$out/$field.txt"; then
@@ -152,7 +160,32 @@ for method in ('begin_get_graph', 'end_get_graph', 'get_graph_urma_resources'):
 PY
 flock -u 8
 exec 8>&-
-if [[ $mode == active-history ]]; then
+if [[ $mode == pr30-parity ]]; then
+    echo "CONFIG reference=main_plus_PR30 candidate=active_512k NPU=4 BS=16 Q=4 warmup=4 measured_graphs=1 calls_per_graph=20"
+    compare="$support/pr30_archive_compare.py"
+    declare -A reference
+    missing=()
+    for g in 10 4 17 7 2; do
+        if path=$("$PYTHON" -B "$compare" --candidate "$archive" --repo "$repo" --find-exact-group "$g"); then
+            reference[$g]=$path
+            echo "G$g PR30_REFERENCE=archive root=$path"
+        else
+            rc=$?
+            if (( rc != 3 )); then exit "$rc"; fi
+            missing+=("$g")
+        fi
+    done
+    if (( ${#missing[@]} )); then
+        ref_out=$(mktemp -d "$area/pr30-reference-five.XXXXXX")
+        pr30_src=$(checkout "$pr30")
+        printf '%s\n' "$pr30" > "$ref_out/main.txt"
+        for field in reader kvaf kvaf_tree host physical_npu boot_id machine_id; do
+            if [[ -f $out/$field.txt ]]; then cp "$out/$field.txt" "$ref_out/$field.txt"; fi
+        done
+        printf 'PR30_MISSING_GROUPS=%s REFERENCE_ROOT=%s\n' "${missing[*]}" "$ref_out"
+        for g in "${missing[@]}"; do reference[$g]=$ref_out; done
+    fi
+elif [[ $mode == active-history ]]; then
     echo "CONFIG measured=active_512k archive=$archive native=$main sdk=$sdk NPU=4 BS=16 Q=4 warmup=4 calls=20"
 elif [[ $mode == cap-pair ]]; then
     echo "CONFIG measured=capacity_pair model_limit=131072/524288 bound_history=131328/524544 input=original_capture native=$main sdk=$sdk NPU=4 BS=16 Q=4 warmup=4 measured_per_arm=20"
@@ -269,6 +302,7 @@ PY_DEVICE
         cap128k) args+=(--history-cap 131328);;
         cap512k) args+=(--history-cap 524544);;
     esac
+    if [[ $mode == pr30-parity ]]; then args+=(--production-graph); fi
     display=$label
     if [[ $label == mainline ]]; then display=$name; fi
     echo "CASE_BEGIN G$g $display"
@@ -304,6 +338,28 @@ run_group() (
     g=$1
     trace=$(bash "$entry/peer_g2_input.sh" "$work" "$g")
     owner=$(select_owner "$g")
+    if [[ $mode == pr30-parity ]]; then
+        local_ref=${reference[$g]}
+        placement="$archive/g$g/cap512k/thp.json"
+        # Keep each arm's production checkout and receipt under its own root.
+        measure_pr30() (
+            if [[ $local_ref == "${ref_out:-}" ]]; then
+                out=$ref_out
+                main=$pr30
+                main_src=$pr30_src
+                export PYTHONPATH="$main_src/python:$sdk_src/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
+                run_arm "$g" cap128k "$trace" "$owner" "$placement"
+            fi
+            exit 0
+        )
+        # Alternate first arm when both measurements are missing.
+        if [[ $g != 4 && $g != 7 ]]; then measure_pr30; fi
+        run_arm "$g" cap512k "$trace" "$owner" "$placement"
+        if [[ $g == 4 || $g == 7 ]]; then measure_pr30; fi
+        printf '%s\n' "$local_ref" > "$out/g$g/pr30_reference.txt"
+        "$PYTHON" -B "$support/pr30_parity_group.py" "$out" "$g" "$local_ref" "$repo"
+        exit
+    fi
     if [[ $mode == single ]]; then
         run_arm "$g" mainline "$trace" "$owner"
         exit
@@ -341,5 +397,14 @@ if [[ $mode == cap-pair ]]; then
     "$PYTHON" -B "$support/cap_pair_report.py" "$out" --summary
 elif [[ $mode == active-history ]]; then
     "$PYTHON" -B "$support/cap_pair_report.py" "$out" --reference "$archive" --summary
+elif [[ $mode == pr30-parity ]]; then
+    "$PYTHON" -B - "$out" <<'PY_MAP'
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+refs = {g: (root/f'g{g}/pr30_reference.txt').read_text().strip() for g in (10, 4, 17, 7, 2)}
+(root/'pr30_references.json').write_text(json.dumps(refs, indent=2))
+PY_MAP
+    "$PYTHON" -B "$compare" --candidate "$out" --reference-map "$out/pr30_references.json" --repo "$repo"
 fi
 echo "REPLAY_COMPLETE RESULT_ROOT=$out"

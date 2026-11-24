@@ -90,7 +90,7 @@ def decomposition(profile, timing, checked):
     return metrics
 
 
-def measure_arm(root, arm, revision, group):
+def measure_arm(root, arm, revision, group, *, verify_library=False):
     folder = case_folder(root, group, arm)
     timing = read(folder/'path_result.json')['all_rounds']
     protocol = timing['timing_protocol']
@@ -103,7 +103,7 @@ def measure_arm(root, arm, revision, group):
     archived = read(case_folder(owner, group, 'logical-ties').parent/'replay_input.json')
     cap_meta = 'capture_input.json' if (folder.parent/'capture_input.json').exists() else None
     checked, _, thp, proof, cfg = measured_parallel(root, group, arm, revision, owner, ids, old_receipt, archived,
-                                                  verify_library=False, timing_reader=timing_reader,
+                                                  verify_library=verify_library, timing_reader=timing_reader,
                                                   capture_meta_name=cap_meta)
     runtime = proof['runtime']
     if runtime['host'] != marker(root, 'host') or runtime['visible'] != '4':

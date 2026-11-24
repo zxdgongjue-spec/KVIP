@@ -129,6 +129,7 @@ def worker(args):
     borrow_calls = {'measured': {}, 'detail': {}}
     cq_calls = {'measured': {}, 'detail': {}}
     measured_requests = {}
+    private_buffers = {name: set() for name in ('index', 'kv', 'winners', 'window')}
     detail_ids = {}
     mailboxes = set()
     cq_status_ranges = []
@@ -165,6 +166,13 @@ def worker(args):
                 if (self.history != args.history_cap or self.workspace.block_history != args.history_cap
                         or not np.all(key_lengths == args.history_cap) or not np.array_equal(ends, inputs.query_ends)):
                     raise ValueError('Device binding did not retain full configured capacity and original Q ends')
+            if args.production_graph:
+                for name, buffer in (('index', self.storage.keys), ('kv', self.output),
+                                     ('winners', self.workspace.topk), ('window', self.rotating.rank_progress)):
+                    address = buffer.data_ptr()
+                    if address in private_buffers[name]:
+                        raise ValueError(f'Two calls share mutable {name} storage')
+                    private_buffers[name].add(address)
             if self.forward.terminal is None:
                 raise RuntimeError('Production operator selected the legacy tail')
             lib = Path(self.rotating.library._name).resolve()
@@ -246,7 +254,7 @@ def worker(args):
         ex.measure_replay_batch = measure
     ex.CorrectnessRecorder = Recorder
     ex.FusedReplayState = AuditedState
-    if history_cap:
+    if history_cap and not args.production_graph:
         from cap_pair_timing import install
         install(ex, cfg)
     fused = folder / 'fused'
@@ -297,6 +305,13 @@ def worker(args):
             key: [measured_requests[i][column] for i in range(CALLS)]
             for column, key in enumerate(('prefetch', 'final'))}
         device_proof['history_cap'] = history_cap
+    if args.production_graph:
+        from main_five_report import main_times
+        main_times(fused, result['all_rounds'])
+        counts = {name: len(addresses) for name, addresses in private_buffers.items()}
+        if set(counts.values()) != {CALLS}:
+            raise ValueError(f'Expected 20 independent states within one graph: {counts}')
+        device_proof['independent_buffers'] = counts
     runtime = dict(host=platform.node(), visible=os.environ['ASCEND_RT_VISIBLE_DEVICES'],
                    npu=torch.npu.get_device_name(torch.device('npu:0')), torch=str(torch.__version__),
                    torch_npu=str(torch_npu.__version__), cann=str(getattr(torch.version, 'cann', '')))
@@ -403,6 +418,10 @@ if __name__ == '__main__':
     modes.add_argument('--borrow-audit', action='store_true')
     modes.add_argument('--history-cap', type=int, choices=(131328, 524544),
                        help='Physical Q4 history capacity for the same 128K captured input')
+    parser.add_argument('--production-graph', action='store_true',
+                        help='Use the production graph containing 20 independent calls at the specified capacity')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parsed = parser.parse_args()
+    if parsed.production_graph and not parsed.history_cap:
+        parser.error('--production-graph requires --history-cap')
     (worker if parsed.worker else main)(parsed)
