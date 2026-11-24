@@ -100,7 +100,8 @@ def main_times(folder, timing):
                 final_topk_through_tail=(mean(after), median(after)))
 
 
-def measured_parallel(root, group, arm, revision, owner, native, old_receipt, archived_inputs, *, verify_library):
+def measured_parallel(root, group, arm, revision, owner, native, old_receipt, archived_inputs, *,
+                      verify_library, timing_reader=main_times, capture_meta_name=None):
     from li_restore_archive import check_snapshot
     from ranked_integration_sets import INPUT_AND_RESULTS
     from score_equivalence_report import measured_sets
@@ -109,8 +110,9 @@ def measured_parallel(root, group, arm, revision, owner, native, old_receipt, ar
     out = read(folder / 'path_result.json')
     config = read(folder.parent / 'config.json')
     inputs = read(folder.parent / 'replay_input.json')
-    if inputs != archived_inputs:
-        check_snapshot(group, INPUT_AND_RESULTS[group][0], archived_inputs, inputs)
+    capture = read(folder.parent / capture_meta_name) if capture_meta_name else inputs
+    if capture != archived_inputs:
+        check_snapshot(group, INPUT_AND_RESULTS[group][0], archived_inputs, capture)
     if out['input_paths'] != inputs['source_paths'] or inputs['geometry'] != out['geometry']:
         raise ValueError(f'G{group}: output capture metadata mismatch')
     expected = dict(group=group, transport='urma', input='real', device=0, physical_npu=4, warmup=4,
@@ -146,7 +148,7 @@ def measured_parallel(root, group, arm, revision, owner, native, old_receipt, ar
     if proof['capture_operand_hashes'] != source['identity']['inputs']:
         raise ValueError(f'G{group}: measured input differs from the archived native operands')
     exact = measured_sets(folder, group, (inputs, out['topk_set_digests']), native, receipt)
-    new_times = main_times(folder, out['all_rounds'])
+    new_times = timing_reader(folder, out['all_rounds'])
     thp = read(root / f'g{group}/{arm}/thp.json')
     if (thp.get('status') != 'measured' or thp.get('page_mode') != 'thp'
             or thp['bytes'] <= 0):
