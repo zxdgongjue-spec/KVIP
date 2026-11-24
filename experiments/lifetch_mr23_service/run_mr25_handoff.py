@@ -95,6 +95,17 @@ def summarize(directory, completed):
     return all(row['paired'] for row in rows)
 
 
+def bench_arguments(kvaf, batches):
+    return ['bench', '--transport', 'urma', '--input', 'synthetic',
+             '--device', os.environ.get('KVIP_A5_DEVICE', '0'), '--kvaf-root', str(kvaf),
+             '--kvaf-server', os.environ.get('KVIP_KVAF_SERVER', '127.0.0.1:28985'),
+             '--batches', ','.join(map(str, batches)), '--miss-percent', '10',
+             '--queries', '4', '--history', '131072', '--resident', '16384',
+             '--index-heads', '32', '--seed', '43', '--prefetch-tokens', '512',
+             '--prefetch-rank-start', '1024', '--intermediate-fetches', '4',
+             '--warmup', '2', '--iterations', '10', '--timeout-seconds', '1800']
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--comparison-dry-run', action='store_true')
@@ -105,14 +116,7 @@ def main():
     print('MR25 handoff comparison: ' + str(output), flush=True)
 
     kvaf = Path(os.environ.get('KVIP_KVAF_ROOT', ROOT / 'third_party/KVAF')).resolve()
-    bench = ['bench', '--transport', 'urma', '--input', 'synthetic',
-             '--device', os.environ.get('KVIP_A5_DEVICE', '0'), '--kvaf-root', str(kvaf),
-             '--kvaf-server', os.environ.get('KVIP_KVAF_SERVER', '127.0.0.1:28985'),
-             '--batches', ','.join(map(str, BATCHES)), '--miss-percent', '10',
-             '--queries', '4', '--history', '131072', '--resident', '16384',
-             '--index-heads', '32', '--seed', '43', '--prefetch-tokens', '512',
-             '--prefetch-rank-start', '1024', '--intermediate-fetches', '4',
-             '--warmup', '2', '--iterations', '10', '--timeout-seconds', '1800']
+    bench = bench_arguments(kvaf, BATCHES)
     completed = {}
     manifest = dict(status='NOT_RUN', commit=git(ROOT, 'rev-parse', 'HEAD'), main_commit=MAIN,
                     expected_kvaf=KVAF, arguments=bench, variants=dict(main='OFF', local_counts='ON'),

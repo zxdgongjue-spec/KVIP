@@ -23,7 +23,7 @@ __aicore__ inline bool HasUniformLengths(const rotating::RuntimeShape& shape, GM
 }
 
 template <SequenceLiPhase Phase>
-__aicore__ inline void RunLi(GM_ADDR bindings) {
+__aicore__ inline void RunLi(GM_ADDR bindings, uint32_t hotParts = 2) {
     using namespace AscendC; using namespace QLICommon;
     auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
@@ -46,13 +46,13 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
         2048,shape.liCores,128,shape.history/128,0,16384,128,shape.resident,
         splitSequence ? 0U : shape.splitQ,shape.aicCount};
     if ASCEND_IS_AIV { op.vectorService.SetStreamingWorkspace(P(15)); }
-    op.Init(P(0),P(1),P(2),P(3),P(4),P(5),P(6),P(7),P(9),P(12),&tiling,&pipe);
+    op.Init(P(0),P(1),P(2),P(3),P(4),P(5),P(6),P(7),P(9),P(12),&tiling,&pipe,hotParts);
     if ASCEND_IS_AIV {
         op.vectorService.SetPrefixStorage(P(13));
         op.vectorService.SetRotationContext(P(14));
     }
     if constexpr (Phase == SequenceLiPhase::Hot) {
-        if (splitSequence) op.template ProcessSequenceSplit<Phase>();
+        if (splitSequence) op.template ProcessSequenceSplit<Phase>(hotParts);
         else op.Process();
     } else {
         op.template ProcessSequenceSplit<Phase>();
@@ -69,6 +69,15 @@ extern "C" __global__ __aicore__ void v9_li_kernel(GM_ADDR bindings) {
     RunLi<SequenceLiPhase::Hot>(bindings);
 #endif
 }
+
+#if KVIP_HOT_SCORE_PARTITION
+extern "C" __global__ __aicore__ void v9_li_kernel_hot_partitioned(GM_ADDR bindings, uint32_t parts) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    RunLi<SequenceLiPhase::Hot>(bindings, parts);
+#endif
+}
+#endif
 
 extern "C" __global__ __aicore__ void v9_li_kernel_1(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)

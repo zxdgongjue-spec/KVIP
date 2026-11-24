@@ -207,14 +207,15 @@ def test_terminal_queues_are_disjoint_and_rebind_output():
             bind_queues(1, views, 656)
 
 
-def test_parallel_terminal_same_graph_accounting():
+@pytest.mark.parametrize("hot_kernel", ["v9_li_kernel_0", "v9_li_kernel_hot_partitioned_0"])
+def test_parallel_terminal_same_graph_accounting(hot_kernel):
     from diagnostics import account, decode_terminal_timeline
     from performance import split_graph_invocations
 
     events = [dict(name="replay", ph="X", ts=0, dur=100)]
     for origin in (1, 41):
         for index, (name, duration) in enumerate(
-            (("v9_li_kernel_0", 5), ("v9_li_kernel_1_1", 5), ("v9_li_kernel_2_2", 5), ("v9_parallel_terminal_0", 15))
+            ((hot_kernel, 5), ("v9_li_kernel_1_1", 5), ("v9_li_kernel_2_2", 5), ("v9_parallel_terminal_0", 15))
         ):
             events.append(dict(name=name, ph="X", cat="kernel", ts=origin + index * 5, dur=duration))
     accounting = account(events, "replay", 100, full=True, fused_final=True)

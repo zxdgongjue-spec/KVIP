@@ -25,6 +25,7 @@
 #include "indexer_types.h"
 #include <indexer_vector.h>
 #include "indexer_cube.h"
+#include "../../../common/lifetch/hot_score_partition.h"
 
 namespace QLIKernel {
 using namespace QLICommon;
@@ -62,10 +63,11 @@ public:
                                 __gm__ uint8_t *queryScale, __gm__ uint8_t *keyScale, __gm__ uint8_t *actualSeqLengthsQ,
                                 __gm__ uint8_t *actualSeqLengthsK, __gm__ uint8_t *blockTable,
                                 __gm__ uint8_t *sparseIndices,
-                                __gm__ uint8_t *workspace, const QLITilingData *__restrict tiling, TPipe *tPipe);
+                                __gm__ uint8_t *workspace, const QLITilingData *__restrict tiling, TPipe *tPipe,
+                                uint32_t seqParts = 2);
     __aicore__ inline void Process();
     template <SequenceLiPhase Phase>
-    __aicore__ inline void ProcessSequenceSplit();
+    __aicore__ inline void ProcessSequenceSplit(uint32_t parts = 2);
 
     // =================================类型定义区=================================
     using Q_T = typename QLIT::queryType;
@@ -445,7 +447,8 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
                                               __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengthsK,
                                               __gm__ uint8_t *blockTable,
                                               __gm__ uint8_t *sparseIndices, __gm__ uint8_t *workspace,
-                                              const QLITilingData *__restrict tiling, TPipe *tPipe)
+                                              const QLITilingData *__restrict tiling, TPipe *tPipe,
+                                              uint32_t seqParts)
 {
     if ASCEND_IS_AIV {
         tmpBlockIdx = GetBlockIdx();  // vec:0-47
@@ -460,7 +463,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
 
     // 获取分核信息
     if (sequenceSplit_) {
-        splitCoreInfo.bN2Start = aiCoreIdx / 2;
+        splitCoreInfo.bN2Start = aiCoreIdx / seqParts;
         splitCoreInfo.bN2End = splitCoreInfo.bN2Start;
         splitCoreInfo.s2End = constInfo.kSeqSize / constInfo.s2BaseSize - 1;
     } else {
@@ -474,7 +477,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
     GlobalTensor<SCORE_T> scoreGm; // 存放vec核写出的score
     uint64_t singleCoreScoreSize = constInfo.s1BaseSize * QLICommon::Align((uint64_t)constInfo.kSeqSize,
                                     (uint64_t)constInfo.s2BaseSize)  * sizeof(SCORE_T);
-    uint32_t scoreRow = sequenceSplit_ ? aiCoreIdx / 2 : aiCoreIdx;
+    uint32_t scoreRow = sequenceSplit_ ? splitCoreInfo.bN2Start : aiCoreIdx;
     scoreGm.SetGlobalBuffer((__gm__ SCORE_T *)(workspace + scoreRow * singleCoreScoreSize));
     offset += GetBlockNum() * singleCoreScoreSize;
 
@@ -749,10 +752,10 @@ __aicore__ inline bool QuantLightningIndexerKernel<QLIT>::ScoreRecent(
 
 template <typename QLIT>
 template <SequenceLiPhase Phase>
-__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(uint32_t parts)
 {
     uint32_t batch = splitCoreInfo.bN2Start;
-    uint32_t shard = aiCoreIdx % 2;
+    uint32_t shard = aiCoreIdx % parts;
     CalcGS1LoopParams(batch);
     CalcS2LoopParams(batch, 0);
 
@@ -795,18 +798,18 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
             bool hasRecent = false;
             if (potentiallyRecent) {
                 auto recentRange = kvip_recent_index::RecentRange(ctxRecent, tempLoopInfo.bIdx, recentEnd);
-                auto recentTiles = kvip_recent_index::Tiles(recentRange, shard, 2);
+                auto recentTiles = kvip_recent_index::Tiles(recentRange, shard, parts);
                 hasRecent = recentTiles.begin != recentTiles.end;
             }
 #endif
-            uint32_t half = resident_ / (2 * S2_BASE_SIZE);
+            const auto tiles = kvip_hot_score::Split(resident_, shard, parts);
 #if !V9_UBMEM
             // Keep Q and its scale until the shard's recent tail finishes. Key
             // and key-scale banks still drain at each discontinuous range.
-            ScanSequenceHalf(shard * half, (shard + 1) * half, shard, loop, scaleLoop, !hasRecent, false);
-            if (hasRecent) ScoreRecent(loop, 0, shard, 2, true);
+            ScanSequenceHalf(tiles.begin, tiles.end, shard, loop, scaleLoop, !hasRecent, false);
+            if (hasRecent) ScoreRecent(loop, 0, shard, parts, true);
 #else
-            ScanSequenceHalf(shard * half, (shard + 1) * half, shard, loop, scaleLoop, true);
+            ScanSequenceHalf(tiles.begin, tiles.end, shard, loop, scaleLoop, true);
 #endif
         } else {
             uint32_t halfTokens = rotating::SequenceHalfWindow(runtimeShape_);

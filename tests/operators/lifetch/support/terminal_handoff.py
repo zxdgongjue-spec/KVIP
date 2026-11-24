@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Build and check evidence for the MR25 rotating-Service handoff benchmark."""
 
+import ctypes
 import hashlib
 import subprocess
 from pathlib import Path
@@ -11,7 +12,7 @@ STAGES = ('hot_us', 'threshold_us', 'cold_service_us', 'terminal_us')
 COUNT_COLUMNS = ('prefetch_requests', 'final_get_requests', 'total_get_requests')
 
 
-def build_library(directory, cann, headers, soc, *, local_counts):
+def build_library(directory, cann, headers, soc, *, local_counts, hot_partition=False):
     from kvip.runtime.build import build_failure
 
     directory = Path(directory)
@@ -25,7 +26,8 @@ def build_library(directory, cann, headers, soc, *, local_counts):
     commands = [
         ['cmake', '-S', str(source), '-B', str(directory), '-DRUN_MODE=npu',
          f'-DASCEND_CANN_PACKAGE_PATH={cann}', f'-DKVAF_INCLUDE={headers}',
-         f'-DSOC_VERSION={soc}', f'-DKVIP_SERVICE_LOCAL_COUNTS={option}'],
+         f'-DSOC_VERSION={soc}', f'-DKVIP_SERVICE_LOCAL_COUNTS={option}',
+         f'-DKVIP_HOT_SCORE_PARTITION={"ON" if hot_partition else "OFF"}'],
         ['cmake', '--build', str(directory), '--target', 'v9_bridge', '--parallel', '2'],
     ]
     with log.open('w') as output:
@@ -37,6 +39,30 @@ def build_library(directory, cann, headers, soc, *, local_counts):
     if not library.is_file():
         raise RuntimeError(f'Missing paired-bench library; see {log}')
     return library
+
+
+def bind_hot_score(state, *, partitioned):
+    """Select the first launch on an already bound dense Terminal pipeline."""
+    inputs = state.workspace.inputs
+    if not (inputs.query_lengths.eq(4).all().item()
+            and inputs.key_lengths.eq(state.history).all().item()):
+        raise ValueError('Hot partition comparison requires dense Q4 and full key lengths')
+    forward = state.forward
+    if forward.terminal is None:
+        raise ValueError('Hot partition comparison requires the MR25 Terminal route')
+    library = forward.rotating.library
+    parts = library.kvip_partitioned_hot_score_parts
+    parts.argtypes, parts.restype = [ctypes.c_void_p], ctypes.c_uint32
+    planned = parts(forward.shape_pointer)
+    if planned < 2:
+        raise ValueError('Hot partition is unsupported for this Terminal shape')
+    if partitioned and planned > 2:
+        function = library.kvip_parallel_tail_hot_partitioned_forward
+        function.argtypes = [ctypes.c_void_p] * 4
+        function.restype = ctypes.c_uint32
+        forward.terminal_function = function
+        return planned
+    return 2
 
 
 def fixture_hash(path):

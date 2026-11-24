@@ -76,3 +76,18 @@ Open `summary.csv` at the printed `Summary:` path. Use accepted rows and `fused_
 When `pipeline_count_status=PASS`, `prefetch_requests_per_call` and `final_get_requests_per_call` give actual early and final token Get requests per batch invocation. Check for a positive prefetch count in each route to confirm that all three posted early requests. Per-request counts are in `case-b*/fused/path_result.json` under `pipeline_counts.records`.
 
 The full route requires four ordered LI kernels in its measured trace, Score, threshold, Cold T2 and Final. The runner rejects an independent Service launch in that route. `cold_t2_us` covers the combined reread, classification and Service work.
+## Hot Score-only comparison on MR28
+
+Run this experiment in the same A5 container as `run_mr25_handoff.sh`, with the MR28 source based on `f29180a0` and the existing CANN/KVAF setup.
+
+```bash
+bash experiments/lifetch_mr23_service/run_mr25_score.sh --batch 1 --batch 2 --batch 4 --batch 8 --batch 16
+```
+
+Pass a single `--batch N` to run one case. Pass `--comparison-dry-run` to print and save the plan without an NPU. Pass `--reverse-order` to run the partitioned arm first. Each batch has an independent output and two separate workers. All workers in one command share the same compiled bridge, with `KVIP_SERVICE_LOCAL_COUNTS=ON`.
+
+Both arms use synthetic dense Q4/G32, H128K/R16K, miss 10%, seed 43, requested W4, prefetch budget 512, initial rank 1024, 2 warmups and 10 graph invocations. The partitioned entry uses all available Hot Score groups up to the resident page budget. Scores land in the original canonical GM rows. Threshold, Cold, rotating Service and Terminal use the same launches in both arms.
+
+At effective C32, the five partition counts per request are 32/16/8/4/2. Each MIX task computes all four Q over its assigned resident pages. BS16 uses the original Hot kernel in both arms and serves as the equal-geometry control.
+
+The output includes Hot, Threshold, Cold/Service, Terminal and KV-ready times, plus allocated MIX groups and tokens per group in `summary.csv`. The comparator requires correctness, the same fixture and library, and equal per-invocation completed prefetch/Final Get counters. Hot time is the kernel span, and KV ready is the per-invocation graph Event mean. The new experiment measures Hot partitioning. A Cold-only partition experiment needs a separate progress-publication design.

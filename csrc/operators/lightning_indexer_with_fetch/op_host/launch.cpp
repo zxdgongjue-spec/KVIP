@@ -124,12 +124,38 @@ extern "C" uint32_t kvip_parallel_tail_supported(const rotating::RuntimeShape* s
     return shape && shape->batch && shape->batch<=16 && shape->finalWorkers==4 &&
         shape->batch*4<=shape->aicCount*2 && rotating::UseSequenceSplit(*shape);
 }
-extern "C" uint32_t kvip_parallel_tail_forward(void* bindings,void* terminal,
-    void* stream,const rotating::RuntimeShape* shape) {
+// Keep the threshold, Cold/Service and Terminal launches in one shared path.
+#if KVIP_HOT_SCORE_PARTITION
+#include "../../common/lifetch/hot_score_partition.h"
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_hot_partitioned(uint32_t,void*,void*,uint32_t);
+#endif
+static uint32_t LaunchParallelTail(void* bindings,void* terminal,
+    void* stream,const rotating::RuntimeShape* shape,uint32_t hotParts) {
     if(!bindings || !terminal || !stream || !kvip_parallel_tail_supported(shape))return 100000;
-    uint32_t result=aclrtlaunch_v9_li_kernel(shape->liCores,stream,bindings);
+    uint32_t result;
+#if KVIP_HOT_SCORE_PARTITION
+    if(hotParts>2)result=aclrtlaunch_v9_li_kernel_hot_partitioned(shape->batch*hotParts,stream,bindings,hotParts);
+    else
+#endif
+    result=aclrtlaunch_v9_li_kernel(shape->liCores,stream,bindings);
     if(!result)result=aclrtlaunch_v9_li_kernel_1(shape->liCores,stream,bindings);
     if(!result)result=aclrtlaunch_v9_li_kernel_2(shape->liCores,stream,bindings);
     if(!result)result=aclrtlaunch_v9_parallel_terminal(shape->batch*4,stream,terminal);
     return result;
 }
+extern "C" uint32_t kvip_parallel_tail_forward(void* bindings,void* terminal,
+    void* stream,const rotating::RuntimeShape* shape) {
+    return LaunchParallelTail(bindings,terminal,stream,shape,2);
+}
+
+#if KVIP_HOT_SCORE_PARTITION
+extern "C" uint32_t kvip_partitioned_hot_score_parts(const rotating::RuntimeShape* shape) {
+    return kvip_parallel_tail_supported(shape) ? kvip_hot_score::Parts(shape->batch,shape->resident,shape->aicCount) : 0;
+}
+extern "C" uint32_t kvip_parallel_tail_hot_partitioned_forward(void* bindings,void* terminal,
+    void* stream,const rotating::RuntimeShape* shape) {
+    const auto parts=kvip_partitioned_hot_score_parts(shape);
+    if(parts<2)return 100000;
+    return LaunchParallelTail(bindings,terminal,stream,shape,parts);
+}
+#endif

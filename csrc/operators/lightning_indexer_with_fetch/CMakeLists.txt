@@ -11,6 +11,7 @@ if(NOT EXISTS "${KVAF_INCLUDE}/kvaf_batch_get_device.h")
 endif()
 set(KVIP_FUSE_QUERY_WORK ON)
 option(KVIP_SERVICE_LOCAL_COUNTS "Reuse same-core TopK counts in the rotating Service" OFF)
+option(KVIP_HOT_SCORE_PARTITION "Build the experimental dense Hot Score entry" OFF)
 include(${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
 set(KVIP_OUTPUT_WORKER ON)
 if(KVIP_OUTPUT_WORKER AND NOT KVIP_FUSE_QUERY_WORK)
@@ -25,10 +26,12 @@ ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WO
   -mllvm -user-reserved-ub-size=223232 -DV9_USER_UB_BYTES=223232
   -DV9_PARTIAL_SCAN_SIMD=1 -DV9_PROBE_EPOCH=0 -DV9_INTERMEDIATE_PROFILING=0
   -DKVIP_SERVICE_LOCAL_COUNTS=$<BOOL:${KVIP_SERVICE_LOCAL_COUNTS}>
+  -DKVIP_HOT_SCORE_PARTITION=$<BOOL:${KVIP_HOT_SCORE_PARTITION}>
   -DV9_BATCH_POST=2 -DSIM_Q=4 -DSIM_CAPTURE_HITS=1 -DV9_SIMULATION=0 -DROTATION_PUBLISH_TILES=1)
 add_library(v9_bridge SHARED op_host/launch.cpp)
 target_include_directories(v9_bridge PRIVATE ${KVAF_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/include ${_base}/include)
-target_compile_definitions(v9_bridge PRIVATE KVIP_OUTPUT_WORKER=$<BOOL:${KVIP_OUTPUT_WORKER}>)
+target_compile_definitions(v9_bridge PRIVATE KVIP_OUTPUT_WORKER=$<BOOL:${KVIP_OUTPUT_WORKER}>
+  KVIP_HOT_SCORE_PARTITION=$<BOOL:${KVIP_HOT_SCORE_PARTITION}>)
 target_link_libraries(v9_bridge PRIVATE v9_kernel host_intf_pub ascendcl)
 
 # Independent compile options preserve the retained four-AIV terminal code.
