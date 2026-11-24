@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'experiments/lifetch_mr23_service'))
 from lifetch_msprof_timeline import (  # noqa: E402
-    PHASES, PHASES_COLD_P4, device_business_view, publish_business_views, require_fused_replay,
+    PHASES, PHASES_COLD_P4, PHASES_UNIFIED, device_business_view, publish_business_views, require_fused_replay,
 )
 
 
@@ -95,6 +95,15 @@ def test_generic_a5_task_is_bound_by_unique_device_id_and_marker_range():
     other = hardware('AIV_SQE', 1130, 42, 6, task_type='AIV_SQE')
     with pytest.raises(ValueError, match='no unique compute task'):
         require_fused_replay([*raw, other])
+
+
+def test_unified_score_and_cold_t2_must_match_their_route():
+    raw = fused_replay(PHASES_UNIFIED)
+    for route in ('full_p2', 'full_uniform'):
+        stages = require_fused_replay(raw, cold_route=route)
+        assert [stage['kernel'] for stage in stages] == [kernel for _, kernel, _ in PHASES_UNIFIED]
+    with pytest.raises(ValueError, match='different named kernel'):
+        require_fused_replay(raw)
 
 
 def test_published_source_and_vendor_views_keep_their_clocks(tmp_path):

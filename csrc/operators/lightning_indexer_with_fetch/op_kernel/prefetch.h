@@ -922,12 +922,14 @@ if (rt_batchedRows) {
             auto input=cfg[256+(b/rt_serviceLanes)*80];if(!input.GetValue(64))continue;
             auto in64=input.ReinterpretCast<uint64_t>();uint64_t db=in64.GetValue(8),head=in64.GetValue(25);
             if(captureIo && !firstDoorbell)firstDoorbell=GetSystemCycle();
+            KVIP_TRACE_BEGIN(doorbellScope, stageTrace, Cold, PrefetchDoorbell, epoch, kvip_trace::PipeDetail(b));
 #if V9_SIMULATION
             *reinterpret_cast<__gm__ uint64_t*>(db)=head;
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(db),64);
 #else
             st_dev(uint32_t(head),reinterpret_cast<__gm__ uint32_t*>(db),0);
 #endif
+            KVIP_TRACE_END(doorbellScope);
             if(captureIo){lastDoorbell=GetSystemCycle();++doorbells;}
         }
         V9_FETCH_PROFILE(postTicks+=GetSystemCycle()-begin;)

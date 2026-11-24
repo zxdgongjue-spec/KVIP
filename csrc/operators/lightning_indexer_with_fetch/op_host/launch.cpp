@@ -255,13 +255,22 @@ extern "C" uint32_t kvip_unified_score_parts(const rotating::RuntimeShape* shape
     return parts >= 2 && shape->history / 256 >= parts ? parts : 0;
 }
 
+template<bool Profile = false>
 static uint32_t LaunchUnifiedScore(void* bindings, void* terminal, void* stream,
     const rotating::RuntimeShape* shape, uint32_t parts) {
     if (!bindings || !terminal || !stream || parts < 2) return 100000;
-    uint32_t result = aclrtlaunch_v9_li_kernel_score_t2(shape->batch * parts, stream, bindings, parts);
-    if (!result) result = aclrtlaunch_v9_li_kernel_1(shape->liCores, stream, bindings);
-    if (!result) result = aclrtlaunch_v9_li_kernel_cold_t2(shape->liCores, stream, bindings);
-    if (!result) result = aclrtlaunch_v9_parallel_terminal(shape->batch * 4, stream, terminal);
+    uint32_t result = LaunchTailStage<Profile>(stream, ParallelTailStage::Hot, [&] {
+        return aclrtlaunch_v9_li_kernel_score_t2(shape->batch * parts, stream, bindings, parts);
+    });
+    if (!result) result = LaunchTailStage<Profile>(stream, ParallelTailStage::Threshold, [&] {
+        return aclrtlaunch_v9_li_kernel_1(shape->liCores, stream, bindings);
+    });
+    if (!result) result = LaunchTailStage<Profile>(stream, ParallelTailStage::ColdService, [&] {
+        return aclrtlaunch_v9_li_kernel_cold_t2(shape->liCores, stream, bindings);
+    });
+    if (!result) result = LaunchTailStage<Profile>(stream, ParallelTailStage::Terminal, [&] {
+        return aclrtlaunch_v9_parallel_terminal(shape->batch * 4, stream, terminal);
+    });
     return result;
 }
 
@@ -274,4 +283,15 @@ extern "C" uint32_t kvip_parallel_tail_unified_partitioned_forward(void* binding
     void* stream, const rotating::RuntimeShape* shape) {
     return LaunchUnifiedScore(bindings, terminal, stream, shape, kvip_unified_score_parts(shape));
 }
+#if KVIP_STAGE_TRACE
+extern "C" uint32_t kvip_parallel_tail_unified_p2_profile_forward(void* bindings, void* terminal,
+    void* stream, const rotating::RuntimeShape* shape) {
+    return LaunchUnifiedScore<true>(bindings, terminal, stream, shape, kvip_unified_score_parts(shape) ? 2 : 0);
+}
+
+extern "C" uint32_t kvip_parallel_tail_unified_partitioned_profile_forward(void* bindings, void* terminal,
+    void* stream, const rotating::RuntimeShape* shape) {
+    return LaunchUnifiedScore<true>(bindings, terminal, stream, shape, kvip_unified_score_parts(shape));
+}
+#endif
 #endif

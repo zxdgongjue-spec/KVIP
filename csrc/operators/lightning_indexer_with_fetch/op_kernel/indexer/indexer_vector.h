@@ -209,7 +209,7 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
 #endif
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
     __aicore__ inline void ProcessPrecomputedVec1(const QLICommon::RunInfo &info,
-        uint32_t progressShard, bool publishShardEnd);
+        uint32_t progressShard, bool publishShardEnd KVIP_PIPE_PARAM_DEFAULT);
 #endif
     __aicore__ inline void ProcessTopK(const QLICommon::RunInfo &info, uint32_t queryRow = SIM_Q);
     __aicore__ inline void SetPrefixStorage(GM_ADDR output) { prefixOutput_ = output; }
@@ -965,25 +965,30 @@ __aicore__ inline void QLIVector<QLIT>::PublishColdTile(const QLICommon::RunInfo
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::ProcessPrecomputedVec1(const QLICommon::RunInfo &info,
-    uint32_t progressShard, bool publishShardEnd) {
+    uint32_t progressShard, bool publishShardEnd KVIP_PIPE_PARAM) {
     const uint32_t pingpong = info.loop % 2;
     const uint32_t query = (blockId_ % 2) * 2;
     auto scoresLocal = vec1OutUB_[pingpong * (UB_BANK_STRIDE / sizeof(uint16_t))];
+    KVIP_PIPE_SAMPLE(bankScope, pipeSample, ColdT2BankWait);
     WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
     // MTE3_V orders the vector pipe. The V_MTE2 handoff makes that
     // wait and the preceding vector reads visible before MTE2 reuses UB.
     SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
     WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+    KVIP_TRACE_END(bankScope);
     const uint32_t scoreBytes = s2BaseSize_ * sizeof(SCORE_T);
     DataCopyExtParams copy{2, scoreBytes, (runtimeShape_.history - s2BaseSize_) * uint32_t(sizeof(SCORE_T)),
         (UB_BANK_DEPTH_STRIDE - scoreBytes) / 32, 0};
     DataCopyPadExtParams<SCORE_T> pad{false, 0, 0, 0};
+    KVIP_PIPE_SAMPLE(loadScope, pipeSample, ColdT2ScoreMte2);
     DataCopyPad(scoresLocal, scoreGm[query * runtimeShape_.history + info.s2Idx * s2BaseSize_], copy, pad);
     SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    KVIP_TRACE_END(loadScope);
     auto scores = reinterpret_cast<__ubuf__ uint16_t*>(scoresLocal.GetPhyAddr());
     auto threshold = reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_.GetPhyAddr());
     auto hits = reinterpret_cast<__ubuf__ uint16_t*>(classifyUB_.GetPhyAddr()) + pingpong * 256;
+    KVIP_PIPE_SAMPLE(classifyScope, pipeSample, ColdT2PredicateVf);
     __VEC_SCOPE__ {
         MicroAPI::RegTensor<uint16_t> values;
         auto all = MicroAPI::CreateMask<uint16_t, MicroAPI::MaskPattern::ALL>();
@@ -992,10 +997,13 @@ __aicore__ inline void QLIVector<QLIT>::ProcessPrecomputedVec1(const QLICommon::
             vector1::ClassifyScore(values, threshold + q * 128, hits + q * 128, all);
         }
     }
+    KVIP_TRACE_END(classifyScope);
+    KVIP_PIPE_SAMPLE(publishScope, pipeSample, ColdT2PublishMte3);
     SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
     WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
     PublishColdTile(info, query, 2, progressShard, publishShardEnd);
     SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+    KVIP_TRACE_END(publishScope);
 }
 #endif
 

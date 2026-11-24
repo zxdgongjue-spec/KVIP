@@ -9,6 +9,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'experiments/lifetch_mr23_service'))
 from lifetch_cold_trace_comparison import summarize_scopes, write_comparison  # noqa: E402
+from lifetch_msprof_timeline import ROUTE_PHASES  # noqa: E402
+from lifetch_unified_trace_comparison import write_unified_comparison  # noqa: E402
 
 
 def span(kernel, phase, start, duration, lane=0, window=1):
@@ -68,3 +70,48 @@ def test_pair_preserves_native_delta_waits_and_different_get_work(tmp_path):
     captures['cold_p4']['report']['library_sha256'] = 'wrong_bridge'
     with pytest.raises(ValueError, match='different fixture or build fields'):
         write_comparison(tmp_path, captures, local_counts=True)
+
+
+def unified_capture(route, score, cold, prefetch):
+    (hot, threshold, cold_kernel, terminal) = (kernel for _, kernel, _ in ROUTE_PHASES[route])
+    fixture = capture(route, cold_kernel, cold, 0, prefetch)
+    fixture['report'].update(local_counts=False, hot_parts=4 if route == 'full_uniform' else 2)
+    next_start = 1000
+    intervals = []
+    for (_, kernel, label), duration in zip(ROUTE_PHASES[route], (score, 10, cold, 60), strict=True):
+        intervals.append(dict(name=label, kernel=kernel, begin_us=next_start,
+                              end_us=next_start + duration, duration_us=duration))
+        next_start += duration + 5
+    fixture['intervals'] = intervals
+    fixture['source']['traceEvents'] = [
+        dict(span(hot, 1, 0, score), name='Score body'),
+        dict(span(threshold, 23, score + 5, 10), name='Resident threshold'),
+        dict(span(cold_kernel, 154, score + 30, 3), name='Prefetch WQE submission'),
+        dict(span(cold_kernel, 223, score + 33, 1), name='Prefetch doorbell'),
+        dict(span(terminal, 1, score + 20 + cold, 60), name='Terminal body'),
+    ]
+    if route != 'p2':
+        fixture['source']['traceEvents'].append(dict(span(cold_kernel, 220, score + 20, 2),
+                                                     name='Cold T2 score read'))
+    return fixture
+
+
+def test_unified_report_keeps_independent_clocks_and_absent_scopes(tmp_path):
+    captures = {'p2': unified_capture('p2', 20, 100, 1),
+                'full_p2': unified_capture('full_p2', 90, 110, 1),
+                'full_uniform': unified_capture('full_uniform', 30, 105, 2)}
+    report = write_unified_comparison(tmp_path, captures, local_counts=False)
+    native = report['routes']['p2']
+    uniform = report['routes']['full_uniform']
+    assert native['score_to_kv_ready_device_us'] == 205
+    assert native['source_first_doorbell_us'] == 53
+    assert uniform['delta_score_to_kv_ready_device_us'] == 15
+    assert uniform['source_first_doorbell_to_terminal_us'] == 92
+    assert uniform['get_comparison']['status'] == 'different_request_totals'
+    with (tmp_path / 'unified_trace_scopes.csv').open() as stream:
+        read = next(row for row in csv.DictReader(stream) if row['phase_id'] == '220')
+    assert (read['p2_events'], read['full_uniform_events'], read['full_uniform_delta_source_union_us']) == ('', '1', '')
+    captures['full_uniform']['source']['traceEvents'] = [
+        event for event in captures['full_uniform']['source']['traceEvents'] if event['args']['phase_id'] != 223]
+    with pytest.raises(ValueError, match='missing Terminal or observed prefetch doorbell'):
+        write_unified_comparison(tmp_path, captures, local_counts=False)

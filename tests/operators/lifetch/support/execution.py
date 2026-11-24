@@ -3974,9 +3974,10 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     if baseline_trace and (not msprof_output or instruction_replay):
         raise ValueError('Baseline stage trace requires an exclusive profile output')
     if cold_route is not None:
-        if not baseline_trace or cold_route not in ('p2', 'cold_p4'):
-            raise ValueError('Cold partition trace requires the marked P2/P4 replay')
+        if not baseline_trace or cold_route not in ('p2', 'cold_p4', 'full_p2', 'full_uniform'):
+            raise ValueError('Score comparison requires a marked fusion replay')
         if (tuple(config.batches) != (8,) or config.history != 131072 or config.queries != 4
+                or config.resident != 16384 or config.index_heads != 32
                 or config.miss_percent != 10 or config.prefetch_tokens != 512
                 or config.prefetch_rank_start != 1024 or type(config.msprof_local_counts) is not bool
                 or not config.msprof_build_dir):
@@ -4131,8 +4132,15 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         if baseline_trace:
             from baseline_stage_trace import StageBuffer, scoped_msprof, write_capture
 
-            cold_parts = 2
-            if cold_route is not None:
+            cold_parts = score_parts = 2
+            if cold_route in ('full_p2', 'full_uniform'):
+                from terminal_handoff import bind_unified_score
+
+                score_parts = bind_unified_score(state, cold_route)
+                expected_parts = 4 if cold_route == 'full_uniform' else 2
+                if score_parts != expected_parts:
+                    raise ValueError(f'Expected full Score P{expected_parts}, got P{score_parts}')
+            elif cold_route is not None:
                 from terminal_handoff import bind_score_partition
 
                 _, cold_parts = bind_score_partition(state, hot=False, cold=cold_route == 'cold_p4')
@@ -4140,7 +4148,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 if cold_parts != expected_parts:
                     raise ValueError(f'Expected Cold P{expected_parts}, got P{cold_parts}')
             trace = StageBuffer(state, cold_route=cold_route or 'p2')
-            replay_stage(f'calibrating device counter and warming up unmarked Cold P{cold_parts}')
+            replay_stage(f'calibrating device counter and warming up unmarked {cold_route or "p2"}')
             pending = True
             counter_mhz = state.forward.calibrate_counter_mhz()
             pending = False
@@ -4155,7 +4163,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             trace.attach()
             stream.synchronize()
             pending = False
-            replay_stage(f'initialization and warmup finished; collecting only marked Cold P{cold_parts}/Terminal')
+            replay_stage(f'initialization and warmup finished; collecting only marked {cold_route or "p2"}')
             with scoped_msprof(acl.prof, msprof_output, config.device) as capture:
                 pending = True
                 try:
@@ -4171,7 +4179,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             (directory / 'baseline_stage_trace.bin').write_bytes(raw)
             validate(initial)
             return write_capture(directory, raw, counter_mhz, state, library, config, soc, capture,
-                                 cold_parts=cold_parts)
+                                 cold_parts=cold_parts, score_parts=score_parts)
         pending = True
         replay_stage('first eager forward and device completion')
         state.forward()

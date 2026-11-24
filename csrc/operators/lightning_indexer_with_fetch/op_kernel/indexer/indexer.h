@@ -717,7 +717,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
 #endif
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
         if constexpr (Precomputed) {
-            vectorService.ProcessPrecomputedVec1(info, shard, tile + 1 == end);
+            vectorService.ProcessPrecomputedVec1(info, shard, tile + 1 == end KVIP_PIPE_ARG);
         } else
 #endif
         {
@@ -818,6 +818,8 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(u
         uint32_t loop = 0, scaleLoop = 0;
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
         if constexpr (Phase == SequenceLiPhase::UnifiedScore) {
+            KVIP_TRACE_RECORD(unifiedScanScope, stageTrace_, kvip_trace::Hot,
+                kvip_trace::ScanPhase(), 0, batch);
             const auto tiles = kvip_hot_score::Split(runtimeShape_.history, shard, parts);
             ScanSequenceHalf(tiles.begin, tiles.end, shard, loop, scaleLoop, true, false, true);
         } else
@@ -904,8 +906,10 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(u
             vectorService.FreeEventID();
         } else {
             matmulService.FreeEventID();
-            KVIP_TRACE_RECORD(cubeTailScope, stageTrace_, Phase == SequenceLiPhase::Hot ?
-                kvip_trace::Hot : kvip_trace::Cold, kvip_trace::LiCubeWait, runtimeShape_.rounds, batch);
+            KVIP_TRACE_RECORD(cubeTailScope, stageTrace_,
+                (Phase == SequenceLiPhase::Hot || Phase == SequenceLiPhase::UnifiedScore)
+                    ? kvip_trace::Hot : kvip_trace::Cold,
+                kvip_trace::LiCubeWait, runtimeShape_.rounds, batch);
             CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT);
             CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT + 1);
         }

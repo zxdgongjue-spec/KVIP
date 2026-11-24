@@ -17,35 +17,42 @@ from baseline_stage_trace import (  # noqa: E402
 )
 
 
-def sample_buffer(*, pipe_scopes=False, batch=1, cold_parts=2):
+def sample_buffer(*, pipe_scopes=False, batch=1, cold_parts=2, score_parts=2, unified=False):
     lane_stride = LANE_BYTES + CAPACITY * EVENT.size
     raw = bytearray(HEADER_BYTES + LANES * lane_stride)
     struct.pack_into('<Q4I', raw, 0, MAGIC, VERSION, LANES, CAPACITY, EVENT.size)
     cold_blocks = batch * cold_parts
-    for lane in (*range(2 * cold_blocks), *range(64, 64 + cold_blocks)):
+    score_blocks = batch * score_parts
+    total_blocks = max(score_blocks, cold_blocks)
+    for lane in (*range(2 * total_blocks), *range(64, 64 + total_blocks)):
         base = HEADER_BYTES + lane * lane_stride
         count = 0
         for kernel, phases in REQUIRED.items():
-            active_blocks = cold_blocks if kernel == 22 else 2 * batch
+            active_blocks = {20: score_blocks, 22: cold_blocks}.get(kernel, 2 * batch)
             if lane not in range(2 * active_blocks) and lane not in range(64, 64 + active_blocks):
                 continue
-            if lane >= 64 and kernel in (21, 23):
+            if lane >= 64 and (kernel in (21, 23) or (unified and kernel == 22)):
                 continue
             begin = 3_000 + (kernel - 20) * 1_000 + lane
             selected = phases if lane == 0 else {1}
+            if unified and kernel == 22:
+                selected = selected - {21}
             if pipe_scopes:
                 core_type = 'AIC' if lane >= 64 else 'AIV'
-                selected = selected | {phase for phase in REQUIRED_PIPE[kernel] if PIPE_SCOPES[phase][0] == core_type}
+                pipe_phases = source_trace.T2_PIPE_PHASES if unified and kernel == 22 else REQUIRED_PIPE[kernel]
+                selected = selected | {phase for phase in pipe_phases if PIPE_SCOPES[phase][0] == core_type}
             for phase in sorted(selected):
                 phase_begin = begin + count * 3 if phase != 1 else begin
                 detail = 0
                 if phase in PIPE_SCOPES:
                     query_start = NO_QUERY if lane >= 64 else lane % 2 * 2
                     detail = (3 << 24) | (query_start << 20) | 127
-                event = (phase_begin, begin + (800 if phase == 1 else 500), lane, kernel, phase, lane % 64,
-                         int(lane in (1, 3)), 0, detail, 1, 0, 0)
-                EVENT.pack_into(raw, base + LANE_BYTES + count * EVENT.size, *event)
-                count += 1
+                windows = (1, 2, 3) if phase in source_trace.T2_PIPE_PHASES else (0,)
+                for window in windows:
+                    event = (phase_begin, begin + (800 if phase == 1 else 500), lane, kernel, phase, lane % 64,
+                             int(lane in (1, 3)), window, detail, 1, 0, 0)
+                    EVENT.pack_into(raw, base + LANE_BYTES + count * EVENT.size, *event)
+                    count += 1
             if cold_parts == 4 and kernel == 22 and lane == 0:
                 for epoch in (1, 2, 3):
                     begin_wait = begin + epoch * 100
@@ -157,6 +164,25 @@ def test_cold_p4_uses_native_alias_and_separate_part_waits():
         'v9_li_kernel_cold_partitioned': 96, 'v9_parallel_terminal': 32,
     }
     assert {stage['window_epoch'] for stage in stages if stage['phase_id'] == WAIT_PARTITIONED_HALF} == {1, 2, 3}
+
+
+def test_full_score_records_partitioned_compute_and_aiv_only_cold_t2():
+    events = decode(sample_buffer(pipe_scopes=True, batch=8, score_parts=4, unified=True))
+    verify_route(events, batch=8, require_pipe_scopes=True, cold_route='full_uniform', score_parts=4)
+    with pytest.raises(ValueError, match='Missing required pipe scopes'):
+        verify_route([event for event in events if event['phase'] != 220], batch=8,
+                     require_pipe_scopes=True, cold_route='full_uniform', score_parts=4)
+    with pytest.raises(ValueError, match='expected window/lane coverage'):
+        verify_route([event for event in events
+                      if (event['phase'], event['lane'], event['iteration']) != (220, 0, 1)],
+                     batch=8, require_pipe_scopes=True, cold_route='full_uniform', score_parts=4)
+    document, stages = render(events, counter_mhz=1000, cold_route='full_uniform')
+    bodies = {stage['kernel_entry']: stage['logical_lanes'] for stage in stages if stage['phase_id'] == 1}
+    assert bodies['v9_li_kernel_score_t2'] == 96
+    assert bodies['v9_li_kernel_cold_t2'] == 32
+    sample = next(event for event in document['traceEvents'] if event['name'] == 'Cold T2 Score GM to UB with fence')
+    assert sample['args']['query_start'] == sample['args']['block'] % 2 * 2
+    assert sample['args']['sampled_scan_tile'] is True
 
 
 def test_source_lane_count_deduplicates_nested_scopes():

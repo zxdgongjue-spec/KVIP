@@ -42,7 +42,16 @@ COLD_P4_KERNELS = {
     21: (KERNELS[21][0], 'v9_li_kernel_threshold_cold_partitioned'),
     22: (KERNELS[22][0], 'v9_li_kernel_cold_partitioned'),
 }
+UNIFIED_ROUTES = ('full_p2', 'full_uniform')
+UNIFIED_KERNELS = {
+    **KERNELS,
+    20: ('Full history Score', 'v9_li_kernel_score_t2'),
+    22: ('Cold T2 + rotating Service', 'v9_li_kernel_cold_t2'),
+}
+ROUTE_KERNELS = {'p2': KERNELS, 'cold_p4': COLD_P4_KERNELS,
+                 **{route: UNIFIED_KERNELS for route in UNIFIED_ROUTES}}
 WAIT_PARTITIONED_HALF = 218
+T2_PIPE_PHASES = (219, 220, 221, 222)
 PHASES = {
     1: 'Kernel body',
     2: 'Kernel setup',
@@ -102,6 +111,11 @@ PIPE_SCOPES = {
     216: ('AIV', 'VF', 'Index update with fence'),
     217: ('AIV', 'VF', 'Final WQE assembly with fence'),
     WAIT_PARTITIONED_HALF: ('AIV', 'WAIT', 'WaitPartitionedHalf'),
+    219: ('AIV', 'WAIT', 'Cold T2 output bank and MTE2 handoff'),
+    220: ('AIV', 'MTE2', 'Cold T2 Score GM to UB with fence'),
+    221: ('AIV', 'VF', 'Cold T2 resident-threshold predicate'),
+    222: ('AIV', 'MTE3', 'Cold T2 predicate and progress publication'),
+    223: ('AIV', 'STORE', 'Prefetch doorbell'),
 }
 PHASES.update({phase: name for phase, (_, _, name) in PIPE_SCOPES.items()})
 NO_TILE, NO_QUERY, SERVICE_LANE = (1 << 20) - 1, 15, 14
@@ -169,6 +183,8 @@ class StageBuffer:
         profile_symbol = {
             'p2': 'kvip_parallel_tail_profile_forward',
             'cold_p4': 'kvip_parallel_tail_cold_partitioned_profile_forward',
+            'full_p2': 'kvip_parallel_tail_unified_p2_profile_forward',
+            'full_uniform': 'kvip_parallel_tail_unified_partitioned_profile_forward',
         }[cold_route]
         self.profile_forward = getattr(library, profile_symbol)
         self.profile_forward.argtypes = [ctypes.c_void_p] * 4
@@ -235,7 +251,7 @@ def decode(raw):
     return sorted(events, key=lambda e: (e['begin'], -e['end'], e['lane']))
 
 
-def verify_route(events, batch, *, require_pipe_scopes=False, cold_route='p2'):
+def verify_route(events, batch, *, require_pipe_scopes=False, cold_route='p2', score_parts=2):
     phases = defaultdict(set)
     bodies = defaultdict(set)
     for event in events:
@@ -248,13 +264,16 @@ def verify_route(events, batch, *, require_pipe_scopes=False, cold_route='p2'):
             bodies[kernel].add(lane)
     if set(phases) != set(REQUIRED):
         raise ValueError(f'Expected Hot/Threshold/Cold/Terminal trace, got kernel IDs {sorted(phases)}')
-    missing = {kernel: sorted(expected - phases[kernel]) for kernel, expected in REQUIRED.items()
+    unified = cold_route in UNIFIED_ROUTES
+    required = {**REQUIRED, 22: REQUIRED[22] - {21}} if unified else REQUIRED
+    missing = {kernel: sorted(expected - phases[kernel]) for kernel, expected in required.items()
                if not expected.issubset(phases[kernel])}
     if missing:
         raise ValueError(f'Missing required source stages: {missing}')
     if require_pipe_scopes:
-        missing_pipe = {KERNELS[kernel][1]: sorted(expected - phases[kernel])
-                        for kernel, expected in REQUIRED_PIPE.items() if not expected.issubset(phases[kernel])}
+        required_pipe = {**REQUIRED_PIPE, 22: set(T2_PIPE_PHASES)} if unified else REQUIRED_PIPE
+        missing_pipe = {ROUTE_KERNELS[cold_route][kernel][1]: sorted(expected - phases[kernel])
+                        for kernel, expected in required_pipe.items() if not expected.issubset(phases[kernel])}
         if missing_pipe:
             raise ValueError(f'Missing required pipe scopes: {missing_pipe}')
     partition_waits = [event for event in events if event['phase'] == WAIT_PARTITIONED_HALF]
@@ -263,17 +282,35 @@ def verify_route(events, batch, *, require_pipe_scopes=False, cold_route='p2'):
                 or any(event['kernel'] != 22 or event['lane'] >= 64 for event in partition_waits)):
             raise ValueError('Cold P4 WaitPartitionedHalf trace must cover all three Cold windows on AIV')
     elif partition_waits:
-        raise ValueError('Unexpected WaitPartitionedHalf on native Cold P2')
+        raise ValueError('Unexpected WaitPartitionedHalf on a two-shard Cold replay')
+    if any(event['phase'] in T2_PIPE_PHASES and (not unified or event['kernel'] != 22)
+           for event in events):
+        raise ValueError('Unexpected Cold T2 pipe scope for this replay')
+    if unified and any(event['kernel'] == 22 and (event['lane'] >= 64 or event['phase'] == 21)
+                       for event in events):
+        raise ValueError('Cold T2 must only trace AIV work')
     four_aiv = set(range(4 * batch))
     two_aic = set(range(64, 64 + 2 * batch))
-    cold_lanes = (set(range(8 * batch)) | set(range(64, 64 + 4 * batch))
-                  if cold_route == 'cold_p4' else four_aiv | two_aic)
-    expected = {20: four_aiv | two_aic, 21: four_aiv, 22: cold_lanes, 23: four_aiv}
-    kernels = COLD_P4_KERNELS if cold_route == 'cold_p4' else KERNELS
+    cold_lanes = {'cold_p4': set(range(8 * batch)) | set(range(64, 64 + 4 * batch)),
+                  'p2': four_aiv | two_aic}.get(cold_route, four_aiv)
+    score_groups = batch * score_parts
+    score_lanes = set(range(2 * score_groups)) | set(range(64, 64 + score_groups))
+    expected = {20: score_lanes, 21: four_aiv, 22: cold_lanes, 23: four_aiv}
+    kernels = ROUTE_KERNELS[cold_route]
     for kernel, lanes in expected.items():
         if bodies[kernel] != lanes:
             raise ValueError(f'{kernels[kernel][1]} expected {len(lanes)} marked lanes, '
                              f'got {len(bodies[kernel])}')
+    if any(event['lane'] not in bodies[event['kernel']] for event in events):
+        raise ValueError('A source scope has no corresponding kernel body on its lane')
+    if unified and require_pipe_scopes:
+        sampled = {(event['iteration'], event['phase'], event['lane']) for event in events
+                   if event['phase'] in T2_PIPE_PHASES}
+        needed = {(window, phase, lane) for window in (1, 2, 3)
+                  for phase in T2_PIPE_PHASES for lane in cold_lanes}
+        if sampled != needed:
+            raise ValueError(f'Cold T2 samples differ from expected window/lane coverage: '
+                             f'{len(needed - sampled)} missing, {len(sampled - needed)} unexpected')
 
 
 def source_lane_counts(spans):
@@ -302,7 +339,11 @@ def render(events, counter_mhz, *, cold_route='p2'):
         raise ValueError('A positive measured device counter frequency is required')
     origin = min(event['begin'] for event in events)
     trace = []
-    kernels = COLD_P4_KERNELS if cold_route == 'cold_p4' else KERNELS
+    kernels = ROUTE_KERNELS[cold_route]
+    scope_labels = {(20, 22): 'AIV full-history Score scan',
+                    (20, 191): 'Full-history Score reduction SIMD VF',
+                    (20, 192): 'Full-history Score writeback issue',
+                    (22, 22): 'AIV precomputed Cold tile scan'} if cold_route in UNIFIED_ROUTES else {}
 
     def metadata(name, pid, tid, label):
         trace.append(dict(name=name, ph='M', pid=pid, tid=tid, args={'name': label}))
@@ -349,7 +390,7 @@ def render(events, counter_mhz, *, cold_route='p2'):
             if phase == WAIT_PARTITIONED_HALF:
                 args.update(query_start=query, cold_part=slot)
             elif query not in (NO_QUERY, SERVICE_LANE):
-                args['query_start' if phase < 200 else 'query'] = query
+                args['query_start' if phase < 200 or phase in T2_PIPE_PHASES else 'query'] = query
             if phase != WAIT_PARTITIONED_HALF and slot != NO_TILE:
                 args['tile_index'] = slot
                 args['sampled_scan_tile'] = True
@@ -362,7 +403,7 @@ def render(events, counter_mhz, *, cold_route='p2'):
             args['service_lane'] = event['detail']
         elif phase == 154:
             args['request_or_service_lane'] = event['detail']
-        add_span(PHASES[phase], category, pid, lane, begin, end, args)
+        add_span(scope_labels.get((kernel, phase), PHASES[phase]), category, pid, lane, begin, end, args)
         if phase == 1:
             kernel_bodies[kernel].append(event)
             lane_scopes[(core_type, 'kernel body')].append(event)
@@ -389,7 +430,8 @@ def render(events, counter_mhz, *, cold_route='p2'):
         for span in spans:
             mapping = aic if span['lane'] >= 64 else aiv
             mapping[(span['block'], span['subblock'])].add(span['core'])
-        summaries.append(dict(kernel_entry=kernels[kernel][1], phase=PHASES[phase], window_epoch=window_epoch,
+        summaries.append(dict(kernel_entry=kernels[kernel][1],
+                              phase=scope_labels.get((kernel, phase), PHASES[phase]), window_epoch=window_epoch,
                               kernel_id=kernel, phase_id=phase,
                               pipe=PIPE_SCOPES[phase][1] if phase in PIPE_SCOPES else None,
                               events=len(spans), logical_lanes=len({e['lane'] for e in spans}),
@@ -445,13 +487,15 @@ def write_instruction_replay(directory, state, library, config, soc):
     return report
 
 
-def write_capture(directory, raw, counter_mhz, state, library, config, soc, msprof_capture, *, cold_parts=2):
+def write_capture(directory, raw, counter_mhz, state, library, config, soc, msprof_capture, *,
+                  cold_parts=2, score_parts=2):
     comparison_route = getattr(config, 'msprof_cold_route', None)
     cold_route = comparison_route or 'p2'
     events = decode(raw)
-    verify_route(events, state.batch, require_pipe_scopes=True, cold_route=cold_route)
+    verify_route(events, state.batch, require_pipe_scopes=True, cold_route=cold_route, score_parts=score_parts)
     if comparison_route:
-        for phase in (21, 22, 151, 192):
+        cold_phases = (22, 151) if cold_route in UNIFIED_ROUTES else (21, 22, 151, 192)
+        for phase in cold_phases:
             windows = {event['iteration'] for event in events if event['kernel'] == 22 and event['phase'] == phase}
             if windows != {1, 2, 3}:
                 raise ValueError(f'Cold comparison phase {PHASES[phase]} must cover all three Cold windows')
@@ -459,13 +503,15 @@ def write_capture(directory, raw, counter_mhz, state, library, config, soc, mspr
     report = replay_evidence(state, library, config, soc)
     if cold_route == 'cold_p4':
         report['route'] = 'Hot P2 + Cold P4 + four-AIV Terminal'
+    elif cold_route in UNIFIED_ROUTES:
+        report['route'] = f'Full Score P{score_parts} + Cold T2 + four-AIV Terminal'
     phases = {event['phase'] for event in events}
     if ((report['total_prefetch'] and not {153, 154, 168, 204, 205}.issubset(phases))
             or (report['total_final_get'] and not {164, 165, 167, 215, 217}.issubset(phases))):
         raise ValueError('Observed Get counts have missing descriptor, submission or completion markers')
     report.update(
         traced_invocations=1,
-        cold_route=cold_route, hot_parts=2, cold_parts=cold_parts,
+        cold_route=cold_route, hot_parts=score_parts, cold_parts=cold_parts,
         service_lanes=int(state.rotating.runtime_shape.serviceLanes),
         local_counts=getattr(config, 'msprof_local_counts', False),
         clock=CLOCK, counter_mhz=counter_mhz, events=len(events), stages=stages,
@@ -484,7 +530,7 @@ def main():
     parser.add_argument('raw', type=Path, help='captured baseline_stage_trace.bin')
     parser.add_argument('--counter-mhz', type=float, required=True, help='use the measured value from the capture report')
     parser.add_argument('--output', type=Path, required=True, help='output Chrome/Perfetto trace JSON')
-    parser.add_argument('--cold-route', choices=('p2', 'cold_p4'), default='p2',
+    parser.add_argument('--cold-route', choices=ROUTE_KERNELS, default='p2',
                         help='kernel aliases used by the recorded replay')
     args = parser.parse_args()
     document, _ = render(decode(args.raw.read_bytes()), args.counter_mhz, cold_route=args.cold_route)

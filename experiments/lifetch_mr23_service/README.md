@@ -245,3 +245,37 @@ The paired trace captures one instrumented eager replay per arm. Compare
 Get placement and totals alongside the native wall delta. Per-scope
 intervals can overlap, and their deltas cannot be summed into the
 historical 18.58 us difference from the uninstrumented graph run.
+
+### BS8 unified Score end-to-end profiling
+
+In the A5 container, use the existing built unified KVAF dependencies.
+
+```bash
+bash experiments/lifetch_mr23_service/run_mr28_baseline_msprof.sh --unified-compare
+```
+
+This runs one checked, marked fused replay for each of native P2, full
+Score P2, and full Score P4. All use BS8, Q4/G32, H128K/R16K, miss 10%,
+seed 43, W4, rank 1024, and prefetch budget 512. Local counts defaults
+to OFF. Pass `--dry-run` to inspect the plan without CANN or KVAF.
+
+- `unified_trace_native.json` puts the four native msprof tasks from
+  each route on parallel lanes using Score start as each lane's origin.
+- `unified_trace_stages.csv` compares those task durations and gaps.
+  `unified_trace_comparison.json` adds Score-to-Terminal device spans,
+  per-window Get counts and comparisons, and first-prefetch doorbell
+  timing from the source counter.
+- `unified_trace_scopes.csv` reports per-window and per-stage source
+  intervals, including union time across cores and maximum lane union.
+  For each route, `lifetch_business_trace.json` contains the individual
+  AIC/AIV tracks and `lifetch_msprof_trace.json` contains the CANN tracks.
+
+Cold T2 records first and last tile samples for bank reuse, the GM score
+read with its existing fence, threshold classification, and predicate/
+progress publication. The shared Service records predecessor wait,
+incremental TopK, deduplication, WQE submission and actual batched
+doorbells. Terminal retains its Top2048, Resolve, final Get/CQ, Index,
+prefetch CQ and completion scopes. Source scope unions can overlap, and
+the relative source and native clocks are independent. Use
+`run_mr28_unified_score.sh --batch 8` for an uninstrumented graph Event
+mean with the same synthetic case.

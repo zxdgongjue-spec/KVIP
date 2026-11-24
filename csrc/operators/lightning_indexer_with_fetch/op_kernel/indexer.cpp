@@ -29,12 +29,14 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2) {
     auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
 #if KVIP_STAGE_TRACE
-    constexpr bool traceScorePath = Phase != SequenceLiPhase::UnifiedScore && Phase != SequenceLiPhase::PrecomputedCold;
-    const uint64_t stageTrace = traceScorePath && (parts == 2 || Phase == SequenceLiPhase::Cold)
+    constexpr bool traceHotSlot = Phase == SequenceLiPhase::Hot || Phase == SequenceLiPhase::UnifiedScore;
+    constexpr bool traceColdSlot = Phase == SequenceLiPhase::Cold || Phase == SequenceLiPhase::PrecomputedCold;
+    const uint64_t stageTrace = (parts == 2 || Phase == SequenceLiPhase::Cold ||
+        Phase == SequenceLiPhase::UnifiedScore)
         ? KVIP_TRACE_WORKSPACE(P(15)) : 0;
-    constexpr uint32_t traceKernel = Phase == SequenceLiPhase::Hot ? kvip_trace::Hot :
+    constexpr uint32_t traceKernel = traceHotSlot ? kvip_trace::Hot :
         Phase == SequenceLiPhase::Threshold ? kvip_trace::Threshold :
-        Phase == SequenceLiPhase::Cold ? kvip_trace::Cold : kvip_trace::Final;
+        traceColdSlot ? kvip_trace::Cold : kvip_trace::Final;
 #endif
     KVIP_TRACE_RECORD(kernelScope, stageTrace, traceKernel, kvip_trace::KernelBody, 0, 0);
     KVIP_TRACE_RECORD(setupScope, stageTrace, traceKernel, kvip_trace::Setup, 0, 0);

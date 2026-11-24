@@ -47,7 +47,10 @@ enum Phase : uint32_t {
     TerminalResolveVf = 213, TerminalOutputMte3 = 214, TerminalSqMte3 = 215,
     TerminalIndexVf = 216, TerminalWqeVf = 217,
     // Detail stores the request, first local Q, and the leader's partition index.
-    ColdPartitionWait = 218
+    ColdPartitionWait = 218,
+    ColdT2BankWait = 219, ColdT2ScoreMte2 = 220,
+    ColdT2PredicateVf = 221, ColdT2PublishMte3 = 222,
+    PrefetchDoorbell = 223
 };
 }
 

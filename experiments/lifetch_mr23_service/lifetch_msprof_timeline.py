@@ -19,7 +19,14 @@ PHASES_COLD_P4 = (
     ('COLD_SERVICE', 'v9_li_kernel_cold_partitioned', PHASES[2][2]),
     PHASES[3],
 )
-ROUTE_PHASES = {'p2': PHASES, 'cold_p4': PHASES_COLD_P4}
+PHASES_UNIFIED = (
+    ('HOT', 'v9_li_kernel_score_t2', 'Full history Score'),
+    PHASES[1],
+    ('COLD_SERVICE', 'v9_li_kernel_cold_t2', 'Cold T2 + rotating Service'),
+    PHASES[3],
+)
+ROUTE_PHASES = {'p2': PHASES, 'cold_p4': PHASES_COLD_P4,
+                'full_p2': PHASES_UNIFIED, 'full_uniform': PHASES_UNIFIED}
 MARKERS = {f'KVIP_LIFETCH_{stage}_{side}' for stage, _, _ in PHASES for side in ('BEGIN', 'END')}
 KERNELS = {kernel for phases in ROUTE_PHASES.values() for _, kernel, _ in phases}
 COMPUTE_TYPES = {'AI_CORE', 'AI_VECTOR_CORE', 'MIX_AIC', 'MIX_AIV', 'AIV_SQE', 'FUSION'}
