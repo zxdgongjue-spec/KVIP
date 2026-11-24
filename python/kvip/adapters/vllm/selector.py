@@ -85,7 +85,6 @@ class VllmIndexSelector:
         self.attention_indices = None
         self.plans = None
         self.tail_source = None
-        self.snapshot = None
 
     def prepare(self, plans, *, prepare_inputs=True):
         """CPU request layout, once per forward; no device readback."""
@@ -117,8 +116,6 @@ class VllmIndexSelector:
         self.inputs.pack(query, weights, query_scale)
         if self.tail_source is not None:
             self.rotating.tail_bounds.copy_(self.tail_source)
-        if self.snapshot is not None:
-            self.snapshot.capture()
         # v9_init owns round-local initialization inside the captured launch.
         self.forward()
 

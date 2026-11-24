@@ -11,10 +11,6 @@ from workloads import configuration  # noqa: E402
 
 def main(argv=None):
     config = configuration(argv)
-    if config.mode == 'replay-snapshot':
-        from service_snapshot import run_service_snapshot
-
-        return run_service_snapshot(config)
     from execution import dispatch
 
     return dispatch(config)

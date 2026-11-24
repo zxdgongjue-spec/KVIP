@@ -44,13 +44,6 @@ def bind_selectors(torch, policy, config, *, batch=None):
             selectors = _bind_selectors(torch, policy, config, setup, workspace)
         else:
             raise ValueError(f"Unsupported LIFetch transport: {config.transport}")
-        if getattr(config, "lifetch_snapshot_dir", ""):
-            from kvip.adapters.vllm.snapshot import LIFetchSnapshot
-
-            group = config.lifetch_snapshot_group
-            if group not in selectors:
-                raise ValueError(f"LIFetch snapshot group {group} is out of range")
-            selectors[group].snapshot = LIFetchSnapshot(selectors[group], config)
         if batch is None:
             policy.indexer_selectors = selectors
         return selectors

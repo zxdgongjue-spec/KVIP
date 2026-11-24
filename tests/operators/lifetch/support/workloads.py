@@ -143,19 +143,7 @@ def configuration(argv=None):
     converter = commands.add_parser('convert-trace', help='CPU-only legacy trace conversion')
     converter.add_argument('source', type=Path)
     converter.add_argument('--output', type=Path, required=True)
-    snapshot = commands.add_parser('replay-snapshot', help='replay packed LIFetch operands captured by the service')
-    snapshot.add_argument('snapshot', type=Path)
-    snapshot.add_argument('--output', type=Path, required=True)
-    snapshot.add_argument('--kvaf-root', type=Path, required=True)
-    snapshot.add_argument('--kvaf-server', required=True)
-    snapshot.add_argument('--device', type=int, default=0)
-    snapshot.add_argument('--warmup', type=int, default=4)
-    snapshot.add_argument('--iterations', type=int, default=20)
     args = parser.parse_args(argv)
-    if args.mode == 'replay-snapshot':
-        if args.device < 0 or args.warmup < 0 or args.iterations < 1:
-            parser.error('device and warmup must be nonnegative, iterations must be positive')
-        return args
     if args.mode == 'convert-trace':
         return args
     if args.device < 0 or args.timeout_seconds <= 0:
