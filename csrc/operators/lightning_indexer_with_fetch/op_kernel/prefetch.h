@@ -417,7 +417,7 @@ static_assert(kWindowSetWords <= kDirectWindowWords);
 
 template<bool BuildSimt>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512)
-inline void BatchBuild(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,__gm__ Context* ctx,uint32_t epoch,uint32_t lane,uint32_t begin,
+inline void BatchBuild(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,bool sparseWindow,__gm__ Context* ctx,uint32_t epoch,uint32_t lane,uint32_t begin,
     __ubuf__ uint64_t* remote,__ubuf__ uint32_t* meta,__ubuf__ uint32_t* inputs,__ubuf__ uint32_t* wqes) {
     const uint32_t g=threadIdx.x/rt_postThreads,t=threadIdx.x%rt_postThreads,b=lane+rt_serviceLanes*g;
     const bool active=b<rt_batch;
@@ -453,7 +453,7 @@ inline void BatchBuild(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_residen
                 }
                 TrackMapping(ctx,b,slot-rt_resident,token,i+1==n);
                 asc_stcg(map+token,slot);
-                if (rt_history / 32 > kDirectWindowWords) {
+                if (sparseWindow) {
                     auto covered = reinterpret_cast<__gm__ uint32_t*>(input64[37]);
                     asc_atomic_or(covered + token / 32, 1U << (token % 32));
                 }
@@ -591,6 +591,13 @@ template<bool captureIo, bool predecessorChecked=false>
 __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,
     uint32_t sequenceHalfWindow) {
+    // Only IDs in the service lane's scoring range can be nominated. Size the
+    // local set by that range; mappings and global covered rows use the full stride.
+    const uint32_t tokenLimit = sequenceHalfWindow
+        ? SequenceWindowEnd(rt_history, rt_resident, sequenceHalfWindow, rt_rounds - 1)
+        : rt_history;
+    const uint32_t windowWords = tokenLimit / 32;
+    const bool sparseWindow = windowWords > kDirectWindowWords;
     uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;
     uint64_t scanBegin=0,candidateBegin=0,postBegin=0,begin=0;
     uint64_t firstDoorbell=0,lastDoorbell=0;
@@ -648,9 +655,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         uint32_t counts[4],maxCount=0;
         for(uint32_t q=0;q<4;++q){counts[q]=cfg.GetValue(128+q*32+6);if(counts[q]>maxCount)maxCount=counts[q];}
         cfg.SetValue(40,0);
-        const uint32_t historyWords = rt_history / 32;
-        const bool sparseWindow = historyWords > kDirectWindowWords;
-        const uint32_t setWords = sparseWindow ? kWindowSetWords : historyWords;
+        const uint32_t setWords = sparseWindow ? kWindowSetWords : windowWords;
         Duplicate(scratch, sparseWindow ? UINT32_MAX : 0U, setWords);
         auto input=scratch[setWords];
         // Four 256-ID rows fit before the unchanged service output at 23808.
@@ -669,7 +674,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
                 reinterpret_cast<__ubuf__ uint32_t*>(input.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),width,n[0],n[1],n[2],n[3],available<kCandidateCapacity?available:kCandidateCapacity,historyWords,start+256>=maxCount,
+                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),width,n[0],n[1],n[2],n[3],available<kCandidateCapacity?available:kCandidateCapacity,windowWords,start+256>=maxCount,
                 reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(b)*rt_history,ctx,b,rt_resident);
         }
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
@@ -710,7 +715,7 @@ if (rt_batchedRows) {
                     GlobalTensor<int32_t> admitted;
                     admitted.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(post64.GetValue(37)));
                     SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
-                    SetAtomicAdd<int32_t>();DataCopy(admitted,scratch.ReinterpretCast<int32_t>(),historyWords);SetAtomicNone();
+                    SetAtomicAdd<int32_t>();DataCopy(admitted,scratch.ReinterpretCast<int32_t>(),windowWords);SetAtomicNone();
                     SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
                 }
                 GlobalTensor<uint32_t> jobs;
@@ -763,7 +768,7 @@ if (rt_batchedRows) {
             uint32_t n=cfg.GetValue(256+(b/rt_serviceLanes)*80+64);if(n>maxCount)maxCount=n;
         }
         for(uint32_t start=0;start<maxCount;start+=rt_postBank) {
-            Simt::VF_CALL<BatchBuild<V9_BATCH_POST==1>>(Simt::Dim3{512,1,1},rt_batch,rt_history,rt_resident,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,ctx,epoch,lane,start,
+            Simt::VF_CALL<BatchBuild<V9_BATCH_POST==1>>(Simt::Dim3{512,1,1},rt_batch,rt_history,rt_resident,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,sparseWindow,ctx,epoch,lane,start,
                 reinterpret_cast<__ubuf__ uint64_t*>(work[512].GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(cfg[256].GetPhyAddr()),
