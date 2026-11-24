@@ -3943,10 +3943,14 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     handoff = getattr(config, 'mr25_handoff', None)
     hot_partition = getattr(config, 'mr25_hot_partition', None)
     cold_partition = getattr(config, 'mr25_cold_partition', None)
+    unified_score = getattr(config, 'mr28_unified_score', None)
     partition_trial = hot_partition is not None or cold_partition is not None
-    if partition_trial and not (fused and handoff and config.transport == 'urma'
-                                and config.input == 'synthetic'):
+    score_trial = partition_trial or unified_score is not None
+    if score_trial and not (fused and handoff and config.transport == 'urma'
+                            and config.input == 'synthetic'):
         raise ValueError('The Score trial uses the dense synthetic URMA Terminal comparison')
+    if partition_trial and unified_score is not None:
+        raise ValueError('Windowed partition and unified Score are separate trials')
     torch.npu.set_device(config.device)
     device = torch.device(f'npu:{config.device}')
     stream = torch.npu.current_stream(device)
@@ -4003,7 +4007,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
 
                     library = build_library(config.handoff_build_dir, cann, headers, soc,
                                             local_counts=handoff == 'local_counts' or partition_trial,
-                                            hot_partition=partition_trial)
+                                            hot_partition=score_trial)
                 else:
                     (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers, soc=soc)
             else:
@@ -4023,6 +4027,10 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 from terminal_handoff import bind_score_partition
 
                 score_parts = bind_score_partition(state, hot=hot_partition, cold=cold_partition)
+            if unified_score is not None:
+                from terminal_handoff import bind_unified_score
+
+                unified_parts = bind_unified_score(state, unified_score)
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
@@ -4073,6 +4081,9 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                     if partition_trial:
                         if bind_score_partition(replica, hot=hot_partition, cold=cold_partition) != score_parts:
                             raise RuntimeError('Score partition changed between graph invocations')
+                    if unified_score is not None:
+                        if bind_unified_score(replica, unified_score) != unified_parts:
+                            raise RuntimeError('Unified Score partition changed between graph invocations')
                 else:
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
                 batch_states.append(replica)
@@ -4089,15 +4100,20 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 result['handoff_route'] = dict(mode=handoff, library=str(library), soc=soc, effective_aic=aics,
                                               score_parts=2, score_blocks=shape.liCores, windows=shape.rounds,
                                               service_lanes=shape.serviceLanes, terminal_tasks=4 * g['batch'])
-                if partition_trial:
-                    hot_parts, cold_parts = score_parts
+                if score_trial:
                     with Path(library).open('rb') as binary:
                         binary_sha = hashlib.file_digest(binary, 'sha256').hexdigest()
+                    result['handoff_route'].update(library_sha256=binary_sha, local_counts=partition_trial)
+                if partition_trial:
+                    hot_parts, cold_parts = score_parts
                     result['handoff_route'].update(hot_score_parts=hot_parts,
                                                    hot_score_blocks=hot_parts * g['batch'],
                                                    cold_score_parts=cold_parts,
-                                                   cold_score_blocks=cold_parts * g['batch'],
-                                                   library_sha256=binary_sha, local_counts=True)
+                                                   cold_score_blocks=cold_parts * g['batch'])
+                if unified_score is not None:
+                    result['handoff_route'].update(unified_score=unified_score != 'p2',
+                                                   producer_parts=unified_parts,
+                                                   producer_blocks=unified_parts * g['batch'])
             atomic_json(directory / 'path_result.json', result)
             return result
         state.reset()

@@ -903,7 +903,7 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
     for event in events:
         n = event.get("name", "").lower()
         if "li" in groups and re.fullmatch(
-            r"v9_li_kernel_(?:hot|cold|threshold_cold)_partitioned(?:_\d+)*", n
+            r"v9_li_kernel_(?:(?:hot|cold|threshold_cold)_partitioned|(?:score|cold)_t2)(?:_\d+)*", n
         ):
             n = kernels["li"]
         cat = (event.get("cat") or "").lower()

@@ -187,6 +187,10 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
 #else
                                      bool publishShardEnd = false);
 #endif
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    __aicore__ inline void ProcessPrecomputedVec1(const QLICommon::RunInfo &info,
+        uint32_t progressShard, bool publishShardEnd);
+#endif
     __aicore__ inline void ProcessTopK(const QLICommon::RunInfo &info, uint32_t queryRow = SIM_Q);
     __aicore__ inline void SetPrefixStorage(GM_ADDR output) { prefixOutput_ = output; }
 #if KVIP_STREAMING_LI
@@ -238,6 +242,8 @@ protected:
     static constexpr uint32_t V_MTE2_EVENT3 = EVENT_ID5;
 
 private:
+    __aicore__ inline void PublishColdTile(const QLICommon::RunInfo &info, uint32_t query,
+        uint32_t queryCount, uint32_t progressShard, bool publishShardEnd);
     __aicore__ inline uint32_t RotationCore() const {
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
         if (coldParts_) return rotationCore_;
@@ -843,31 +849,35 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     copyOutParams.srcStride = (UB_BANK_DEPTH_STRIDE - copyOutParams.blockLen) / 32;
     copyOutParams.dstStride = (QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_) - s2BaseSize_) * sizeof(SCORE_T);
     DataCopyPad(scoreGm[vec1OutGmOffset], outBase, copyOutParams);
-#if SIM_CAPTURE_HITS
 #if !V9_UBMEM
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {
 #else
     if (curS2Idx >= runtimeShape_.resident) {
 #endif
-        constexpr uint32_t prefixBytes = SIM_Q * 2048 * 6 + SIM_Q * 256;
-        GlobalTensor<uint8_t> outputHits;
-        outputHits.SetGlobalBuffer((__gm__ uint8_t *)(prefixOutput_ + runtimeShape_.batch * prefixBytes));
-        DataCopyExtParams hitCopy;
-        hitCopy.blockCount = curAivS1ProcNum;
-        hitCopy.blockLen = 32;
-        hitCopy.srcStride = 7; // classifyUB query stride is 256 bytes.
-        hitCopy.dstStride = runtimeShape_.history / 4 - 32;
-        DataCopyPad(outputHits[(info.bIdx * SIM_Q + curAivS1Idx) * (runtimeShape_.history / 4) + curS2Idx / 4],
-                    classifyUB_[pingpong * 256].template ReinterpretCast<uint8_t>(), hitCopy);
+        PublishColdTile(info, curAivS1Idx, curAivS1ProcNum, progressShard, publishShardEnd);
     }
-#endif
+    SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+    CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB
+}
 
-#if !V9_UBMEM
-    if (!scoreOnly && curS2Idx >= runtimeShape_.resident && (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
-#else
-    if (curS2Idx >= runtimeShape_.resident && (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
+template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::PublishColdTile(const QLICommon::RunInfo &info, uint32_t query,
+    uint32_t queryCount, uint32_t progressShard, bool publishShardEnd) {
+    const uint32_t queryRow = info.bIdx * SIM_Q + query;
+#if SIM_CAPTURE_HITS
+    constexpr uint32_t prefixBytes = SIM_Q * 2048 * 6 + SIM_Q * 256;
+    GlobalTensor<uint8_t> outputHits;
+    outputHits.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(prefixOutput_ + runtimeShape_.batch * prefixBytes));
+    DataCopyExtParams hitCopy;
+    hitCopy.blockCount = queryCount;
+    hitCopy.blockLen = 32;
+    hitCopy.srcStride = 7; // classifyUB query stride is 256 bytes.
+    hitCopy.dstStride = runtimeShape_.history / 4 - 32;
+    DataCopyPad(outputHits[queryRow * (runtimeShape_.history / 4) + info.s2Idx * s2BaseSize_ / 4],
+        classifyUB_[(info.loop % 2) * 256].template ReinterpretCast<uint8_t>(), hitCopy);
 #endif
-        rotating::IsTrigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,info.s2Idx + 1))) {
+    if (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
+        rotating::IsTrigger(runtimeShape_.history, runtimeShape_.resident, runtimeShape_.rounds, info.s2Idx + 1)) {
         const uint32_t tableBase = (info.s2Idx / 64) * 64;
         if (tableBase != rotationProgressBase_) {
             SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
@@ -878,28 +888,62 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
             rotationProgressBase_ = tableBase;
         }
         DataCopyExtParams publish;
-        publish.blockCount = curAivS1ProcNum; // Q2: one query/AIV; Q4: two
+        publish.blockCount = queryCount;
         publish.blockLen = 32;
         publish.srcStride = 0;
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
         if (coldParts_) {
-            // MTE3 has already queued this tile's scores and predicates.
+            // MTE3 has already queued this tile's predicates.
             // Each physical part has an exclusive cache line per query.
             publish.dstStride = coldParts_ * kvip_cold_score::kProgressBytes - publish.blockLen;
-            DataCopyPad(coldProgressGm_[kvip_cold_score::ProgressOffset(
-                info.bIdx * SIM_Q + curAivS1Idx, progressShard, coldParts_)],
+            DataCopyPad(coldProgressGm_[kvip_cold_score::ProgressOffset(queryRow, progressShard, coldParts_)],
                 rotationProgress_[(info.s2Idx % 64) * 16], publish);
         } else
 #endif
         {
             publish.dstStride = 96;
-            DataCopyPad(rotationProgressGm_[(info.bIdx * SIM_Q + curAivS1Idx) * 32 + progressShard * 16],
-            rotationProgress_[(info.s2Idx % 64) * 16], publish);
+            DataCopyPad(rotationProgressGm_[queryRow * 32 + progressShard * 16],
+                rotationProgress_[(info.s2Idx % 64) * 16], publish);
         }
     }
-    SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
-    CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB
 }
+
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::ProcessPrecomputedVec1(const QLICommon::RunInfo &info,
+    uint32_t progressShard, bool publishShardEnd) {
+    const uint32_t pingpong = info.loop % 2;
+    const uint32_t query = (blockId_ % 2) * 2;
+    auto scoresLocal = vec1OutUB_[pingpong * (UB_BANK_STRIDE / sizeof(uint16_t))];
+    WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+    // MTE3_V orders the vector pipe. The V_MTE2 handoff makes that
+    // wait and the preceding vector reads visible before MTE2 reuses UB.
+    SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+    WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+    const uint32_t scoreBytes = s2BaseSize_ * sizeof(SCORE_T);
+    DataCopyExtParams copy{2, scoreBytes, (runtimeShape_.history - s2BaseSize_) * uint32_t(sizeof(SCORE_T)),
+        (UB_BANK_DEPTH_STRIDE - scoreBytes) / 32, 0};
+    DataCopyPadExtParams<SCORE_T> pad{false, 0, 0, 0};
+    DataCopyPad(scoresLocal, scoreGm[query * runtimeShape_.history + info.s2Idx * s2BaseSize_], copy, pad);
+    SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    auto scores = reinterpret_cast<__ubuf__ uint16_t*>(scoresLocal.GetPhyAddr());
+    auto threshold = reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_.GetPhyAddr());
+    auto hits = reinterpret_cast<__ubuf__ uint16_t*>(classifyUB_.GetPhyAddr()) + pingpong * 256;
+    __VEC_SCOPE__ {
+        MicroAPI::RegTensor<uint16_t> values;
+        auto all = MicroAPI::CreateMask<uint16_t, MicroAPI::MaskPattern::ALL>();
+        for (uint16_t q = 0; q < 2; ++q) {
+            MicroAPI::LoadAlign(values, scores + q * (UB_BANK_DEPTH_STRIDE / sizeof(uint16_t)));
+            vector1::ClassifyScore(values, threshold + q * 128, hits + q * 128, all);
+        }
+    }
+    SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
+    WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
+    PublishColdTile(info, query, 2, progressShard, publishShardEnd);
+    SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+}
+#endif
 
 #if KVIP_STREAMING_LI
 template <typename QLIT>

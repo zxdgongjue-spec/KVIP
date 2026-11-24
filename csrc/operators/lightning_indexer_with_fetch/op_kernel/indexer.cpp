@@ -129,6 +129,20 @@ extern "C" __global__ __aicore__ void v9_li_kernel_cold_partitioned(GM_ADDR bind
     RunLi<SequenceLiPhase::Cold>(bindings, parts);
 #endif
 }
+
+extern "C" __global__ __aicore__ void v9_li_kernel_score_t2(GM_ADDR bindings, uint32_t parts) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    RunLi<SequenceLiPhase::UnifiedScore>(bindings, parts);
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_li_kernel_cold_t2(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    if ASCEND_IS_AIV { RunLi<SequenceLiPhase::PrecomputedCold>(bindings); }
+#endif
+}
 #endif
 
 extern "C" __global__ __aicore__ void v9_li_kernel_1(GM_ADDR bindings) {

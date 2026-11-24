@@ -78,7 +78,7 @@ When `pipeline_count_status=PASS`, `prefetch_requests_per_call` and `final_get_r
 The full route requires four ordered LI kernels in its measured trace, Score, threshold, Cold T2 and Final. The runner rejects an independent Service launch in that route. `cold_t2_us` covers the combined reread, classification and Service work.
 ## Hot and Cold Score comparisons on MR28
 
-Run this experiment in the same A5 container as `run_mr25_handoff.sh`, with the MR28 source based on `f29180a0` and the existing CANN/KVAF setup.
+Run this experiment in the same A5 container as `run_mr25_handoff.sh`. MR28 checkouts that include MR26 use the unified KVAF setup below.
 
 ```bash
 bash experiments/lifetch_mr23_service/run_mr25_score.sh --batch 1 --batch 2 --batch 4 --batch 8 --batch 16
@@ -102,3 +102,39 @@ bash experiments/lifetch_mr23_service/run_mr25_score.sh \
 Use `--batch 1` for a short run. Add `--stage hot` to rerun the Hot-only control in the same command. Both Cold candidates keep the two logical half-windows and the original rotation of Service lanes. Each half uses multiple MIX producers with independent progress. Service consumes their contiguous progress and uses the existing thresholds, candidate selection and prefetch budgets. The threshold launch includes candidate progress initialization. The BS16 arms use the original P2 launches at C32.
 
 `paired` requires exact prefetch and Final Get vectors for every measured request and invocation. `get_comparison=same_request_totals` identifies runs where the vectors differ and each request still completes the same total number of Gets. The `observed_*_over_p2` fields retain the observed timing ratios for those runs and the console flags the change in early/final placement. Correctness, fixture, library, route and sample checks apply to both. The default Hot-only invocation keeps the strict exit status. Explicit Cold comparisons return success for a valid same-total observation and keep the strict result in `paired`.
+
+## Unified Score on the latest main
+
+Run one synthetic Q4/G32, H128K/R16K, miss 10%, seed 43 case at each of BS1, 2, 4, 8 and 16. Each case compares three routes in a shared library with local counts OFF and uses the current main Terminal, requested W4, original resident threshold, prefetch budget 512 and rank start 1024.
+
+| Route | Score producer | Window consumer |
+| --- | --- | --- |
+| `p2` | Native Hot P2 then Cold P2 | Native Cold with rotating Service |
+| `full_p2` | Full-history Score P2, direct GM output | Cold T2 reads existing scores after Threshold and runs rotating Service |
+| `full_uniform` | Same full-history kernel at P16/P16/P8/P4/P2 on C32 | The same Cold T2 |
+
+### Shared A5 checkout setup
+
+On the host, prepare network dependencies in the existing shared tree. This command selects KVAF `813f1750` and prepares the UMDK checkout used by KVAF.
+
+```bash
+bash experiments/lifetch_mr23_service/run_mr28_unified_score.sh --prepare-deps
+```
+
+In the A5 container, with the serving Python and CANN environment, build once if this unified KVAF checkout and the current KVIP LIDU are unbuilt.
+
+```bash
+bash experiments/lifetch_mr23_service/run_mr28_unified_score.sh --build-deps
+```
+
+In the same container, run all five batches.
+
+```bash
+bash experiments/lifetch_mr23_service/run_mr28_unified_score.sh
+```
+
+Set `KVIP_KVAF_ROOT` in both places to reuse a compatible dependency checkout. The default is `$KVIP_A5_ROOT/KVAF-unified-813f1750`, alongside the earlier SDK checkout. The launcher defaults to a separate CPU service port, `127.0.0.1:28986`. Use `KVIP_KVAF_SERVER` to select an existing compatible service. Use `KVIP_A5_DEVICE` for the container-visible ordinal.
+
+Use `--batch 1` for the three-route smoke case, repeat `--batch` to select multiple sizes, or add `--comparison-dry-run` to check the plan offline. Optional `--prefetch-trace` records first-prefetch doorbell lead time relative to Terminal entry during a separate diagnostic replay.
+
+`score_over_full_p2` compares the two equal-scope full-history Score stages. `observed_kv_ready_over_native_p2` compares complete KV-ready time with native P2. Check `get_vs_native_p2` and `get_vs_full_p2` for equality of Get vectors, equality of per-request totals only, or different totals. Prefetch, final and total Get counts remain visible even when workloads differ. BS16 uses the same unified P2 entry in both full-history arms.

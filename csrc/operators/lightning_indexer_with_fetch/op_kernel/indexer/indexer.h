@@ -34,7 +34,7 @@ using AscendC::CacheMode;
 using AscendC::CrossCoreSetFlag;
 using AscendC::CrossCoreWaitFlag;
 
-enum class SequenceLiPhase { Hot, Threshold, Cold, Final };
+enum class SequenceLiPhase { Hot, Threshold, Cold, Final, UnifiedScore, PrecomputedCold };
 
 // 由于S2循环前，RunInfo还没有赋值，使用TempLoopInfo临时存放B、N、S1轴相关的信息；同时减少重复计算
 struct TempLoopInfo {
@@ -147,9 +147,11 @@ protected:
     __aicore__ inline uint32_t GetS2BaseBlockNumOnMask(uint32_t s1gIdx, uint32_t actS1Size, uint32_t actS2SizeOrig);
     // ================================Process functions================================
     __aicore__ inline void ProcessMain();
+    template <bool Precomputed = false>
     __aicore__ inline void ScanSequenceHalf(uint32_t begin, uint32_t end, uint32_t shard,
 #if !V9_UBMEM
-                                           uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery = false);
+                                           uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery = false,
+                                           bool scoreOnly = false);
     __aicore__ inline bool ScoreRecent(uint32_t& loop, uint32_t qScaleLoop,
                                       uint32_t shard = 0, uint32_t shards = 1, bool reuseRetained = false);
     __aicore__ inline void FinishBaseBlock(const QLICommon::RunInfo& runInfo);
@@ -672,9 +674,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessInvalid()
 }
 
 template <typename QLIT>
+template <bool Precomputed>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
 #if !V9_UBMEM
-    uint32_t begin, uint32_t end, uint32_t shard, uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery)
+    uint32_t begin, uint32_t end, uint32_t shard, uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery,
+    bool scoreOnly)
 #else
     uint32_t begin, uint32_t end, uint32_t shard, uint32_t& loop, uint32_t& scaleLoop, bool last)
 #endif
@@ -695,10 +699,21 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
 #if !V9_UBMEM
         info.reuseQuery = newQuery && tile == begin;
 #endif
-        if ASCEND_IS_AIC {
-            matmulService.ComputeMm1(info);
-        } else {
-            vectorService.ProcessVec1(info, shard, tile + 1 == end);
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+        if constexpr (Precomputed) {
+            vectorService.ProcessPrecomputedVec1(info, shard, tile + 1 == end);
+        } else
+#endif
+        {
+            if ASCEND_IS_AIC {
+                matmulService.ComputeMm1(info);
+            } else {
+#if !V9_UBMEM
+                vectorService.ProcessVec1(info, shard, tile + 1 == end, scoreOnly);
+#else
+                vectorService.ProcessVec1(info, shard, tile + 1 == end);
+#endif
+            }
         }
     }
 #if !V9_UBMEM
@@ -774,13 +789,21 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(u
     } else {
         if ASCEND_IS_AIV {
             vectorService.AllocEventID();
-            CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT);
-            CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + 1);
+            if constexpr (Phase != SequenceLiPhase::PrecomputedCold) {
+                CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT);
+                CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + 1);
+            }
         } else {
             matmulService.AllocEventID();
         }
 
         uint32_t loop = 0, scaleLoop = 0;
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+        if constexpr (Phase == SequenceLiPhase::UnifiedScore) {
+            const auto tiles = kvip_hot_score::Split(runtimeShape_.history, shard, parts);
+            ScanSequenceHalf(tiles.begin, tiles.end, shard, loop, scaleLoop, true, false, true);
+        } else
+#endif
         if constexpr (Phase == SequenceLiPhase::Hot) {
 #if !V9_UBMEM
             auto ctxRecent = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
@@ -838,7 +861,8 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(u
                 if (parts > 2) tiles = kvip_cold_score::Split(runtimeShape_.history, runtimeShape_.resident,
                     halfTokens, epoch, shard, parts);
 #endif
-                ScanSequenceHalf(tiles.begin, tiles.end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
+                ScanSequenceHalf<Phase == SequenceLiPhase::PrecomputedCold>(
+                    tiles.begin, tiles.end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
                 if ASCEND_IS_AIV {
                     if (serviceLeader && serviceEpoch == epoch) {
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM

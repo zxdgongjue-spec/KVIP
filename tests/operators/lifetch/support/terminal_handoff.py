@@ -45,8 +45,7 @@ def bind_hot_score(state, *, partitioned):
     return bind_score_partition(state, hot=partitioned)[0]
 
 
-def bind_score_partition(state, *, hot, cold=None):
-    """Select the experimental Score launches for a dense Terminal pipeline."""
+def dense_terminal(state):
     workspace = state.workspace
     if not (workspace.query_lengths.eq(4).all().item()
             and workspace.key_lengths.eq(state.history).all().item()):
@@ -54,6 +53,13 @@ def bind_score_partition(state, *, hot, cold=None):
     forward = state.forward
     if forward.terminal is None:
         raise ValueError('Score partition comparison requires the MR25 Terminal route')
+    return forward
+
+
+def bind_score_partition(state, *, hot, cold=None):
+    """Select the experimental Score launches for a dense Terminal pipeline."""
+    workspace = state.workspace
+    forward = dense_terminal(state)
     library = forward.rotating.library
 
     def parts(name, enabled):
@@ -82,6 +88,31 @@ def bind_score_partition(state, *, hot, cold=None):
         function.restype = ctypes.c_uint32
         forward.terminal_function = function
     return hot_parts, cold_parts
+
+
+def bind_unified_score(state, mode):
+    """Keep native P2 or bind a full-history Score before the same Terminal."""
+    forward = dense_terminal(state)
+    if mode == 'p2':
+        return 2
+    if mode not in ('full_p2', 'full_uniform'):
+        raise ValueError(f'Unknown unified Score mode {mode!r}')
+    workspace = state.workspace
+    if not (workspace.tail_bounds.eq(0).all().item()
+            and workspace.inputs.query_ends.eq(state.history).all().item()):
+        raise ValueError('Unified Score requires full query bounds and no recent tail')
+    library = forward.rotating.library
+    select = library.kvip_unified_score_parts
+    select.argtypes, select.restype = [ctypes.c_void_p], ctypes.c_uint32
+    planned = select(forward.shape_pointer)
+    if planned < 2:
+        raise ValueError('Unified Score is unsupported for this Terminal shape')
+    parts = planned if mode == 'full_uniform' else 2
+    name = 'kvip_parallel_tail_unified_partitioned_forward' if parts > 2 else 'kvip_parallel_tail_unified_p2_forward'
+    function = getattr(library, name)
+    function.argtypes, function.restype = [ctypes.c_void_p] * 4, ctypes.c_uint32
+    forward.terminal_function = function
+    return parts
 
 
 def fixture_hash(path):

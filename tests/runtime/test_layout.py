@@ -214,6 +214,7 @@ def test_terminal_queues_are_disjoint_and_rebind_output():
     ("v9_li_kernel_hot_partitioned_0", "v9_li_kernel_1_1", "v9_li_kernel_2_2"),
     ("v9_li_kernel_0", "v9_li_kernel_threshold_cold_partitioned_0", "v9_li_kernel_cold_partitioned_0"),
     ("v9_li_kernel_hot_partitioned", "v9_li_kernel_threshold_cold_partitioned", "v9_li_kernel_cold_partitioned"),
+    ("v9_li_kernel_score_t2_0", "v9_li_kernel_1_1", "v9_li_kernel_cold_t2_2"),
 ])
 def test_parallel_terminal_same_graph_accounting(hot_kernel, threshold_kernel, cold_kernel):
     from diagnostics import account, decode_terminal_timeline
@@ -268,7 +269,7 @@ def test_score_partitions_bind_real_workspace_lengths(batch, parts):
     from unittest.mock import Mock
 
     import torch
-    from terminal_handoff import bind_hot_score, bind_score_partition
+    from terminal_handoff import bind_hot_score, bind_score_partition, bind_unified_score
 
     from kvip.operators.lifetch.forward import LIFetchForward
     from kvip.operators.lifetch.workspace import LIFetchWorkspace
@@ -288,6 +289,7 @@ def test_score_partitions_bind_real_workspace_lengths(batch, parts):
     arguments = workspace.arguments(storage)
     assert arguments[5] is workspace.query_lengths
     assert arguments[6] is workspace.key_lengths
+    workspace.inputs.query_ends.fill_(history)
 
     for hot, cold, entry in ((False, None, "p2"), (True, None, "hot"), (False, True, "cold"),
                              (True, True, "history"), (False, False, "p2")):
@@ -325,6 +327,28 @@ def test_score_partitions_bind_real_workspace_lengths(batch, parts):
         workspace.compute = workspace.compute[:64]
         with pytest.raises(ValueError, match="aligned progress space"):
             bind_score_partition(state, hot=False, cold=True)
+    native = Mock(return_value=0)
+    full_p2 = Mock(return_value=0)
+    full_uniform = Mock(return_value=0)
+    forward.rotating.library = SimpleNamespace(
+        kvip_unified_score_parts=Mock(return_value=min(16, parts)),
+        kvip_parallel_tail_unified_p2_forward=full_p2,
+        kvip_parallel_tail_unified_partitioned_forward=full_uniform,
+    )
+    forward.terminal_function = native
+    assert bind_unified_score(state, "p2") == 2
+    forward()
+    native.assert_called_once_with(101, 202, 404, 303)
+    assert bind_unified_score(state, "full_p2") == 2
+    forward()
+    full_p2.assert_called_once_with(101, 202, 404, 303)
+    assert bind_unified_score(state, "full_uniform") == min(16, parts)
+    forward()
+    assert full_p2.call_count == (2 if parts == 2 else 1)
+    assert full_uniform.call_count == (0 if parts == 2 else 1)
+    workspace.tail_bounds[0, 1] = 128
+    with pytest.raises(ValueError, match="no recent tail"):
+        bind_unified_score(state, "full_p2")
     workspace.key_lengths[0] = history - 1
     with pytest.raises(ValueError, match="full key lengths"):
         bind_hot_score(state, partitioned=True)

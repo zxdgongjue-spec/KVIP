@@ -18,8 +18,8 @@ SUPPORT = ROOT / 'tests/operators/lifetch/support'
 sys.path[:0] = [str(SUPPORT), str(ROOT / 'python')]
 from terminal_handoff import COUNT_COLUMNS, STAGES  # noqa: E402
 
-MAIN = '609fa26fd715f9409bbe74e1b2d3685c58dfb0cf'
-KVAF = '1c1310387ebfb6776a07316874e924265b209ada'
+MAIN = 'd6cfd392f722dd3f96ef6e05175f503aac511dbb'
+KVAF = '813f1750a50b7e6c92d5f5397f2fbc05befef6da'
 BATCHES = (1, 8, 16)
 VARIANTS = ('main', 'local_counts')
 

@@ -131,6 +131,8 @@ extern "C" uint32_t kvip_parallel_tail_supported(const rotating::RuntimeShape* s
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_hot_partitioned(uint32_t,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_threshold_cold_partitioned(uint32_t,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_partitioned(uint32_t,void*,void*,uint32_t);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_score_t2(uint32_t,void*,void*,uint32_t);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_t2(uint32_t,void*,void*);
 #endif
 static uint32_t LaunchParallelTail(void* bindings,void* terminal,
     void* stream,const rotating::RuntimeShape* shape,uint32_t hotParts,uint32_t coldParts=2) {
@@ -188,5 +190,33 @@ extern "C" uint32_t kvip_parallel_tail_history_partitioned_forward(void* binding
     const auto cold=kvip_partitioned_cold_score_parts(shape);
     if(hot<2 || cold<2)return 100000;
     return LaunchParallelTail(bindings,terminal,stream,shape,hot,cold);
+}
+
+extern "C" uint32_t kvip_unified_score_parts(const rotating::RuntimeShape* shape) {
+    if (!kvip_parallel_tail_supported(shape) || shape->liCores != 2 * shape->batch ||
+        shape->history % 256 || shape->rounds > 4) return 0;
+    const uint32_t budget = shape->aicCount / shape->batch;
+    const uint32_t parts = budget < 16 ? budget : 16;
+    return parts >= 2 && shape->history / 256 >= parts ? parts : 0;
+}
+
+static uint32_t LaunchUnifiedScore(void* bindings, void* terminal, void* stream,
+    const rotating::RuntimeShape* shape, uint32_t parts) {
+    if (!bindings || !terminal || !stream || parts < 2) return 100000;
+    uint32_t result = aclrtlaunch_v9_li_kernel_score_t2(shape->batch * parts, stream, bindings, parts);
+    if (!result) result = aclrtlaunch_v9_li_kernel_1(shape->liCores, stream, bindings);
+    if (!result) result = aclrtlaunch_v9_li_kernel_cold_t2(shape->liCores, stream, bindings);
+    if (!result) result = aclrtlaunch_v9_parallel_terminal(shape->batch * 4, stream, terminal);
+    return result;
+}
+
+extern "C" uint32_t kvip_parallel_tail_unified_p2_forward(void* bindings, void* terminal,
+    void* stream, const rotating::RuntimeShape* shape) {
+    return LaunchUnifiedScore(bindings, terminal, stream, shape, kvip_unified_score_parts(shape) ? 2 : 0);
+}
+
+extern "C" uint32_t kvip_parallel_tail_unified_partitioned_forward(void* bindings, void* terminal,
+    void* stream, const rotating::RuntimeShape* shape) {
+    return LaunchUnifiedScore(bindings, terminal, stream, shape, kvip_unified_score_parts(shape));
 }
 #endif
