@@ -1,0 +1,339 @@
+diff --git a/experiments/lifetch_score_t2/run_a5.py b/experiments/lifetch_score_t2/run_a5.py
+index f6abd951..9a6e8fc0 100644
+--- a/experiments/lifetch_score_t2/run_a5.py
++++ b/experiments/lifetch_score_t2/run_a5.py
+@@ -77,13 +77,13 @@ def plan_routes(selected, batches, parts_map):
+     return routes
+ 
+ 
+-def li_components(folder, mode, geometry):
++def li_components(folder, mode, geometry, *, verify_full=False):
+     """Named kernels from the same measured graph, excluding detail replays.
+ 
+     The known window launch contract identifies Hot as the first score launch
+     inside each recorded invocation; no phase is inferred from its duration.
+     """
+-    if mode not in ('window','window_query','aligned'):
++    if mode not in ('window','window_query','aligned') and not (mode=='full' and verify_full):
+         return None
+     profiles=sorted(folder.glob('diagnose/round-*/graph_profile.json'))
+     if not profiles:
+@@ -95,6 +95,9 @@ def li_components(folder, mode, geometry):
+         aliases.update(service='v9_li_window_post',query_topk='v9_li_window_topk')
+     if mode=='aligned':
+         aliases={'score':'v9_li_kernel_score_aligned','full_topk_classify':'v9_li_full_topk'}
++    if mode=='full':
++        aliases={'score':'v9_li_kernel_score_t2', 'theta':'v9_li_kernel_1',
++                 'cold_t2':'v9_li_kernel_cold_t2', 'final':'v9_li_kernel_3'}
+     for path in profiles:
+         profile=json.loads(path.read_text())
+         trace=json.loads((path.parent/'trace.json').read_text())
+@@ -103,6 +106,12 @@ def li_components(folder, mode, geometry):
+         if len(scopes)!=1:
+             raise RuntimeError('Expected exactly one measured graph scope for component accounting')
+         origin=Decimal(str(scopes[0]['ts']))
++        if mode=='full':
++            end=origin+Decimal(str(scopes[0]['dur']))
++            independent=('v9_li_window_service','v9_li_window_post','v9_staged_service')
++            if any(e.get('ph')=='X' and e.get('name','').lower().startswith(independent) and
++                   origin<=Decimal(str(e['ts']))<end for e in events):
++                raise RuntimeError(f'Independent Service launch in the measured full route: {path}')
+         per_call=[]
+         for sample in profile['samples']:
+             intervals=sample['intervals_us']['li']
+@@ -116,15 +125,28 @@ def li_components(folder, mode, geometry):
+                 start=float(Decimal(str(event['ts']))-origin);duration=float(event['dur'])
+                 if any(abs(start-a)<.01 and abs(start+duration-b)<.01 for a,b in intervals):
+                     parts[key].append((start,duration))
+-            waves=len(geometry['waves'])
+-            expected={'score':waves,'service':waves,'theta':1,'final':1}
+-            if mode=='window_query':expected['query_topk']=waves
+-            if mode=='aligned':expected={'score':1,'full_topk_classify':1}
++            if mode=='full':
++                expected={'score':1,'theta':1,'cold_t2':1,'final':1}
++                if len(intervals)!=len(expected):
++                    raise RuntimeError(f'Full route must use four LI launches: {path}, invocation {sample["invocation"]}')
++            elif mode=='aligned':
++                expected={'score':1,'full_topk_classify':1}
++            else:
++                waves=len(geometry['waves'])
++                expected={'score':waves,'service':waves,'theta':1,'final':1}
++                if mode=='window_query':expected['query_topk']=waves
+             if {k:len(v) for k,v in parts.items()}!=expected:
+                 raise RuntimeError(f'Incomplete/duplicate LI components: {path}, invocation {sample["invocation"]}')
+             scores=sorted(parts['score'])
+             if mode=='aligned':
+                 item=dict(score_full_us=scores[0][1],full_topk_classify_us=parts['full_topk_classify'][0][1])
++            elif mode=='full':
++                ordered=[parts[key][0] for key in ('score','theta','cold_t2','final')]
++                if any(length<=0 or begin+length>next_begin+.01
++                       for (begin,length),(next_begin,_) in zip(ordered,ordered[1:])) or ordered[-1][1]<=0:
++                    raise RuntimeError(f'Full route LI order differs from Score, threshold, Cold T2, Final: {path}')
++                item=dict(score_full_us=scores[0][1],theta_us=parts['theta'][0][1],
++                          cold_t2_us=parts['cold_t2'][0][1],final_us=parts['final'][0][1])
+             else:
+                 item=dict(score_hot_us=scores[0][1],score_cold_us=sum(v for _,v in scores[1:]),
+                           theta_us=parts['theta'][0][1],service_us=sum(v for _,v in parts['service']),
+diff --git a/experiments/lifetch_score_t2/test_route_comparison.py b/experiments/lifetch_score_t2/test_route_comparison.py
+index 6da283aa..aca7aacf 100644
+--- a/experiments/lifetch_score_t2/test_route_comparison.py
++++ b/experiments/lifetch_score_t2/test_route_comparison.py
+@@ -47,12 +47,16 @@ def write_json(path, value):
+ 
+ def component_trace(folder,geometry,li_us,calls):
+     query=geometry['mode']=='window_query'
+-    names=[]
+-    for epoch in range(len(geometry['waves'])):
+-        names.append('v9_li_kernel_score_window_t2_7_2')
+-        if epoch==0:names.append('v9_li_kernel_1_2')
+-        names.extend(['v9_li_window_topk_3','v9_li_window_post_2'] if query else ['v9_li_window_service_2'])
+-    names.append('v9_li_kernel_3_1')
++    if geometry['mode']=='full':
++        names=['v9_li_kernel_score_t2_7_2', 'v9_li_kernel_1_2',
++               'v9_li_kernel_cold_t2_3', 'v9_li_kernel_3_1']
++    else:
++        names=[]
++        for epoch in range(len(geometry['waves'])):
++            names.append('v9_li_kernel_score_window_t2_7_2')
++            if epoch==0:names.append('v9_li_kernel_1_2')
++            names.extend(['v9_li_window_topk_3','v9_li_window_post_2'] if query else ['v9_li_window_service_2'])
++        names.append('v9_li_kernel_3_1')
+     duration=li_us/len(names);stride=li_us+10
+     events=[dict(name='lifetch_measured_graph',ph='X',ts=1000,dur=stride*calls)]
+     samples=[]
+@@ -86,7 +90,7 @@ def write_job(job, cfg, *, bad_case=None):
+             write_json(folder/'report.json',dict(batch=batch,miss_percent=miss,
+                 execution='COMPLETED',correctness='PASS' if okay else 'FAIL'))
+             for name in ('serial','fused'):
+-                fused_base={'mr23':90.,'window_budget':60.,'query_budget':50.}[job['case']]
++                fused_base={'mr23':90.,'window_budget':60.,'query_budget':50.,'full_budget':55.}[job['case']]
+                 event=(100. if name=='serial' else fused_base)+batch+miss
+                 timing=dict(timing_protocol='one_profiled_graph',event_mean_us=event,p50_us=event-1,
+                             stage_mean_us=(dict(li=event-30,resolve_update=20) if name=='fused' else
+@@ -100,19 +104,63 @@ def write_job(job, cfg, *, bad_case=None):
+                         rounds=waves,indexHeads=cfg.index_heads,splitQ=1,liCores=2*batch,
+                         aicCount=32,serviceLanes=lanes)
+                     query=job['case']=='query_budget'
+-                    geometry=(None if job['case']=='mr23' else
++                    geometry=(None if job['case'] in ('mr23','full_budget') else
+                               score_window_schedule(shape,job['parts_map'][batch],query))
+                     result.update(score_parts=0 if job['case']=='mr23' else job['parts_map'][batch],
+-                        score_mode='full' if job['case']=='mr23' else 'window_query' if query else 'window',
++                        score_mode='full' if job['case']=='mr23' else comparison.MODES[job['case']],
+                         score_geometry=geometry,effective_aic=32,
+                         li_schedule=dict(liCores=2*batch,rounds=waves,serviceAics=lanes,
+                                          serviceLanes=lanes,finalWorkers=2))
+-                    if geometry:component_trace(folder/name,geometry,event-30,cfg.iterations)
++                    if geometry or job['case']=='full_budget':
++                        component_trace(folder/name,geometry or {'mode':'full'},event-30,cfg.iterations)
+                 write_json(folder/name/'path_result.json',result)
+     return bench
+ 
+ 
+ class RouteComparison(unittest.TestCase):
++    def test_full_budget_pairs_with_mr23_and_window_budget(self):
++        with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()):
++            root=Path(tmp)
++            cfg=config(root, '--compare-routes', 'mr23,window_budget,full_budget',
++                       '--batches', '1,8,16','--miss-percent','10')
++            sources={name: root/name for name in cfg.compare_routes}
++            jobs=comparison.build_commands(cfg,root,sources,PARTS)
++            self.assertEqual(len(jobs),3)
++            self.assertEqual(option(jobs[-1]['args'],'--li-score-mode'),'full')
++            for job in jobs:
++                self.assertEqual(option(job['args'],'--batches'),'1,8,16')
++                self.assertEqual(option(job['args'],'--prefetch-tokens'),'512')
++                write_job(job,cfg)
++            rows=comparison.summarize(root,jobs,cfg)
++            self.assertEqual(len(rows),9)
++            full16=next(row for row in rows if row['batch']==16 and row['case']=='full_budget')
++            self.assertTrue(full16['accepted'])
++            self.assertEqual(full16['li_kernel_launches'],4)
++            self.assertGreater(full16['cold_t2_us'],0)
++            self.assertIsNone(full16['service_us'])
++            self.assertAlmostEqual(full16['over_mr23'],81/116)
++            self.assertAlmostEqual(full16['over_window_budget'],81/86)
++
++    def test_full_budget_rejects_a_separate_service_instead_of_cold_t2(self):
++        with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()):
++            root=Path(tmp)
++            cfg=config(root, '--compare-routes', 'mr23,full_budget', '--batches','16','--miss-percent','10')
++            jobs=comparison.build_commands(cfg,root,{name:root/name for name in cfg.compare_routes},PARTS)
++            for job in jobs:
++                write_job(job,cfg)
++            trace=next(Path(jobs[1]['output']).rglob('trace.json'))
++            original=trace.read_text()
++            extra_service=json.loads(original)
++            extra_service['traceEvents'].append(
++                dict(name='v9_li_window_service_3',ph='X',cat='kernel',ts=1005,dur=1))
++            for altered in (original.replace('v9_li_kernel_cold_t2_3','v9_li_window_service_3'),
++                            json.dumps(extra_service)):
++                trace.write_text(altered)
++                full16=next(row for row in comparison.summarize(root,jobs,cfg) if row['case']=='full_budget')
++                self.assertFalse(full16['accepted'])
++                self.assertIsNone(full16['over_mr23'])
++                self.assertIn('LI components rejected',full16['reason'])
++
+     def test_default_plan_keeps_all_batches_in_each_route_worker(self):
+         with tempfile.TemporaryDirectory() as tmp:
+             root=Path(tmp); cfg=config(root)
+@@ -497,11 +545,24 @@ class RouteComparison(unittest.TestCase):
+             self.assertEqual(len(rows),2)
+             for row in rows:
+                 self.assertEqual(row['pipeline_count_status'],'PASS')
++                self.assertTrue(row['both_posted_prefetch'])
+                 self.assertEqual(row['prefetch_requests_per_call'],34)
+                 self.assertEqual(row['final_get_requests_per_call'],18)
+                 self.assertEqual(row['total_get_requests_per_call'],52)
+                 self.assertNotEqual(row['prefetch_requests_per_call'],cfg.prefetch_tokens)
+             window=next(j for j in jobs if j['case']=='window_budget')
++            path=next(Path(window['output']).rglob('case-b2/fused/path_result.json'))
++            result=json.loads(path.read_text())
++            no_prefetch=json.loads(json.dumps(report))
++            for record in no_prefetch['records']:
++                record['prefetch_requests']=0
++                record['total_get_requests']=record['final_get_requests']
++            write_json(path,{**result,'pipeline_counts':no_prefetch})
++            with redirect_stdout(io.StringIO()):rows=comparison.summarize(root,jobs,cfg)
++            row=next(r for r in rows if r['case']=='window_budget')
++            self.assertTrue(row['accepted'])
++            self.assertFalse(row['both_posted_prefetch'])
++            write_json(path,result)
+             for path in [next(Path(window['output']).rglob('case-b2/report.json')),
+                          next(Path(window['output']).rglob('case-b2/fused/path_result.json'))]:
+                 result=json.loads(path.read_text());result['correctness']='FAIL';write_json(path,result)
+diff --git a/tests/operators/lifetch/support/route_comparison.py b/tests/operators/lifetch/support/route_comparison.py
+index 8b413b62..aacfbdbb 100644
+--- a/tests/operators/lifetch/support/route_comparison.py
++++ b/tests/operators/lifetch/support/route_comparison.py
+@@ -24,10 +24,10 @@ import time
+ ROOT = Path(__file__).resolve().parents[4]
+ KVAF = '1c1310387ebfb6776a07316874e924265b209ada'
+ MODES = {'mr23': 'original', 'window_budget': 'window', 'query_budget': 'window_query',
+-         'aligned_budget': 'aligned'}
++         'full_budget': 'full', 'aligned_budget': 'aligned'}
+ DEFAULT_PARTS = {1: 16, 2: 16, 4: 8, 8: 4, 16: 2}
+ COMPONENT_FIELDS = ('score_hot_us', 'score_cold_us', 'theta_us', 'query_topk_us',
+-                    'service_us', 'final_us', 'score_full_us', 'full_topk_classify_us')
++                    'service_us', 'final_us', 'score_full_us', 'cold_t2_us', 'full_topk_classify_us')
+ COUNT_FIELDS = ('prefetch_requests_per_call', 'final_get_requests_per_call', 'total_get_requests_per_call')
+ SOURCE_PATHS = ('python/kvip', 'tests/operators/lifetch',
+                 'csrc/operators/lightning_indexer_with_fetch',
+@@ -306,6 +306,7 @@ def fixture_hashes(folder):
+ 
+ def collect_job(job, config):
+     records = {}
++    mode = MODES[job['case']]
+     pools = sorted(Path(job['output']).rglob('pool.json'))
+     pool = json.loads(pools[0].read_text()) if len(pools) == 1 else {}
+     if not isinstance(pool, dict):
+@@ -366,8 +367,8 @@ def collect_job(job, config):
+         expected_parts = 0 if job['case'] == 'mr23' else mapping.get(key[0], mapping.get(str(key[0])))
+         if fused.get('score_parts', 0) != expected_parts:
+             reasons.append('actual score partition count differs from requested route')
+-        if job['case'] != 'mr23' and (fused.get('score_mode') != MODES[job['case']] or
+-                                     not fused.get('score_geometry') or not fused.get('li_schedule')):
++        if job['case'] != 'mr23' and (fused.get('score_mode') != mode or not fused.get('li_schedule') or
++                                     (mode != 'full' and not fused.get('score_geometry'))):
+             reasons.append('candidate mode or geometry evidence missing')
+         s, f = [paths[name].get('all_rounds', {}) for name in ('serial', 'fused')]
+         stages = f.get('stage_mean_us', {})
+@@ -378,15 +379,19 @@ def collect_job(job, config):
+         launches = 4 if job['case'] == 'mr23' else None
+         if job['case'] != 'mr23':
+             try:
+-                if not isinstance(geometry, dict) or geometry.get('mode') != MODES[job['case']]:
+-                    raise ValueError('actual component geometry/mode missing')
+-                waves = geometry['waves']
+-                if not isinstance(waves, list) or not waves:
+-                    raise ValueError('actual Score windows missing')
+-                expected = 2 if job['case'] == 'aligned_budget' else len(waves)*(3 if job['case']=='query_budget' else 2)+2
+-                if geometry.get('li_launches') != expected:
+-                    raise ValueError('actual LI launch count differs from route contract')
+-                components = reference.li_components(path.parent/'fused', MODES[job['case']], geometry)
++                if mode == 'full':
++                    expected = 4
++                else:
++                    if not isinstance(geometry, dict) or geometry.get('mode') != mode:
++                        raise ValueError('actual component geometry/mode missing')
++                    waves = geometry['waves']
++                    if not isinstance(waves, list) or not waves:
++                        raise ValueError('actual Score windows missing')
++                    expected = 2 if mode == 'aligned' else len(waves)*(3 if mode == 'window_query' else 2)+2
++                    if geometry.get('li_launches') != expected:
++                        raise ValueError('actual LI launch count differs from route contract')
++                components = reference.li_components(path.parent/'fused', mode, geometry,
++                                                     verify_full=(mode == 'full'))
+                 if not components or any(not positive_number(v) for v in components.values()):
+                     raise ValueError('same-graph component durations missing or invalid')
+                 if not positive_number(stages.get('li')) or abs(sum(components.values())-stages['li']) > .05:
+@@ -400,12 +405,12 @@ def collect_job(job, config):
+             accepted=not reasons, reason='; '.join(reasons), serial_event_us=s.get('event_mean_us'),
+             fused_event_us=f.get('event_mean_us'), li_us=stages.get('li'),
+             resolve_fetch_us=stages.get('resolve_update'), score_parts=expected_parts,
+-            score_mode=MODES[job['case']], score_geometry=geometry,
++            score_mode=mode, score_geometry=geometry,
+             li_schedule=fused.get('li_schedule'), li_kernel_launches=launches,
+             effective_aic=fused.get('effective_aic'), pool=pool, report=str(path),
+             pipeline_counts=fused.get('pipeline_counts'), **pipeline_count_summary(fused, config, key[0]),
+             **{field: components.get(field) for field in COMPONENT_FIELDS},
+-            score_total_us=(components.get('score_full_us') if job['case']=='aligned_budget' else
++            score_total_us=(components.get('score_full_us') if mode in ('full','aligned') else
+                             components.get('score_hot_us', 0)+components.get('score_cold_us', 0)) if components else None,
+             fixture_sha256=fixture_cache[fixture], failures={name: result.get('failures', [])
+                                                            for name, result in paths.items()})
+@@ -474,7 +479,7 @@ def summarize(output, jobs, config):
+                     serial_event_us=None, fused_event_us=None, li_us=None, resolve_fetch_us=None,
+                     **{field: None for field in (*COMPONENT_FIELDS, 'score_total_us')},
+                     **{field: None for field in COUNT_FIELDS},
+-                    pipeline_count_status='MISSING', pipeline_count_reason='',
++                    pipeline_count_status='MISSING', pipeline_count_reason='', both_posted_prefetch=None,
+                     over_mr23=None, net_gain_vs_mr23_us=None,
+                     over_window_budget=None, net_gain_vs_window_us=None, window_comparison_reason='')
+                 if accepted:
+@@ -494,16 +499,23 @@ def summarize(output, jobs, config):
+                     if v.get('pipeline_count_status') != 'PASS'))
+                 if any(v.get('pipeline_count_status') == 'INVALID' for v in values):
+                     row['pipeline_count_status'] = 'INVALID'
+-                if case == 'query_budget':
++                if len(reference) == len(values) and all(v.get('pipeline_count_status') == 'PASS'
++                                                         for v in values + reference):
++                    row['both_posted_prefetch'] = all(v['prefetch_requests_per_call'] > 0
++                                                     for v in values + reference)
++                if case in ('query_budget', 'full_budget'):
+                     if not accepted:
+-                        row['window_comparison_reason'] = 'query result not accepted'
++                        row['window_comparison_reason'] = 'candidate result not accepted'
+                     elif len(window) != len(values) or not all(v['accepted'] for v in window):
+                         row['window_comparison_reason'] = 'window reference not accepted or not selected'
+                     else:
+                         pairs = [(v, next(w for w in window if w['round']==v['round'])) for v in values]
+-                        if any(v['fixture_sha256'] != w['fixture_sha256'] or
+-                               window_configuration(v) != window_configuration(w) for v, w in pairs):
+-                            row['window_comparison_reason'] = 'window/query operands or common Score/window configuration differ'
++                        common = ('fixture_sha256', 'score_parts', 'effective_aic', 'li_schedule')
++                        mismatched = any(v[key] != w[key] for v,w in pairs for key in common)
++                        if case == 'query_budget':
++                            mismatched |= any(window_configuration(v) != window_configuration(w) for v,w in pairs)
++                        if mismatched:
++                            row['window_comparison_reason'] = 'operands or common Score/window configuration differ'
+                         else:
+                             old_window = sum(v['fused_event_us'] for v in window)/len(window)
+                             row.update(over_window_budget=row['fused_event_us']/old_window,
+diff --git a/tests/operators/lifetch/support/workloads.py b/tests/operators/lifetch/support/workloads.py
+index 49b98fd5..afa20689 100644
+--- a/tests/operators/lifetch/support/workloads.py
++++ b/tests/operators/lifetch/support/workloads.py
+@@ -232,10 +232,10 @@ def configuration(argv=None):
+             parser.error('prefetch-rank-start must be in 1..2048')
+         comparing = getattr(args, 'compare_routes', None) is not None
+         if comparing:
+-            allowed = {'mr23', 'window_budget', 'query_budget', 'aligned_budget'}
++            allowed = {'mr23', 'window_budget', 'query_budget', 'full_budget', 'aligned_budget'}
+             if (len(args.compare_routes) < 2 or 'mr23' not in args.compare_routes
+                     or set(args.compare_routes) - allowed):
+-                parser.error('compare-routes must include mr23 and at least one window_budget/query_budget/aligned_budget candidate')
++                parser.error('compare-routes must include mr23 and at least one supported candidate')
+             if args.transport != 'urma' or args.input != 'synthetic' or args.index_heads != 32:
+                 parser.error('route comparison requires bench URMA synthetic Q4/head32 inputs')
+             if 'aligned_budget' in args.compare_routes and args.prefetch_tokens:
