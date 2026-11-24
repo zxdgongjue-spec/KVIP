@@ -6,56 +6,68 @@ import math
 import numpy as np
 
 
-def decode_call(number, records, details):
+def decode_call(number, records, details, event_words, history, resident):
+    """Match each producer DMA interval to its real row, shard, and service."""
     records = np.asarray(records, dtype=np.uint64)
     batch = records.shape[0]
-    if records.shape != (batch, 4, 32) or batch < 1:
-        raise ValueError(f'Unexpected rank-progress shape {records.shape}')
+    if records.shape != (batch, 4, 32) or batch < 1 or (history-resident) % 256:
+        raise ValueError(f'Unexpected split-Q geometry {records.shape} H={history} R={resident}')
+    raw = np.asarray(event_words).reshape(-1, 128).view('<u8')
     head = details['streaming_cycles'][0]
     clock = float(head['terminal_timeline']['clock_mhz'])
-    services = head['prefetch_services']
-    if not math.isfinite(clock) or clock <= 0 or len(services) != batch * 4:
-        raise ValueError('Clock or window service count is invalid')
-    by_aiv = {}
-    for e in services:
+    if not math.isfinite(clock) or clock <= 0 or raw.shape != (4 * batch, 16):
+        raise ValueError('Invalid clock or service records')
+    half_tiles = (((history - resident) // 256 + 1) // 2 + 2) // 3 * 2
+    workers = []
+    seen = set()
+    for e in head['prefetch_services']:
         lane, epoch = e['lane'], e['epoch']
-        # In split-Q, both vector subcores of an AIC serve consecutive lanes.
         aiv = 2 * e['core'] + lane % 2
-        if (aiv in by_aiv or e['event'] != epoch * batch + lane or
-                not 0 <= epoch < 4 or not 0 <= lane < batch or e['end_cycles'] < e['begin_cycles']):
-            raise ValueError(f'Invalid split-Q event mapping: {e}')
-        by_aiv[aiv] = e
-    if set(by_aiv) != set(range(4 * batch)):
-        raise ValueError('One or more physical vector workers did not report')
-    rows, workers = [], []
-    for aiv, record in enumerate(records.reshape(-1, 32)[:, 16:]):
-        score_end, safe, freeze_start, freeze_end, *stamps = map(int, record)
-        e = by_aiv[aiv]
-        if not 0 < score_end <= safe or safe < e['end_cycles']:
-            raise ValueError(f'Invalid scoring/drain clocks for call {number} AIV {aiv}')
-        workers.append(dict(aiv=aiv, service_epoch=e['epoch'], service_lane=e['lane'],
-                            score_end_cycles=score_end, safe_cycles=safe))
-        if e['epoch'] != 3:
-            if freeze_start or freeze_end or any(stamps):
-                raise ValueError(f'Non-owner AIV {aiv} wrote last-window stamps')
-            continue
-        if not score_end <= freeze_start <= freeze_end <= e['begin_cycles']:
-            raise ValueError(f'Invalid frontier snapshot on AIV {aiv}')
-        previous = freeze_end
-        queries = []
-        for q in range(4):
-            begin, end, packed = stamps[3*q:3*q+3]
-            if not previous <= begin < end <= e['begin_cycles']:
-                raise ValueError(f'Invalid per-query clock for call {number} AIV {aiv} query {q}')
-            previous = end
-            queries.append(dict(q=q, begin_cycles=begin, end_cycles=end,
-                                ready0=packed & 0xffffffff, ready1=packed >> 32))
-        rows.append(dict(row=e['lane'], owner_aiv=aiv, freeze_begin_cycles=freeze_start,
-                         freeze_end_cycles=freeze_end, queries=queries,
-                         post_begin_cycles=e['begin_cycles'], post_end_cycles=e['end_cycles']))
-    if sorted(r['row'] for r in rows) != list(range(batch)):
-        raise ValueError('Duplicate or missing last-window owner')
-    return dict(call=number, clock_mhz=clock, workers=workers, rows=sorted(rows, key=lambda r: r['row']))
+        idx = epoch * batch + lane
+        if (not 0 <= epoch < 4 or not 0 <= lane < batch or idx != e['event']
+                or not 0 <= aiv < batch * 4 or aiv in seen):
+            raise ValueError(f'Invalid or duplicate service on AIV {aiv}')
+        seen.add(aiv)
+        words = list(map(int, records.reshape(-1, 32)[aiv, 16:]))
+        origin, first, freeze0, freeze1 = words[:4]
+        wait, acquired = int(raw[idx, 4]), int(raw[idx, 13])
+        post, end = e['begin_cycles'], e['end_cycles']
+        if not 0 < origin <= wait <= acquired <= freeze0 <= freeze1 <= post <= end:
+            raise ValueError(f'Service clocks out of order on call {number} AIV {aiv}')
+        first_time, first_ok = first & ((1 << 63) - 1), bool(first >> 63)
+        if (epoch and not wait <= first_time <= acquired) or (not epoch and first != 0):
+            raise ValueError(f'Invalid first predecessor read on AIV {aiv}')
+        shard = (aiv // 2) % 2
+        samples = []
+        last_done = origin
+        for segment in range(3):
+            start = resident // 128 + (2 * segment + shard) * half_tiles
+            stop = min(start + half_tiles, history // 128)
+            group = []
+            for q in range(4):
+                packed = words[4 + segment * 4 + q]
+                issued = origin + (packed & 0xffffffff)
+                done = issued + ((packed >> 32) & 65535)
+                tile = packed >> 48
+                threshold = start + ((stop - start) * (q + 1) + 3) // 4
+                sample = [tile, issued, done]
+                same = bool(group) and sample == group[-1]
+                if (not threshold <= tile <= stop or (q == 3 and tile != stop)
+                        or not packed or (not same and issued < last_done)
+                        or (segment < epoch and done > wait)
+                        or (segment >= epoch and issued < end)):
+                    raise ValueError(f'Invalid score frontier on call {number} AIV {aiv} segment {segment+1} mark {q+1}: {sample}')
+                group.append(sample)
+                last_done = done
+            samples.append(group)
+        workers.append(dict(aiv=aiv, scoring_row=aiv//4, shard=shard, first_query=2*(aiv%2),
+                            service_row=lane, service_epoch=epoch, clock_origin=origin,
+                            wait_begin=wait, first_poll=first_time, first_poll_complete=first_ok,
+                            acquired=acquired, freeze_begin=freeze0, freeze_end=freeze1,
+                            post_begin=post, post_end=end, segments=samples))
+    if len(seen) != 4 * batch:
+        raise ValueError('Missing physical vector workers')
+    return dict(call=number, clock_mhz=clock, workers=sorted(workers, key=lambda x:x['aiv']))
 
 
 def measure(torch, states, sequence, config, directory, *, fused):
@@ -128,13 +140,13 @@ def measure(torch, states, sequence, config, directory, *, fused):
                               for b, qs in enumerate(records) for q, words in enumerate(qs)
                               for w, v in enumerate(words[:4]) if v])
             details.append(detail)
-            calls.append(decode_call(i, records, detail))
+            events = state.rotating.events.cpu().numpy().reshape(-1, 128)
+            calls.append(decode_call(i, records, detail, events, config.history, config.resident))
         np.savez_compressed(target/'raw_rank_progress.npz', records=np.stack(raw_rank))
         atomic_json(target/'detail_samples.json', details)
-        atomic_json(target/'owner_availability.json', dict(schema=1, group=config.group, calls=calls,
-                    safe_definition='last cold block returned, both UB score banks released, MTE2/MTE3/V joined to scalar',
-                    query_definition='original AdvanceIncremental scalar start/return including its existing overlap with writeback of adjacent queries',
-                    post_definition='original scan, dedup, and submission until the service completion marker'))
+        atomic_json(target/'cold_publication.json', dict(schema=1, group=config.group, calls=calls,
+                    segment_sample_fields=['exclusive_tile_end_128_tokens', 'before_frontier_dma_cycle',
+                                           'after_frontier_dma_join_cycle']))
         return dict(correctness='FAIL' if checks.failures else 'PASS', failures=checks.failures,
                     diagnostic_only=True, diagnostic_calls=len(calls))
     except BaseException as error:

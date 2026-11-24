@@ -52,7 +52,7 @@ if [[ $availability == 1 ]]; then
     fi
     extra=(--availability-only)
     arm_label=diagnostic_only
-    prefix=li-ready-diagnosis
+    prefix=li-cold-publication
 elif [[ $availability != 0 ]]; then
     echo 'PEER_AVAILABILITY_ONLY must be 0 or 1' >&2
     exit 2
@@ -232,13 +232,13 @@ if (( ${#failed[@]} )); then
 fi
 if [[ $availability == 1 ]]; then
     "$PYTHON" -B "$support/audit_ready_diagnostics.py" "$out" "$dual_archive" | tee -a "$out/summary.txt"
-    "$PYTHON" -B "$support/idle_query_schedule.py" "$out" | tee -a "$out/summary.txt"
+    "$PYTHON" -B "$support/cold_publication_report.py" "$out" | tee -a "$out/summary.txt"
     files=(candidate.txt reader.txt main.txt host.txt boot_id.txt physical_npu.txt kvaf.txt diagnostic_reference.txt summary.txt)
     for g in "${groups[@]}"; do
-        files+=("g$g/owner_availability.json" "g$g/detail_samples.json" "g$g/raw_rank_progress.npz" "g$g/ready_checks.json" "g$g/li-window/thp.json")
+        files+=("g$g/cold_publication.json" "g$g/detail_samples.json" "g$g/raw_rank_progress.npz" "g$g/ready_checks.json" "g$g/li-window/thp.json")
     done
-    tar -C "$out" -czf "$out/window-ready-diagnostics.tar.gz" "${files[@]}"
-    echo "RETURN_FILE=$out/window-ready-diagnostics.tar.gz"
+    tar -C "$out" -czf "$out/cold-publication.tar.gz" "${files[@]}"
+    echo "RETURN_FILE=$out/cold-publication.tar.gz"
 elif [[ $native != "$main_rev" ]]; then
     "$PYTHON" -B "$support/li_window_report.py" summary "$out" | tee -a "$out/summary.txt"
 fi

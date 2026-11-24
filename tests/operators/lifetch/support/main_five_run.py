@@ -186,13 +186,19 @@ def worker(args):
     if args.availability_only:
         from check_isolated_device import extract
         library, = library_paths
-        sections = extract(library)['parallel_terminal_kernel']
+        device = extract(library)
+        li_hashes = {key[1]: hashlib.sha256(code).hexdigest()
+                     for key, code in device['v9_kernel'].items() if key[4] == '.text'}
+        if li_hashes != {0: 'e3f40f2396952467d081fce63cac46752dab4dd413e5750b0a62681192b41e1c',
+                         1: '7863fcf3cfc86d7cbedbc5f901f6f5b7af58493f17fa99fa1bacf9f8bf7307f9'}:
+            raise ValueError(f'Loaded cold score diagnostic differs from simulator build: {li_hashes}')
+        sections = device['parallel_terminal_kernel']
         tail, = [code for key, code in sections.items() if key[1] == 1 and key[4] == '.text']
         digest = hashlib.sha256(tail).hexdigest()
         if digest != '5054a60bd3822bd0790b781620f21cbfd9b8816f6d08684adc1f540a9f1083b4':
             raise ValueError(f'Loaded terminal code differs from B24 upstream: {digest} ({library})')
         atomic_json(fused / 'ready_checks.json', dict(physical_npu=4, production_revision=args.revision,
-            terminal_text_sha256=digest,
+            terminal_text_sha256=digest, li_text_sha256=li_hashes,
             capture_operand_hashes=operand_hashes, loaded_library=str(library),
             library_sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
             kv_calls=len(outputs), ordered_index_calls=len(ordered), ordered_index_rows=sum(ordered.values())))
@@ -267,14 +273,14 @@ def main(args):
         if (ref['calls'], ref['queries'], checks['kv_calls'], checks['ordered_index_rows']) != (CALLS, CALLS*4*BATCH, CALLS, CALLS*BATCH):
             raise ValueError('Incomplete availability replay checks')
         output = args.output.parent
-        for name in ('detail_samples.json', 'owner_availability.json', 'raw_rank_progress.npz'):
+        for name in ('detail_samples.json', 'cold_publication.json', 'raw_rank_progress.npz'):
             shutil.copyfile(fused / 'diagnose/round-1' / name, output / name)
         atomic_json(output/'ready_checks.json', dict(**checks, score_check=ref))
         print(f'G{args.group} DIAGNOSTIC_CHECK TopK_score_vs_strong_serial=PASS '
               f'calls={ref["calls"]}/{CALLS} queries={ref["queries"]}/{4*BATCH*CALLS} '
               f'exact_sets={ref["exact_queries"]}/{ref["queries"]} '
               f'KV=PASS ordered_Index=PASS rows={checks["ordered_index_rows"]}/{CALLS*BATCH} '
-              f'workers_per_call={BATCH*4} last_window_queries_per_call={BATCH*4} terminal_text_vs_upstream=PASS', flush=True)
+              f'workers_per_call={BATCH*4} score_publications_per_call={BATCH*4*12} terminal_text_vs_upstream=PASS', flush=True)
 
 
 if __name__ == '__main__':
