@@ -87,14 +87,27 @@ def worker(args):
         '--prefetch-rank-start', '1024', '--prefetch-tokens', '1024', '--intermediate-fetches', '4',
         '--warmup', '4', '--iterations', str(CALLS), '--level', '2', '--output', str(args.output / 'results'),
     ])
+    pages = ReplayPagePlan(sequence)
+    paths = [str(ref.manifest_path) for refs in sequence.rounds for ref in refs]
+    capture_receipt = dict(geometry=inputs.geometry, identities=inputs.identities, rounds=1,
+                           page_count=pages.page_count, kv_payload='synthetic identity C8; actual KV not captured',
+                           source_paths=paths)
+    history_cap = None
+    if args.history_cap:
+        from cap_pair_input import bind_capacity
+        if (inputs.geometry['history'] != 131328 or np.max(inputs.query_ends) > 131075
+                or not np.array_equal(inputs.query_ends, receipt['native_reference']['effective_native_ends'])):
+            raise ValueError('Expected the original 128K capture and the same active bounds as the strong serial')
+        sequence, inputs, pages, history_cap = bind_capacity(sequence, inputs, pages, args.history_cap, digest)
+        cfg.history = args.history_cap
     folder = case_path(args)
     folder.mkdir(parents=True, exist_ok=False)
     atomic_json(folder / 'config.json', {**{k: str(v) if isinstance(v, Path) else v
                                            for k, v in vars(cfg).items()},
                                        'physical_npu': 4, 'fused_only': True, 'production_root': str(main),
                                        'production_revision': args.revision})
-    pages = ReplayPagePlan(sequence)
-    paths = [str(ref.manifest_path) for refs in sequence.rounds for ref in refs]
+    if history_cap:
+        atomic_json(folder / 'capture_input.json', capture_receipt)
     if (inputs.geometry['batch'], inputs.geometry['token_bytes'], len(sequence.rounds)) != (BATCH, 656, 1):
         raise ValueError('Expected one captured BS16 Q4 656B round')
     atomic_json(folder / 'replay_input.json', dict(geometry=inputs.geometry, identities=inputs.identities,
@@ -115,6 +128,7 @@ def worker(args):
 
     borrow_calls = {'measured': {}, 'detail': {}}
     cq_calls = {'measured': {}, 'detail': {}}
+    measured_requests = {}
     detail_ids = {}
     mailboxes = set()
     cq_status_ranges = []
@@ -145,6 +159,12 @@ def worker(args):
     class AuditedState(ex.FusedReplayState):
         def __init__(self, *arguments, **kwargs):
             super().__init__(*arguments, **kwargs)
+            if history_cap:
+                ends = self.workspace.inputs.query_ends.cpu().numpy().reshape(BATCH, 4)
+                key_lengths = self.workspace.key_lengths.cpu().numpy()
+                if (self.history != args.history_cap or self.workspace.block_history != args.history_cap
+                        or not np.all(key_lengths == args.history_cap) or not np.array_equal(ends, inputs.query_ends)):
+                    raise ValueError('Device binding did not retain full configured capacity and original Q ends')
             if self.forward.terminal is None:
                 raise RuntimeError('Production operator selected the legacy tail')
             lib = Path(self.rotating.library._name).resolve()
@@ -162,6 +182,13 @@ def worker(args):
 
         def validate_index(self, sample, output):
             layout, valid = super().validate_index(sample, output)
+            if history_cap and current and current[1] == 'measured':
+                call = int(current[2])
+                if call in measured_requests:
+                    raise ValueError(f'Repeated measured request count: {call}')
+                prefetched = self.rotating.rows[:, 9].cpu().numpy()
+                final = self.rotating.final_posts[:, :, 0].cpu().numpy()
+                measured_requests[call] = (int(prefetched.sum()), int(final.sum()))
             if args.borrow_audit and current:
                 phase, call = current[1], int(current[2])
                 borrow.check_flags(*borrow.options(self.forward), phase == 'detail')
@@ -219,6 +246,9 @@ def worker(args):
         ex.measure_replay_batch = measure
     ex.CorrectnessRecorder = Recorder
     ex.FusedReplayState = AuditedState
+    if history_cap:
+        from cap_pair_timing import install
+        install(ex, cfg)
     fused = folder / 'fused'
     result = ex.run_path(cfg, fused, sequence, pages, fused=True)
     if result['correctness'] != 'PASS' or result['failures']:
@@ -260,6 +290,13 @@ def worker(args):
     if args.revision == 'd6cfd392f722dd3f96ef6e05175f503aac511dbb':
         from unified_main_device import check
         device_proof['device_text_sha256'] = check(library)
+    if history_cap:
+        if set(measured_requests) != set(range(CALLS)):
+            raise ValueError('Missing measured prefetch or terminal request counts')
+        history_cap['measured_requests'] = {
+            key: [measured_requests[i][column] for i in range(CALLS)]
+            for column, key in enumerate(('prefetch', 'final'))}
+        device_proof['history_cap'] = history_cap
     runtime = dict(host=platform.node(), visible=os.environ['ASCEND_RT_VISIBLE_DEVICES'],
                    npu=torch.npu.get_device_name(torch.device('npu:0')), torch=str(torch.__version__),
                    torch_npu=str(torch_npu.__version__), cann=str(getattr(torch.version, 'cann', '')))
@@ -364,6 +401,8 @@ if __name__ == '__main__':
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--availability-only', action='store_true')
     modes.add_argument('--borrow-audit', action='store_true')
+    modes.add_argument('--history-cap', type=int, choices=(131328, 524544),
+                       help='Physical Q4 history capacity for the same 128K captured input')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parsed = parser.parse_args()
     (worker if parsed.worker else main)(parsed)
