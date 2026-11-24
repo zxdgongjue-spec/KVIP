@@ -25,7 +25,7 @@ from typing import Any
 
 import kvip
 import numpy as np
-from correctness import check_sfa
+from correctness import check_sfa, validate_terminal_receipts
 from diagnostics import actual_reads, collect_core, completion_failures, core_summary, score_rows, selected_bounds
 from kvip.adapters.kvaf import UbmemLease
 from kvip.cache.index_storage import IndexCacheStorage
@@ -3461,6 +3461,11 @@ class FusedReplayState:
 
     def validate(self, inputs):
         self.check_completion()
+        terminal = self.forward.terminal
+        if terminal is not None:
+            counts = self.rotating.final_posts[:, :, 0].cpu().numpy()
+            statuses = terminal.owner.core_status.cpu().numpy().view(np.uint64)
+            validate_terminal_receipts(counts, statuses, terminal.queue_views)
         ids = self.update.logical_output.cpu().numpy().reshape(self.batch, 4, 2048)
         slots = self.update.slot_output.cpu().numpy().reshape(self.batch, 4, 2048)
         invalid = (ids < 0) | (ids >= self.history) | (slots < 0) | (slots >= self.stride)
