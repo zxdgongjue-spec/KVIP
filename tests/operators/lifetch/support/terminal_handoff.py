@@ -42,27 +42,46 @@ def build_library(directory, cann, headers, soc, *, local_counts, hot_partition=
 
 
 def bind_hot_score(state, *, partitioned):
-    """Select the first launch on an already bound dense Terminal pipeline."""
+    return bind_score_partition(state, hot=partitioned)[0]
+
+
+def bind_score_partition(state, *, hot, cold=None):
+    """Select the experimental Score launches for a dense Terminal pipeline."""
     workspace = state.workspace
     if not (workspace.query_lengths.eq(4).all().item()
             and workspace.key_lengths.eq(state.history).all().item()):
-        raise ValueError('Hot partition comparison requires dense Q4 and full key lengths')
+        raise ValueError('Score partition comparison requires dense Q4 and full key lengths')
     forward = state.forward
     if forward.terminal is None:
-        raise ValueError('Hot partition comparison requires the MR25 Terminal route')
+        raise ValueError('Score partition comparison requires the MR25 Terminal route')
     library = forward.rotating.library
-    parts = library.kvip_partitioned_hot_score_parts
-    parts.argtypes, parts.restype = [ctypes.c_void_p], ctypes.c_uint32
-    planned = parts(forward.shape_pointer)
-    if planned < 2:
-        raise ValueError('Hot partition is unsupported for this Terminal shape')
-    if partitioned and planned > 2:
-        function = library.kvip_parallel_tail_hot_partitioned_forward
+
+    def parts(name, enabled):
+        select = getattr(library, f'kvip_partitioned_{name}_score_parts')
+        select.argtypes, select.restype = [ctypes.c_void_p], ctypes.c_uint32
+        planned = select(forward.shape_pointer)
+        if planned < 2:
+            raise ValueError(f'{name.title()} partition is unsupported for this Terminal shape')
+        return planned if enabled else 2
+
+    hot_parts = parts('hot', hot)
+    cold_parts = parts('cold', cold) if cold is not None else 2
+    if cold_parts > 2:
+        queries = workspace.query_lengths.numel() * 4
+        required_bytes = queries * (2 * state.history + 64 * cold_parts)
+        if workspace.compute.nbytes < required_bytes or workspace.compute.data_ptr() % 64:
+            raise ValueError('Cold partition requires aligned progress space after the Score rows')
+    entry = {
+        (True, False): 'kvip_parallel_tail_hot_partitioned_forward',
+        (False, True): 'kvip_parallel_tail_cold_partitioned_forward',
+        (True, True): 'kvip_parallel_tail_history_partitioned_forward',
+    }.get((hot_parts > 2, cold_parts > 2))
+    if entry:
+        function = getattr(library, entry)
         function.argtypes = [ctypes.c_void_p] * 4
         function.restype = ctypes.c_uint32
         forward.terminal_function = function
-        return planned
-    return 2
+    return hot_parts, cold_parts
 
 
 def fixture_hash(path):

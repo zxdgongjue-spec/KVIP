@@ -814,20 +814,38 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(u
         } else {
             uint32_t halfTokens = rotating::SequenceHalfWindow(runtimeShape_);
             uint32_t half = halfTokens / S2_BASE_SIZE;
-            uint32_t serviceEpoch = rotating::ServiceRank(runtimeShape_.batch, runtimeShape_.splitQ,
-                                                          aiCoreIdx) / runtimeShape_.serviceAics;
+            uint32_t serviceCore = aiCoreIdx;
+            bool serviceLeader = true;
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+            if (parts > 2) {
+                const uint32_t shardParts = parts / 2;
+                serviceCore = batch * 2 + shard / shardParts;
+                serviceLeader = shard % shardParts == 0;
+            }
+#endif
+            const uint32_t serviceEpoch = rotating::ServiceRank(runtimeShape_.batch, runtimeShape_.splitQ,
+                serviceCore) / runtimeShape_.serviceAics;
             if ASCEND_IS_AIV {
                 vectorService.LoadSequenceSplitThresholds(batch);
                 vectorService.PrepareRotationProgress();
-                if (serviceEpoch == 0) vectorService.RotateFetch(0, halfTokens);
+                if (serviceLeader && serviceEpoch == 0) vectorService.RotateFetch(0, halfTokens);
             }
             uint32_t begin = resident_ / S2_BASE_SIZE + shard * half;
             for (uint32_t epoch = 1; epoch < runtimeShape_.rounds; ++epoch, begin += 2 * half) {
-                uint32_t end = begin + half;
-                if (end > runtimeShape_.history / S2_BASE_SIZE) end = runtimeShape_.history / S2_BASE_SIZE;
-                ScanSequenceHalf(begin, end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
+                auto tiles = kvip_hot_score::TileRange{begin, begin + half};
+                if (tiles.end > runtimeShape_.history / S2_BASE_SIZE) tiles.end = runtimeShape_.history / S2_BASE_SIZE;
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+                if (parts > 2) tiles = kvip_cold_score::Split(runtimeShape_.history, runtimeShape_.resident,
+                    halfTokens, epoch, shard, parts);
+#endif
+                ScanSequenceHalf(tiles.begin, tiles.end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
                 if ASCEND_IS_AIV {
-                    if (serviceEpoch == epoch) vectorService.RotateFetch(epoch, halfTokens);
+                    if (serviceLeader && serviceEpoch == epoch) {
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+                        if (parts > 2) vectorService.WaitPartitionedHalf(batch, shard, epoch, halfTokens);
+#endif
+                        vectorService.RotateFetch(epoch, halfTokens);
+                    }
                 }
             }
         }

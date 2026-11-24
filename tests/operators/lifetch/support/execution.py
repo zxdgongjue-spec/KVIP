@@ -3903,9 +3903,11 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     build = config.kvaf_root / 'build-npu'
     handoff = getattr(config, 'mr25_handoff', None)
     hot_partition = getattr(config, 'mr25_hot_partition', None)
-    if hot_partition is not None and not (fused and handoff and config.transport == 'urma'
-                                          and config.input == 'synthetic'):
-        raise ValueError('The Hot trial uses the dense synthetic URMA Terminal comparison')
+    cold_partition = getattr(config, 'mr25_cold_partition', None)
+    partition_trial = hot_partition is not None or cold_partition is not None
+    if partition_trial and not (fused and handoff and config.transport == 'urma'
+                                and config.input == 'synthetic'):
+        raise ValueError('The Score trial uses the dense synthetic URMA Terminal comparison')
     torch.npu.set_device(config.device)
     device = torch.device(f'npu:{config.device}')
     stream = torch.npu.current_stream(device)
@@ -3966,8 +3968,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                     from terminal_handoff import build_library
 
                     library = build_library(config.handoff_build_dir, cann, headers, soc,
-                                            local_counts=handoff == 'local_counts' or hot_partition is not None,
-                                            hot_partition=hot_partition is not None)
+                                            local_counts=handoff == 'local_counts' or partition_trial,
+                                            hot_partition=partition_trial)
                 else:
                     (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers, soc=soc)
             else:
@@ -3983,10 +3985,10 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 shape = state.rotating.runtime_shape
                 if state.forward.terminal is None or shape.liCores != 2 * g['batch']:
                     raise RuntimeError('MR25 handoff comparison requires the P2 sequence-split Terminal route')
-            if hot_partition is not None:
-                from terminal_handoff import bind_hot_score
+            if partition_trial:
+                from terminal_handoff import bind_score_partition
 
-                hot_parts = bind_hot_score(state, partitioned=hot_partition)
+                score_parts = bind_score_partition(state, hot=hot_partition, cold=cold_partition)
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
@@ -4034,9 +4036,9 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
                         prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease)
                     replica.failure_directory = directory
-                    if hot_partition is not None:
-                        if bind_hot_score(replica, partitioned=hot_partition) != hot_parts:
-                            raise RuntimeError('Hot partition changed between graph invocations')
+                    if partition_trial:
+                        if bind_score_partition(replica, hot=hot_partition, cold=cold_partition) != score_parts:
+                            raise RuntimeError('Score partition changed between graph invocations')
                 else:
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
                 batch_states.append(replica)
@@ -4049,14 +4051,18 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                           runtime_workers=shared_pool.workers if borrowed else workers, geometry=g,
                           input_paths=[str(ref.manifest_path) for refs in sequence.rounds for ref in refs])
             if handoff:
+                # The rotating Service geometry still uses the P2 shape.
                 result['handoff_route'] = dict(mode=handoff, library=str(library), soc=soc, effective_aic=aics,
                                               score_parts=2, score_blocks=shape.liCores, windows=shape.rounds,
                                               service_lanes=shape.serviceLanes, terminal_tasks=4 * g['batch'])
-                if hot_partition is not None:
+                if partition_trial:
+                    hot_parts, cold_parts = score_parts
                     with Path(library).open('rb') as binary:
                         binary_sha = hashlib.file_digest(binary, 'sha256').hexdigest()
                     result['handoff_route'].update(hot_score_parts=hot_parts,
                                                    hot_score_blocks=hot_parts * g['batch'],
+                                                   cold_score_parts=cold_parts,
+                                                   cold_score_blocks=cold_parts * g['batch'],
                                                    library_sha256=binary_sha, local_counts=True)
             atomic_json(directory / 'path_result.json', result)
             return result

@@ -497,7 +497,7 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
 __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     uint32_t lane=rotating::ServiceLane(runtimeShape_.batch,runtimeShape_.splitQ,
-        runtimeShape_.serviceAics,blockId_/2,blockId_%2);
+        runtimeShape_.serviceAics,RotationCore(),blockId_%2);
     // The predecessor wait is part of the optional window service and can
     // delay the producer. Capture it separately from incremental computation.
     bool trace=streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U);
@@ -517,9 +517,14 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     const bool stagedMetadata=(runtimeShape_.batch+runtimeShape_.serviceLanes-1)/runtimeShape_.serviceLanes<=2;
     incrementalMetadataActive_=stagedMetadata;
     if(incrementalMetadataActive_) {
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    if (!coldParts_)
+#endif
+    {
     GlobalTensor<uint32_t> progressSource;progressSource.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
     for(uint32_t b=lane,i=0;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes,i+=128)
         DataCopy(incrementalOld_[i],progressSource[b*128],128);
+    }
     // Stage the first 64 bytes of each row after progress. At most two rows
     // use words [256, 288), disjoint from progress words [0, 256).
     GlobalTensor<uint32_t> rowsSource;rowsSource.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rows));
@@ -538,8 +543,18 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     if(incrementalMetadataActive_) {
         if(ownedQueries>0)requests0=incrementalOld_.GetValue(256+9);
         if(ownedQueries>4)requests1=incrementalOld_.GetValue(256+16+9);
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+        if (coldParts_) {
+            for (uint32_t b = lane, index = 0; b < runtimeShape_.batch; b += runtimeShape_.serviceLanes) {
+                for (uint32_t q = 0; q < 4; ++q, ++index)
+                    incrementalMetadata_.SetValue(index * 16 + 4, PartitionedColdReady(b * 4 + q, half));
+            }
+        } else
+#endif
+        {
         for(uint32_t i=0;i<ownedQueries;++i)
             incrementalMetadata_.SetValue(i*16+4,uint64_t(incrementalOld_.GetValue(i*32))|(uint64_t(incrementalOld_.GetValue(i*32+16))<<32));
+        }
     }
     uint32_t cap=half?rotating::SequenceWindowEnd(runtimeShape_.history,runtimeShape_.resident,half,epoch):
         rotating::Trigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,epoch)*128;
@@ -550,6 +565,9 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
         uint32_t progressIndex=(((b-lane)/runtimeShape_.serviceLanes)*4+q)*16+4;
         uint64_t ready;
         if(incrementalMetadataActive_)ready=incrementalMetadata_.GetValue(progressIndex);
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+        else if (coldParts_) ready = PartitionedColdReady(b * 4 + q, half);
+#endif
         else {
             auto progress=reinterpret_cast<__gm__ volatile uint32_t*>(ctx->progress)+(b*4+q)*32;
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ uint32_t*>(progress)),128);

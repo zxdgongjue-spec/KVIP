@@ -127,10 +127,13 @@ extern "C" uint32_t kvip_parallel_tail_supported(const rotating::RuntimeShape* s
 // Keep the threshold, Cold/Service and Terminal launches in one shared path.
 #if KVIP_HOT_SCORE_PARTITION
 #include "../../common/lifetch/hot_score_partition.h"
+#include "../../common/lifetch/cold_score_partition.h"
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_hot_partitioned(uint32_t,void*,void*,uint32_t);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_threshold_cold_partitioned(uint32_t,void*,void*,uint32_t);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_partitioned(uint32_t,void*,void*,uint32_t);
 #endif
 static uint32_t LaunchParallelTail(void* bindings,void* terminal,
-    void* stream,const rotating::RuntimeShape* shape,uint32_t hotParts) {
+    void* stream,const rotating::RuntimeShape* shape,uint32_t hotParts,uint32_t coldParts=2) {
     if(!bindings || !terminal || !stream || !kvip_parallel_tail_supported(shape))return 100000;
     uint32_t result;
 #if KVIP_HOT_SCORE_PARTITION
@@ -138,8 +141,18 @@ static uint32_t LaunchParallelTail(void* bindings,void* terminal,
     else
 #endif
     result=aclrtlaunch_v9_li_kernel(shape->liCores,stream,bindings);
-    if(!result)result=aclrtlaunch_v9_li_kernel_1(shape->liCores,stream,bindings);
-    if(!result)result=aclrtlaunch_v9_li_kernel_2(shape->liCores,stream,bindings);
+#if KVIP_HOT_SCORE_PARTITION
+    if(coldParts>2){
+        if(!result)result=aclrtlaunch_v9_li_kernel_threshold_cold_partitioned(
+            shape->liCores,stream,bindings,coldParts);
+        if(!result)result=aclrtlaunch_v9_li_kernel_cold_partitioned(
+            shape->batch*coldParts,stream,bindings,coldParts);
+    } else
+#endif
+    {
+        if(!result)result=aclrtlaunch_v9_li_kernel_1(shape->liCores,stream,bindings);
+        if(!result)result=aclrtlaunch_v9_li_kernel_2(shape->liCores,stream,bindings);
+    }
     if(!result)result=aclrtlaunch_v9_parallel_terminal(shape->batch*4,stream,terminal);
     return result;
 }
@@ -157,5 +170,23 @@ extern "C" uint32_t kvip_parallel_tail_hot_partitioned_forward(void* bindings,vo
     const auto parts=kvip_partitioned_hot_score_parts(shape);
     if(parts<2)return 100000;
     return LaunchParallelTail(bindings,terminal,stream,shape,parts);
+}
+extern "C" uint32_t kvip_partitioned_cold_score_parts(const rotating::RuntimeShape* shape) {
+    if(!kvip_parallel_tail_supported(shape) || shape->liCores!=2*shape->batch)return 0;
+    return kvip_cold_score::Parts(shape->batch,shape->history,shape->resident,
+        rotating::SequenceHalfWindow(*shape),shape->rounds,shape->aicCount);
+}
+extern "C" uint32_t kvip_parallel_tail_cold_partitioned_forward(void* bindings,void* terminal,
+    void* stream,const rotating::RuntimeShape* shape) {
+    const auto cold=kvip_partitioned_cold_score_parts(shape);
+    if(cold<2)return 100000;
+    return LaunchParallelTail(bindings,terminal,stream,shape,2,cold);
+}
+extern "C" uint32_t kvip_parallel_tail_history_partitioned_forward(void* bindings,void* terminal,
+    void* stream,const rotating::RuntimeShape* shape) {
+    const auto hot=kvip_partitioned_hot_score_parts(shape);
+    const auto cold=kvip_partitioned_cold_score_parts(shape);
+    if(hot<2 || cold<2)return 100000;
+    return LaunchParallelTail(bindings,terminal,stream,shape,hot,cold);
 }
 #endif

@@ -33,6 +33,9 @@
 #include "incremental_vector_helpers.h"
 #include "window_fast_vector.h"
 #endif
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+#include "../../../common/lifetch/cold_score_partition.h"
+#endif
 
 namespace QLIKernel {
 using namespace QLICommon;
@@ -60,6 +63,32 @@ public:
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     }
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    __aicore__ inline void BindPartitionedCold(GM_ADDR compute, uint32_t parts) {
+        coldParts_ = parts;
+        const uint32_t physical = blockId_ / 2;
+        const uint32_t part = physical % parts;
+        rotationCore_ = (physical / parts) * 2 + part / (parts / 2);
+        coldProgress_ = compute + kvip_cold_score::ScoreBytes(runtimeShape_.batch, runtimeShape_.history);
+        coldProgressGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(coldProgress_));
+    }
+
+    __aicore__ inline void WaitPartitionedHalf(uint32_t batch, uint32_t part, uint32_t epoch, uint32_t half) {
+        // The leader's own Q files have finished publishing before polling helpers.
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        const uint32_t beginQ = batch * 4 + (blockId_ % 2) * 2;
+        const uint32_t endPart = part + coldParts_ / 2;
+        for (uint32_t p = part + 1; p < endPart; ++p) {
+            const auto tile = kvip_cold_score::Split(runtimeShape_.history, runtimeShape_.resident, half,
+                epoch, p, coldParts_);
+            const uint32_t end = tile.end * kvip_cold_score::kTileTokens;
+            for (uint32_t query = beginQ; query < beginQ + 2; ++query) {
+                while (ReadColdCursor(query, p) < end) {}
+            }
+        }
+    }
+#endif
 #if KVIP_PARALLEL_TERMINAL
     __aicore__ inline LocalTensor<uint32_t> TerminalCompact() { return incrementalNew_.template ReinterpretCast<uint32_t>(); }
     __aicore__ inline LocalTensor<uint32_t> TerminalScratch() { return topkSharedTmpLocal_; }
@@ -118,7 +147,7 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
 #if defined(V9_UBMEM) && V9_UBMEM
         rotating::Service(rotationContext_, epoch, blockId_ / 2, blockId_ % 2,
 #else
-        rotating::Service(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,runtimeShape_.serviceLanes,runtimeShape_.tokenBytes,runtimeShape_.postThreads,runtimeShape_.postBank,runtimeShape_.batchedRows,runtimeShape_.scanTokens,rotationContext_, epoch, blockId_ / 2, blockId_ % 2,
+        rotating::Service(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,runtimeShape_.serviceLanes,runtimeShape_.tokenBytes,runtimeShape_.postThreads,runtimeShape_.postBank,runtimeShape_.batchedRows,runtimeShape_.scanTokens,rotationContext_, epoch, RotationCore(), blockId_ % 2,
 #endif
 #if !KVIP_STREAMING_LI
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow);
@@ -209,6 +238,37 @@ protected:
     static constexpr uint32_t V_MTE2_EVENT3 = EVENT_ID5;
 
 private:
+    __aicore__ inline uint32_t RotationCore() const {
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+        if (coldParts_) return rotationCore_;
+#endif
+        return blockId_ / 2;
+    }
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    __aicore__ inline uint32_t ReadColdCursor(uint32_t query, uint32_t part) const {
+        const uint64_t offset = kvip_cold_score::ProgressOffset(query, part, coldParts_);
+        auto cursor = reinterpret_cast<__gm__ volatile uint32_t*>(coldProgress_) + offset;
+        kvaf_device::CleanCacheLines(
+            reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ uint32_t*>(cursor)),
+            kvip_cold_score::kProgressBytes);
+        return *cursor;
+    }
+
+    __aicore__ inline uint64_t PartitionedColdReady(uint32_t query, uint32_t half) const {
+        uint32_t cursors[kvip_cold_score::kMaxParts];
+        for (uint32_t part = 0; part < coldParts_; ++part) cursors[part] = ReadColdCursor(query, part);
+        const uint32_t lastEpoch = runtimeShape_.rounds - 1;
+        const uint32_t end0 = kvip_cold_score::Prefix(cursors, runtimeShape_.history, runtimeShape_.resident,
+            half, lastEpoch, 0, coldParts_);
+        const uint32_t end1 = kvip_cold_score::Prefix(cursors, runtimeShape_.history, runtimeShape_.resident,
+            half, lastEpoch, 1, coldParts_);
+        return uint64_t(end0) | (uint64_t(end1) << 32);
+    }
+    GM_ADDR coldProgress_ = nullptr;
+    uint32_t coldParts_ = 0;
+    uint32_t rotationCore_ = 0;
+    GlobalTensor<uint32_t> coldProgressGm_;
+#endif
     GM_ADDR rotationContext_ = nullptr;
 #if KVIP_STREAMING_LI
     GM_ADDR streamingWorkspace_ = nullptr;
@@ -821,9 +881,21 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         publish.blockCount = curAivS1ProcNum; // Q2: one query/AIV; Q4: two
         publish.blockLen = 32;
         publish.srcStride = 0;
-        publish.dstStride = 96;
-        DataCopyPad(rotationProgressGm_[(info.bIdx * SIM_Q + curAivS1Idx) * 32 + progressShard * 16],
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+        if (coldParts_) {
+            // MTE3 has already queued this tile's scores and predicates.
+            // Each physical part has an exclusive cache line per query.
+            publish.dstStride = coldParts_ * kvip_cold_score::kProgressBytes - publish.blockLen;
+            DataCopyPad(coldProgressGm_[kvip_cold_score::ProgressOffset(
+                info.bIdx * SIM_Q + curAivS1Idx, progressShard, coldParts_)],
+                rotationProgress_[(info.s2Idx % 64) * 16], publish);
+        } else
+#endif
+        {
+            publish.dstStride = 96;
+            DataCopyPad(rotationProgressGm_[(info.bIdx * SIM_Q + curAivS1Idx) * 32 + progressShard * 16],
             rotationProgress_[(info.s2Idx % 64) * 16], publish);
+        }
     }
     SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
     CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB

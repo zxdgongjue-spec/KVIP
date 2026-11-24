@@ -902,7 +902,9 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
     groups = {stage: [] for stage in kernels}
     for event in events:
         n = event.get("name", "").lower()
-        if "li" in groups and re.fullmatch(r"v9_li_kernel_hot_partitioned(?:_\d+)*", n):
+        if "li" in groups and re.fullmatch(
+            r"v9_li_kernel_(?:hot|cold|threshold_cold)_partitioned(?:_\d+)*", n
+        ):
             n = kernels["li"]
         cat = (event.get("cat") or "").lower()
         # CANN may omit cat. Accept exact kernel names with numeric dispatch

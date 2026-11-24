@@ -209,15 +209,20 @@ def test_terminal_queues_are_disjoint_and_rebind_output():
             bind_queues(1, views, 656)
 
 
-@pytest.mark.parametrize("hot_kernel", ["v9_li_kernel_0", "v9_li_kernel_hot_partitioned_0"])
-def test_parallel_terminal_same_graph_accounting(hot_kernel):
+@pytest.mark.parametrize(("hot_kernel", "threshold_kernel", "cold_kernel"), [
+    ("v9_li_kernel_0", "v9_li_kernel_1_1", "v9_li_kernel_2_2"),
+    ("v9_li_kernel_hot_partitioned_0", "v9_li_kernel_1_1", "v9_li_kernel_2_2"),
+    ("v9_li_kernel_0", "v9_li_kernel_threshold_cold_partitioned_0", "v9_li_kernel_cold_partitioned_0"),
+    ("v9_li_kernel_hot_partitioned", "v9_li_kernel_threshold_cold_partitioned", "v9_li_kernel_cold_partitioned"),
+])
+def test_parallel_terminal_same_graph_accounting(hot_kernel, threshold_kernel, cold_kernel):
     from diagnostics import account, decode_terminal_timeline
     from performance import split_graph_invocations
 
     events = [dict(name="replay", ph="X", ts=0, dur=100)]
     for origin in (1, 41):
         for index, (name, duration) in enumerate(
-            ((hot_kernel, 5), ("v9_li_kernel_1_1", 5), ("v9_li_kernel_2_2", 5), ("v9_parallel_terminal_0", 15))
+            ((hot_kernel, 5), (threshold_kernel, 5), (cold_kernel, 5), ("v9_parallel_terminal_0", 15))
         ):
             events.append(dict(name=name, ph="X", cat="kernel", ts=origin + index * 5, dur=duration))
     accounting = account(events, "replay", 100, full=True, fused_final=True)
@@ -258,12 +263,12 @@ def test_parallel_forward_uses_live_stream_without_rebinding(monkeypatch):
 
 
 @pytest.mark.parametrize(("batch", "parts"), [(1, 32), (2, 16), (4, 8), (8, 4), (16, 2)])
-def test_hot_score_binds_real_workspace_lengths(batch, parts):
+def test_score_partitions_bind_real_workspace_lengths(batch, parts):
     from types import SimpleNamespace
     from unittest.mock import Mock
 
     import torch
-    from terminal_handoff import bind_hot_score
+    from terminal_handoff import bind_hot_score, bind_score_partition
 
     from kvip.operators.lifetch.forward import LIFetchForward
     from kvip.operators.lifetch.workspace import LIFetchWorkspace
@@ -284,11 +289,14 @@ def test_hot_score_binds_real_workspace_lengths(batch, parts):
     assert arguments[5] is workspace.query_lengths
     assert arguments[6] is workspace.key_lengths
 
-    for partitioned in (False, True):
-        baseline, uniform = Mock(return_value=0), Mock(return_value=0)
+    for hot, cold, entry in ((False, None, "p2"), (True, None, "hot"), (False, True, "cold"),
+                             (True, True, "history"), (False, False, "p2")):
+        entries = {name: Mock(return_value=0) for name in ("p2", "hot", "cold", "history")}
         library = SimpleNamespace(
             kvip_partitioned_hot_score_parts=Mock(return_value=parts),
-            kvip_parallel_tail_hot_partitioned_forward=uniform,
+            kvip_partitioned_cold_score_parts=Mock(return_value=parts),
+            **{f"kvip_parallel_tail_{name}_partitioned_forward": entries[name]
+               for name in ("hot", "cold", "history")},
         )
         stream = SimpleNamespace(npu_stream=404)
         forward = LIFetchForward.__new__(LIFetchForward)
@@ -299,15 +307,24 @@ def test_hot_score_binds_real_workspace_lengths(batch, parts):
         forward.shape_pointer = 303
         forward.bindings = SimpleNamespace(data_ptr=lambda: 101)
         forward.terminal = SimpleNamespace(workspace=SimpleNamespace(data_ptr=lambda: 202))
-        forward.terminal_function = baseline
+        forward.terminal_function = entries["p2"]
         state = SimpleNamespace(workspace=workspace, history=history, forward=forward)
 
-        use_uniform = partitioned and parts > 2
-        assert bind_hot_score(state, partitioned=partitioned) == (parts if use_uniform else 2)
+        expected = (parts if hot else 2, parts if cold else 2)
+        if cold is None:
+            assert bind_hot_score(state, partitioned=hot) == expected[0]
+            library.kvip_partitioned_cold_score_parts.assert_not_called()
+        else:
+            assert bind_score_partition(state, hot=hot, cold=cold) == expected
         forward()
-        (uniform if use_uniform else baseline).assert_called_once_with(101, 202, 404, 303)
-        (baseline if use_uniform else uniform).assert_not_called()
+        selected = entry if parts > 2 else "p2"
+        entries[selected].assert_called_once_with(101, 202, 404, 303)
+        assert sum(fn.call_count for fn in entries.values()) == 1
 
+    if parts > 2:
+        workspace.compute = workspace.compute[:64]
+        with pytest.raises(ValueError, match="aligned progress space"):
+            bind_score_partition(state, hot=False, cold=True)
     workspace.key_lengths[0] = history - 1
     with pytest.raises(ValueError, match="full key lengths"):
         bind_hot_score(state, partitioned=True)

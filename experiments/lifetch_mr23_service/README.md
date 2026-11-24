@@ -76,7 +76,7 @@ Open `summary.csv` at the printed `Summary:` path. Use accepted rows and `fused_
 When `pipeline_count_status=PASS`, `prefetch_requests_per_call` and `final_get_requests_per_call` give actual early and final token Get requests per batch invocation. Check for a positive prefetch count in each route to confirm that all three posted early requests. Per-request counts are in `case-b*/fused/path_result.json` under `pipeline_counts.records`.
 
 The full route requires four ordered LI kernels in its measured trace, Score, threshold, Cold T2 and Final. The runner rejects an independent Service launch in that route. `cold_t2_us` covers the combined reread, classification and Service work.
-## Hot Score-only comparison on MR28
+## Hot and Cold Score comparisons on MR28
 
 Run this experiment in the same A5 container as `run_mr25_handoff.sh`, with the MR28 source based on `f29180a0` and the existing CANN/KVAF setup.
 
@@ -90,4 +90,15 @@ Both arms use synthetic dense Q4/G32, H128K/R16K, miss 10%, seed 43, requested W
 
 At effective C32, the five partition counts per request are 32/16/8/4/2. Each MIX task computes all four Q over its assigned resident pages. BS16 uses the original Hot kernel in both arms and serves as the equal-geometry control.
 
-The output includes Hot, Threshold, Cold/Service, Terminal and KV-ready times, plus allocated MIX groups and tokens per group in `summary.csv`. The comparator requires correctness, the same fixture and library, and equal per-invocation completed prefetch/Final Get counters. Hot time is the kernel span, and KV ready is the per-invocation graph Event mean. The new experiment measures Hot partitioning. A Cold-only partition experiment needs a separate progress-publication design.
+The output includes Hot, Threshold, Cold/Service, Terminal and KV-ready times, plus allocated MIX groups in `summary.csv`. Hot and Cold/Service are profiler kernel spans. KV ready is the per-invocation graph Event mean.
+
+To evaluate Cold alone and then Hot plus Cold with one P2 baseline per batch, run
+
+```bash
+bash experiments/lifetch_mr23_service/run_mr25_score.sh \
+  --batch 1 --batch 8 --batch 16 --stage cold --stage hot-cold
+```
+
+Use `--batch 1` for a short run. Add `--stage hot` to rerun the Hot-only control in the same command. Both Cold candidates keep the two logical half-windows and the original rotation of Service lanes. Each half uses multiple MIX producers with independent progress. Service consumes their contiguous progress and uses the existing thresholds, candidate selection and prefetch budgets. The threshold launch includes candidate progress initialization. The BS16 arms use the original P2 launches at C32.
+
+`paired` requires exact prefetch and Final Get vectors for every measured request and invocation. `get_comparison=same_request_totals` identifies runs where the vectors differ and each request still completes the same total number of Gets. The `observed_*_over_p2` fields retain the observed timing ratios for those runs and the console flags the change in early/final placement. Correctness, fixture, library, route and sample checks apply to both. The default Hot-only invocation keeps the strict exit status. Explicit Cold comparisons return success for a valid same-total observation and keep the strict result in `paired`.
