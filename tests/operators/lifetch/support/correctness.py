@@ -13,6 +13,7 @@ FIXED_CASES = {
     'boundary': [('all_hit_budget0', 2, 0., 0), ('all_miss', 2, 100., 512),
                  ('prefetch_zero', 2, 10., 0), ('boundary_regular', 2, 10., 512)],
     'stateful': [('stateful', 2, 100., 0)],
+    'long-history': [('history_512k', 16, 25., 1024), ('model_512k_q4', 16, 25., 1024)],
 }
 
 
@@ -81,13 +82,16 @@ def check_jobs(config):
                       'miss_percent': miss, 'prefetch_tokens': budget, 'warmup': 0, 'iterations': 1}
             if suite == 'stateful':
                 values.update(history=12288, resident=4096)
+            if suite == 'long-history':
+                values.update(history=524288 if name == 'history_512k' else 524544, resident=16384,
+                              intermediate_fetches=4, iterations=2)
             jobs.append((name, SimpleNamespace(**values)))
     return jobs
 
 
 def check_contracts(transport):
     """Exercise production validation rather than merely the CLI parser."""
-    from kvip.operators.lifetch.geometry import prefetch_budget
+    from kvip.operators.lifetch.geometry import MAX_HISTORY_TOKENS, prefetch_budget
 
     rows = []
     def rejected(name, callback):
@@ -124,7 +128,7 @@ def check_contracts(transport):
         defaults = dict(batch=2, history=131072, resident=16384, heads=32,
                         token_bytes=656, aic_count=32, intermediate_fetches=8, soc='Ascend950PR_9599')
         for key, value in (('heads', 16), ('token_bytes', 128), ('intermediate_fetches', 33),
-                           ('soc', 'invalid'), ('history', 211200)):
+                           ('soc', 'invalid'), ('history', MAX_HISTORY_TOKENS + 256)):
             rejected(f'reject_{key}', lambda k=key, v=value: UbmemGeometry(**(defaults | {k: v})))
     return rows
 

@@ -42,6 +42,17 @@ class FusedInputsTest(unittest.TestCase):
         self.assertEqual(inputs.unpack_indices[:5].tolist(), [0, 4, 5, 6, 7])
         self.assertEqual(inputs.output_valid[:8].tolist(), [1, 1, 1, 1, 1, 0, 0, 0])
 
+    def test_512k_q4_causal_bounds_and_owner_block_table(self):
+        sequence_length = 512 * 1024
+        for history, first_position in ((sequence_length, sequence_length - 4), (524544, sequence_length - 1)):
+            inputs = QueryInputs(torch, 2, torch.device("cpu"), pin_memory=False, history=history)
+            inputs.prepare([4], query_owners=[2])
+            ends = inputs.bind_positions(torch.arange(first_position, first_position + 4))
+            self.assertEqual(ends.tolist(), [list(range(first_position + 1, first_position + 5)), [0] * 4])
+            blocks = history // 128
+            self.assertEqual(inputs.block_table.shape[1], blocks)
+            self.assertEqual(inputs.block_table[0, -1].item(), 3 * blocks - 1)
+
     def test_replay_metadata_and_mtp_rollback_keep_addresses(self):
         inputs = QueryInputs(torch, 2, torch.device("cpu"), pin_memory=False)
         pointers = (inputs.metadata.data_ptr(), inputs.query_ends.data_ptr(), inputs.query.data_ptr())

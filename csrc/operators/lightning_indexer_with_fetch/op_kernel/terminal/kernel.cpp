@@ -128,7 +128,9 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  uint32_t tailCapacity=ctx->outputStride?uint32_t(ctx->outputStride)-s.resident:0;
  uint32_t counts[4]={0,0,0,0};counts[q]=candidates;
  uint32_t width=(candidates+31)/32*32;
- uint32_t bitmapWords=s.history/32;
+ // PackUniqueLocal uses one output slot per TopK position. Its control
+ // words immediately follow those outputs in the same private UB bank.
+ auto postControl=postScratch[2048];
 
  auto activeLru=reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+uint64_t(b)*rotating::kLruSlots;
  uint32_t slotCapacity=rotating::kLruSlots;bool capacityCounted=false;
@@ -138,11 +140,11 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  Simt::VF_CALL<PrepareTerminalCapacity>(Simt::Dim3{32,1,1},
   reinterpret_cast<__ubuf__ uint32_t*>(postIds.GetPhyAddr()),candidates,mapping,
   headers,flags,generation,q,priorSlots,
-  reinterpret_cast<__ubuf__ uint32_t*>(postScratch[bitmapWords+16].GetPhyAddr()));
+  reinterpret_cast<__ubuf__ uint32_t*>(postControl[16].GetPhyAddr()));
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
- uint32_t upper=postScratch.GetValue(bitmapWords+16);
- capacityCounted=postScratch.GetValue(bitmapWords+18)!=0;
- if(capacityCounted){candidates=postScratch.GetValue(bitmapWords+17);counts[q]=candidates;width=(candidates+31)/32*32;}
+ uint32_t upper=postControl.GetValue(16);
+ capacityCounted=postControl.GetValue(18)!=0;
+ if(capacityCounted){candidates=postControl.GetValue(17);counts[q]=candidates;width=(candidates+31)/32*32;}
  if(upper>rotating::kLruSlots){
   auto extended=reinterpret_cast<__gm__ uint32_t*>(runtime->reserved[0])+uint64_t(b)*(rotating::kChangeCapacity+4*((s.resident+31)/32));
   auto savedIds=reinterpret_cast<__gm__ uint32_t*>(ctx->incremental+uint64_t(s.batch)*512+uint64_t(b)*(4*2048*6+1024)+4*2048*2);
@@ -159,15 +161,15 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  // Consume the original compact UB result directly; compact destinations use postWork.
  // MERGED_OUTPUT_BEFORE_WQE
  if(profile)ts[6]=GetSystemCycle();
- Simt::VF_CALL<PackUniqueLocal>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(postIds.GetPhyAddr()),width,counts[0],counts[1],counts[2],counts[3],q,mapping,reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch[bitmapWords].GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch.GetPhyAddr()),(reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+uint64_t(b)*1),reinterpret_cast<__gm__ uint64_t*>(rotating::RequestAddressTable(ctx,b,owner,s.history)),reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postWork[2048].GetPhyAddr()),s.resident,reinterpret_cast<__ubuf__ uint32_t*>(postWork[4096].GetPhyAddr()),activeLru,slotCapacity,capacityCounted,capacityPass==0,headers,priorSlots,(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity),(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+uint64_t(b)*rotating::kChangeCapacity),(uint64_t(tailEnd)<<32)|tailBegin,tailCapacity,reinterpret_cast<__gm__ uint32_t*>(runtime->templates)+query*32,args,reinterpret_cast<__ubuf__ uint32_t*>(op.TerminalIds().GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch[bitmapWords+8].GetPhyAddr()),(reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history),flags,generation,s.history,reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+query*2048,owner*uint32_t(ctx->outputStride),update,s.batch,query);
+ Simt::VF_CALL<PackUniqueLocal>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(postIds.GetPhyAddr()),width,counts[0],counts[1],counts[2],counts[3],q,mapping,reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postControl.GetPhyAddr()),(reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+uint64_t(b)*1),reinterpret_cast<__gm__ uint64_t*>(rotating::RequestAddressTable(ctx,b,owner,s.history)),reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postWork[2048].GetPhyAddr()),s.resident,reinterpret_cast<__ubuf__ uint32_t*>(postWork[4096].GetPhyAddr()),activeLru,slotCapacity,capacityCounted,capacityPass==0,headers,priorSlots,(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity),(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+uint64_t(b)*rotating::kChangeCapacity),(uint64_t(tailEnd)<<32)|tailBegin,tailCapacity,reinterpret_cast<__gm__ uint32_t*>(runtime->templates)+query*32,args,reinterpret_cast<__ubuf__ uint32_t*>(op.TerminalIds().GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postControl[8].GetPhyAddr()),(reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history),flags,generation,s.history,reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+query*2048,owner*uint32_t(ctx->outputStride),update,s.batch,query);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
- if(!postScratch.GetValue(bitmapWords+14))break;
+ if(!postControl.GetValue(14))break;
  }
  if(profile)ts[11]=GetSystemCycle();
- uint32_t own=postScratch.GetValue(bitmapWords);
- uint32_t total=postScratch.GetValue(bitmapWords+13);
+ uint32_t own=postControl.GetValue(0);
+ uint32_t total=postControl.GetValue(13);
  const auto batches=rotating::PlanTerminalBatches(own,total,priorSlots);
- uint32_t slotBase=postScratch.GetValue(bitmapWords+1);
+ uint32_t slotBase=postControl.GetValue(1);
  if(profile){ts[20]=own;ts[21]=own;ts[22]=slotBase;}
  if(profile)ts[12]=GetSystemCycle();
  auto ids=op.TerminalIds();
@@ -175,8 +177,8 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(runtime->logical)+query*2048);slots.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048);
  SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
  DataCopy(slots,postScratch,2048);
- PublishTerminalOutputs(update,s.batch,query,ids,postScratch,postScratch[bitmapWords+9],ctx->locations+uint64_t(query)*2048*4);
- uint32_t packError=postScratch.GetValue(bitmapWords+8);ownError|=packError;
+ PublishTerminalOutputs(update,s.batch,query,ids,postScratch,postControl[9],ctx->locations+uint64_t(query)*2048*4);
+ uint32_t packError=postControl.GetValue(8);ownError|=packError;
  if(profile)ts[7]=GetSystemCycle();
  auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args->queue_state);
  uint64_t originalHead=uint64_t(postWork.GetValue(6144+18))|(uint64_t(postWork.GetValue(6144+19))<<32);

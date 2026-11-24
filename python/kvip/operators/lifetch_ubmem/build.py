@@ -9,6 +9,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from kvip.operators.lifetch.geometry import validate_history
 from kvip.runtime.build import build_failure
 
 
@@ -30,10 +31,7 @@ class UbmemGeometry:
             raise ValueError("UBmem LIFetch supports BS1..16 and 1..32 AICs; larger batches are not supported")
         if self.batch > self.aic_count:
             raise ValueError("UBmem LIFetch requests must fit concurrently resident LI cores")
-        if self.history % 256 or self.resident % 256 or not 2048 <= self.resident < self.history <= 210944:
-            raise ValueError("UBmem history/resident must align to 256, with 2048 <= resident < history <= 210944")
-        if self.resident > 131072:
-            raise ValueError("LIFetch hot bitmap supports resident <= 131072")
+        validate_history(self.history, self.resident)
         if self.heads not in (32, 64) or self.token_bytes not in (656, 2624):
             raise ValueError("UBmem supports 32/64 Indexer heads and 656/2624-byte KV rows")
         if not 1 <= self.intermediate_fetches <= 32 or not self.soc.startswith("Ascend950"):

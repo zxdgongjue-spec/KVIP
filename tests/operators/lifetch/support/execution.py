@@ -302,6 +302,11 @@ def run_config(path, shared_pool=None):
         code = run_real(config, path.parent)
         atomic_json(path.parent / 'worker-result.json', dict(exit_code=code))
         return code
+    if getattr(config, 'check_suite', None) == 'long-history':
+        from long_history import check_max_history
+        code = check_max_history(config, path.parent, run_path)
+        atomic_json(path.parent / 'worker-result.json', dict(exit_code=code))
+        return code
     if getattr(config, 'check_suite', None) == 'stateful':
         code = run_stateful(config, path.parent)
         atomic_json(path.parent / 'worker-result.json', dict(exit_code=code))
@@ -3936,8 +3941,9 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     cann, headers = kvaf_build_paths(build)
     soc = acl.get_soc_name()
     aics = query_device_resources(cann, config.device)['effective_aic']
-    _, registration, _ = _load_native_operators('c8_offload')
-    registration.require_a5_dsa_registration(('lidu_fused_batch_get_prepare_mtp_out',))
+    if not fused:
+        _, registration, _ = _load_native_operators('c8_offload')
+        registration.require_a5_dsa_registration(('lidu_fused_batch_get_prepare_mtp_out',))
     g = initial.geometry
     width = g['token_bytes']
     workers = 40 if fused and config.transport == 'urma' else 2
@@ -3978,7 +3984,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         expanded = SimpleNamespace(addresses=view.addresses[indices].contiguous(),
                                    valid=view.valid[indices].contiguous())
         page_addresses = expanded.addresses.cpu().numpy().view(np.uint64).reshape(g['batch'], -1)
-        logical_addresses = (page_addresses[:, :, None] + np.arange(128) * width).reshape(g['batch'], -1)
+        logical_addresses = (page_addresses[:, :, None] + np.arange(128, dtype=np.uint64) * np.uint64(width)).reshape(g['batch'], -1)
         if fused:
             if config.transport == 'urma':
                 (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers, soc=soc)

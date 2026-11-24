@@ -5,7 +5,13 @@ from kvip.runtime.loader import load_lifetch_library
 
 import numpy as np
 
-from kvip.operators.lifetch.geometry import final_aivs, li_geometry, prefetch_budget
+from kvip.operators.lifetch.geometry import (
+    MAX_SEQUENCE_TOKENS,
+    final_aivs,
+    li_geometry,
+    prefetch_budget,
+    validate_history,
+)
 from kvip.operators.lifetch.tiling import RuntimeShape
 from kvip.operators.lifetch.workspace import rotation_spec
 
@@ -41,10 +47,9 @@ class LIFetchBinding:
         if not isinstance(prefetch_rank_start, int) or not 1 <= prefetch_rank_start <= 2048:
             raise ValueError("prefetch_rank_start must be an integer in 1..2048")
         self.prefetch_rank_start = prefetch_rank_start
-        if history >= (1 << 26):
-            raise ValueError("Ranked LIFetch history must fit the 26-bit progress counter")
-        if resident > 131072:
-            raise ValueError("LIFetch hot bitmap supports resident <= 131072")
+        validate_history(history, resident)
+        if history > MAX_SEQUENCE_TOKENS and query_ends is None:
+            raise ValueError("The padded 512K Q4 workspace requires explicit exclusive query_ends")
         if not 1 <= batch <= 16:
             raise ValueError(f"LIFetch supports BS1..16; received BS={batch}; no legacy fallback")
         self.torch, self.owner = torch, owner

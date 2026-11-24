@@ -484,8 +484,18 @@ URMA 正式 LIFetch 使用窗口增量 TopK，最终 TopK 继续合并尚未覆�
 
 ABC 种子范围读取正式绑定的 `tail_bounds`，按 query 有效长度及输出容量裁剪。
 不传 ABC bounds 时不推断尾部命中，也不固定读取末尾 384 个 token。
-当前增量位图缓冲支持 history 不超过 131072；超出时绑定明确报错。
-UBmem 保留主线执行路径。
+512K 对应模型序列长度 524,288。Q4 推测解码最多额外占三个位置，按 256 对齐后
+物理行长为 524,544。此时须传入四个 Q 各自的有效结束位置，例如 524,288、
+524,289、524,290、524,291（右端不含）。最后 253 个位置是填充。
+热缓存仍为 2,048～131,072 个 token。URMA 在长序列窗口里按完整 token ID
+去重，并只为实际发出的预取设置标记。最终 TopK 仍在尾部按各 Q 的有效范围确定。
+
+从 KVIP 根目录执行以下命令，可在物理 NPU4 上分别验证 524,288 和 524,544 两种物理行长。
+测试使用 BS16、Q4 和本机临时 URMA 测试进程，核对 TopK、KV 内容、Index 顺序和每个 Q 的完成回执。
+
+```bash
+bash tests/operators/lifetch/check_long_history_npu4.sh /home/c00982601/CacheOS/ubmem-validation/recent-index-threshold
+```
 
 ```bash
 python tests/operators/lifetch/test_lifetch.py check \

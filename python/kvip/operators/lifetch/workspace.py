@@ -35,8 +35,7 @@ def rotation_spec(batch, history, resident, final, rounds, lanes, status_bytes):
 
 class LIFetchWorkspace:
     def __init__(self, torch, *, batch, history, aics, windows, device, pin_memory=True, index_heads=64, compute=None):
-        if history % 256:
-            raise ValueError("Original LIFetch history must align to 256 tokens")
+        tiling_geometry.validate_history(history)
         geometry = tiling_geometry.li_geometry(batch, "auto", windows, aics)
         self.inputs = self._make_inputs(torch, batch, device, pin_memory=pin_memory, history=history, index_heads=index_heads)
         self.query_lengths = torch.full((batch,), 4, dtype=torch.int32, device=device)

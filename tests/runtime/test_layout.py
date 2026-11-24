@@ -520,6 +520,25 @@ def test_diagnostic_legacy_tables_and_source_rounds_remain_separate():
     assert all("| -" in r for r in rows)  # One sample per source round; no fabricated quantiles.
 
 
+def test_lifetch_sequence_capacity_is_independent_of_resident_slots():
+    import pytest
+    from kvip.operators.lifetch.binding import LIFetchBinding
+    from kvip.operators.lifetch.geometry import trigger_tokens
+    from kvip.operators.lifetch_ubmem.build import UbmemGeometry
+
+    for history in (211200, 524288, 524544):
+        shape = UbmemGeometry(16, history, 131072, 32, 656, 32, 4, "Ascend950DT_9582")
+        assert trigger_tokens(shape.batch, history, shape.resident, intermediate_fetches=4)[-1] == history
+    with pytest.raises(ValueError, match="query_ends"):
+        LIFetchBinding(None, None, [], None, batch=16, history=524544, resident=16384)
+    for history, resident in ((524287, 16384), (524289, 16384), (524800, 16384), (524288, 131328)):
+        # Bad dimensions must fail before any library or NPU allocation is needed.
+        with pytest.raises(ValueError):
+            LIFetchBinding(None, None, [], None, batch=16, history=history, resident=resident)
+        with pytest.raises(ValueError):
+            UbmemGeometry(16, history, resident, 32, 656, 32, 4, "Ascend950DT_9582")
+
+
 def test_large_index_snapshot_workspace_is_sized_and_bound_per_request(monkeypatch):
     from types import SimpleNamespace
 
@@ -538,8 +557,8 @@ def test_large_index_snapshot_workspace_is_sized_and_bound_per_request(monkeypat
         kvip_lifetch_streaming_forward=lambda *args: 0,
     )
     # Short histories previously reserved too little space for a full snapshot;
-    # 128K must reuse the already larger allocation without growing it.
-    for history, resident in ((8192, 4096), (131328, 16384)):
+    # Long histories must reuse the already larger allocation without growing it.
+    for history, resident in ((8192, 4096), (131328, 16384), (524544, 16384)):
         device = torch.device("cpu")
         dummy = torch.zeros(1, dtype=torch.int64)
         rotating = SimpleNamespace(

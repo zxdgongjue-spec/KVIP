@@ -406,6 +406,12 @@ __aicore__ inline void SubmitFinal(uint32_t rt_tokenBytes,__gm__ Row* row,LocalT
 // Imported from batch_post.h
 
 namespace rotating {
+// Four 256-ID input rows must fit before the compact output in scratch.
+constexpr uint32_t kWindowOutputOffset = 23808 / sizeof(uint32_t);
+constexpr uint32_t kDirectWindowWords = kWindowOutputOffset - 4 * 256;
+constexpr uint32_t kWindowSetWords = 4096;
+static_assert(kWindowSetWords <= kDirectWindowWords);
+
 // One SIMT task covers every batch assigned to this AIV. Per-batch queues
 // remain independent. locations is dead until final resolve and stages IDs.
 
@@ -447,6 +453,10 @@ inline void BatchBuild(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_residen
                 }
                 TrackMapping(ctx,b,slot-rt_resident,token,i+1==n);
                 asc_stcg(map+token,slot);
+                if (rt_history / 32 > kDirectWindowWords) {
+                    auto covered = reinterpret_cast<__gm__ uint32_t*>(input64[37]);
+                    asc_atomic_or(covered + token / 32, 1U << (token % 32));
+                }
 
                 RecordPrefetchSlot(rt_resident,ctx,b,slot,token,physical);
             }
@@ -525,8 +535,19 @@ inline void PrepareCandidateWqes(uint32_t rt_resident,__ubuf__ uint32_t* ids,__u
     }
     asc_threadfence();
 }
-// One UB bit per token gives exact deduplication. Expand only newly inserted
-// compact IDs, never scan the history-sized set. Each warp reserves output once.
+// Hash collisions probe the next slot and compare the full token ID. If the
+// table is full, at least kCandidateCapacity distinct IDs were already saved.
+static_assert(kWindowSetWords >= kCandidateCapacity && (kWindowSetWords & (kWindowSetWords - 1)) == 0);
+__simt_callee__ inline bool InsertWindowToken(__ubuf__ uint32_t* keys, uint32_t token) {
+    uint32_t slot = (token * 0x9e3779b9U) >> 20;
+    for (uint32_t i = 0; i < kWindowSetWords; ++i) {
+        uint32_t previous = asc_atomic_cas(keys + slot, UINT32_MAX, token);
+        if (previous == UINT32_MAX || previous == token) return previous == UINT32_MAX;
+        slot = (slot + 1) & (kWindowSetWords - 1);
+    }
+    return false;
+}
+// Expand only newly inserted compact IDs. Each warp reserves output once.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
 inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
     __ubuf__ uint32_t* ids,__ubuf__ uint32_t* cfg,uint32_t stride,
@@ -542,8 +563,12 @@ inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
             // is authoritative even when the exported eligibility is stale.
             // Never create a second Index exchange for an admitted source.
             if(token/32<words && DirectTailSlot(ctx,batch,resident,token)==UINT32_MAX && asc_ldcg(mapping+token)==UINT32_MAX){
-                uint32_t bit=1U<<(token%32);
-                fresh=(asc_atomic_or(bits+token/32,bit)&bit)==0;
+                if (words > kDirectWindowWords) {
+                    fresh = InsertWindowToken(bits, token);
+                } else {
+                    uint32_t bit=1U<<(token%32);
+                    fresh=(asc_atomic_or(bits+token/32,bit)&bit)==0;
+                }
             }
         }
         uint32_t mask=asc_ballot(fresh),base=0;
@@ -554,7 +579,7 @@ inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
     }
     asc_syncthreads();
     // Earlier chunks still need all bits for dedup. Prune only after the last.
-    if(last && limit && cfg[40]>limit) {
+    if(words <= kDirectWindowWords && last && limit && cfg[40]>limit) {
         for(uint32_t i=tid;i<words;i+=256)bits[i]=0;
         asc_syncthreads();
         for(uint32_t i=tid;i<limit;i+=256){uint32_t token=ids[i];asc_atomic_or(bits+token/32,1U<<(token%32));}
@@ -582,7 +607,7 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
 
     auto cfg=work[4096];
     auto rowStorage=ids;
-    if(rt_batchedRows)ids=scratch[23808/4];
+    if(rt_batchedRows)ids=scratch[kWindowOutputOffset];
     GlobalTensor<uint32_t> allRows;allRows.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rows));
     if(rt_batchedRows) {
         if(lane<rt_batch) {
@@ -623,8 +648,11 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         uint32_t counts[4],maxCount=0;
         for(uint32_t q=0;q<4;++q){counts[q]=cfg.GetValue(128+q*32+6);if(counts[q]>maxCount)maxCount=counts[q];}
         cfg.SetValue(40,0);
-        Duplicate(scratch,uint32_t(0),rt_history/32);
-        auto input=scratch[rt_history/32];
+        const uint32_t historyWords = rt_history / 32;
+        const bool sparseWindow = historyWords > kDirectWindowWords;
+        const uint32_t setWords = sparseWindow ? kWindowSetWords : historyWords;
+        Duplicate(scratch, sparseWindow ? UINT32_MAX : 0U, setWords);
+        auto input=scratch[setWords];
         // Four 256-ID rows fit before the unchanged service output at 23808.
         // Dense tails use the same bounded loop; all reads finish before jobs
         // overwrite ctx->locations in the original downstream submission path.
@@ -641,7 +669,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
                 reinterpret_cast<__ubuf__ uint32_t*>(input.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),width,n[0],n[1],n[2],n[3],available<kCandidateCapacity?available:kCandidateCapacity,rt_history/32,start+256>=maxCount,
+                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),width,n[0],n[1],n[2],n[3],available<kCandidateCapacity?available:kCandidateCapacity,historyWords,start+256>=maxCount,
                 reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(b)*rt_history,ctx,b,rt_resident);
         }
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
@@ -676,11 +704,15 @@ if (rt_batchedRows) {
                 queueGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(queueAddress));
                 DataCopy(postInput,entityGm,48);DataCopy(postInput[48],queueGm,16);
                 SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-                GlobalTensor<int32_t> admitted;
-                admitted.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(post64.GetValue(37)));
-                SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
-                SetAtomicAdd<int32_t>();DataCopy(admitted,scratch.ReinterpretCast<int32_t>(),rt_history/32);SetAtomicNone();
-                SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
+                // Long windows publish from the capped job list in BatchBuild.
+                // Dropped nominations must remain eligible in the next window.
+                if (!sparseWindow) {
+                    GlobalTensor<int32_t> admitted;
+                    admitted.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(post64.GetValue(37)));
+                    SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
+                    SetAtomicAdd<int32_t>();DataCopy(admitted,scratch.ReinterpretCast<int32_t>(),historyWords);SetAtomicNone();
+                    SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
+                }
                 GlobalTensor<uint32_t> jobs;
                 jobs.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192);
                 SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);

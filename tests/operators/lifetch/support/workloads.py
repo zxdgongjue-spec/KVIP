@@ -151,7 +151,7 @@ def configuration(argv=None):
     if args.mode == 'check':
         if 'all' in args.suite and len(args.suite) != 1:
             parser.error('suite all cannot be combined with individual suites')
-        if set(args.suite) - {*CHECK_SUITES, 'all'}:
+        if set(args.suite) - {*CHECK_SUITES, 'long-history', 'all'}:
             parser.error('unknown check suite')
         if 'real' in args.suite and args.snapshot is None:
             parser.error('suite real requires --snapshot')

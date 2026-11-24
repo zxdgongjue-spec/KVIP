@@ -1,5 +1,20 @@
 """Native Q4/Q2 geometry scaled to the active logical device's AIC budget."""
 
+MAX_SEQUENCE_TOKENS = 512 * 1024
+# vLLM reserves three speculative positions after max_model_len for a Q4 step.
+MAX_HISTORY_TOKENS = ((MAX_SEQUENCE_TOKENS + 3 + 255) // 256) * 256
+MAX_RESIDENT_TOKENS = 128 * 1024
+
+
+def validate_history(history, resident=None):
+    """Check the full sequence capacity and the separately sized hot bitmap."""
+    if not 0 < history <= MAX_HISTORY_TOKENS or history % 256:
+        raise ValueError(f"LIFetch history must align to 256 and be in 1..{MAX_HISTORY_TOKENS}")
+    if resident is not None and (
+        not 2048 <= resident <= MAX_RESIDENT_TOKENS or resident >= history or resident % 256
+    ):
+        raise ValueError(f"LIFetch resident must align to 256, be in 2048..{MAX_RESIDENT_TOKENS} and below history")
+
 
 def prefetch_budget(prefetch_limit=512, window_limit=None, intermediate_fetches=8):
     """Limit speculative fetches only; final TopK repair has its own capacity."""
@@ -50,8 +65,9 @@ def trigger_tokens(batch, history, resident, tiling="auto", intermediate_fetches
     """Hot-ready first window, followed by evenly spaced cold boundaries."""
     rounds = li_geometry(batch, tiling, intermediate_fetches, aic_count)["intermediate_fetches"]
     cold_tiles = (history - resident) // 128
-    if history % 256 or resident % 256 or resident < 2048 or cold_tiles <= rounds:
-        raise ValueError("Requires aligned H>R>=2048 and more cold tiles than windows")
+    validate_history(history, resident)
+    if cold_tiles <= rounds:
+        raise ValueError("LIFetch requires more cold tiles than windows")
     return [resident + 128 * (cold_tiles * e // max(1, rounds - 1)) for e in range(rounds)]
 
 

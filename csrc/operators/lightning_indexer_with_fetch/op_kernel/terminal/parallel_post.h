@@ -1,5 +1,4 @@
 #pragma once
-// The original window's exact UB bitmap, partitioned by Q ownership.
 // Same terminal slot/record operations, with request-local pointers resolved once.
 __simt_callee__ inline void PrepareDirect(
  uint32_t resident,__ubuf__ uint32_t* ids,__ubuf__ uint32_t* slots,
@@ -17,7 +16,7 @@ __simt_callee__ inline void PrepareDirect(
 
 __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PackUniqueLocal(
  __ubuf__ uint32_t* input,uint32_t width,uint32_t n0,uint32_t n1,uint32_t n2,uint32_t n3,uint32_t q,
- __gm__ uint32_t* mapping,__ubuf__ uint32_t* ids,__ubuf__ uint32_t* counter,__ubuf__ uint32_t* bits,__gm__ rotating::Row* row,__gm__ uint64_t* addresses,__ubuf__ uint32_t* lo,__ubuf__ uint32_t* hi,uint32_t resident,__ubuf__ uint32_t* slots,__gm__ uint32_t* lru,uint32_t slotCapacity,bool preclaimed,bool capacityProbe,__gm__ uint32_t* headers,uint32_t priorSlots,__gm__ uint32_t* changes,__gm__ uint32_t* changeSlots,uint64_t tailRange,uint32_t tailCapacity,__gm__ uint32_t* boundTemplate,__gm__ KvafExecuteBatchGetKernelArgs* qArgs,__ubuf__ uint32_t* fullIds,__ubuf__ uint32_t* outputSlots,__ubuf__ uint32_t* error,__gm__ uint64_t* logical,__gm__ uint32_t* flags,uint32_t generation,uint32_t history,__gm__ uint32_t* selected,uint32_t outputBase,__gm__ uint64_t* update,uint32_t batch,uint32_t query){
+ __gm__ uint32_t* mapping,__ubuf__ uint32_t* ids,__ubuf__ uint32_t* counter,__gm__ rotating::Row* row,__gm__ uint64_t* addresses,__ubuf__ uint32_t* lo,__ubuf__ uint32_t* hi,uint32_t resident,__ubuf__ uint32_t* slots,__gm__ uint32_t* lru,uint32_t slotCapacity,bool preclaimed,bool capacityProbe,__gm__ uint32_t* headers,uint32_t priorSlots,__gm__ uint32_t* changes,__gm__ uint32_t* changeSlots,uint64_t tailRange,uint32_t tailCapacity,__gm__ uint32_t* boundTemplate,__gm__ KvafExecuteBatchGetKernelArgs* qArgs,__ubuf__ uint32_t* fullIds,__ubuf__ uint32_t* outputSlots,__ubuf__ uint32_t* error,__gm__ uint64_t* logical,__gm__ uint32_t* flags,uint32_t generation,uint32_t history,__gm__ uint32_t* selected,uint32_t outputBase,__gm__ uint64_t* update,uint32_t batch,uint32_t query){
  uint32_t tailBegin=uint32_t(tailRange),tailEnd=uint32_t(tailRange>>32);
  uint32_t counts[4]={n0,n1,n2,n3},tid=threadIdx.x,lane=tid%32;
  if(tid>=2 && tid<9 && tid!=5)counter[tid]=0; // The original block barrier publishes all control words.

@@ -2,6 +2,10 @@
 #include <stdint.h>
 // Immutable per-launch geometry, prepared before graph capture. No device discovery here.
 namespace rotating {
+// BSND decode carries four query positions; the three lookahead positions
+// share the model-length row, padded to the streaming 256-token alignment.
+constexpr uint32_t kMaxSequenceTokens = 512U * 1024;
+constexpr uint32_t kMaxHistoryTokens = (kMaxSequenceTokens + 3U + 255U) / 256U * 256U;
 struct RuntimeShape {
     uint32_t batch;
     uint32_t history;
@@ -30,8 +34,8 @@ inline uint32_t PrepareShape(RuntimeShape* s) {
     if (!s || !s->batch || s->batch>32 || !s->aicCount || s->aicCount>32 ||
         s->batch>s->aicCount || (s->indexHeads!=32 && s->indexHeads!=64) ||
         (s->tokenBytes!=656 && s->tokenBytes!=2624) || s->history%256 ||
-        s->resident%256 || s->resident<2048 || s->history<=s->resident ||
-        s->history>210944 || !s->rounds || s->rounds>32 || s->splitQ>1) return 100000;
+        s->resident%256 || s->resident<2048 || s->resident>131072 || s->history<=s->resident ||
+        s->history>kMaxHistoryTokens || !s->rounds || s->rounds>32 || s->splitQ>1) return 100000;
     s->splitQ = s->splitQ && 2*s->batch<=s->aicCount;
     s->liCores = s->batch*(1+s->splitQ);
     if(s->rounds>s->liCores)s->rounds=s->liCores;

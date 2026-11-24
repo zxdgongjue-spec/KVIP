@@ -236,10 +236,12 @@ from its bindings. Rebuild LIFetch after updating; it no longer depends on a sep
 
 Supported runtime dimensions: batch 1–16 (also limited by the concurrently resident AIV budget),
 index heads 32/64, 1–32 requested windows, 256-aligned history/resident with
-2048 <= resident <= 131072 and resident < history <= 210944. Existing UB/queue constraints are checked
-before launch. Q4, TopK 2048 and the existing element types remain fixed. These
-limits preserve the original kernel's storage budget; this is not unrestricted
-shape support. Each captured graph still owns its shape-specific buffers and
+a hot cache of 2,048–131,072 tokens and `resident < history`. A 512K model
+sequence has 524,288 tokens. For Q4 speculative decode the binding also accepts
+a physical history of 524,544 slots, which fits three lookahead positions after
+524,288 and rounds the allocation up to 256. Supply the four exclusive
+`query_ends` for this padded shape. Each Q can select tokens only below its own
+end. Final TopK remains 2,048. Each captured graph still owns its shape-specific buffers and
 launch object. Changing shape requires another binding/capture, not another binary.
 
 To check different batch/history/resident/head/window combinations with one
@@ -301,7 +303,7 @@ execution, graph replay, changed owner packing, and Index/payload consistency.
 UBmem uses one library per CANN/SoC build for batch 1–16, 32/64 Indexer
 heads and both 656/2624-byte records; runtime geometry is prepared before
 graph capture. History and hot capacity are 256-aligned, with
-`2048 <= resident < history <= 210944` and `resident <= 131072`. The binary
+`2048 <= resident < history <= 524544` and `resident <= 131072`. The binary
 cache key includes source and toolchain identity but not workload shape. The
 controller processes more than eight request rows per service lane in bounded
 chunks. BS > 16 is rejected at binding, without a legacy fallback. Generalized hot capacities require NPU validation. Compilation and

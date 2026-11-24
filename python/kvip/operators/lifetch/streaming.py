@@ -5,6 +5,8 @@ import ctypes
 
 import numpy as np
 
+from kvip.operators.lifetch.geometry import validate_history
+
 
 class StreamingLIFetchForward:
     def __init__(self, rotating, update, torch, prefetch_limit, *, fused_final=False, q_workers=None):
@@ -18,14 +20,9 @@ class StreamingLIFetchForward:
         self.shape_pointer = ctypes.byref(shape)
         if not 1 <= self.batch <= 16:
             raise ValueError(f"LIFetch supports BS1..16; received BS={self.batch}; no legacy fallback")
-        if not (
-            2048 <= self.resident <= 131072
-            and self.resident < self.history <= 210944
-            and self.history % 256 == 0
-            and self.resident % 256 == 0
-            and shape.indexHeads in (32, 64)
-        ):
-            raise ValueError("Unsupported LIFetch history/resident or Index head geometry")
+        validate_history(self.history, self.resident)
+        if shape.indexHeads not in (32, 64):
+            raise ValueError("LIFetch requires 32 or 64 Index heads")
         if not 0 <= prefetch_limit <= 2048:
             raise ValueError("LIFetch prefetch budget must be in 0..2048")
         keys, scales, addresses, logical = update.storage[:4]
