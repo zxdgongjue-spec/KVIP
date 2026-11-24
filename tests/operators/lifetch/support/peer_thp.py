@@ -54,6 +54,29 @@ def numa_placement(numa_maps, selected):
     return nodes
 
 
+def registration(line, allocations, unified):
+    """Associate a unified URMA session's registration with its owning CPU allocation."""
+    if unified and '[KVAF_CPU] DDR_ALLOCATED ' in line:
+        fields = dict(re.findall(r'(\w+)=([^\s]+)', line))
+        allocations[(int(fields['memory'], 0), int(fields['bytes'], 0))] = fields['page_mode']
+        return None
+    if '[KVAF_CPU] REGION_ALLOCATED ' not in line:
+        return None
+    fields = dict(re.findall(r'(\w+)=([^\s]+)', line))
+    size = int(fields['bytes'], 0)
+    if unified:
+        base = int(fields['memory'], 0)
+        mode = allocations.get((base, size))
+        if fields['page_mode'] != 'shared':
+            raise ValueError(f'unexpected unified registration: {line.strip()}')
+    else:
+        base = int(fields['base'], 0)
+        mode = fields['page_mode']
+    if size <= 0 or base <= 0 or mode != 'thp':
+        raise ValueError(f'unverified CPU THP allocation: {line.strip()}')
+    return fields, base, size
+
+
 def observe(args):
     deadline = time.monotonic() + args.timeout
     if args.pid <= 0 or args.timeout <= 0:
@@ -62,16 +85,14 @@ def observe(args):
     fd = os.open(f'/proc/{args.pid}', os.O_RDONLY | os.O_DIRECTORY)
     try:
         proc = Path(f'/proc/self/fd/{fd}')
+        allocations = {}
         with args.log.open(errors='replace') as log:
             while time.monotonic() < deadline:
                 for line in log:
-                    if '[KVAF_CPU] REGION_ALLOCATED ' not in line:
+                    registered = registration(line, allocations, args.unified_sdk)
+                    if registered is None:
                         continue
-                    fields = dict(re.findall(r'(\w+)=([^\s]+)', line))
-                    size = int(fields['bytes'], 0)
-                    base = int(fields['base'], 0)
-                    if size <= 0 or base <= 0 or fields.get('page_mode') != 'thp':
-                        raise ValueError(f'unexpected CPU region: {line.strip()}')
+                    fields, base, size = registered
                     low, high, selected = huge_bounds((proc / 'smaps').read_text(), base, size)
                     try:
                         nodes = numa_placement((proc / 'numa_maps').read_text(), selected)
@@ -93,6 +114,7 @@ def observe(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--unified-sdk', action='store_true')
     parser.add_argument('--pid', required=True, type=int)
     parser.add_argument('--log', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
