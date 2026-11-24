@@ -113,6 +113,23 @@ def worker(args):
     library_paths = set()
     label_pattern = re.compile(r'(measured|detail)/input(\d+)/round1$')
 
+    borrow_calls = {'measured': {}, 'detail': {}}
+    detail_ids = {}
+    mailboxes = set()
+    if args.borrow_audit:
+        import last_window_borrow as borrow
+
+        class BorrowForward(ex.StreamingForward):
+            def set_diagnostics(self, enabled):
+                borrow.set_terminal_only(self, enabled)
+
+            def diagnostic_cycles(self):
+                # Prefetch stage timestamps are explicitly disabled for the normal LI schedule.
+                return [dict(terminal_timeline=diagnostics.decode_terminal_timeline(
+                    self.terminal.times.cpu().tolist(), self.counter_clock_mhz))]
+
+        ex.StreamingForward = BorrowForward
+
     class Recorder(ex.CorrectnessRecorder):
         def check(self, label, callback):
             nonlocal current
@@ -127,10 +144,26 @@ def worker(args):
             super().__init__(*arguments, **kwargs)
             if self.forward.terminal is None:
                 raise RuntimeError('Production operator selected the legacy tail')
-            library_paths.add(Path(self.rotating.library._name).resolve())
+            lib = Path(self.rotating.library._name).resolve()
+            if args.borrow_audit:
+                borrow.check_workspace(self.forward)
+                address = self.rotating.rank_progress.data_ptr()
+                if address in mailboxes:
+                    raise ValueError('The independent calls unexpectedly share a window mailbox')
+                mailboxes.add(address)
+                if lib not in library_paths:
+                    borrow.check_device(lib)
+            library_paths.add(lib)
 
         def validate_index(self, sample, output):
             layout, valid = super().validate_index(sample, output)
+            if args.borrow_audit and current:
+                phase, call = current[1], int(current[2])
+                borrow.check_flags(*borrow.options(self.forward), phase == 'detail')
+                if call in borrow_calls[phase]:
+                    raise ValueError(f'Repeated normal LI mailbox: {phase}/{call}')
+                borrow_calls[phase][call] = borrow.decode_mailbox(
+                    self.rotating.rank_progress.cpu().numpy(), self.resident, self.history)
             if current and current[1] == 'detail':
                 call = int(current[2])
                 if call in ordered:
@@ -164,6 +197,8 @@ def worker(args):
 
         def validate(self, sample):
             super().validate(sample)
+            if args.borrow_audit and current and current[1] == 'detail':
+                detail_ids[int(current[2])] = fused_li_output(self)
             if current and current[1] == ('detail' if args.availability_only else 'measured'):
                 call = int(current[2])
                 if call in outputs:
@@ -224,6 +259,17 @@ def worker(args):
         production_terminal=True, profiled_terminal_kernel='v9_parallel_terminal',
         measured_calls=len(outputs), measured_kv_index_rows=len(outputs) * BATCH,
         ordered_diagnostic_calls=len(ordered), ordered_diagnostic_rows=sum(ordered.values())))
+    if args.borrow_audit:
+        if len(mailboxes) < CALLS:
+            raise ValueError('Missing independent window mailbox storage')
+        atomic_json(fused/'borrow_checks.json', dict(
+            device_text_sha256=borrow.check_device(library),
+            measured=borrow.summarize(borrow_calls['measured']),
+            terminal_only=borrow.summarize(borrow_calls['detail']),
+            calls={phase: [values[i] for i in range(CALLS)] for phase, values in borrow_calls.items()}))
+        if set(detail_ids) != set(range(CALLS)):
+            raise ValueError('Incomplete terminal-only TopK results')
+        np.save(fused/'terminal_only_ids.npy', np.stack([detail_ids[i] for i in range(CALLS)]), allow_pickle=False)
     if team_trace:
         if set(window_workers) != set(outputs):
             raise ValueError('Missing final-window worker diagnostic calls')
@@ -261,6 +307,14 @@ def main(args):
     inputs = next(iter(ReplaySequence(args.trace, args.group, (1, 1))))
     save_checked(fused, args.group, inputs, serial,
                  {**source, 'origin': 'completed-owner-archive', 'archive_path': str(args.owner_archive)}, outputs)
+    if args.borrow_audit:
+        extra_dir = fused/'terminal_only'
+        extra_dir.mkdir(exist_ok=False)
+        file = fused/'terminal_only_ids.npy'
+        save_checked(extra_dir, args.group, inputs, serial,
+                     {**source, 'origin': 'completed-owner-archive', 'archive_path': str(args.owner_archive)},
+                     np.load(file, allow_pickle=False))
+        file.unlink()
     result_file = fused / 'path_result.json'
     result = json.loads(result_file.read_text())
     result['topk_set_digests'] = [topk_fingerprint(value) for value in outputs]
@@ -290,7 +344,9 @@ if __name__ == '__main__':
     parser.add_argument('--revision', default=REVISION)
     parser.add_argument('--kvaf-server', required=True)
     parser.add_argument('--group', type=int, choices=(2, 4, 7, 10, 17), required=True)
-    parser.add_argument('--availability-only', action='store_true')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--availability-only', action='store_true')
+    modes.add_argument('--borrow-audit', action='store_true')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parsed = parser.parse_args()
     (worker if parsed.worker else main)(parsed)

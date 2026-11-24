@@ -40,10 +40,25 @@ if [[ $native != "$main_rev" ]]; then
     }
 fi
 availability=${PEER_AVAILABILITY_ONLY:-0}
+borrow_audit=${PEER_BORROW_AUDIT:-0}
+dual=aa6889e773c57ff737fd5ddec75307613d8949dc
+dual_archive="$area/li-window-five.gv5LRE"
 extra=()
+if [[ $borrow_audit == 1 ]]; then
+    if [[ $availability != 0 || $native != e308c913d10a77117665cb53ad7b56412ee6dc00 ||
+          ! -r "$dual_archive/candidate.txt" || $(<"$dual_archive/candidate.txt") != "$dual" ||
+          ! -r "$dual_archive/physical_npu.txt" || $(<"$dual_archive/physical_npu.txt") != 4 ]]; then
+        echo 'Expected the full-length tested candidate and its B24 NPU4 dual-cut archive' >&2
+        exit 1
+    fi
+    extra=(--borrow-audit)
+    prefix=li-last-window-borrow
+    arm_label=last_window_borrow
+elif [[ $native == e308c913d10a77117665cb53ad7b56412ee6dc00 || $borrow_audit != 0 ]]; then
+    echo 'The row-local helper requires PEER_BORROW_AUDIT=1 and its pinned native build' >&2
+    exit 2
+fi
 if [[ $availability == 1 ]]; then
-    dual=aa6889e773c57ff737fd5ddec75307613d8949dc
-    dual_archive="$area/li-window-five.gv5LRE"
     if [[ $native == "$dual" ]] || ! git -C "$repo" merge-base --is-ancestor "$dual" "$native" ||
        [[ ! -r $dual_archive/candidate.txt || $(<"$dual_archive/candidate.txt") != "$dual" ||
           ! -r $dual_archive/physical_npu.txt || $(<"$dual_archive/physical_npu.txt") != 4 ]]; then
@@ -84,6 +99,10 @@ if [[ ( $availability == 1 && ! -f $trace_header ) || ( $availability == 0 && -f
     echo 'Dedicated readiness diagnostic requires both the instrumented build and PEER_AVAILABILITY_ONLY=1' >&2
     exit 1
 fi
+if [[ $borrow_audit == 1 && ! -f "$main_src/csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer/last_window_row.h" ]]; then
+    echo 'Missing production row-local helper implementation' >&2
+    exit 1
+fi
 support="$reader_src/tests/operators/lifetch/support"
 printf '%s\n' "$main_rev" >"$out/main.txt"
 if [[ $native != "$main_rev" ]]; then
@@ -109,6 +128,10 @@ archive_for() {
 }
 for group in "${groups[@]}"; do
     archive=$(archive_for "$group")
+    if [[ $borrow_audit == 1 && ! -s "$dual_archive/g$group/li-window/thp.json" ]]; then
+        echo "Missing dual-cut G$group archive at $dual_archive" >&2
+        exit 1
+    fi
     if [[ $native != "$main_rev" && ! -s "$reference/g$group/mainline/thp.json" ]]; then
         echo "Missing upstream G$group archive at $reference" >&2
         exit 1
@@ -208,6 +231,9 @@ run_group() (
         "$PYTHON" -B "$support/main_five_report.py" "$out" "$group" "$archive" | tee -a "$out/summary.txt"
     else
         "$PYTHON" -B "$support/li_window_report.py" group "$out" "$group" "$archive" "$reference" | tee -a "$out/summary.txt"
+        if [[ $borrow_audit == 1 ]]; then
+            "$PYTHON" -B "$support/borrow_report.py" "$out" "$group" "$archive" "$dual_archive" | tee -a "$out/summary.txt"
+        fi
     fi
 )
 failed=()
@@ -241,5 +267,16 @@ if [[ $availability == 1 ]]; then
     echo "RETURN_FILE=$out/cold-publication.tar.gz"
 elif [[ $native != "$main_rev" ]]; then
     "$PYTHON" -B "$support/li_window_report.py" summary "$out" | tee -a "$out/summary.txt"
+fi
+if [[ $borrow_audit == 1 ]]; then
+    files=(candidate.txt reader.txt main.txt host.txt boot_id.txt physical_npu.txt kvaf.txt reference.txt summary.txt)
+    for g in "${groups[@]}"; do
+        path="g$g/li-window/results/mainline/cases/diagnose/fused"
+        files+=("g$g/comparison.json" "g$g/borrow_comparison.json" "$path/borrow_checks.json"
+                "$path/mainline_checks.json" "$path/score_topk_check.json" "$path/terminal_only/score_topk_check.json"
+                "$path/diagnose/round-1/full_attribution.json" "g$g/li-window/thp.json")
+    done
+    tar -C "$out" -czf "$out/last-window-borrow.tar.gz" "${files[@]}"
+    echo "RETURN_FILE=$out/last-window-borrow.tar.gz"
 fi
 echo "REPLAY_COMPLETE RESULT_ROOT=$out"
