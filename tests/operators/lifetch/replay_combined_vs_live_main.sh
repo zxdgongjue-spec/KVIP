@@ -4,7 +4,8 @@ set -euo pipefail
 repo=${1:?supply the local KVIP repository}
 reader=${2:?supply the full reader revision}
 run=${3:?supply the directory for this comparison}
-work=${PEER_G2_WORK:?supply the B24 validation workspace}
+export PEER_G2_WORK=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold}
+work=$PEER_G2_WORK
 native=20915a78b682378ea60889afbcd14b9a21123913
 main=d6cfd392f722dd3f96ef6e05175f503aac511dbb
 export PEER_PHYSICAL_NPU=4 ASCEND_RT_VISIBLE_DEVICES=4 PEER_LOCAL_ONLY=1
@@ -21,7 +22,7 @@ if [[ $(git -C "$run/reader" rev-parse HEAD) != "$reader" || -n $(git -C "$run/r
 fi
 scripts="$run/reader/$entry"
 printf 'PAIR_DIRECTORY=%s\n' "$run"
-printf 'RETRY_COMMAND=bash %q %q %q %q\n' "$scripts/replay_combined_vs_live_main.sh" "$repo" "$reader" "$run"
+printf 'RETRY_COMMAND=PEER_G2_WORK=%q bash %q %q %q %q\n' "$work" "$scripts/replay_combined_vs_live_main.sh" "$repo" "$reader" "$run"
 measure_arm() {
     local name=$1 script=$2 rev=$3 log="$run/$1.log" result
     if [[ -s "$run/$name.root" ]]; then

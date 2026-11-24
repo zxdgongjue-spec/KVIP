@@ -3,14 +3,14 @@ import argparse
 from pathlib import Path
 from statistics import mean
 
+from last_window_borrow import COMBINED as CANDIDATE, expected_text
 from li_restore_report import saved, stats
 from main_five_report import archived_oracle, case_folder, measured_parallel, read
 from peer_delta import pair_placement
 from reporting import atomic_json
+from unified_main_device import EXPECTED_TEXT as MAIN_TEXT, REVISION as UPSTREAM
 
 
-CANDIDATE = '20915a78b682378ea60889afbcd14b9a21123913'
-UPSTREAM = 'd6cfd392f722dd3f96ef6e05175f503aac511dbb'
 LEGACY_SDK = 'a2857b460a74704114fd30a849ae38666cc2c372'
 UNIFIED_SDK = '813f1750a50b7e6c92d5f5397f2fbc05befef6da'
 GROUPS = (10, 4, 17, 7, 2)
@@ -45,6 +45,10 @@ def compare(candidate, main, reader, output):
             arms.append(measured_parallel(root, group, arm, revision, owner, ids, receipt, inputs,
                                           verify_library=True))
         (old, _, main_ddr, main_proof, main_cfg), (new, _, cand_ddr, cand_proof, cand_cfg) = arms
+        combined_proof = read(case_folder(candidate, group, 'li-window') / 'borrow_checks.json')
+        if (main_proof.get('device_text_sha256') != MAIN_TEXT or
+                combined_proof.get('device_text_sha256') != expected_text(CANDIDATE)):
+            raise ValueError(f'G{group}: saved kernel evidence differs from independently built LI and terminal')
         if (main_proof['capture_operand_hashes'] != cand_proof['capture_operand_hashes']
                 or main_proof['runtime'] != cand_proof['runtime']
                 or main_ddr['bytes'] != cand_ddr['bytes']
