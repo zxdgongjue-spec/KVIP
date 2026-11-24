@@ -1101,7 +1101,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
 #if !V9_UBMEM
         if (!prefixActive_ && validS2Len >= runtimeShape_.resident &&
             (uint64_t(validS2Len)+127U)/128U*128U <= runtimeShape_.history) {
-            FinalIncremental(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, validS2Len);
+            FinalIncremental(info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx, validS2Len, queryRow < SIM_Q);
         } else if (validS2Len >= topkCount_) {
 #else
         if (validS2Len >= topkCount_) {

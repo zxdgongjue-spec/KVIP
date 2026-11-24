@@ -695,7 +695,7 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     }
     return true;
 }
-__aicore__ inline void FinalIncremental(uint32_t query,uint32_t valid) {
+__aicore__ inline void FinalIncremental(uint32_t query,uint32_t valid,bool sequenceSplit) {
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     if(runtimeShape_.rounds) {
         uint32_t lane=(query/4)%runtimeShape_.serviceLanes;
@@ -703,7 +703,12 @@ __aicore__ inline void FinalIncremental(uint32_t query,uint32_t valid) {
         // an optional intermediate window.
         while(!PreviousServiceReady(runtimeShape_.rounds,lane)) {}
     }
-    uint32_t half=rotating::UseSequenceSplit(runtimeShape_)?rotating::SequenceHalfWindow(runtimeShape_):0;
+    uint32_t scanEnd=runtimeShape_.history;
+#if KVIP_URMA_WINDOW_LI
+    if(sequenceSplit)scanEnd=rotating::ActiveScanHistory(runtimeShape_,
+        reinterpret_cast<__gm__ const uint32_t*>(ctx->queryEnds),query/4);
+#endif
+    uint32_t half=rotating::UseSequenceSplit(runtimeShape_)?rotating::SequenceHalfWindow(runtimeShape_,scanEnd):0;
     uint32_t alignedValid=(valid+127U)&~127U;
     incrementalFinalValid_=valid;
     AdvanceIncremental(query,alignedValid,half?alignedValid:0,half);

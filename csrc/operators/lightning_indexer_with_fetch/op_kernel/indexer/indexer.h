@@ -812,30 +812,44 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
             ScanSequenceHalf(shard * half, (shard + 1) * half, shard, loop, scaleLoop, true);
 #endif
         } else {
-            uint32_t halfTokens = rotating::SequenceHalfWindow(runtimeShape_);
+            uint32_t scanEnd = runtimeShape_.history;
+#if KVIP_URMA_WINDOW_LI
+            auto ends = reinterpret_cast<__gm__ const uint32_t*>(
+                reinterpret_cast<__gm__ rotating::Context*>(rotationContext_)->queryEnds);
+            scanEnd = rotating::ActiveScanHistory(runtimeShape_, ends, batch);
+#endif
+            uint32_t halfTokens = rotating::SequenceHalfWindow(runtimeShape_, scanEnd);
             uint32_t half = halfTokens / S2_BASE_SIZE;
             uint32_t serviceEpoch = rotating::ServiceRank(runtimeShape_.batch, runtimeShape_.splitQ,
                                                           aiCoreIdx) / runtimeShape_.serviceAics;
+            uint32_t serviceHalf = halfTokens;
             if ASCEND_IS_AIV {
 #if KVIP_URMA_WINDOW_LI
+                // Each scorer serves a lane which may own a different request.
+                const uint32_t lane = rotating::ServiceLane(runtimeShape_.batch, runtimeShape_.splitQ,
+                    runtimeShape_.serviceAics, aiCoreIdx, tmpBlockIdx % 2);
+                if (runtimeShape_.history > rotating::kShortQ4History && lane != batch % runtimeShape_.serviceLanes) {
+                    serviceHalf = rotating::SequenceHalfWindow(runtimeShape_,
+                        rotating::ActiveScanHistory(runtimeShape_, ends, lane));
+                }
                 vectorService.lastRowTeam_ = vectorService.HasLastRowTeam();
 #endif
                 vectorService.LoadSequenceSplitThresholds(batch);
                 vectorService.PrepareRotationProgress();
-                if (serviceEpoch == 0) vectorService.RotateFetch(0, halfTokens);
+                if (serviceEpoch == 0) vectorService.RotateFetch(0, serviceHalf);
             }
             uint32_t begin = resident_ / S2_BASE_SIZE + shard * half;
             for (uint32_t epoch = 1; epoch < runtimeShape_.rounds; ++epoch, begin += 2 * half) {
                 uint32_t end = begin + half;
-                if (end > runtimeShape_.history / S2_BASE_SIZE) end = runtimeShape_.history / S2_BASE_SIZE;
+                if (end > scanEnd / S2_BASE_SIZE) end = scanEnd / S2_BASE_SIZE;
                 ScanSequenceHalf(begin, end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
                 if ASCEND_IS_AIV {
-                    if (serviceEpoch == epoch) vectorService.RotateFetch(epoch, halfTokens);
+                    if (serviceEpoch == epoch) vectorService.RotateFetch(epoch, serviceHalf);
 #if KVIP_URMA_WINDOW_LI
                     if (epoch + 1 == runtimeShape_.rounds && serviceEpoch == 0 && vectorService.lastRowTeam_) {
                         uint32_t row = rotating::ServiceLane(runtimeShape_.batch, runtimeShape_.splitQ,
                             runtimeShape_.serviceAics, aiCoreIdx, tmpBlockIdx % 2);
-                        vectorService.HelpLastPair(row, halfTokens);
+                        vectorService.HelpLastPair(row, serviceHalf);
                     }
 #endif
                 }
