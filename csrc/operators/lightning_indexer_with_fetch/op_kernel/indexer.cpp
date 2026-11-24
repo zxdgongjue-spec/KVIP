@@ -1,6 +1,7 @@
 #include "kernel_operator.h"
 #if defined(__CCE_AICORE__)
 #include "context.h"
+#include "stage_trace.h"
 #if !V9_UBMEM
 #include "round_prepare.h"
 #endif
@@ -27,6 +28,15 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2) {
     using namespace AscendC; using namespace QLICommon;
     auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
+#if KVIP_STAGE_TRACE
+    constexpr bool traceBaseline = Phase != SequenceLiPhase::UnifiedScore && Phase != SequenceLiPhase::PrecomputedCold;
+    const uint64_t stageTrace = traceBaseline && parts == 2 ? KVIP_TRACE_WORKSPACE(P(15)) : 0;
+    constexpr uint32_t traceKernel = Phase == SequenceLiPhase::Hot ? kvip_trace::Hot :
+        Phase == SequenceLiPhase::Threshold ? kvip_trace::Threshold :
+        Phase == SequenceLiPhase::Cold ? kvip_trace::Cold : kvip_trace::Final;
+#endif
+    KVIP_TRACE_RECORD(kernelScope, stageTrace, traceKernel, kvip_trace::KernelBody, 0, 0);
+    KVIP_TRACE_RECORD(setupScope, stageTrace, traceKernel, kvip_trace::Setup, 0, 0);
     auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(a[14]));
     bool splitSequence = rotating::UseSequenceSplit(shape) && HasUniformLengths(shape, P(5), P(6));
     if constexpr (Phase != SequenceLiPhase::Hot) {
@@ -38,6 +48,9 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2) {
         bfloat16_t,float,float,uint16_t>;
     QLIKernel::QuantLightningIndexerKernel<Type> op;
     op.runtimeShape_ = shape;
+#if KVIP_STAGE_TRACE
+    op.stageTrace_ = stageTrace;
+#endif
 #if !V9_UBMEM
     op.rotationContext_ = P(14);
 #endif
@@ -57,6 +70,7 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2) {
         }
 #endif
     }
+    KVIP_TRACE_END(setupScope);
     if constexpr (Phase == SequenceLiPhase::Hot) {
         if (splitSequence) op.template ProcessSequenceSplit<Phase>(parts);
         else op.Process();

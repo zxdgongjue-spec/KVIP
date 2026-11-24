@@ -12,7 +12,7 @@ STAGES = ('hot_us', 'threshold_us', 'cold_service_us', 'terminal_us')
 COUNT_COLUMNS = ('prefetch_requests', 'final_get_requests', 'total_get_requests')
 
 
-def build_library(directory, cann, headers, soc, *, local_counts, hot_partition=False):
+def build_library(directory, cann, headers, soc, *, local_counts, hot_partition=False, stage_trace=False):
     from kvip.runtime.build import build_failure
 
     directory = Path(directory)
@@ -27,7 +27,8 @@ def build_library(directory, cann, headers, soc, *, local_counts, hot_partition=
         ['cmake', '-S', str(source), '-B', str(directory), '-DRUN_MODE=npu',
          f'-DASCEND_CANN_PACKAGE_PATH={cann}', f'-DKVAF_INCLUDE={headers}',
          f'-DSOC_VERSION={soc}', f'-DKVIP_SERVICE_LOCAL_COUNTS={option}',
-         f'-DKVIP_HOT_SCORE_PARTITION={"ON" if hot_partition else "OFF"}'],
+         f'-DKVIP_HOT_SCORE_PARTITION={"ON" if hot_partition else "OFF"}',
+         f'-DKVIP_STAGE_TRACE={"ON" if stage_trace else "OFF"}'],
         ['cmake', '--build', str(directory), '--target', 'v9_bridge', '--parallel', '2'],
     ]
     with log.open('w') as output:

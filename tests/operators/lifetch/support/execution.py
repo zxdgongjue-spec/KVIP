@@ -3944,6 +3944,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     hot_partition = getattr(config, 'mr25_hot_partition', None)
     cold_partition = getattr(config, 'mr25_cold_partition', None)
     unified_score = getattr(config, 'mr28_unified_score', None)
+    baseline_trace = getattr(config, 'msprof_baseline', False)
     partition_trial = hot_partition is not None or cold_partition is not None
     score_trial = partition_trial or unified_score is not None
     if score_trial and not (fused and handoff and config.transport == 'urma'
@@ -3951,14 +3952,23 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         raise ValueError('The Score trial uses the dense synthetic URMA Terminal comparison')
     if partition_trial and unified_score is not None:
         raise ValueError('Windowed partition and unified Score are separate trials')
+    if baseline_trace and (not fused or handoff or score_trial or config.transport != 'urma'
+                           or config.input != 'synthetic' or config.mode != 'bench'
+                           or config.iterations != 1 or len(config.batches) != 1
+                           or config.intermediate_fetches != 4 or config.prefetch_tokens <= 0):
+        raise ValueError('Baseline stage trace requires one synthetic P2 URMA case with W4 and prefetch enabled')
     torch.npu.set_device(config.device)
     device = torch.device(f'npu:{config.device}')
     stream = torch.npu.current_stream(device)
     cann, headers = kvaf_build_paths(build)
     soc = acl.get_soc_name()
     aics = query_device_resources(cann, config.device)['effective_aic']
-    _, registration, _ = _load_native_operators('c8_offload')
-    registration.require_a5_dsa_registration(('lidu_fused_batch_get_prepare_mtp_out',))
+    if baseline_trace:
+        if aics != 32 or 'Ascend950' not in soc:
+            raise ValueError(f'Baseline stage trace targets A5 with 32 effective AICs; got {soc}, AICs={aics}')
+    else:
+        _, registration, _ = _load_native_operators('c8_offload')
+        registration.require_a5_dsa_registration(('lidu_fused_batch_get_prepare_mtp_out',))
     g = initial.geometry
     width = g['token_bytes']
     workers = 40 if fused and config.transport == 'urma' else 2
@@ -4002,7 +4012,13 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         logical_addresses = (page_addresses[:, :, None] + np.arange(128) * width).reshape(g['batch'], -1)
         if fused:
             if config.transport == 'urma':
-                if handoff:
+                if baseline_trace:
+                    from terminal_handoff import build_library
+
+                    replay_stage('building P2/Terminal with opt-in source trace')
+                    library = build_library(directory / 'trace_build', cann, headers, soc,
+                                            local_counts=False, stage_trace=True)
+                elif handoff:
                     from terminal_handoff import build_library
 
                     library = build_library(config.handoff_build_dir, cann, headers, soc,
@@ -4062,6 +4078,35 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 raise
             else:
                 pending = False
+        if baseline_trace:
+            from baseline_stage_trace import StageBuffer, write_capture
+
+            shape = state.rotating.runtime_shape
+            if (state.forward.terminal is None or shape.liCores != 2 * g['batch']
+                    or shape.rounds != min(config.intermediate_fetches, shape.liCores)):
+                raise RuntimeError('Baseline stage trace requires the P2 and four-AIV Terminal route')
+            trace = StageBuffer(state)
+            replay_stage('calibrating device counter and warming up unmarked P2 kernels')
+            pending = True
+            counter_mhz = state.forward.calibrate_counter_mhz()
+            pending = False
+            for _ in range(config.warmup):
+                pending = True
+                state.reset()
+                state.forward()
+                stream.synchronize()
+                validate(initial)
+            pending = True
+            state.reset()
+            trace.attach()
+            replay_stage('capturing one marked P2/Terminal invocation')
+            state.forward()
+            stream.synchronize()
+            trace.detach()
+            raw = trace.read()
+            (directory / 'baseline_stage_trace.bin').write_bytes(raw)
+            validate(initial)
+            return write_capture(directory, raw, counter_mhz, state, library, config, soc)
         pending = True
         replay_stage('first eager forward and device completion')
         state.forward()
@@ -4258,6 +4303,9 @@ def run_synthetic_batch(config, directory, *, shared_pool=None):
             from workloads import payload
             pages.token_payload = lambda row, ids: payload(row, np.asarray(ids))
             folder = directory / f'case-b{batch}'
+            if getattr(config, 'msprof_baseline', False):
+                run_path(config, folder, sequence, pages, fused=True, shared_pool=pool)
+                continue
             if handoff:
                 result = run_path(config, folder / 'fused', sequence, pages, fused=True, shared_pool=pool)
                 atomic_json(folder / 'report.json', dict(batch=batch, miss_percent=config.miss_percent,

@@ -508,9 +508,12 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     // Same predecessor dependency as original FastService, moved before the
     // added calculation so private per-lane state cannot have two writers.
     if(epoch) {
+        KVIP_TRACE_BEGIN(predecessorScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+            Cold, ServicePredecessor, epoch, lane);
         auto previous=reinterpret_cast<__gm__ volatile rotating::Event*>(ctx->events)+(epoch-1)*runtimeShape_.serviceLanes+lane;
         do {kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ rotating::Event*>(previous)),64);}while(!previous->complete);
     }
+    KVIP_TRACE_BEGIN(windowScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_), Cold, LiWindow, epoch, lane);
     uint64_t begin=trace?GetSystemCycle():0;
     exportWindowCold_=true;rankedEpoch_=epoch;rankTrace_=trace;
     incrementalCalls_=0;incrementalScanned_=0;incrementalCandidates_=0;
@@ -585,6 +588,8 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
             incrementalNextEnd0_=Min(uint32_t(nextReady),cap);
             incrementalNextEnd1_=half?Min(uint32_t(nextReady>>32),cap):0;
         }
+        KVIP_TRACE_BEGIN(queryScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+            Cold, WindowQueryTopK, epoch, b * 4 + q);
         AdvanceIncremental(b*4+q,end0,end1,half);
     }
     JoinColdOutput();

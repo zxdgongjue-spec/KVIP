@@ -138,3 +138,27 @@ Set `KVIP_KVAF_ROOT` in both places to reuse a compatible dependency checkout. T
 Use `--batch 1` for the three-route smoke case, repeat `--batch` to select multiple sizes, or add `--comparison-dry-run` to check the plan offline. Optional `--prefetch-trace` records first-prefetch doorbell lead time relative to Terminal entry during a separate diagnostic replay.
 
 `score_over_full_p2` compares the two equal-scope full-history Score stages. `observed_kv_ready_over_native_p2` compares complete KV-ready time with native P2. Check `get_vs_native_p2` and `get_vs_full_p2` for equality of Get vectors, equality of per-request totals only, or different totals. Prefetch, final and total Get counts remain visible even when workloads differ. BS16 uses the same unified P2 entry in both full-history arms.
+
+## A5 msprof for the main fused baseline
+
+In the existing A5 container checkout, run one checked replay of main `d6cfd392`'s P2 path.
+
+```bash
+bash experiments/lifetch_mr23_service/run_mr28_baseline_msprof.sh
+```
+
+The default case is BS16, Q4, H128K, R16K, 32 index heads, miss 10%, requested W4, and the existing prefetch threshold with budget 512 and rank start 1024. The launcher accepts `--batch 1|2|4|8|16`, `--miss-percent N`, and optional `--warmup N`. The stock P2 planner reduces BS1 to two effective windows. Use `--dry-run` to see the plan. It uses the same container-visible `KVIP_A5_DEVICE` and unified KVAF service as the unified Score runner above. If the pinned dependencies are already built, start with the capture command. Otherwise use `--prepare-deps` on the networked host and `--build-deps` in the container. Both paths use the existing shared directory.
+
+The worker compiles an isolated diagnostic bridge and executes Hot Score, resident Threshold, Cold Score with rotating Service, then the current four-AIV-per-request Terminal. The instrumentation follows MR12's source-cycle scopes and leaves the default build flag off. Hot and Cold keep their original MIX partition. Threshold, candidate deduplication, prefetch, final Get, and Index publication retain the baseline ordering.
+
+Under the printed `Run output` directory, open these files in Perfetto or MindStudio Insight as appropriate:
+
+| Output | Contents |
+| --- | --- |
+| `msprof/PROF_*/mindstudio_profiler_output/msprof_*.json` | CANN's native timeline of actual kernel launches and task intervals |
+| `worker/miss*/case-b*/baseline_stage_trace.json` | Source stage scopes grouped by kernel and logical AIC/AIV lane, with window and request/query tags |
+| `worker/miss*/case-b*/baseline_stage_report.json` | Coverage, stage timing summary, Top2048/KV/Index verification and prefetch/final Get counts |
+| `worker/miss*/case-b*/baseline_stage_trace.bin` | Original source-cycle records used for the stage timeline |
+| `manifest.json` | Revisions, fixture, command, exit status and paths |
+
+The two timelines describe the same capture and use separate clocks. The source view uses a measured device-counter frequency. Scope spans include existing waits and marker overhead, so use uninstrumented runs for latency comparisons.

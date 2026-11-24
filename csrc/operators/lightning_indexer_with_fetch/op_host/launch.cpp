@@ -1,6 +1,9 @@
 #include "../op_kernel/pipeline_types.h"
 #include "api.h"
 #include "context.h"
+#if KVIP_STAGE_TRACE
+extern "C" uint32_t kvip_stage_trace_supported() { return 1; }
+#endif
 extern "C" uint32_t kvip_prepare_shape(rotating::RuntimeShape* shape) { return rotating::PrepareShape(shape); }
 extern "C" uint32_t aclrtlaunch_v9_init_kernel(uint32_t,void*,void*,uint32_t,void*,
     uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);

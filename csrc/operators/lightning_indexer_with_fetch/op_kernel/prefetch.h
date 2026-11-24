@@ -14,6 +14,7 @@ namespace kvaf_device { using ubmem_device::CleanCacheLines; constexpr uint32_t 
 #include "simt_api/device_warp_functions.h"
 #include "context.h"
 #include "indexer/ranked_candidates.h"
+#include "stage_trace.h"
 #include "../../common/lifetch/prefetch_budget.h"
 
 // Imported from direct_slots.h
@@ -565,7 +566,11 @@ inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
 template<bool captureIo, bool predecessorChecked=false>
 __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,
-    uint32_t sequenceHalfWindow, const __ubuf__ uint64_t* windowMetadata = nullptr) {
+    uint32_t sequenceHalfWindow, const __ubuf__ uint64_t* windowMetadata = nullptr
+#if KVIP_STAGE_TRACE
+    , uint64_t stageTrace = 0
+#endif
+) {
     uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;
     uint64_t scanBegin=0,candidateBegin=0,postBegin=0,begin=0;
     uint64_t firstDoorbell=0,lastDoorbell=0;
@@ -614,6 +619,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         uint32_t available=requests<ctx->prefetchLimit?ctx->prefetchLimit-requests:0;
         if(available>ctx->windowLimit)available=ctx->windowLimit;
         V9_FETCH_PROFILE(scanBegin=GetSystemCycle();)
+        KVIP_TRACE_BEGIN(selectScope, stageTrace, Cold, ServiceSelect, epoch, b);
         // Counts occupy spare incremental metadata, exported alongside TopK.
         GlobalTensor<uint32_t> compact;
         compact.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192);
@@ -660,7 +666,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         }
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
         candidateCount=cfg.GetValue(40);if(candidateCount>kCandidateCapacity)candidateCount=kCandidateCapacity;
-
+        KVIP_TRACE_END(selectScope);
 
         V9_FETCH_PROFILE(scanTicks+=GetSystemCycle()-scanBegin;totalCandidates+=candidateCount;)
         V9_FETCH_PROFILE(candidateBegin=GetSystemCycle();postBegin=0;)
@@ -672,6 +678,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
             missing=candidateCount;count=missing<available?missing:available;
             V9_FETCH_PROFILE(candidateTicks+=GetSystemCycle()-candidateBegin;)
             if(count) {
+                KVIP_TRACE_BEGIN(prepareScope, stageTrace, Cold, PrefetchPrepare, epoch, b);
                 const auto& args=reinterpret_cast<__gm__ KvafExecuteBatchGetKernelArgs*>(ctx->args)[b*2];
                 const uint64_t entityAddress=args.channel_entity,queueAddress=args.queue_state;
                 uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
@@ -708,6 +715,8 @@ if (rt_batchedRows) {
                         reinterpret_cast<__ubuf__ uint32_t*>(work[512].GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work[1024].GetPhyAddr()),
                         map,reinterpret_cast<__gm__ uint64_t*>(addresses),count,rt_resident+slots,ctx,b,reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddress(ctx->incremental,rt_batch,rt_history,b)));
                     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+                    KVIP_TRACE_END(prepareScope);
+                    KVIP_TRACE_BEGIN(submitScope, stageTrace, Cold, PrefetchSubmit, epoch, b);
                     if(captureIo && !firstDoorbell)firstDoorbell=GetSystemCycle();
                     SubmitWqesAt(rt_tokenBytes,entityAddress,queueAddress,output,work[1024],scratch,work,work[512],cfg,count,256,false,nullptr);
                     ++pending;
@@ -739,6 +748,7 @@ if (rt_batchedRows) {
     }
 if (rt_batchedRows) {
     if(postedCount) {
+        KVIP_TRACE_BEGIN(batchSubmitScope, stageTrace, Cold, PrefetchSubmit, epoch, lane);
         V9_FETCH_PROFILE(begin=GetSystemCycle();)
         uint32_t maxCount=0;
         for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
@@ -811,12 +821,24 @@ namespace rotating {
 __aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_splitQ,uint32_t rt_rounds,uint32_t rt_serviceAics,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer, uint32_t epoch, uint32_t core,
     uint32_t lane, LocalTensor<uint32_t> scratch, LocalTensor<uint16_t> flags,
     LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false,
-    const __ubuf__ uint64_t* windowMetadata = nullptr) {
+    const __ubuf__ uint64_t* windowMetadata = nullptr
+#if KVIP_STAGE_TRACE
+    , uint64_t stageTrace = 0
+#endif
+) {
     // RotateFetch calls AdvanceWindow first, which joins the same lane's
     // predecessor before touching incremental state. A second CQ-independent
     // poll here adds no ordering and delays the resumed score producer.
-    if(captureIo) FastService<true,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow, windowMetadata);
-    else FastService<false,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow, windowMetadata);
+    if(captureIo) FastService<true,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow, windowMetadata
+#if KVIP_STAGE_TRACE
+        , stageTrace
+#endif
+    );
+    else FastService<false,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow, windowMetadata
+#if KVIP_STAGE_TRACE
+        , stageTrace
+#endif
+    );
 }
 }
 

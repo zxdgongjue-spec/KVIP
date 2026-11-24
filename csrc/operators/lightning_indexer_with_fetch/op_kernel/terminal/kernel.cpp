@@ -2,6 +2,7 @@
 #include "window_types.h"
 #if defined(__CCE_AICORE__)
 #include "shadow_exchange_parallel.h"
+#include "stage_trace.h"
 using namespace pipeline_ab;
 // Reuse dead TopK scratch: the original hash checks and swap plans need 20.5 KiB.
 constexpr uint32_t TAIL_SRCSET=0, TAIL_DSTSET=2048, TAIL_PLAN_SRC=4096,
@@ -96,6 +97,11 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  if ASCEND_IS_AIV {
  auto runtime=reinterpret_cast<__gm__ terminal_runtime::Binding*>(binding);
  GM_ADDR arg=reinterpret_cast<GM_ADDR>(runtime->pipeline);
+#if KVIP_STAGE_TRACE
+ const uint64_t stageTrace=KVIP_TRACE_WORKSPACE(arg);
+#endif
+ KVIP_TRACE_BEGIN(kernelScope, stageTrace, Terminal, KernelBody, 0, GetBlockIdx());
+ KVIP_TRACE_BEGIN(setupScope, stageTrace, Terminal, Setup, 0, GetBlockIdx());
  auto a=reinterpret_cast<__gm__ pipeline_ab::Args*>(arg);auto ctx=reinterpret_cast<__gm__ rotating::Context*>(a->context);auto s=rotating::LoadRuntimeShape(ctx);
  bool profile=(runtime->options&1U)!=0;
  uint32_t b=GetBlockIdx()/4,q=GetBlockIdx()%4,query=b*4+q;
@@ -116,7 +122,11 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  QLIKernel::QLIVector<Type> op;QLICommon::ConstInfo ci{};ci.gSize=32;ci.qHeadNum=32;ci.kHeadNum=1;ci.headDim=128;ci.mBaseSize=64;ci.s1BaseSize=2;ci.s2BaseSize=128;ci.sparseCount=2048;ci.kSeqSize=s.history;ci.kCacheBlockSize=128;ci.maxBlockNumPerBatch=s.history/128;
  QLITilingData tiling{};op.SetStreamingWorkspace(arg);op.InitParams(ci,&tiling,false);op.InitBuffers(&pipe,false);op.SetRotationContext(reinterpret_cast<GM_ADDR>(ctx));
  GlobalTensor<uint16_t> scores;op.InitVecWorkspaceTensor(scores);GlobalTensor<bfloat16_t> weights;GlobalTensor<float> qs,ks;GlobalTensor<int32_t> out,blocks;out.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(ctx->selected));op.InitVecInputTensor(weights,qs,ks,out,blocks);
- op.AllocEventID();if(profile)ts[1]=GetSystemCycle();uint32_t topkError=op.TerminalQueryRuntime(query);
+ op.AllocEventID();if(profile)ts[1]=GetSystemCycle();
+ KVIP_TRACE_END(setupScope);
+ KVIP_TRACE_BEGIN(topkScope, stageTrace, Terminal, TerminalTopK, 0, query);
+ uint32_t topkError=op.TerminalQueryRuntime(query);
+ KVIP_TRACE_END(topkScope);
  uint32_t ownError=topkError;if(profile)ts[2]=GetSystemCycle();Signal(flags,q,generation);
  auto postWork=op.TerminalWork(),postIds=op.TerminalCompact(),postScratch=op.TerminalScratch();
  auto compact=reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048;
@@ -135,6 +145,7 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  auto headers=reinterpret_cast<__gm__ uint32_t*>(rotating::TopKHeader(ctx))+b*128;
  for(uint32_t capacityPass=0;capacityPass<2;++capacityPass){
  if(capacityPass){
+ KVIP_TRACE_BEGIN(capacityScope, stageTrace, Terminal, TerminalCapacity, capacityPass, query);
  Simt::VF_CALL<PrepareTerminalCapacity>(Simt::Dim3{32,1,1},
   reinterpret_cast<__ubuf__ uint32_t*>(postIds.GetPhyAddr()),candidates,mapping,
   headers,flags,generation,q,priorSlots,
@@ -159,8 +170,10 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  // Consume the original compact UB result directly; compact destinations use postWork.
  // MERGED_OUTPUT_BEFORE_WQE
  if(profile)ts[6]=GetSystemCycle();
+ KVIP_TRACE_BEGIN(resolveScope, stageTrace, Terminal, TerminalResolve, capacityPass, query);
  Simt::VF_CALL<PackUniqueLocal>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(postIds.GetPhyAddr()),width,counts[0],counts[1],counts[2],counts[3],q,mapping,reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch[bitmapWords].GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch.GetPhyAddr()),(reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+uint64_t(b)*1),reinterpret_cast<__gm__ uint64_t*>(rotating::RequestAddressTable(ctx,b,owner,s.history)),reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postWork[2048].GetPhyAddr()),s.resident,reinterpret_cast<__ubuf__ uint32_t*>(postWork[4096].GetPhyAddr()),activeLru,slotCapacity,capacityCounted,capacityPass==0,headers,priorSlots,(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity),(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+uint64_t(b)*rotating::kChangeCapacity),(uint64_t(tailEnd)<<32)|tailBegin,tailCapacity,reinterpret_cast<__gm__ uint32_t*>(runtime->templates)+query*32,args,reinterpret_cast<__ubuf__ uint32_t*>(op.TerminalIds().GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch[bitmapWords+8].GetPhyAddr()),(reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history),flags,generation,s.history,reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+query*2048,owner*uint32_t(ctx->outputStride),update,s.batch,query);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ KVIP_TRACE_END(resolveScope);
  if(!postScratch.GetValue(bitmapWords+14))break;
  }
  if(profile)ts[11]=GetSystemCycle();
@@ -168,6 +181,7 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  uint32_t slotBase=postScratch.GetValue(bitmapWords+1),all=own,offset=0;
  if(profile){ts[20]=own;ts[21]=all;ts[22]=slotBase;}
  if(profile)ts[12]=GetSystemCycle();
+ KVIP_TRACE_BEGIN(outputScope, stageTrace, Terminal, TerminalOutput, 0, query);
  auto ids=op.TerminalIds();
  GlobalTensor<uint32_t> output,slots;
  output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(runtime->logical)+query*2048);slots.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048);
@@ -175,18 +189,22 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  DataCopy(slots,postScratch,2048);
  PublishTerminalOutputs(update,s.batch,query,ids,postScratch,postScratch[bitmapWords+9],ctx->locations+uint64_t(query)*2048*4);
  uint32_t packError=postScratch.GetValue(bitmapWords+8);ownError|=packError;
+ KVIP_TRACE_END(outputScope);
  if(profile)ts[7]=GetSystemCycle();
  auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args->queue_state);
  uint64_t originalHead=uint64_t(postWork.GetValue(6144+18))|(uint64_t(postWork.GetValue(6144+19))<<32);
  uint64_t remote=(reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+uint64_t(b)*1)->addresses;
  if(own){
+  KVIP_TRACE_BEGIN(wqeScope, stageTrace, Terminal, TerminalWqe, 0, query);
   if(profile)ts[13]=GetSystemCycle();
   rotating::WriteReservedWqes(s.tokenBytes,args->channel_entity,args->queue_state,args->output,postWork[4096],postScratch,postWork,postWork[2048],postWork[6144],own,256,false,nullptr,offset,all,reinterpret_cast<__gm__ uint32_t*>(runtime->templates)+query*32,originalHead);
  }
  if(profile)ts[14]=GetSystemCycle();
  // Logical IDs are emitted with slots after all admissions are visible.
  if(profile)ts[15]=GetSystemCycle();
+ KVIP_TRACE_BEGIN(doorbellScope, stageTrace, Terminal, TerminalDoorbell, 0, query);
  rotating::CommitTerminalPost(args,originalHead,own,post);
+ KVIP_TRACE_END(doorbellScope);
  if(profile)ts[4]=GetSystemCycle();
 
  op.FreeEventID();
@@ -209,6 +227,7 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  }
  if(profile)ts[26]=GetSystemCycle();
+ KVIP_TRACE_BEGIN(indexScope, stageTrace, Terminal, TerminalIndex, 0, query);
  uint32_t indexError=0;
  Simt::VF_CALL<UpdateIndex>(Simt::Dim3{512,1,1},src,dst,n,s.resident,s.history,(reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*s.history*16),(reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*s.history),(reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride),(reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history),work,ctx,total,q,first,reinterpret_cast<__gm__ uint32_t*>(rotating::TopKHeader(ctx))+query*32,reinterpret_cast<__gm__ uint32_t*>(ctx->progress)+query*32,priorJournalCount,b,flags+(12+q)*32,false);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
@@ -256,10 +275,17 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  }
  ownError|=(indexError<<4);
+ KVIP_TRACE_END(indexScope);
  if(profile)ts[16]=GetSystemCycle();
+ KVIP_TRACE_BEGIN(cqScope, stageTrace, Terminal, TerminalGetCq, 0, query);
  uint64_t cqError=rotating::CompleteTerminalPost(args,post);
+ KVIP_TRACE_END(cqScope);
  if(profile)ts[24]=GetSystemCycle();
- if(q==1)rotating::CompleteTerminalPrefetch(ctx,b);
+ if(q==1) {
+   KVIP_TRACE_BEGIN(prefetchCqScope, stageTrace, Terminal, TerminalPrefetchCq, 0, query);
+   rotating::CompleteTerminalPrefetch(ctx,b);
+ }
+ KVIP_TRACE_BEGIN(finishScope, stageTrace, Terminal, TerminalFinish, 0, query);
  ownError|=uint32_t(cqError);
  if(profile)ts[17]=GetSystemCycle();
  if(profile)ts[9]=GetSystemCycle();

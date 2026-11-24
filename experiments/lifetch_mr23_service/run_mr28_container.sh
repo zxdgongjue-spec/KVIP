@@ -4,11 +4,11 @@ set -eo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 mode=${1:-}
 case "$mode" in
-    --mr25-handoff|--mr25-score|--mr28-unified-score) shift ;;
+    --mr25-handoff|--mr25-score|--mr28-unified-score|--mr28-baseline-msprof) shift ;;
 esac
 a5_root=${KVIP_A5_ROOT:-/home/w00568585/li-aligned-a5}
 unified_runtime=false
-if [[ $mode == --mr25-handoff || $mode == --mr25-score || $mode == --mr28-unified-score ]]; then
+if [[ $mode == --mr25-handoff || $mode == --mr25-score || $mode == --mr28-unified-score || $mode == --mr28-baseline-msprof ]]; then
     unified_runtime=true
     checkout=$(cd -- "$here/../.." && pwd)
     export KVIP_KVAF_ROOT="${KVIP_KVAF_ROOT:-"$a5_root/KVAF-unified-813f1750"}"
@@ -45,17 +45,21 @@ fi
 source "$cann_root/set_env.sh"
 export KVIP_PYTHON="${KVIP_PYTHON:-$(command -v python3)}"
 
-opp="${KVIP_LIDU_OPP:-"$lidu/_custom_opp/vendors/customize"}"
-if [[ -z ${KVIP_LIDU_OPP:-} && -f "$opp/op_api/lib/libcust_opapi.so" ]]; then
-    export KVIP_LIDU_OPP="$opp"
+if [[ $mode != --mr28-baseline-msprof ]]; then
+    opp="${KVIP_LIDU_OPP:-"$lidu/_custom_opp/vendors/customize"}"
+    if [[ -z ${KVIP_LIDU_OPP:-} && -f "$opp/op_api/lib/libcust_opapi.so" ]]; then
+        export KVIP_LIDU_OPP="$opp"
+    fi
+    if [[ -f "$opp/op_api/lib/libcust_opapi.so" ]]; then
+        export ASCEND_CUSTOM_OPP_PATH="$opp${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
+    fi
+    if compgen -G "$lidu/torch_extension/nanovllm_dsa_lidu_fused_batch_get_prepare_mtp/_C*.so" >/dev/null; then
+        export PYTHONPATH="$lidu/torch_extension${PYTHONPATH:+:$PYTHONPATH}"
+    fi
+    "$KVIP_PYTHON" -c 'import acl, torch, torch_npu, nanovllm_dsa_lidu_fused_batch_get_prepare_mtp'
+else
+    "$KVIP_PYTHON" -c 'import acl, torch, torch_npu'
 fi
-if [[ -f "$opp/op_api/lib/libcust_opapi.so" ]]; then
-    export ASCEND_CUSTOM_OPP_PATH="$opp${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
-fi
-if compgen -G "$lidu/torch_extension/nanovllm_dsa_lidu_fused_batch_get_prepare_mtp/_C*.so" >/dev/null; then
-    export PYTHONPATH="$lidu/torch_extension${PYTHONPATH:+:$PYTHONPATH}"
-fi
-"$KVIP_PYTHON" -c 'import acl, torch, torch_npu, nanovllm_dsa_lidu_fused_batch_get_prepare_mtp'
 if [[ $unified_runtime == true ]]; then
     PYTHONPATH="$KVIP_KVAF_ROOT/build-npu/python${PYTHONPATH:+:$PYTHONPATH}" \
         "$KVIP_PYTHON" -c 'import kvaf; getattr(kvaf.NpuRuntime, "get_graph_urma_resources")'
@@ -107,6 +111,8 @@ elif [[ $mode == --mr25-score ]]; then
     "$KVIP_PYTHON" -B "$here/run_mr25_score.py" "$@" 2>&1 | tee "$KVIP_AB_OUTPUT/console.log"
 elif [[ $mode == --mr28-unified-score ]]; then
     "$KVIP_PYTHON" -B "$here/run_mr28_unified_score.py" "$@" 2>&1 | tee "$KVIP_AB_OUTPUT/console.log"
+elif [[ $mode == --mr28-baseline-msprof ]]; then
+    "$KVIP_PYTHON" -B "$here/run_mr28_baseline_msprof.py" "$@" 2>&1 | tee "$KVIP_AB_OUTPUT/console.log"
 else
     bash "$here/run_a5.sh" "$@" 2>&1 | tee "$KVIP_AB_OUTPUT/console.log"
 fi

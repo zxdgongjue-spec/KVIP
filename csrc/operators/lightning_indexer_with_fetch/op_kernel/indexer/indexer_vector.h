@@ -1,3 +1,4 @@
+#include "stage_trace.h"
 #include "prefetch.h"
 #if KVIP_STREAMING_LI
 #include "pipeline_types.h"
@@ -132,6 +133,12 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
 #endif
     __aicore__ inline void RotateFetch(uint32_t epoch, uint32_t sequenceHalfWindow = 0) {
 #if !V9_UBMEM
+#if KVIP_STAGE_TRACE
+        const uint64_t stageTrace = KVIP_TRACE_WORKSPACE(streamingWorkspace_);
+        const uint32_t serviceLane = rotating::ServiceLane(runtimeShape_.batch, runtimeShape_.splitQ,
+            runtimeShape_.serviceAics, RotationCore(), blockId_ % 2);
+        KVIP_TRACE_BEGIN(serviceScope, stageTrace, Cold, ServiceBody, epoch, serviceLane);
+#endif
 #if KVIP_SERVICE_LOCAL_COUNTS
         const bool stagedMetadata = AdvanceWindow(epoch, sequenceHalfWindow);
         // The same lane owns this UB until Service returns. Keep the GM
@@ -156,6 +163,11 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
             streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U)
 #if !V9_UBMEM && KVIP_SERVICE_LOCAL_COUNTS
             , windowMetadata
+#elif KVIP_STAGE_TRACE && !V9_UBMEM
+            , nullptr
+#endif
+#if KVIP_STAGE_TRACE && !V9_UBMEM
+            , stageTrace
 #endif
         );
 #endif
