@@ -43,9 +43,9 @@ def build_library(directory, cann, headers, soc, *, local_counts, hot_partition=
 
 def bind_hot_score(state, *, partitioned):
     """Select the first launch on an already bound dense Terminal pipeline."""
-    inputs = state.workspace.inputs
-    if not (inputs.query_lengths.eq(4).all().item()
-            and inputs.key_lengths.eq(state.history).all().item()):
+    workspace = state.workspace
+    if not (workspace.query_lengths.eq(4).all().item()
+            and workspace.key_lengths.eq(state.history).all().item()):
         raise ValueError('Hot partition comparison requires dense Q4 and full key lengths')
     forward = state.forward
     if forward.terminal is None:

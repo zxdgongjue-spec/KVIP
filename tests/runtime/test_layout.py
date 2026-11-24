@@ -3,6 +3,8 @@
 import importlib
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -253,6 +255,62 @@ def test_parallel_forward_uses_live_stream_without_rebinding(monkeypatch):
     monkeypatch.setattr(StreamingLIFetchForward, "__call__", lambda self: calls.append("legacy"))
     forward()
     assert calls[-1] == "legacy"
+
+
+@pytest.mark.parametrize(("batch", "parts"), [(1, 32), (2, 16), (4, 8), (8, 4), (16, 2)])
+def test_hot_score_binds_real_workspace_lengths(batch, parts):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import torch
+    from terminal_handoff import bind_hot_score
+
+    from kvip.operators.lifetch.forward import LIFetchForward
+    from kvip.operators.lifetch.workspace import LIFetchWorkspace
+
+    history = 4096
+    workspace = LIFetchWorkspace(
+        torch,
+        batch=batch,
+        history=history,
+        aics=32,
+        windows=4,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        index_heads=32,
+    )
+    storage = SimpleNamespace(history=history, keys=object(), scales=object())
+    arguments = workspace.arguments(storage)
+    assert arguments[5] is workspace.query_lengths
+    assert arguments[6] is workspace.key_lengths
+
+    for partitioned in (False, True):
+        baseline, uniform = Mock(return_value=0), Mock(return_value=0)
+        library = SimpleNamespace(
+            kvip_partitioned_hot_score_parts=Mock(return_value=parts),
+            kvip_parallel_tail_hot_partitioned_forward=uniform,
+        )
+        stream = SimpleNamespace(npu_stream=404)
+        forward = LIFetchForward.__new__(LIFetchForward)
+        forward.rotating = SimpleNamespace(
+            library=library,
+            owner=SimpleNamespace(lease=SimpleNamespace(check_stream=lambda: stream)),
+        )
+        forward.shape_pointer = 303
+        forward.bindings = SimpleNamespace(data_ptr=lambda: 101)
+        forward.terminal = SimpleNamespace(workspace=SimpleNamespace(data_ptr=lambda: 202))
+        forward.terminal_function = baseline
+        state = SimpleNamespace(workspace=workspace, history=history, forward=forward)
+
+        use_uniform = partitioned and parts > 2
+        assert bind_hot_score(state, partitioned=partitioned) == (parts if use_uniform else 2)
+        forward()
+        (uniform if use_uniform else baseline).assert_called_once_with(101, 202, 404, 303)
+        (baseline if use_uniform else uniform).assert_not_called()
+
+    workspace.key_lengths[0] = history - 1
+    with pytest.raises(ValueError, match="full key lengths"):
+        bind_hot_score(state, partitioned=True)
 
 
 def test_terminal_counts_do_not_invent_retired_admission_identities():
