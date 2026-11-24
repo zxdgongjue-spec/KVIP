@@ -17,6 +17,37 @@ GROUPS = (10, 4, 17, 7, 2)
 MAIN = "609fa26fd715f9409bbe74e1b2d3685c58dfb0cf"
 SAMPLES_PER_ROW = 32
 WIDTH = 128
+# From the 20-call B24 ready trace. The first row most often finished cold
+# scoring last among non-final-window workers. The second was most often the
+# last W3 service row. Ties use the smaller row number.
+CRITICAL_ROWS = {10: (0, 13), 4: (0, 12), 17: (2, 8), 7: (2, 14), 2: (0, 14)}
+
+
+def full_rows(inputs, group):
+    rows = np.array(CRITICAL_ROWS[group], dtype=np.int32)
+    history = inputs.geometry['history']
+    if (inputs.query.shape != (16, 4, 32, 128) or history != 131328
+            or inputs.geometry['resident'] != 16384):
+        raise ValueError(f'G{group} incompatible full-row geometry')
+    layout = inputs.captured_layout[rows]
+    if not np.all(np.sort(layout, axis=1) == np.arange(history)):
+        raise ValueError(f'G{group} invalid captured physical-to-logical layout')
+
+    def physical(source):
+        return np.stack([source[row][ids] for row, ids in zip(rows, layout)])
+
+    def query_physical(source):
+        return np.stack([np.take(source[row], ids, axis=1) for row, ids in zip(rows, layout)])
+
+    return dict(rows=rows, layout=layout, keys=physical(inputs.logical_keys),
+                key_scale=physical(inputs.logical_scales),
+                score_keys=query_physical(inputs.logical_score_keys),
+                score_valid=query_physical(inputs.logical_score_valid),
+                address_valid=physical(inputs.logical_address_valid),
+                query=inputs.query[rows], weights=inputs.weights[rows],
+                query_scale=inputs.query_scale[rows], query_ends=inputs.query_ends[rows],
+                tail_bounds=inputs.tail_bounds[rows], hot_valid=inputs.captured_hot_valid[rows],
+                lru=inputs.captured_lru[rows])
 
 
 def sampled_arrays(inputs, group):
@@ -74,14 +105,15 @@ def file_digest(path):
         return hashlib.file_digest(file, 'sha256').hexdigest()
 
 
-def run(work, repo):
+def run(work, repo, *, critical_rows=False):
     archive = work / 'peer-baseline/main-five.hF6qQ8'
     if (archive/'main.txt').read_text().strip() != MAIN or (archive/'physical_npu.txt').read_text().strip() != '4':
         raise ValueError(f'unexpected archive {archive}')
     reader = (archive/'reader.txt').read_text().strip()
     if not re.fullmatch(r'[0-9a-f]{40}', reader):
         raise ValueError(f'invalid archived reader {reader!r}')
-    output = Path(tempfile.mkdtemp(prefix='li-page-sample.', dir=work))
+    label = 'li-full-critical-rows' if critical_rows else 'li-page-sample'
+    output = Path(tempfile.mkdtemp(prefix=label + '.', dir=work))
     # Load the same immutable decoder the mainline run used. Only these two
     # modules are needed for archived DP captures and merged captures.
     with tempfile.TemporaryDirectory(dir=output) as scratch:
@@ -115,16 +147,20 @@ def run(work, repo):
             if checked['production_revision'] != MAIN or hashes != checked['capture_operand_hashes']:
                 raise ValueError(f'G{group} operands differ from the tensors used for the timed run')
             export = Path(scratch)/f'g{group}.npz'
-            np.savez_compressed(export, **sampled_arrays(inputs, group))
+            arrays = full_rows(inputs, group) if critical_rows else sampled_arrays(inputs, group)
+            np.savez_compressed(export, **arrays)
             output_hashes[export.name] = file_digest(export)
-            print(f'G{group} rows=16 pages_per_row={SAMPLES_PER_ROW} compressed_bytes={export.stat().st_size}', flush=True)
-            del inputs, seq
+            selection = (f'rows={CRITICAL_ROWS[group]} pages_per_row={inputs.geometry["history"] // WIDTH}'
+                         if critical_rows else f'rows=16 pages_per_row={SAMPLES_PER_ROW}')
+            print(f'G{group} {selection} compressed_bytes={export.stat().st_size}', flush=True)
+            del inputs, seq, arrays
         metadata = Path(scratch)/'manifest.json'
         metadata.write_text(json.dumps(
-            dict(archive=str(archive), main=MAIN, reader=reader, pages_per_row=SAMPLES_PER_ROW,
-                 payload='Lightning Indexer Q, Index keys, weights, scales, score keys and physical page numbers',
+            dict(archive=str(archive), main=MAIN, reader=reader, pages_per_row=131328 // WIDTH if critical_rows else SAMPLES_PER_ROW,
+                 payload=('Two full-length LI rows in captured physical order, with score validity and LRU'
+                          if critical_rows else 'Lightning Indexer Q, Index keys, weights, scales, score keys and physical page numbers'),
                  files=output_hashes), indent=2) + '\n')
-        result = output/'li-page-sample.tar'
+        result = output/(label + '.tar')
         staging = Path(scratch)/result.name
         with tarfile.open(staging, 'w') as tar:
             for path in sorted(Path(scratch).glob('*.npz')) + [metadata]:
@@ -137,5 +173,7 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--work', type=Path, default=Path('/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold'))
     p.add_argument('--repo', type=Path, default=Path('/home/c00982601/CacheOS/vLLM-DSA/third_party/KVIP'))
+    p.add_argument('--full-critical-rows', action='store_true',
+                   help='export all pages for the two recorded critical rows per group')
     args = p.parse_args()
-    run(args.work, args.repo)
+    run(args.work, args.repo, critical_rows=args.full_critical_rows)
