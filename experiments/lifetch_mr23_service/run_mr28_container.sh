@@ -2,6 +2,11 @@
 set -eo pipefail
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+mr25_handoff=false
+if [[ ${1:-} == --mr25-handoff ]]; then
+    mr25_handoff=true
+    shift
+fi
 a5_root=${KVIP_A5_ROOT:-/home/w00568585/li-aligned-a5}
 export KVIP_KVAF_ROOT="${KVIP_KVAF_ROOT:-"$a5_root/KVAF-score-t2-1c131038"}"
 export KVIP_A5_DEVICE="${KVIP_A5_DEVICE:-0}"
@@ -63,4 +68,8 @@ if ! kvaf_port_open; then
     fi
 fi
 
-bash "$here/run_a5.sh" "$@" 2>&1 | tee "$KVIP_AB_OUTPUT/console.log"
+if "$mr25_handoff"; then
+    "$KVIP_PYTHON" -B "$here/run_mr25_handoff.py" "$@" 2>&1 | tee "$KVIP_AB_OUTPUT/console.log"
+else
+    bash "$here/run_a5.sh" "$@" 2>&1 | tee "$KVIP_AB_OUTPUT/console.log"
+fi

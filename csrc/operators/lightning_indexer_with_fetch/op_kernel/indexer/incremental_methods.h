@@ -514,7 +514,8 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     uint64_t begin=trace?GetSystemCycle():0;
     exportWindowCold_=true;rankedEpoch_=epoch;rankTrace_=trace;
     incrementalCalls_=0;incrementalScanned_=0;incrementalCandidates_=0;
-    incrementalMetadataActive_=(runtimeShape_.batch+runtimeShape_.serviceLanes-1)/runtimeShape_.serviceLanes<=2;
+    const bool stagedMetadata=(runtimeShape_.batch+runtimeShape_.serviceLanes-1)/runtimeShape_.serviceLanes<=2;
+    incrementalMetadataActive_=stagedMetadata;
     if(incrementalMetadataActive_) {
     GlobalTensor<uint32_t> progressSource;progressSource.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
     for(uint32_t b=lane,i=0;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes,i+=128)
@@ -593,7 +594,7 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
         stamp[2]=begin;stamp[3]=GetSystemCycle();stamp[4]=uint64_t(incrementalCalls_) | (uint64_t(incrementalScanned_)<<16) | (uint64_t(incrementalCandidates_)<<40);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event),128);
     }
-    return true;
+    return stagedMetadata;
 }
 __aicore__ inline void FinalIncremental(uint32_t query,uint32_t valid) {
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);

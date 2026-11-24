@@ -3671,6 +3671,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
     graph = torch.npu.NPUGraph()
     capture = torch.npu.Stream()
     checks = CorrectnessRecorder()
+    handoff = getattr(config, 'mr25_handoff', None)
+    handoff_samples, handoff_counts = [], []
     pending = False
     def replay():
         nonlocal pending
@@ -3759,6 +3761,16 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             measured = profile_graph_batch(torch, TrackedGraph(), calls=len(states), folder=folder,
                                            serial=not fused, transport=config.transport, stream=stream)
             validate_all(inputs, 'measured')
+            if handoff:
+                from terminal_handoff import request_counts, terminal_stages
+
+                handoff_samples.extend(terminal_stages(measured))
+                for index, state in enumerate(states):
+                    rotating = state.rotating
+                    records = request_counts(rotating.rows.cpu().numpy(), rotating.final_posts.cpu().numpy(),
+                                             rotating.rounds, config.prefetch_tokens)
+                    handoff_counts.extend(dict(source_round=inputs.source_round, invocation=index, **record)
+                                          for record in records)
             rounds[inputs.source_round] = measured['timing']
             samples = []
             for i, item in enumerate(measured['samples']):
@@ -3858,9 +3870,12 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                        inter_kernel_gap_mean_us=sum(t['inter_kernel_gap_mean_us'] for t in rounds.values())/len(rounds),
                        overlap_mean_us=sum(t['overlap_mean_us'] for t in rounds.values())/len(rounds),
                        outside_invocations_mean_us=sum(t['outside_invocations_mean_us'] for t in rounds.values())/len(rounds))
-        return dict(rounds=rounds, all_rounds=overall, correctness=checks.status,
-                    failures=checks.failures, sequence_graph_sum=dict(
-                        mean_us=sum(t['mean_us'] for t in rounds.values()), samples=1))
+        result = dict(rounds=rounds, all_rounds=overall, correctness=checks.status,
+                      failures=checks.failures, sequence_graph_sum=dict(
+                          mean_us=sum(t['mean_us'] for t in rounds.values()), samples=1))
+        if handoff:
+            result.update(handoff_stage_samples=handoff_samples, pipeline_counts=handoff_counts)
+        return result
     except BaseException as error:
         if pending:
             NativeFetchSession.quarantine('batched_replay_completion_uncertain', error)
@@ -3886,6 +3901,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     directory.mkdir(parents=True, exist_ok=True)
     initial = next(iter(sequence))
     build = config.kvaf_root / 'build-npu'
+    handoff = getattr(config, 'mr25_handoff', None)
     torch.npu.set_device(config.device)
     device = torch.device(f'npu:{config.device}')
     stream = torch.npu.current_stream(device)
@@ -3942,7 +3958,13 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         logical_addresses = (page_addresses[:, :, None] + np.arange(128) * width).reshape(g['batch'], -1)
         if fused:
             if config.transport == 'urma':
-                (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers, soc=soc)
+                if handoff:
+                    from terminal_handoff import build_library
+
+                    library = build_library(config.handoff_build_dir, cann, headers, soc,
+                                            local_counts=handoff == 'local_counts')
+                else:
+                    (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers, soc=soc)
             else:
                 shape = UbmemGeometry(g['batch'], g['history'], g['resident'], g['heads'], width,
                                       aics, config.intermediate_fetches, soc)
@@ -3952,6 +3974,10 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
                 prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024))
+            if handoff:
+                shape = state.rotating.runtime_shape
+                if state.forward.terminal is None or shape.liCores != 2 * g['batch']:
+                    raise RuntimeError('MR25 handoff comparison requires the P2 sequence-split Terminal route')
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
@@ -4010,6 +4036,10 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             result.update(transport=config.transport, path='fused' if fused else 'serial',
                           runtime_workers=shared_pool.workers if borrowed else workers, geometry=g,
                           input_paths=[str(ref.manifest_path) for refs in sequence.rounds for ref in refs])
+            if handoff:
+                result['handoff_route'] = dict(mode=handoff, library=str(library), soc=soc, effective_aic=aics,
+                                              score_parts=2, score_blocks=shape.liCores, windows=shape.rounds,
+                                              service_lanes=shape.serviceLanes, terminal_tasks=4 * g['batch'])
             atomic_json(directory / 'path_result.json', result)
             return result
         state.reset()
@@ -4102,6 +4132,11 @@ def run_synthetic_batch(config, directory, *, shared_pool=None):
         prepare_compact_fixture(fixture, config.history, config.resident, config.miss_percent,
                                 config.index_heads, config.seed)
         pool.fixtures[key] = fixture
+    handoff = getattr(config, 'mr25_handoff', None)
+    if handoff:
+        from terminal_handoff import fixture_hash
+
+        fixture_sha256 = fixture_hash(fixture)
     h, r, heads = config.history, config.resident, config.index_heads
     # The previous synthetic runner treats physical fixture rows as logical
     # tokens. Preserve that identity and the exact Q/Index/scale bit patterns.
@@ -4140,6 +4175,14 @@ def run_synthetic_batch(config, directory, *, shared_pool=None):
             from workloads import payload
             pages.token_payload = lambda row, ids: payload(row, np.asarray(ids))
             folder = directory / f'case-b{batch}'
+            if handoff:
+                result = run_path(config, folder / 'fused', sequence, pages, fused=True, shared_pool=pool)
+                atomic_json(folder / 'report.json', dict(batch=batch, miss_percent=config.miss_percent,
+                            input='synthetic', execution='COMPLETED', correctness=result['correctness'],
+                            fixture_sha256=fixture_sha256, route=result['handoff_route'],
+                            timing={'prototype_with_update': result['all_rounds']}))
+                failed |= result['correctness'] != 'PASS'
+                continue
             results = {}
             for name in ('serial', 'fused'):
                 results[name] = run_path(config, folder / name, sequence, pages,

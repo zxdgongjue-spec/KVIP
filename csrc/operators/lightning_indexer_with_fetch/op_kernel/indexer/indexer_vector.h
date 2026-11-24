@@ -103,7 +103,15 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
 #endif
     __aicore__ inline void RotateFetch(uint32_t epoch, uint32_t sequenceHalfWindow = 0) {
 #if !V9_UBMEM
+#if KVIP_SERVICE_LOCAL_COUNTS
+        const bool stagedMetadata = AdvanceWindow(epoch, sequenceHalfWindow);
+        // The same lane owns this UB until Service returns. Keep the GM
+        // publication for later epochs and all existing ordering edges.
+        const __ubuf__ uint64_t* windowMetadata = stagedMetadata && sequenceHalfWindow
+            ? reinterpret_cast<const __ubuf__ uint64_t*>(incrementalMetadata_.GetPhyAddr()) : nullptr;
+#else
         AdvanceWindow(epoch,sequenceHalfWindow);
+#endif
 #endif
         // Join this producer's hit publication. Other producers remain free.
         PipeBarrier<PIPE_ALL>();
@@ -116,7 +124,11 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow);
 #else
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow,
-            streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U));
+            streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U)
+#if !V9_UBMEM && KVIP_SERVICE_LOCAL_COUNTS
+            , windowMetadata
+#endif
+        );
 #endif
     }
     __aicore__ inline void LoadSequenceSplitThresholds(uint32_t batch) {

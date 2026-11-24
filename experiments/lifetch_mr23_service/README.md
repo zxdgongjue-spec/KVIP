@@ -1,4 +1,20 @@
-# MR23 A5 Service comparison
+# A5 LIFetch Service comparisons
+
+## MR25 Terminal paired benchmark
+
+Run `run_mr25_handoff.sh` from the MR !28 checkout in `lifetch-aligned-a5`.
+
+```bash
+bash /home/w00568585/li-aligned-a5/KVIP-mr28/experiments/lifetch_mr23_service/run_mr25_handoff.sh
+```
+
+The launcher builds two libraries from this checkout using the pinned KVAF and the same CANN toolchain. `main` builds with `KVIP_SERVICE_LOCAL_COUNTS=OFF`. `local_counts` builds with it `ON`. The option defaults to off and applies to the original LI kernels. Both workers require the MR25 Terminal route with P2 and the original Cold rotation. On the candidate, the same lane reads TopK's four compact counts from the existing UB metadata when the P2 lane owns at most two requests. The candidate IDs, cross-window GM publication, local readiness, predecessor ordering, prefetch policy and Terminal stay on the shared path.
+
+Each worker runs BS1/8/16, Q4, H131072, R16384, G32, seed43 and miss10%. Both use the same resident threshold rule, rank start 1024, prefetch budget 512 per request and four requested windows. The runner records the actual window and Service lane counts. It uses two warmups and ten measured graph calls per case. Add `--comparison-dry-run` to print the 6-case plan without device or KVAF setup.
+
+The final `Summary:` points to `summary.csv`. Compare `paired=True` rows. `kv_ready_us` is the graph Event mean through completed CQ and Index. The four same-graph kernel spans are `hot_us`, `threshold_us`, `cold_service_us` and `terminal_us`. Cold includes its rotating Service. The Get counters are token requests per complete batch invocation, split into `prefetch_requests_per_call` and `final_get_requests_per_call`. The runner reads them after the measured graph completes. `both_posted_prefetch` indicates that both variants issued early Get requests. The raw counters by call, request, window and Q are in `*/miss10/case-b*/fused/path_result.json`.
+
+## Historical MR23 three-route benchmark
 
 This experiment is delivered on the MR25 merge tree `609fa26f`. Its launcher stages a separate checkout of `7b4e3d52` and applies `runner.patch` there. The comparison runner exports the MR23 baseline `a56154c3` from Git history. All three measured routes use the MR23 Final and completed Resolve/Get/Index tail.
 
@@ -10,7 +26,7 @@ This experiment is delivered on the MR25 merge tree `609fa26f`. Its launcher sta
 
 The last route moves full-history scoring before the threshold. Its measured difference from `window_budget` includes the changed Score order, the Cold score reread and the removal of separate Service launches.
 
-## Run on A5
+### Run on A5
 
 On the A5 host, fetch the MR and the pinned Score T2 history. Use a detached worktree in the directory shared with the container.
 
@@ -34,7 +50,7 @@ Enter the container with `docker exec -it lifetch-aligned-a5 bash` and use the A
 bash /home/w00568585/li-aligned-a5/KVIP-mr28/experiments/lifetch_mr23_service/run_mr28_container.sh
 ```
 
-### Direct launcher
+#### Direct launcher
 
 Use the existing container's CANN and Python environment with `torch_npu`, the registered LIDU operator, and a running KVAF service. KVAF should use the built `1c1310387ebfb6776a07316874e924265b209ada` checkout.
 
@@ -53,7 +69,7 @@ The defaults use three workers for nine cases at BS1/8/16, miss 10%, Q4, H128K, 
 
 Set `KVIP_AB_OUTPUT` to relocate the results and isolated checkout. The default is `results/mr23_service` under the invoking directory. Add `--comparison-dry-run` to prepare both source snapshots and enumerate the workers without opening a device or transport.
 
-## Interpret the result
+### Interpret the result
 
 Open `summary.csv` at the printed `Summary:` path. Use accepted rows and `fused_event_us` for complete graph Event time per call through KV completion. `over_mr23` is each route's ratio to the original baseline. `over_window_budget` compares the two new routes directly.
 
