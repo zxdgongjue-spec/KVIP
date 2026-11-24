@@ -3958,6 +3958,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     instruction_replay = getattr(config, 'msprof_instruction_replay', False)
     profile_replay = baseline_trace or instruction_replay
     msprof_output = getattr(config, 'msprof_output', None)
+    cold_route = getattr(config, 'msprof_cold_route', None)
     partition_trial = hot_partition is not None or cold_partition is not None
     score_trial = partition_trial or unified_score is not None
     if score_trial and not (fused and handoff and config.transport == 'urma'
@@ -3972,6 +3973,14 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         raise ValueError('Profiling requires one synthetic P2 URMA case with W4 and prefetch enabled')
     if baseline_trace and (not msprof_output or instruction_replay):
         raise ValueError('Baseline stage trace requires an exclusive profile output')
+    if cold_route is not None:
+        if not baseline_trace or cold_route not in ('p2', 'cold_p4'):
+            raise ValueError('Cold partition trace requires the marked P2/P4 replay')
+        if (tuple(config.batches) != (8,) or config.history != 131072 or config.queries != 4
+                or config.miss_percent != 10 or config.prefetch_tokens != 512
+                or config.prefetch_rank_start != 1024 or type(config.msprof_local_counts) is not bool
+                or not config.msprof_build_dir):
+            raise ValueError('Cold partition trace requires the BS8/Q4/128K/miss10 prefetch fixture and one shared build')
     if instruction_replay:
         instruction_library = Path(getattr(config, 'msprof_instruction_library', '')).resolve()
         if config.warmup or msprof_output or not instruction_library.is_file():
@@ -4034,9 +4043,12 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 if baseline_trace:
                     from terminal_handoff import build_library
 
-                    replay_stage('building P2/Terminal with opt-in source trace')
-                    library = build_library(directory / 'trace_build', cann, headers, soc,
-                                            local_counts=False, stage_trace=True)
+                    replay_stage(f'loading marked {cold_route or "p2"} fusion bridge')
+                    library = build_library(
+                        config.msprof_build_dir if cold_route is not None else directory / 'trace_build',
+                        cann, headers, soc, local_counts=getattr(config, 'msprof_local_counts', False),
+                        hot_partition=cold_route is not None, stage_trace=True, ub_candidates=False, post_chunk=0,
+                    )
                 elif instruction_replay:
                     library = instruction_library
                 elif handoff:
@@ -4118,8 +4130,17 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             return write_instruction_replay(directory, state, library, config, soc)
         if baseline_trace:
             from baseline_stage_trace import StageBuffer, scoped_msprof, write_capture
-            trace = StageBuffer(state)
-            replay_stage('calibrating device counter and warming up unmarked P2 kernels')
+
+            cold_parts = 2
+            if cold_route is not None:
+                from terminal_handoff import bind_score_partition
+
+                _, cold_parts = bind_score_partition(state, hot=False, cold=cold_route == 'cold_p4')
+                expected_parts = 4 if cold_route == 'cold_p4' else 2
+                if cold_parts != expected_parts:
+                    raise ValueError(f'Expected Cold P{expected_parts}, got P{cold_parts}')
+            trace = StageBuffer(state, cold_route=cold_route or 'p2')
+            replay_stage(f'calibrating device counter and warming up unmarked Cold P{cold_parts}')
             pending = True
             counter_mhz = state.forward.calibrate_counter_mhz()
             pending = False
@@ -4134,7 +4155,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             trace.attach()
             stream.synchronize()
             pending = False
-            replay_stage('initialization and warmup finished; collecting only marked P2/Terminal')
+            replay_stage(f'initialization and warmup finished; collecting only marked Cold P{cold_parts}/Terminal')
             with scoped_msprof(acl.prof, msprof_output, config.device) as capture:
                 pending = True
                 try:
@@ -4149,7 +4170,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             raw = trace.read()
             (directory / 'baseline_stage_trace.bin').write_bytes(raw)
             validate(initial)
-            return write_capture(directory, raw, counter_mhz, state, library, config, soc, capture)
+            return write_capture(directory, raw, counter_mhz, state, library, config, soc, capture,
+                                 cold_parts=cold_parts)
         pending = True
         replay_stage('first eager forward and device completion')
         state.forward()

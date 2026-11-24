@@ -37,6 +37,12 @@ KERNELS = {
     23: ('Parallel Terminal', 'v9_parallel_terminal'),
     24: ('Fallback Final', 'v9_li_kernel_3'),
 }
+COLD_P4_KERNELS = {
+    **KERNELS,
+    21: (KERNELS[21][0], 'v9_li_kernel_threshold_cold_partitioned'),
+    22: (KERNELS[22][0], 'v9_li_kernel_cold_partitioned'),
+}
+WAIT_PARTITIONED_HALF = 218
 PHASES = {
     1: 'Kernel body',
     2: 'Kernel setup',
@@ -95,6 +101,7 @@ PIPE_SCOPES = {
     215: ('AIV', 'MTE3', 'Terminal WQE writes with fence'),
     216: ('AIV', 'VF', 'Index update with fence'),
     217: ('AIV', 'VF', 'Final WQE assembly with fence'),
+    WAIT_PARTITIONED_HALF: ('AIV', 'WAIT', 'WaitPartitionedHalf'),
 }
 PHASES.update({phase: name for phase, (_, _, name) in PIPE_SCOPES.items()})
 NO_TILE, NO_QUERY, SERVICE_LANE = (1 << 20) - 1, 15, 14
@@ -127,7 +134,7 @@ def scoped_msprof(prof, output, device_id):
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     report = dict(api='acl.prof', output=str(output), device_id=device_id, data_types=MSPROF_DATA_TYPES,
-                  scope='one marked P2/Terminal forward through lease stream completion', status={})
+                  scope='one marked fused forward through lease stream completion', status={})
 
     def checked(operation, *arguments):
         code = getattr(prof, operation)(*arguments)
@@ -150,7 +157,7 @@ def scoped_msprof(prof, output, device_id):
 class StageBuffer:
     """Attach a private trace buffer only for one already-bound native call."""
 
-    def __init__(self, state):
+    def __init__(self, state, *, cold_route='p2'):
         self.forward = state.forward
         library = self.forward.rotating.library
         probe = getattr(library, 'kvip_stage_trace_supported', None)
@@ -159,7 +166,11 @@ class StageBuffer:
         probe.argtypes, probe.restype = [], ctypes.c_uint32
         if probe() != VERSION:
             raise RuntimeError('LIFetch stage trace ABI version mismatch')
-        self.profile_forward = library.kvip_parallel_tail_profile_forward
+        profile_symbol = {
+            'p2': 'kvip_parallel_tail_profile_forward',
+            'cold_p4': 'kvip_parallel_tail_cold_partitioned_profile_forward',
+        }[cold_route]
+        self.profile_forward = getattr(library, profile_symbol)
         self.profile_forward.argtypes = [ctypes.c_void_p] * 4
         self.profile_forward.restype = ctypes.c_uint32
         self.workspace = self.forward.workspace
@@ -224,7 +235,7 @@ def decode(raw):
     return sorted(events, key=lambda e: (e['begin'], -e['end'], e['lane']))
 
 
-def verify_route(events, batch, *, require_pipe_scopes=False):
+def verify_route(events, batch, *, require_pipe_scopes=False, cold_route='p2'):
     phases = defaultdict(set)
     bodies = defaultdict(set)
     for event in events:
@@ -236,7 +247,7 @@ def verify_route(events, batch, *, require_pipe_scopes=False):
                 raise ValueError(f'Multiple marked invocations on kernel {kernel}, lane {lane}')
             bodies[kernel].add(lane)
     if set(phases) != set(REQUIRED):
-        raise ValueError(f'Expected P2 Hot/Threshold/Cold/Terminal trace, got kernel IDs {sorted(phases)}')
+        raise ValueError(f'Expected Hot/Threshold/Cold/Terminal trace, got kernel IDs {sorted(phases)}')
     missing = {kernel: sorted(expected - phases[kernel]) for kernel, expected in REQUIRED.items()
                if not expected.issubset(phases[kernel])}
     if missing:
@@ -246,12 +257,22 @@ def verify_route(events, batch, *, require_pipe_scopes=False):
                         for kernel, expected in REQUIRED_PIPE.items() if not expected.issubset(phases[kernel])}
         if missing_pipe:
             raise ValueError(f'Missing required pipe scopes: {missing_pipe}')
+    partition_waits = [event for event in events if event['phase'] == WAIT_PARTITIONED_HALF]
+    if cold_route == 'cold_p4':
+        if (not partition_waits or {event['iteration'] for event in partition_waits} != {1, 2, 3}
+                or any(event['kernel'] != 22 or event['lane'] >= 64 for event in partition_waits)):
+            raise ValueError('Cold P4 WaitPartitionedHalf trace must cover all three Cold windows on AIV')
+    elif partition_waits:
+        raise ValueError('Unexpected WaitPartitionedHalf on native Cold P2')
     four_aiv = set(range(4 * batch))
     two_aic = set(range(64, 64 + 2 * batch))
-    expected = {20: four_aiv | two_aic, 21: four_aiv, 22: four_aiv | two_aic, 23: four_aiv}
+    cold_lanes = (set(range(8 * batch)) | set(range(64, 64 + 4 * batch))
+                  if cold_route == 'cold_p4' else four_aiv | two_aic)
+    expected = {20: four_aiv | two_aic, 21: four_aiv, 22: cold_lanes, 23: four_aiv}
+    kernels = COLD_P4_KERNELS if cold_route == 'cold_p4' else KERNELS
     for kernel, lanes in expected.items():
         if bodies[kernel] != lanes:
-            raise ValueError(f'{KERNELS[kernel][1]} expected {len(lanes)} marked lanes, '
+            raise ValueError(f'{kernels[kernel][1]} expected {len(lanes)} marked lanes, '
                              f'got {len(bodies[kernel])}')
 
 
@@ -276,11 +297,12 @@ def source_lane_counts(spans):
     return result
 
 
-def render(events, counter_mhz):
+def render(events, counter_mhz, *, cold_route='p2'):
     if not math.isfinite(counter_mhz) or counter_mhz <= 0:
         raise ValueError('A positive measured device counter frequency is required')
     origin = min(event['begin'] for event in events)
     trace = []
+    kernels = COLD_P4_KERNELS if cold_route == 'cold_p4' else KERNELS
 
     def metadata(name, pid, tid, label):
         trace.append(dict(name=name, ph='M', pid=pid, tid=tid, args={'name': label}))
@@ -305,7 +327,7 @@ def render(events, counter_mhz):
             seen_lanes.add(lane)
         begin, end, phase = event['begin'], event['end'], event['phase']
         kernel = event['kernel']
-        kernel_stage, entry = KERNELS[kernel]
+        kernel_stage, entry = kernels[kernel]
         args = dict(kernel_entry=entry, phase_id=phase, block=event['block'], subblock=event['subblock'],
                     core_type=core_type, raw_core_id=event['core'], raw_core_id_hex=hex(event['core']),
                     iteration=event['iteration'], detail=event['detail'], begin_tick=begin, end_tick=end)
@@ -318,16 +340,18 @@ def render(events, counter_mhz):
             _, pipe, _ = PIPE_SCOPES[phase]
             category = f'KVIP source {pipe}'
             detail = event['detail']
-            query, tile = (detail >> 20) & NO_QUERY, detail & NO_TILE
+            query, slot = (detail >> 20) & NO_QUERY, detail & NO_TILE
             args['pipe'] = pipe
             if query == SERVICE_LANE:
                 args['service_lane'] = detail >> 24
             else:
                 args['request_row'] = detail >> 24
-            if query not in (NO_QUERY, SERVICE_LANE):
+            if phase == WAIT_PARTITIONED_HALF:
+                args.update(query_start=query, cold_part=slot)
+            elif query not in (NO_QUERY, SERVICE_LANE):
                 args['query_start' if phase < 200 else 'query'] = query
-            if tile != NO_TILE:
-                args['tile_index'] = tile
+            if phase != WAIT_PARTITIONED_HALF and slot != NO_TILE:
+                args['tile_index'] = slot
                 args['sampled_scan_tile'] = True
             lane_scopes[(core_type, pipe)].append(event)
         elif phase in (23, 155) or kernel == 23:
@@ -348,7 +372,7 @@ def render(events, counter_mhz):
         return min(e['begin'] for e in spans), max(e['end'] for e in spans)
 
     for kernel, spans in sorted(kernel_bodies.items()):
-        name, entry = KERNELS[kernel]
+        name, entry = kernels[kernel]
         metadata('thread_name', 0, kernel, entry)
         begin, end = bounds(spans)
         add_span(name, 'Kernel source envelope', 0, kernel, begin, end,
@@ -365,7 +389,8 @@ def render(events, counter_mhz):
         for span in spans:
             mapping = aic if span['lane'] >= 64 else aiv
             mapping[(span['block'], span['subblock'])].add(span['core'])
-        summaries.append(dict(kernel_entry=KERNELS[kernel][1], phase=PHASES[phase], window_epoch=window_epoch,
+        summaries.append(dict(kernel_entry=kernels[kernel][1], phase=PHASES[phase], window_epoch=window_epoch,
+                              kernel_id=kernel, phase_id=phase,
                               pipe=PIPE_SCOPES[phase][1] if phase in PIPE_SCOPES else None,
                               events=len(spans), logical_lanes=len({e['lane'] for e in spans}),
                               logical_aic_lanes=len({block for block, _ in aic}),
@@ -380,7 +405,8 @@ def render(events, counter_mhz):
             trace.append(dict(name=title, cat='KVIP source lane count', ph='C', pid=3, tid=tid,
                               ts=(tick - origin) / counter_mhz, args={'lanes': count}))
     document = dict(traceEvents=trace, displayTimeUnit='ms',
-                    metadata=dict(clock=CLOCK, counter_mhz=counter_mhz, pipe_scope_semantics=PIPE_SEMANTICS))
+                    metadata=dict(clock=CLOCK, counter_mhz=counter_mhz, cold_route=cold_route,
+                                  pipe_scope_semantics=PIPE_SEMANTICS))
     return document, summaries
 
 
@@ -419,17 +445,29 @@ def write_instruction_replay(directory, state, library, config, soc):
     return report
 
 
-def write_capture(directory, raw, counter_mhz, state, library, config, soc, msprof_capture):
+def write_capture(directory, raw, counter_mhz, state, library, config, soc, msprof_capture, *, cold_parts=2):
+    comparison_route = getattr(config, 'msprof_cold_route', None)
+    cold_route = comparison_route or 'p2'
     events = decode(raw)
-    verify_route(events, state.batch, require_pipe_scopes=True)
-    document, stages = render(events, counter_mhz)
+    verify_route(events, state.batch, require_pipe_scopes=True, cold_route=cold_route)
+    if comparison_route:
+        for phase in (21, 22, 151, 192):
+            windows = {event['iteration'] for event in events if event['kernel'] == 22 and event['phase'] == phase}
+            if windows != {1, 2, 3}:
+                raise ValueError(f'Cold comparison phase {PHASES[phase]} must cover all three Cold windows')
+    document, stages = render(events, counter_mhz, cold_route=cold_route)
     report = replay_evidence(state, library, config, soc)
+    if cold_route == 'cold_p4':
+        report['route'] = 'Hot P2 + Cold P4 + four-AIV Terminal'
     phases = {event['phase'] for event in events}
     if ((report['total_prefetch'] and not {153, 154, 168, 204, 205}.issubset(phases))
             or (report['total_final_get'] and not {164, 165, 167, 215, 217}.issubset(phases))):
         raise ValueError('Observed Get counts have missing descriptor, submission or completion markers')
     report.update(
         traced_invocations=1,
+        cold_route=cold_route, hot_parts=2, cold_parts=cold_parts,
+        service_lanes=int(state.rotating.runtime_shape.serviceLanes),
+        local_counts=getattr(config, 'msprof_local_counts', False),
         clock=CLOCK, counter_mhz=counter_mhz, events=len(events), stages=stages,
         msprof_capture=msprof_capture,
         raw_trace='baseline_stage_trace.bin', visual_trace='baseline_stage_trace.json',
@@ -446,8 +484,10 @@ def main():
     parser.add_argument('raw', type=Path, help='captured baseline_stage_trace.bin')
     parser.add_argument('--counter-mhz', type=float, required=True, help='use the measured value from the capture report')
     parser.add_argument('--output', type=Path, required=True, help='output Chrome/Perfetto trace JSON')
+    parser.add_argument('--cold-route', choices=('p2', 'cold_p4'), default='p2',
+                        help='kernel aliases used by the recorded replay')
     args = parser.parse_args()
-    document, _ = render(decode(args.raw.read_bytes()), args.counter_mhz)
+    document, _ = render(decode(args.raw.read_bytes()), args.counter_mhz, cold_route=args.cold_route)
     atomic_json(args.output, document)
 
 

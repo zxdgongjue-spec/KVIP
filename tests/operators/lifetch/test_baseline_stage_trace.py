@@ -13,18 +13,22 @@ sys.path.insert(0, str(Path(__file__).parent / 'support'))
 import baseline_stage_trace as source_trace  # noqa: E402
 from baseline_stage_trace import (  # noqa: E402
     decode, render, scoped_msprof, verify_route, CAPACITY, EVENT, HEADER_BYTES, LANE_BYTES, LANES, MAGIC,
-    NO_QUERY, PIPE_SCOPES, REQUIRED, REQUIRED_PIPE, VERSION,
+    NO_QUERY, PIPE_SCOPES, REQUIRED, REQUIRED_PIPE, VERSION, WAIT_PARTITIONED_HALF,
 )
 
 
-def sample_buffer(*, pipe_scopes=False):
+def sample_buffer(*, pipe_scopes=False, batch=1, cold_parts=2):
     lane_stride = LANE_BYTES + CAPACITY * EVENT.size
     raw = bytearray(HEADER_BYTES + LANES * lane_stride)
     struct.pack_into('<Q4I', raw, 0, MAGIC, VERSION, LANES, CAPACITY, EVENT.size)
-    for lane in (0, 1, 2, 3, 64, 65):
+    cold_blocks = batch * cold_parts
+    for lane in (*range(2 * cold_blocks), *range(64, 64 + cold_blocks)):
         base = HEADER_BYTES + lane * lane_stride
         count = 0
         for kernel, phases in REQUIRED.items():
+            active_blocks = cold_blocks if kernel == 22 else 2 * batch
+            if lane not in range(2 * active_blocks) and lane not in range(64, 64 + active_blocks):
+                continue
             if lane >= 64 and kernel in (21, 23):
                 continue
             begin = 3_000 + (kernel - 20) * 1_000 + lane
@@ -42,6 +46,14 @@ def sample_buffer(*, pipe_scopes=False):
                          int(lane in (1, 3)), 0, detail, 1, 0, 0)
                 EVENT.pack_into(raw, base + LANE_BYTES + count * EVENT.size, *event)
                 count += 1
+            if cold_parts == 4 and kernel == 22 and lane == 0:
+                for epoch in (1, 2, 3):
+                    begin_wait = begin + epoch * 100
+                    detail = (3 << 24) | (2 << 20) | 2
+                    event = (begin_wait, begin_wait + 10, lane, kernel, WAIT_PARTITIONED_HALF, lane,
+                             0, epoch, detail, 1, 0, 0)
+                    EVENT.pack_into(raw, base + LANE_BYTES + count * EVENT.size, *event)
+                    count += 1
         struct.pack_into('<2I', raw, base, count, 0)
     return raw
 
@@ -117,6 +129,34 @@ def test_pipe_scopes_identify_sampled_tiles_and_core_lanes():
     counts = [event['args']['lanes'] for event in document['traceEvents']
               if event['ph'] == 'C' and event['name'] == 'AIC MTE1 source lanes']
     assert max(counts) == 2 and counts[-1] == 0
+
+
+def test_cold_p4_uses_native_alias_and_separate_part_waits():
+    events = decode(sample_buffer(pipe_scopes=True, batch=8, cold_parts=4))
+    verify_route(events, batch=8, require_pipe_scopes=True, cold_route='cold_p4')
+    with pytest.raises(ValueError, match='Unexpected WaitPartitionedHalf'):
+        verify_route(events, batch=8)
+    missing_window = [event for event in events
+                      if (event['phase'], event['iteration']) != (WAIT_PARTITIONED_HALF, 2)]
+    with pytest.raises(ValueError, match='all three Cold windows'):
+        verify_route(missing_window, batch=8, cold_route='cold_p4')
+
+    document, stages = render(events, counter_mhz=1000, cold_route='cold_p4')
+    trace = document['traceEvents']
+    waits = [event for event in trace if event['name'] == 'WaitPartitionedHalf']
+    assert len(waits) == 3
+    for epoch, event in enumerate(waits, 1):
+        args = event['args']
+        assert args['phase_id'] == WAIT_PARTITIONED_HALF
+        assert args['kernel_entry'] == 'v9_li_kernel_cold_partitioned'
+        assert (args['request_row'], args['query_start'], args['cold_part'], args['window_epoch']) == (3, 2, 2, epoch)
+        assert 'tile_index' not in args and 'sampled_scan_tile' not in args
+    bodies = [event for event in trace if event.get('cat') == 'Kernel source envelope']
+    assert {event['args']['kernel_entry']: event['args']['marked_lanes'] for event in bodies} == {
+        'v9_li_kernel': 48, 'v9_li_kernel_threshold_cold_partitioned': 32,
+        'v9_li_kernel_cold_partitioned': 96, 'v9_parallel_terminal': 32,
+    }
+    assert {stage['window_epoch'] for stage in stages if stage['phase_id'] == WAIT_PARTITIONED_HALF} == {1, 2, 3}
 
 
 def test_source_lane_count_deduplicates_nested_scopes():

@@ -177,10 +177,12 @@ static uint32_t LaunchParallelTail(void* bindings,void* terminal,
     });
 #if KVIP_HOT_SCORE_PARTITION
     if(coldParts>2){
-        if(!result)result=aclrtlaunch_v9_li_kernel_threshold_cold_partitioned(
-            shape->liCores,stream,bindings,coldParts);
-        if(!result)result=aclrtlaunch_v9_li_kernel_cold_partitioned(
-            shape->batch*coldParts,stream,bindings,coldParts);
+        if(!result)result=LaunchTailStage<Profile>(stream,ParallelTailStage::Threshold,[&] {
+            return aclrtlaunch_v9_li_kernel_threshold_cold_partitioned(shape->liCores,stream,bindings,coldParts);
+        });
+        if(!result)result=LaunchTailStage<Profile>(stream,ParallelTailStage::ColdService,[&] {
+            return aclrtlaunch_v9_li_kernel_cold_partitioned(shape->batch*coldParts,stream,bindings,coldParts);
+        });
     } else
 #endif
     {
@@ -229,6 +231,14 @@ extern "C" uint32_t kvip_parallel_tail_cold_partitioned_forward(void* bindings,v
     if(cold<2)return 100000;
     return LaunchParallelTail(bindings,terminal,stream,shape,2,cold);
 }
+#if KVIP_STAGE_TRACE
+extern "C" uint32_t kvip_parallel_tail_cold_partitioned_profile_forward(void* bindings,void* terminal,
+    void* stream,const rotating::RuntimeShape* shape) {
+    const auto cold=kvip_partitioned_cold_score_parts(shape);
+    if(cold<=2)return 100000;
+    return LaunchParallelTail<true>(bindings,terminal,stream,shape,2,cold);
+}
+#endif
 extern "C" uint32_t kvip_parallel_tail_history_partitioned_forward(void* bindings,void* terminal,
     void* stream,const rotating::RuntimeShape* shape) {
     const auto hot=kvip_partitioned_hot_score_parts(shape);

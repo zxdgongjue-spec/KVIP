@@ -207,3 +207,41 @@ the instruction tracks in Insight and correlate by kernel name and source
 location. Hardware instruction sampling covers a subset of cores. The
 generic InstrTimeline route gives no VF-body completeness guarantee. Use
 the per-core source trace for VF launch and dependency boundaries.
+
+### BS8 P2 versus Cold P4 phase comparison
+
+Run on A5 with the existing unified KVAF dependency.
+
+```bash
+bash experiments/lifetch_mr23_service/run_mr28_baseline_msprof.sh --cold-compare
+```
+
+This selects BS8, Q4/G32, H128K/R16K, miss 10%, W4 and seed 43. Both arms
+retain the resident threshold, rank start 1024, prefetch budget 512,
+rotating Service, and four-AIV-per-request Terminal. The P2 arm uses the
+stock launch schedule. The P4 arm subdivides only Cold. Both use one
+diagnostic bridge, with the UB candidate and split-prefetch-post
+experiments disabled. The default is `--local-counts on` for the same
+experimental setting as the historical 186.97/205.55 us comparison.
+Pass `--local-counts off` to use main's default in both arms.
+
+Open the `p2/` and `cold_p4/` business and native timelines in the
+printed output directory. The Cold P4 trace exposes `WaitPartitionedHalf`
+before rotating Service. It brackets the leader's publication fence and
+polls on helper cursors. The separate `Service predecessor wait` scope
+waits for the previous window's Service publication.
+
+`cold_trace_comparison.json` includes the native Cold+Service wall span,
+the historical reference, and actual Get vectors compared by request.
+`cold_trace_scopes.csv` contains both arms and signed deltas for each scope
+and window. Use `max_lane_union_us` for the lane with the most time inside
+one scope and `source_union_us` for that scope's interval union across
+lanes. The report also includes score MTE3 writeback and output-bank wait
+samples, per-Q incremental TopK, candidate deduplication, and WQE/SQ
+submission. Score MTE3 samples cover first and last tiles and record
+source command issue and existing fences.
+
+The paired trace captures one instrumented eager replay per arm. Compare
+Get placement and totals alongside the native wall delta. Per-scope
+intervals can overlap, and their deltas cannot be summed into the
+historical 18.58 us difference from the uninstrumented graph run.

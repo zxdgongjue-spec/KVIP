@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 
+from lifetch_cold_trace_comparison import REFERENCE, ROUTES, write_comparison
 from lifetch_instruction_capture import STAGES, collect_instructions, instruction_plan
 from lifetch_msprof_timeline import publish_business_views, verified_vendor_timeline
 from run_mr25_handoff import KVAF, MAIN, ROOT, git, read, save
@@ -17,16 +18,28 @@ from run_mr25_handoff import KVAF, MAIN, ROOT, git, read, save
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--batch', type=int, choices=(1, 2, 4, 8, 16), default=16)
+    parser.add_argument('--batch', type=int, choices=(1, 2, 4, 8, 16))
     parser.add_argument('--miss-percent', type=int, choices=range(101), metavar='0..100', default=10)
-    parser.add_argument('--warmup', type=int, default=0, help='optional replays with the stage buffer disabled')
+    parser.add_argument('--warmup', type=int, help='replays with the stage buffer disabled')
     parser.add_argument('--timeout-seconds', type=int, default=900, help='limit for capture, including first build')
     parser.add_argument('--instructions', action='store_true', help='also collect on-board msOpProf artifacts')
     parser.add_argument('--instruction-stage', choices=('all', *STAGES), default='all')
     parser.add_argument('--instruction-pipes', default='mte1|mte2|mte3',
                         help='pipe names separated by |, used with --instructions')
+    parser.add_argument('--cold-compare', action='store_true', help='compare native P2 and Cold P4 at BS8/miss10')
+    parser.add_argument('--local-counts', choices=('on', 'off'),
+                        help='common A/B setting with --cold-compare, defaults to on for the historical comparison')
     parser.add_argument('--dry-run', action='store_true', help='print the capture plan without CANN or KVAF')
     args = parser.parse_args(argv)
+    if args.batch is None:
+        args.batch = 8 if args.cold_compare else 16
+    if args.warmup is None:
+        args.warmup = 2 if args.cold_compare else 0
+    if args.cold_compare and (args.batch != 8 or args.miss_percent != 10 or args.instructions):
+        parser.error('--cold-compare uses BS8, miss 10% and the scoped kernel/source trace')
+    if not args.cold_compare and args.local_counts is not None:
+        parser.error('--local-counts applies to --cold-compare')
+    args.local_counts = args.cold_compare and args.local_counts != 'off'
     if args.warmup < 0 or args.timeout_seconds < 1:
         parser.error('warmup must be nonnegative and timeout must be positive')
     try:
@@ -63,16 +76,9 @@ def msprof_timelines(profiler, directory, log):
     return sorted(path for profile in profiles for path in profile.rglob('msprof_*.json'))
 
 
-def capture(args, output, kvaf, arguments, manifest):
+def capture_route(args, output, config, manifest, profiler, *, cold_route='p2'):
     from execution import launch
-    from workloads import configuration
 
-    profiler = shutil.which(os.environ.get('KVIP_MSPROF', 'msprof'))
-    if profiler is None:
-        raise FileNotFoundError('msprof is missing from the active CANN environment')
-    if git(kvaf, 'rev-parse', 'HEAD') != KVAF:
-        raise ValueError(f'Use the unified KVAF checkout at {KVAF}')
-    config = configuration(arguments)
     config.msprof_baseline = True
     worker = output / 'worker'
     raw = output / 'msprof'
@@ -100,8 +106,9 @@ def capture(args, output, kvaf, arguments, manifest):
     if not timelines:
         raise RuntimeError(f'No vendor timeline was exported. See {raw} and {output / "msprof-export.log"}')
     manifest['msprof_timelines'] = [str(path) for path in timelines]
-    native_path, vendor, intervals = verified_vendor_timeline(timelines)
-    business, device = publish_business_views(output, vendor, read(stage_trace), intervals, save)
+    native_path, vendor, intervals = verified_vendor_timeline(timelines, cold_route=cold_route)
+    source = read(stage_trace)
+    business, device = publish_business_views(output, vendor, source, intervals, save, cold_route=cold_route)
     manifest.update(msprof_timeline=str(native_path), business_trace=str(business),
                     msprof_business_trace=str(device), kernel_intervals=intervals)
     print(f'Open fused stages: {business}', flush=True)
@@ -110,12 +117,61 @@ def capture(args, output, kvaf, arguments, manifest):
         print(f'  {row["name"]}: {row["duration_us"]:.2f} us', flush=True)
     print(f'Early prefetch / final Get: {report["total_prefetch"]} / {report["total_final_get"]}', flush=True)
     manifest['business_status'] = 'PASS'
+    return dict(report=report, source=source, intervals=intervals)
+
+
+def capture_cold_pair(args, output, arguments, manifest, profiler):
+    from workloads import configuration
+
+    manifests, captures = {}, {}
+    manifest['routes'] = manifests
+    for route in ROUTES:
+        print(f'Running BS8 Cold trace {route}, local_counts={args.local_counts}', flush=True)
+        arm = output / route
+        arm.mkdir()
+        arm_manifest = manifests[route] = dict(route=route, local_counts=args.local_counts, status='RUNNING')
+        config = configuration(arguments)
+        config.msprof_cold_route = route
+        config.msprof_local_counts = args.local_counts
+        config.msprof_build_dir = str(output / 'trace_build')
+        try:
+            captures[route] = capture_route(args, arm, config, arm_manifest, profiler, cold_route=route)
+            arm_manifest['status'] = 'PASS'
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            arm_manifest.update(status='FAILED', error=str(error))
+            print(f'{route} trace incomplete: {error}', file=sys.stderr, flush=True)
+            if arm_manifest.get('worker_exit_code') != 0:
+                break
+        finally:
+            save(arm / 'manifest.json', arm_manifest)
+    if len(captures) != len(ROUTES):
+        raise RuntimeError('Cold P2/P4 comparison requires both checked source and native captures')
+    result = write_comparison(output, captures, args.local_counts)
+    manifest['comparison'] = str(output / 'cold_trace_comparison.json')
+    print(f"Cold+Service native delta: {result['cold_service_native_delta_us']:+.2f} us; "
+          f"Get comparison: {result['get_comparison']['status']}", flush=True)
+    print(f"Compare per-window scopes: {output / 'cold_trace_scopes.csv'}", flush=True)
+
+
+def capture(args, output, kvaf, arguments, manifest):
+    from workloads import configuration
+
+    profiler = shutil.which(os.environ.get('KVIP_MSPROF', 'msprof'))
+    if profiler is None:
+        raise FileNotFoundError('msprof is missing from the active CANN environment')
+    if git(kvaf, 'rev-parse', 'HEAD') != KVAF:
+        raise ValueError(f'Use the unified KVAF checkout at {KVAF}')
+    if args.cold_compare:
+        capture_cold_pair(args, output, arguments, manifest, profiler)
+        return
+    captured = capture_route(args, output, configuration(arguments), manifest, profiler)
     if args.instruction_plan:
         instruction_output = output / 'instruction'
         manifest['instruction_status_file'] = str(instruction_output / 'instruction_status.json')
         save(output / 'manifest.json', manifest)
         manifest['instruction_capture'] = collect_instructions(
-            profiler, instruction_output, kvaf, configuration(arguments), args.instruction_plan, report['fixture_sha256'],
+            profiler, instruction_output, kvaf, configuration(arguments), args.instruction_plan,
+            captured['report']['fixture_sha256'],
         )
 
 
@@ -126,12 +182,15 @@ def main(argv=None):
     arguments = bench_args(args, kvaf)
     manifest = dict(
         status='NOT_RUN', commit=git(ROOT, 'rev-parse', 'HEAD'), main_commit=MAIN,
-        kvaf_commit=KVAF, route='main_p2_parallel_terminal', local_counts=False,
-        arguments=arguments, requested_stage_replays=1,
+        kvaf_commit=KVAF, route='cold_p2_p4_comparison' if args.cold_compare else 'main_p2_parallel_terminal',
+        local_counts=args.local_counts, arguments=arguments, requested_stage_replays=len(ROUTES) if args.cold_compare else 1,
+        planned_routes=ROUTES if args.cold_compare else ('p2',),
         collection='pyACL_prof_start_stop_around_fused_forward_only',
         instruction_plan=args.instruction_plan,
         clocks='independent: msprof device task clock and calibrated source counter',
     )
+    if args.cold_compare:
+        manifest['historical_reference'] = REFERENCE
     if args.dry_run:
         print(json.dumps(manifest, indent=2))
         return 0

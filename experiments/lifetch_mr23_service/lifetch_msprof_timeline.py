@@ -13,8 +13,15 @@ PHASES = (
     ('COLD_SERVICE', 'v9_li_kernel_2', 'Cold Score + rotating Service'),
     ('TERMINAL', 'v9_parallel_terminal', 'Terminal'),
 )
+PHASES_COLD_P4 = (
+    PHASES[0],
+    ('THRESHOLD', 'v9_li_kernel_threshold_cold_partitioned', PHASES[1][2]),
+    ('COLD_SERVICE', 'v9_li_kernel_cold_partitioned', PHASES[2][2]),
+    PHASES[3],
+)
+ROUTE_PHASES = {'p2': PHASES, 'cold_p4': PHASES_COLD_P4}
 MARKERS = {f'KVIP_LIFETCH_{stage}_{side}' for stage, _, _ in PHASES for side in ('BEGIN', 'END')}
-KERNELS = {kernel for _, kernel, _ in PHASES}
+KERNELS = {kernel for phases in ROUTE_PHASES.values() for _, kernel, _ in phases}
 COMPUTE_TYPES = {'AI_CORE', 'AI_VECTOR_CORE', 'MIX_AIC', 'MIX_AIV', 'AIV_SQE', 'FUSION'}
 
 
@@ -36,7 +43,7 @@ def get_interval(event):
     return begin, begin + duration
 
 
-def require_fused_replay(document):
+def require_fused_replay(document, *, cold_route='p2'):
     """Use stable CANN device task fields and fence every kernel by its marks."""
     tasks, markers = [], defaultdict(set)
     for event in events(document):
@@ -72,7 +79,7 @@ def require_fused_replay(document):
     last_end = Decimal('-Infinity')
     # CANN emits decimal microseconds. Allow 1 ns for timestamp rounding.
     tolerance = Decimal('0.001')
-    for stage, kernel, name in PHASES:
+    for stage, kernel, name in ROUTE_PHASES[cold_route]:
         begin_mark = next(iter(markers[f'KVIP_LIFETCH_{stage}_BEGIN']))[2]
         end_mark = next(iter(markers[f'KVIP_LIFETCH_{stage}_END']))[2]
         if begin_mark < last_end - tolerance or end_mark <= begin_mark:
@@ -120,13 +127,14 @@ def device_business_view(vendor, intervals):
     return result
 
 
-def publish_business_views(output, vendor, source, intervals, save):
+def publish_business_views(output, vendor, source, intervals, save, *, cold_route='p2'):
     """Expose both clock domains at the root of the same checked capture."""
     source_events = events(source)
     kernels = {event['args'].get('kernel_entry') for event in source_events
                if isinstance(event, dict) and event.get('ph') == 'X'
                and isinstance(event.get('args'), dict) and event['args'].get('marked_lanes')}
-    if kernels != KERNELS:
+    expected_kernels = {kernel for _, kernel, _ in ROUTE_PHASES[cold_route]}
+    if kernels != expected_kernels or {interval['kernel'] for interval in intervals} != expected_kernels:
         raise ValueError('Source timeline is missing one or more fusion stages')
     # Keep source cycles and the CANN clock as measured. No cross-clock shifts
     # are necessary to view all of the detailed business stages together.
@@ -140,12 +148,12 @@ def publish_business_views(output, vendor, source, intervals, save):
     return business_path, device_path
 
 
-def verified_vendor_timeline(paths):
+def verified_vendor_timeline(paths, *, cold_route='p2'):
     accepted, failures = [], {}
     for path in paths:
         try:
             document = json.loads(Path(path).read_text())
-            intervals = require_fused_replay(document)
+            intervals = require_fused_replay(document, cold_route=cold_route)
         except (ValueError, OSError) as error:
             failures[str(path)] = str(error)
         else:

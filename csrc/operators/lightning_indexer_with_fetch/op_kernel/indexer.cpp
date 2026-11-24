@@ -29,8 +29,9 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2) {
     auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
 #if KVIP_STAGE_TRACE
-    constexpr bool traceBaseline = Phase != SequenceLiPhase::UnifiedScore && Phase != SequenceLiPhase::PrecomputedCold;
-    const uint64_t stageTrace = traceBaseline && parts == 2 ? KVIP_TRACE_WORKSPACE(P(15)) : 0;
+    constexpr bool traceScorePath = Phase != SequenceLiPhase::UnifiedScore && Phase != SequenceLiPhase::PrecomputedCold;
+    const uint64_t stageTrace = traceScorePath && (parts == 2 || Phase == SequenceLiPhase::Cold)
+        ? KVIP_TRACE_WORKSPACE(P(15)) : 0;
     constexpr uint32_t traceKernel = Phase == SequenceLiPhase::Hot ? kvip_trace::Hot :
         Phase == SequenceLiPhase::Threshold ? kvip_trace::Threshold :
         Phase == SequenceLiPhase::Cold ? kvip_trace::Cold : kvip_trace::Final;

@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'experiments/lifetch_mr23_service'))
 from lifetch_msprof_timeline import (  # noqa: E402
-    PHASES, device_business_view, publish_business_views, require_fused_replay,
+    PHASES, PHASES_COLD_P4, device_business_view, publish_business_views, require_fused_replay,
 )
 
 
@@ -21,9 +21,9 @@ def hardware(name, tick, task, duration=0, *, task_type=None, stream=17):
     return dict(name=name, ph='X', ts=str(tick), dur=duration, pid=1, tid=17, args=args)
 
 
-def fused_replay():
+def fused_replay(phases=PHASES):
     events = []
-    for index, (stage, kernel, _) in enumerate(PHASES):
+    for index, (stage, kernel, _) in enumerate(phases):
         start, first = 1_000 + 40 * index, 3 * index
         for suffix, tick, task in (('BEGIN', start, first), ('END', start + 30, first + 2)):
             marker = f'KVIP_LIFETCH_{stage}_{suffix}'
@@ -66,6 +66,25 @@ def test_phase_requires_a_kernel_task_inside_its_own_marked_stream():
     raw[-1]['args']['Physic Stream Id'] = 5
     with pytest.raises(ValueError, match='outside its device marks'):
         require_fused_replay(raw)
+
+
+def test_cold_p4_aliases_qualify_only_on_the_requested_route(tmp_path):
+    raw = fused_replay(PHASES_COLD_P4)
+    stages = require_fused_replay(raw, cold_route='cold_p4')
+    assert [stage['kernel'] for stage in stages] == [kernel for _, kernel, _ in PHASES_COLD_P4]
+    assert {stage['task_identity'] for stage in stages} == {'named_device_task'}
+    with pytest.raises(ValueError, match='different named kernel'):
+        require_fused_replay(raw)
+    with pytest.raises(ValueError, match='different named kernel'):
+        require_fused_replay(fused_replay(), cold_route='cold_p4')
+
+    source = {'traceEvents': [dict(ph='X', args=dict(marked_lanes=4, kernel_entry=kernel))
+                              for _, kernel, _ in PHASES_COLD_P4]}
+    source_path, _ = publish_business_views(
+        tmp_path, raw, source, stages, lambda path, payload: path.write_text(json.dumps(payload)),
+        cold_route='cold_p4',
+    )
+    assert json.loads(source_path.read_text())['traceEvents'] == source['traceEvents']
 
 
 def test_generic_a5_task_is_bound_by_unique_device_id_and_marker_range():

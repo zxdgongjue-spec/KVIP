@@ -75,6 +75,8 @@ public:
     }
 
     __aicore__ inline void WaitPartitionedHalf(uint32_t batch, uint32_t part, uint32_t epoch, uint32_t half) {
+        KVIP_TRACE_BEGIN(partitionWaitScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+            Cold, ColdPartitionWait, epoch, kvip_trace::PipeDetail(batch, (blockId_ % 2) * 2, part));
         // The leader's own Q files have finished publishing before polling helpers.
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
         WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);

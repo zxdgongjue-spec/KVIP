@@ -45,7 +45,9 @@ enum Phase : uint32_t {
     ServiceUnionVf = 203, PrefetchBuildVf = 204, PrefetchSqMte3 = 205, ServiceInputMte2 = 206,
     TerminalInputMte2 = 210, TerminalTopKVf = 211, TerminalTopKMte3 = 212,
     TerminalResolveVf = 213, TerminalOutputMte3 = 214, TerminalSqMte3 = 215,
-    TerminalIndexVf = 216, TerminalWqeVf = 217
+    TerminalIndexVf = 216, TerminalWqeVf = 217,
+    // Detail stores the request, first local Q, and the leader's partition index.
+    ColdPartitionWait = 218
 };
 }
 
