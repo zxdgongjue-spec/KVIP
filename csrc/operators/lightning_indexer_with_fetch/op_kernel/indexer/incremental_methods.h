@@ -553,10 +553,8 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
     }
 }
-__aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
+__aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half,uint32_t lane) {
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
-    uint32_t lane=rotating::ServiceLane(runtimeShape_.batch,runtimeShape_.splitQ,
-        runtimeShape_.serviceAics,RotationCore(),blockId_%2);
     // The predecessor wait is part of the optional window service and can
     // delay the producer. Capture it separately from incremental computation.
     bool trace=streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U);
@@ -580,7 +578,7 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     incrementalMetadataActive_=stagedMetadata;
     if(incrementalMetadataActive_) {
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
-    if (!coldParts_)
+    if (!coldParts_ && !dedicatedProgress_)
 #endif
     {
     GlobalTensor<uint32_t> progressSource;progressSource.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
@@ -606,7 +604,12 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
         if(ownedQueries>0)requests0=incrementalOld_.GetValue(256+9);
         if(ownedQueries>4)requests1=incrementalOld_.GetValue(256+16+9);
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
-        if (coldParts_) {
+        if (dedicatedProgress_) {
+            for (uint32_t b = lane, index = 0; b < runtimeShape_.batch; b += runtimeShape_.serviceLanes) {
+                for (uint32_t q = 0; q < 4; ++q, ++index)
+                    incrementalMetadata_.SetValue(index * 16 + 4, DedicatedColdReady(b * 4 + q, epoch, half));
+            }
+        } else if (coldParts_) {
             for (uint32_t b = lane, index = 0; b < runtimeShape_.batch; b += runtimeShape_.serviceLanes) {
                 for (uint32_t q = 0; q < 4; ++q, ++index)
                     incrementalMetadata_.SetValue(index * 16 + 4, PartitionedColdReady(b * 4 + q, half));
@@ -641,6 +644,7 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
         uint64_t ready;
         if(incrementalMetadataActive_)ready=incrementalMetadata_.GetValue(progressIndex);
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+        else if (dedicatedProgress_) ready = DedicatedColdReady(b * 4 + q, epoch, half);
         else if (coldParts_) ready = PartitionedColdReady(b * 4 + q, half);
 #endif
         else {
@@ -682,6 +686,9 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     exportWindowCold_=false;
     // The producer's progress lookup table shares the TopK score buffer.
     // Rebuild it before LI resumes; otherwise score bytes become fake progress.
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    if (!dedicatedProgress_)
+#endif
     PrepareRotationProgress();
     if(trace) {
         auto event=reinterpret_cast<__gm__ rotating::Event*>(ctx->events)+epoch*runtimeShape_.serviceLanes+lane;

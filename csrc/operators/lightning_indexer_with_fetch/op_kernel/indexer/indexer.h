@@ -35,7 +35,7 @@ using AscendC::CacheMode;
 using AscendC::CrossCoreSetFlag;
 using AscendC::CrossCoreWaitFlag;
 
-enum class SequenceLiPhase { Hot, Threshold, Cold, Final, UnifiedScore, PrecomputedCold };
+enum class SequenceLiPhase { Hot, Threshold, Cold, Final, UnifiedScore, PrecomputedCold, DedicatedCold };
 
 // 由于S2循环前，RunInfo还没有赋值，使用TempLoopInfo临时存放B、N、S1轴相关的信息；同时减少重复计算
 struct TempLoopInfo {
@@ -69,6 +69,9 @@ public:
     __aicore__ inline void Process();
     template <SequenceLiPhase Phase>
     __aicore__ inline void ProcessSequenceSplit(uint32_t parts = 2);
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    __aicore__ inline void ProcessDedicatedCold(GM_ADDR compute);
+#endif
 
     // =================================类型定义区=================================
     using Q_T = typename QLIT::queryType;
@@ -156,12 +159,17 @@ protected:
     __aicore__ inline void ScanSequenceHalf(uint32_t begin, uint32_t end, uint32_t shard,
 #if !V9_UBMEM
                                            uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery = false,
-                                           bool scoreOnly = false);
+                                           bool scoreOnly = false, bool reloadQuery = false);
     __aicore__ inline bool ScoreRecent(uint32_t& loop, uint32_t qScaleLoop,
                                       uint32_t shard = 0, uint32_t shards = 1, bool reuseRetained = false);
     __aicore__ inline void FinishBaseBlock(const QLICommon::RunInfo& runInfo);
 #else
                                            uint32_t& loop, uint32_t& scaleLoop, bool last);
+#endif
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    __aicore__ inline void BindDedicatedQuery(GM_ADDR compute, uint32_t batch);
+    __aicore__ inline void ScanDedicatedFragment(uint32_t batch, uint32_t half, uint32_t epoch, uint32_t fragment,
+        uint32_t& loop, uint32_t& scaleLoop, bool last, bool reloadQuery = false);
 #endif
     __aicore__ inline void ProcessBaseBlock(uint32_t loop, uint64_t s2LoopIdx,
 #if !V9_UBMEM
@@ -683,7 +691,7 @@ template <bool Precomputed>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
 #if !V9_UBMEM
     uint32_t begin, uint32_t end, uint32_t shard, uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery,
-    bool scoreOnly)
+    bool scoreOnly, bool reloadQuery)
 #else
     uint32_t begin, uint32_t end, uint32_t shard, uint32_t& loop, uint32_t& scaleLoop, bool last)
 #endif
@@ -696,7 +704,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
         QLICommon::RunInfo info;
         CalcRunInfo(loop, tile, info, 0, scaleLoop);
 #if !V9_UBMEM
-        info.isFirstS2InnerLoop = loop == 0 || (newQuery && tile == begin);
+        info.isFirstS2InnerLoop = loop == 0 || ((newQuery || reloadQuery) && tile == begin);
 #else
         info.isFirstS2InnerLoop = loop == 0;
 #endif
@@ -915,6 +923,88 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(u
         }
     }
 }
+
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+template <typename QLIT>
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::BindDedicatedQuery(GM_ADDR compute, uint32_t batch)
+{
+    splitCoreInfo.bN2Start = batch;
+    splitCoreInfo.bN2End = batch;
+    CalcGS1LoopParams(batch);
+    CalcS2LoopParams(batch, 0);
+    if ASCEND_IS_AIV {
+        GlobalTensor<SCORE_T> row;
+        row.SetGlobalBuffer(reinterpret_cast<__gm__ SCORE_T*>(compute) +
+            uint64_t(batch) * runtimeShape_.history * kvip_dedicated_cold::kQueries);
+        vectorService.InitVecWorkspaceTensor(row);
+        vectorService.LoadSequenceSplitThresholds(batch);
+    }
+}
+
+template <typename QLIT>
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanDedicatedFragment(uint32_t batch,
+    uint32_t half, uint32_t epoch, uint32_t fragment, uint32_t& loop, uint32_t& scaleLoop, bool last, bool reloadQuery)
+{
+    const auto tiles = kvip_dedicated_cold::Fragment(runtimeShape_.history, resident_, half, epoch, fragment);
+#if KVIP_STAGE_TRACE
+    traceWindow_ = epoch;
+#endif
+    KVIP_TRACE_RECORD(scanScope, stageTrace_, kvip_trace::Cold, kvip_trace::ScanPhase(), epoch, batch);
+    ScanSequenceHalf(tiles.begin, tiles.end, fragment, loop, scaleLoop, last, false, false, reloadQuery);
+}
+
+template <typename QLIT>
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessDedicatedCold(GM_ADDR compute)
+{
+    const uint32_t half = rotating::SequenceHalfWindow(runtimeShape_);
+    if (aiCoreIdx >= kvip_dedicated_cold::kProducerGroups) {
+        if ASCEND_IS_AIV {
+            vectorService.RunDedicatedService(tmpBlockIdx - 2 * kvip_dedicated_cold::kProducerGroups, half);
+        }
+        return;
+    }
+
+    if ASCEND_IS_AIV {
+        vectorService.AllocEventID();
+        CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT);
+        CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + 1);
+        vectorService.PrepareRotationProgress();
+    } else {
+        matmulService.AllocEventID();
+    }
+
+    constexpr uint32_t groupsPerPair = 3;
+    const uint32_t firstBatch = aiCoreIdx / groupsPerPair * 2;
+    const uint32_t slot = aiCoreIdx % groupsPerPair;
+    if (slot < 2) BindDedicatedQuery(compute, firstBatch + slot);
+    uint32_t loop = 0, scaleLoop = 0;
+    for (uint32_t epoch = 1; epoch < runtimeShape_.rounds; ++epoch) {
+        if ASCEND_IS_AIV { vectorService.SetDedicatedColdEpoch(epoch); }
+        if (slot < 2) {
+            const uint32_t batch = firstBatch + slot;
+            ScanDedicatedFragment(batch, half, epoch, 0, loop, scaleLoop, false);
+            ScanDedicatedFragment(batch, half, epoch, 1, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
+        } else {
+            for (uint32_t batch = firstBatch; batch < firstBatch + 2; ++batch) {
+                // Finish work that used the old query and its tensor bindings.
+                // Keep the FIXP ping-pong counter aligned across both consumers.
+                PipeBarrier<PIPE_ALL>();
+                BindDedicatedQuery(compute, batch);
+                ScanDedicatedFragment(batch, half, epoch, 2, loop, scaleLoop, true, true);
+            }
+        }
+    }
+
+    if ASCEND_IS_AIV {
+        vectorService.FreeEventID();
+    } else {
+        matmulService.FreeEventID();
+        KVIP_TRACE_BEGIN(cubeTailScope, stageTrace_, Cold, LiCubeWait, runtimeShape_.rounds, tempLoopInfo.bIdx);
+        CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT);
+        CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT + 1);
+    }
+}
+#endif
 
 template <typename QLIT>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessMain()

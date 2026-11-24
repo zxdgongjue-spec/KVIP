@@ -30,13 +30,21 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2) {
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
 #if KVIP_STAGE_TRACE
     constexpr bool traceHotSlot = Phase == SequenceLiPhase::Hot || Phase == SequenceLiPhase::UnifiedScore;
-    constexpr bool traceColdSlot = Phase == SequenceLiPhase::Cold || Phase == SequenceLiPhase::PrecomputedCold;
+    constexpr bool traceColdSlot = Phase == SequenceLiPhase::Cold || Phase == SequenceLiPhase::PrecomputedCold ||
+        Phase == SequenceLiPhase::DedicatedCold;
     const uint64_t stageTrace = (parts == 2 || Phase == SequenceLiPhase::Cold ||
         Phase == SequenceLiPhase::UnifiedScore)
         ? KVIP_TRACE_WORKSPACE(P(15)) : 0;
     constexpr uint32_t traceKernel = traceHotSlot ? kvip_trace::Hot :
         Phase == SequenceLiPhase::Threshold ? kvip_trace::Threshold :
         traceColdSlot ? kvip_trace::Cold : kvip_trace::Final;
+#endif
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    if constexpr (Phase == SequenceLiPhase::DedicatedCold) {
+        if ASCEND_IS_AIC {
+            if (GetBlockIdx() >= kvip_dedicated_cold::kProducerGroups) return;
+        }
+    }
 #endif
     KVIP_TRACE_RECORD(kernelScope, stageTrace, traceKernel, kvip_trace::KernelBody, 0, 0);
     KVIP_TRACE_RECORD(setupScope, stageTrace, traceKernel, kvip_trace::Setup, 0, 0);
@@ -70,10 +78,17 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2) {
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
         if constexpr (Phase == SequenceLiPhase::Cold) {
             if (parts > 2) op.vectorService.BindPartitionedCold(P(12), parts);
+        } else if constexpr (Phase == SequenceLiPhase::DedicatedCold) {
+            op.vectorService.BindDedicatedCold(P(12));
         }
 #endif
     }
     KVIP_TRACE_END(setupScope);
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    if constexpr (Phase == SequenceLiPhase::DedicatedCold) {
+        op.ProcessDedicatedCold(P(12));
+    } else
+#endif
     if constexpr (Phase == SequenceLiPhase::Hot) {
         if (splitSequence) op.template ProcessSequenceSplit<Phase>(parts);
         else op.Process();
@@ -103,6 +118,31 @@ __aicore__ inline void ResetPartitionedColdProgress(GM_ADDR bindings, uint32_t p
     TBuf<TPosition::VECCALC> zeros;
     pipe.InitBuffer(zeros, words * sizeof(uint32_t));
     auto values = zeros.Get<uint32_t>();
+    Duplicate(values, 0U, words);
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    DataCopy(output, values, words);
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    pipe.Destroy();
+}
+
+__aicore__ inline void ResetDedicatedColdProgress(GM_ADDR bindings) {
+    using namespace AscendC;
+    const auto a = reinterpret_cast<__gm__ uint64_t*>(bindings);
+    const auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(a[14]));
+    const uint32_t query = GetBlockIdx();
+    if (query >= shape.batch * kvip_dedicated_cold::kQueries) return;
+    constexpr uint32_t words = (kvip_dedicated_cold::kRounds - 1) *
+        kvip_dedicated_cold::kFragments * kvip_dedicated_cold::kProgressWords;
+    const auto progress = reinterpret_cast<GM_ADDR>(a[12]) + kvip_cold_score::ScoreBytes(shape.batch, shape.history);
+    GlobalTensor<uint32_t> output;
+    output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(progress) +
+        kvip_dedicated_cold::ProgressOffset(query, 1, 0));
+    TPipe pipe;
+    TBuf<TPosition::VECCALC> zeros;
+    pipe.InitBuffer(zeros, words * sizeof(uint32_t));
+    const auto values = zeros.Get<uint32_t>();
     Duplicate(values, 0U, words);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
     WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
@@ -146,6 +186,25 @@ extern "C" __global__ __aicore__ void v9_li_kernel_cold_partitioned(GM_ADDR bind
     RunLi<SequenceLiPhase::Cold>(bindings, parts);
 #endif
 }
+
+#if !V9_UBMEM
+extern "C" __global__ __aicore__ void v9_li_kernel_threshold_dedicated_service(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    if ASCEND_IS_AIV {
+        ResetDedicatedColdProgress(bindings);
+        RunLi<SequenceLiPhase::Threshold>(bindings);
+    }
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_li_kernel_cold_dedicated_service(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    RunLi<SequenceLiPhase::DedicatedCold>(bindings);
+#endif
+}
+#endif
 
 extern "C" __global__ __aicore__ void v9_li_kernel_score_t2(GM_ADDR bindings, uint32_t parts) {
 #if defined(__CCE_AICORE__)

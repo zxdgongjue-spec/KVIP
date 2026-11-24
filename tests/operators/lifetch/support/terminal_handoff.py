@@ -119,6 +119,33 @@ def bind_unified_score(state, mode):
     return parts
 
 
+def bind_dedicated_service(state, mode):
+    """Bind the opt-in Cold scheduler to the existing fused Terminal."""
+    forward = dense_terminal(state)
+    if mode == 'p2':
+        return
+    if mode != 'dedicated':
+        raise ValueError(f'Unknown dedicated Service mode {mode!r}')
+    workspace = state.workspace
+    if not (workspace.tail_bounds.eq(0).all().item()
+            and workspace.inputs.query_ends.eq(state.history).all().item()):
+        raise ValueError('Dedicated Service requires full query bounds and no recent tail')
+    queries = state.batch * 4
+    cold_windows = state.rotating.runtime_shape.rounds - 1
+    ledger_bytes = queries * cold_windows * 3 * 64
+    if (workspace.compute.nbytes < queries * state.history * 2 + ledger_bytes
+            or workspace.compute.data_ptr() % 64):
+        raise ValueError('Dedicated Service requires aligned progress space after the Score rows')
+    library = forward.rotating.library
+    supported = library.kvip_dedicated_cold_supported
+    supported.argtypes, supported.restype = [ctypes.c_void_p], ctypes.c_uint32
+    if supported(forward.shape_pointer) != 1:
+        raise ValueError('Dedicated Service is unsupported for this Terminal shape')
+    function = library.kvip_parallel_tail_dedicated_service_forward
+    function.argtypes, function.restype = [ctypes.c_void_p] * 4, ctypes.c_uint32
+    forward.terminal_function = function
+
+
 def fixture_hash(path):
     files = [*(f'arg{i}.bin' for i in range(5)), 'physical_to_logical.npy', 'logical_scores.npy']
     digest = hashlib.sha256()

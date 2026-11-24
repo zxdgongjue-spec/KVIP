@@ -35,6 +35,7 @@
 #include "window_fast_vector.h"
 #endif
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+#include "../../../common/lifetch/dedicated_cold_schedule.h"
 #include "../../../common/lifetch/cold_score_partition.h"
 #endif
 
@@ -72,6 +73,25 @@ public:
         rotationCore_ = (physical / parts) * 2 + part / (parts / 2);
         coldProgress_ = compute + kvip_cold_score::ScoreBytes(runtimeShape_.batch, runtimeShape_.history);
         coldProgressGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(coldProgress_));
+    }
+
+    __aicore__ inline void BindDedicatedCold(GM_ADDR compute) {
+        dedicatedProgress_ = compute + kvip_cold_score::ScoreBytes(runtimeShape_.batch, runtimeShape_.history);
+        dedicatedProgressGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(dedicatedProgress_));
+    }
+
+    __aicore__ inline void SetDedicatedColdEpoch(uint32_t epoch) {
+        dedicatedEpoch_ = epoch;
+    }
+
+    __aicore__ inline void RunDedicatedService(uint32_t lane, uint32_t half) {
+        dedicatedLane_ = lane;
+        AllocEventID();
+        for (uint32_t epoch = 0; epoch < runtimeShape_.rounds; ++epoch) {
+            if (epoch) WaitDedicatedDriver(lane, epoch, half);
+            RotateFetch(epoch, half);
+        }
+        FreeEventID();
     }
 
     __aicore__ inline void WaitPartitionedHalf(uint32_t batch, uint32_t part, uint32_t epoch, uint32_t half) {
@@ -135,20 +155,20 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
 #endif
     __aicore__ inline void RotateFetch(uint32_t epoch, uint32_t sequenceHalfWindow = 0) {
 #if !V9_UBMEM
+        const uint32_t core = RotationCore();
+        const uint32_t serviceLane = ResolveServiceLane(core);
 #if KVIP_STAGE_TRACE
         const uint64_t stageTrace = KVIP_TRACE_WORKSPACE(streamingWorkspace_);
-        const uint32_t serviceLane = rotating::ServiceLane(runtimeShape_.batch, runtimeShape_.splitQ,
-            runtimeShape_.serviceAics, RotationCore(), blockId_ % 2);
         KVIP_TRACE_BEGIN(serviceScope, stageTrace, Cold, ServiceBody, epoch, serviceLane);
 #endif
 #if KVIP_SERVICE_LOCAL_COUNTS
-        const bool stagedMetadata = AdvanceWindow(epoch, sequenceHalfWindow);
+        const bool stagedMetadata = AdvanceWindow(epoch, sequenceHalfWindow, serviceLane);
         // The same lane owns this UB until Service returns. Keep the GM
         // publication for later epochs and all existing ordering edges.
         const __ubuf__ uint64_t* windowMetadata = stagedMetadata && sequenceHalfWindow
             ? reinterpret_cast<const __ubuf__ uint64_t*>(incrementalMetadata_.GetPhyAddr()) : nullptr;
 #else
-        AdvanceWindow(epoch,sequenceHalfWindow);
+        AdvanceWindow(epoch,sequenceHalfWindow,serviceLane);
 #endif
 #endif
         // Join this producer's hit publication. Other producers remain free.
@@ -156,7 +176,7 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
 #if defined(V9_UBMEM) && V9_UBMEM
         rotating::Service(rotationContext_, epoch, blockId_ / 2, blockId_ % 2,
 #else
-        rotating::Service(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,runtimeShape_.serviceLanes,runtimeShape_.tokenBytes,runtimeShape_.postThreads,runtimeShape_.postBank,runtimeShape_.batchedRows,runtimeShape_.scanTokens,rotationContext_, epoch, RotationCore(), blockId_ % 2,
+        rotating::Service(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,runtimeShape_.serviceLanes,runtimeShape_.tokenBytes,runtimeShape_.postThreads,runtimeShape_.postBank,runtimeShape_.batchedRows,runtimeShape_.scanTokens,rotationContext_, epoch, core, serviceLane,
 #endif
 #if !KVIP_STREAMING_LI
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow);
@@ -270,7 +290,58 @@ private:
 #endif
         return blockId_ / 2;
     }
+#if !V9_UBMEM
+    __aicore__ inline uint32_t ResolveServiceLane(uint32_t core) const {
+#if KVIP_HOT_SCORE_PARTITION
+        if (dedicatedLane_ != UINT32_MAX) return dedicatedLane_;
+#endif
+        return rotating::ServiceLane(runtimeShape_.batch, runtimeShape_.splitQ,
+            runtimeShape_.serviceAics, core, blockId_ % 2);
+    }
+#endif
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    __aicore__ inline uint32_t ReadDedicatedCursor(uint32_t query, uint32_t epoch, uint32_t fragment) const {
+        const auto offset = kvip_dedicated_cold::ProgressOffset(query, epoch, fragment);
+        auto cursor = reinterpret_cast<__gm__ volatile uint32_t*>(dedicatedProgress_) + offset;
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ uint32_t*>(cursor)),
+            kvip_dedicated_cold::kProgressWords * sizeof(uint32_t));
+        return *cursor;
+    }
+
+    __aicore__ inline uint64_t DedicatedColdReady(uint32_t query, uint32_t epoch, uint32_t half) const {
+        uint32_t ends[(kvip_dedicated_cold::kRounds - 1) * kvip_dedicated_cold::kFragments] = {};
+        for (uint32_t w = 1; w <= epoch; ++w) {
+            for (uint32_t fragment = 0; fragment < kvip_dedicated_cold::kFragments; ++fragment) {
+                ends[(w - 1) * kvip_dedicated_cold::kFragments + fragment] = ReadDedicatedCursor(query, w, fragment);
+            }
+        }
+        const uint32_t end0 = kvip_dedicated_cold::Prefix(runtimeShape_.history, runtimeShape_.resident, half, epoch, 0, ends);
+        const uint32_t end1 = kvip_dedicated_cold::Prefix(runtimeShape_.history, runtimeShape_.resident, half, epoch, 1, ends);
+        return uint64_t(end0) | (uint64_t(end1) << 32);
+    }
+
+    __aicore__ inline void WaitDedicatedDriver(uint32_t lane, uint32_t epoch, uint32_t half) const {
+        // Preserve the native rotating driver's request, half and Q pair,
+        // even though the stable Service lane can act on a different request.
+        const uint32_t driver = rotating::ServiceCore(runtimeShape_.batch, runtimeShape_.splitQ,
+            runtimeShape_.serviceAics, epoch, lane / 2);
+        const uint32_t shard = driver % 2;
+        const uint32_t firstQuery = driver / 2 * 4 + (lane % 2) * 2;
+        const uint32_t endFragment = shard ? kvip_dedicated_cold::kFragments : 1;
+        KVIP_TRACE_BEGIN(driverScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+            Cold, DedicatedDriverWait, epoch, lane);
+        // The fragment ends are independent monotonic publications. The
+        // driver gate only needs this half, not the rest of the batch.
+        for (uint32_t fragment = shard; fragment < endFragment; ++fragment) {
+            const auto range = kvip_dedicated_cold::Fragment(runtimeShape_.history, runtimeShape_.resident,
+                half, epoch, fragment);
+            const uint32_t limit = range.end * kvip_dedicated_cold::kTileTokens;
+            for (uint32_t query = firstQuery; query < firstQuery + 2; ++query) {
+                while (ReadDedicatedCursor(query, epoch, fragment) < limit) {}
+            }
+        }
+    }
+
     __aicore__ inline uint32_t ReadColdCursor(uint32_t query, uint32_t part) const {
         const uint64_t offset = kvip_cold_score::ProgressOffset(query, part, coldParts_);
         auto cursor = reinterpret_cast<__gm__ volatile uint32_t*>(coldProgress_) + offset;
@@ -294,6 +365,10 @@ private:
     uint32_t coldParts_ = 0;
     uint32_t rotationCore_ = 0;
     GlobalTensor<uint32_t> coldProgressGm_;
+    GM_ADDR dedicatedProgress_ = nullptr;
+    uint32_t dedicatedLane_ = UINT32_MAX;
+    uint32_t dedicatedEpoch_ = 0;
+    GlobalTensor<uint32_t> dedicatedProgressGm_;
 #endif
     GM_ADDR rotationContext_ = nullptr;
 #if KVIP_STREAMING_LI
@@ -946,7 +1021,13 @@ __aicore__ inline void QLIVector<QLIT>::PublishColdTile(const QLICommon::RunInfo
         publish.blockLen = 32;
         publish.srcStride = 0;
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
-        if (coldParts_) {
+        if (dedicatedProgress_) {
+            constexpr uint32_t queryStride = (kvip_dedicated_cold::kRounds - 1) *
+                kvip_dedicated_cold::kFragments * kvip_dedicated_cold::kProgressWords * sizeof(uint32_t);
+            publish.dstStride = queryStride - publish.blockLen;
+            const uint32_t offset = kvip_dedicated_cold::ProgressOffset(queryRow, dedicatedEpoch_, progressShard);
+            DataCopyPad(dedicatedProgressGm_[offset], rotationProgress_[(info.s2Idx % 64) * 16], publish);
+        } else if (coldParts_) {
             // MTE3 has already queued this tile's predicates.
             // Each physical part has an exclusive cache line per query.
             publish.dstStride = coldParts_ * kvip_cold_score::kProgressBytes - publish.blockLen;

@@ -50,7 +50,7 @@ enum Phase : uint32_t {
     ColdPartitionWait = 218,
     ColdT2BankWait = 219, ColdT2ScoreMte2 = 220,
     ColdT2PredicateVf = 221, ColdT2PublishMte3 = 222,
-    PrefetchDoorbell = 223
+    PrefetchDoorbell = 223, DedicatedDriverWait = 224
 };
 }
 

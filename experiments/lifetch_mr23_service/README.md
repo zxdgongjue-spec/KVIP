@@ -279,3 +279,53 @@ prefetch CQ and completion scopes. Source scope unions can overlap, and
 the relative source and native clocks are independent. Use
 `run_mr28_unified_score.sh --batch 8` for an uninstrumented graph Event
 mean with the same synthetic case.
+
+### BS16 Cold Score and independent window Service
+
+Run the native P2 and dedicated Service comparison in the A5 container.
+Both use the same bridge and BS16, Q4/G32, H128K/R16K, W4, original
+prefetch budget 512, and rank start 1024. The default miss rate is 10%.
+
+```bash
+bash experiments/lifetch_mr23_service/run_mr28_dedicated_service.sh
+```
+
+Use `--dry-run` to inspect the plan. Run `--prepare-deps` on the host
+if the existing unified KVAF sources are absent, and `--build-deps`
+in the container if that checkout is unbuilt. All runs use the existing
+shared checkout.
+
+The candidate retains four same-stream launches. Hot and Terminal use the
+native kernels. Threshold also clears the candidate's private readiness
+ledger on every replay. A single Cold launch contains 24 Score MIX groups
+and 16 dedicated Service AIVs. The remaining eight AICs in the launch do
+not participate in the producer credit protocol.
+
+Score groups come in sets of three for each pair of requests. A
+request-local group scores the lower half and the beginning of the upper
+half. The shared group scores the disjoint upper tails of both requests.
+In W1 and W2 every group scans 200 Q4 tiles, and in W3 each pair scans
+198, 198, and 196 tiles. The logical half-window and the original
+canonical Score rows stay intact.
+
+Cube results flow directly to the two paired Score AIVs in UB. Remote
+Service AIVs consume the reduced Score and mask from GM after readiness
+publication. Readiness has one independent cursor per query, window
+and fragment. Service can advance only through contiguous ready ranges,
+so a faster upper tail cannot make an unfinished prefix readable. Each
+request keeps a single Service owner for incremental TopK, Q4 dedup,
+prefetch budget, and SQ updates. W0 can use the resident results while
+Cold scoring starts. In W1–W3, Service waits for the corresponding native
+rotating driver's logical half window to be visible in GM, then consumes
+the target request's current ready ranges. The gate preserves the logical
+trigger, and publication timing can change the prefetch and final Get
+split. Terminal joins early and final Get CQ.
+
+The longest producer receives 598 tiles versus 450 in native P2. This
+is a workload count. Any end-to-end improvement depends on removing
+enough exposed credit wait and overlapping useful Service. Compare
+Score, Threshold, Cold, Terminal, graph Event, and per-request prefetch
+and final Get counts before assigning a latency change to the schedule.
+The run writes `summary.csv` and `requests.csv`. The optional
+`--prefetch-trace` adds a separate replay with prefetch submission
+timestamps and their lead over Terminal.

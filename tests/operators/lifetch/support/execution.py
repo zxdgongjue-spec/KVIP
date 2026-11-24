@@ -3950,6 +3950,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     hot_partition = getattr(config, 'mr25_hot_partition', None)
     cold_partition = getattr(config, 'mr25_cold_partition', None)
     unified_score = getattr(config, 'mr28_unified_score', None)
+    dedicated_service = getattr(config, 'mr28_dedicated_service', None)
     prefetch_trial = handoff in ('baseline', 'ub', 'batch') and hasattr(config, 'service_post_chunk')
     ub_candidates = getattr(config, 'service_ub_candidates', False)
     post_chunk = getattr(config, 'service_post_chunk', 0)
@@ -3960,12 +3961,12 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     msprof_output = getattr(config, 'msprof_output', None)
     cold_route = getattr(config, 'msprof_cold_route', None)
     partition_trial = hot_partition is not None or cold_partition is not None
-    score_trial = partition_trial or unified_score is not None
+    score_trial = partition_trial or unified_score is not None or dedicated_service is not None
     if score_trial and not (fused and handoff and config.transport == 'urma'
                             and config.input == 'synthetic'):
         raise ValueError('The Score trial uses the dense synthetic URMA Terminal comparison')
-    if partition_trial and unified_score is not None:
-        raise ValueError('Windowed partition and unified Score are separate trials')
+    if sum((partition_trial, unified_score is not None, dedicated_service is not None)) > 1:
+        raise ValueError('Windowed partition, unified Score and dedicated Service are separate trials')
     if profile_replay and (not fused or handoff or score_trial or config.transport != 'urma'
                           or config.input != 'synthetic' or config.mode != 'bench'
                           or config.iterations != 1 or len(config.batches) != 1
@@ -3991,7 +3992,12 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     stream = torch.npu.current_stream(device)
     cann, headers = kvaf_build_paths(build)
     soc = acl.get_soc_name()
-    aics = query_device_resources(cann, config.device)['effective_aic']
+    device_resources = query_device_resources(cann, config.device)
+    aics = device_resources['effective_aic']
+    if dedicated_service is not None and (aics != 32 or device_resources['aiv'] < 64
+                                           or 'Ascend950' not in soc):
+        raise ValueError(f"Dedicated Service targets A5 with 32 MIX groups, got {soc} "
+                         f"with {aics} effective AICs and {device_resources['aiv']} AIVs")
     if profile_replay:
         if aics != 32 or 'Ascend950' not in soc:
             raise ValueError(f'Baseline stage trace targets A5 with 32 effective AICs; got {soc}, AICs={aics}')
@@ -4089,6 +4095,10 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 from terminal_handoff import bind_unified_score
 
                 unified_parts = bind_unified_score(state, unified_score)
+            if dedicated_service is not None:
+                from terminal_handoff import bind_dedicated_service
+
+                bind_dedicated_service(state, dedicated_service)
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
@@ -4202,6 +4212,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                     if unified_score is not None:
                         if bind_unified_score(replica, unified_score) != unified_parts:
                             raise RuntimeError('Unified Score partition changed between graph invocations')
+                    if dedicated_service is not None:
+                        bind_dedicated_service(replica, dedicated_service)
                 else:
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
                 batch_states.append(replica)
@@ -4235,6 +4247,15 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                     result['handoff_route'].update(unified_score=unified_score != 'p2',
                                                    producer_parts=unified_parts,
                                                    producer_blocks=unified_parts * g['batch'])
+                if dedicated_service is not None:
+                    dedicated = dedicated_service == 'dedicated'
+                    result['handoff_route'].update(
+                        dedicated_service=dedicated, available_aiv=device_resources['aiv'],
+                        cold_mixed_groups=shape.liCores,
+                        cold_score_aic=24 if dedicated else shape.liCores,
+                        cold_score_aiv=48 if dedicated else 2 * shape.liCores,
+                        cold_service_aiv=shape.serviceLanes,
+                    )
             atomic_json(directory / 'path_result.json', result)
             return result
         state.reset()

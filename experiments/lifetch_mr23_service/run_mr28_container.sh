@@ -3,13 +3,15 @@ set -eo pipefail
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 mode=${1:-}
-case "$mode" in
-    --mr25-handoff|--mr25-score|--mr28-unified-score|--mr28-baseline-msprof) shift ;;
-esac
 a5_root=${KVIP_A5_ROOT:-/home/w00568585/li-aligned-a5}
 unified_runtime=false
-if [[ $mode == --mr25-handoff || $mode == --mr25-score || $mode == --mr28-unified-score || $mode == --mr28-baseline-msprof ]]; then
-    unified_runtime=true
+case "$mode" in
+    --mr25-handoff|--mr25-score|--mr28-unified-score|--mr28-baseline-msprof|--mr28-dedicated-service)
+        shift
+        unified_runtime=true
+        ;;
+esac
+if [[ $unified_runtime == true ]]; then
     checkout=$(cd -- "$here/../.." && pwd)
     export KVIP_KVAF_ROOT="${KVIP_KVAF_ROOT:-"$a5_root/KVAF-unified-813f1750"}"
     export KVIP_KVAF_SERVER="${KVIP_KVAF_SERVER:-127.0.0.1:28986}"
@@ -113,6 +115,8 @@ elif [[ $mode == --mr28-unified-score ]]; then
     "$KVIP_PYTHON" -B "$here/run_mr28_unified_score.py" "$@" 2>&1 | tee "$KVIP_AB_OUTPUT/console.log"
 elif [[ $mode == --mr28-baseline-msprof ]]; then
     "$KVIP_PYTHON" -B "$here/run_mr28_baseline_msprof.py" "$@" 2>&1 | tee "$KVIP_AB_OUTPUT/console.log"
+elif [[ $mode == --mr28-dedicated-service ]]; then
+    "$KVIP_PYTHON" -B "$here/run_mr28_dedicated_service.py" "$@" 2>&1 | tee "$KVIP_AB_OUTPUT/console.log"
 else
     bash "$here/run_a5.sh" "$@" 2>&1 | tee "$KVIP_AB_OUTPUT/console.log"
 fi

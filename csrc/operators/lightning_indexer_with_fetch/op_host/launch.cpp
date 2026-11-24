@@ -132,11 +132,14 @@ extern "C" uint32_t kvip_parallel_tail_supported(const rotating::RuntimeShape* s
 #if KVIP_HOT_SCORE_PARTITION
 #include "../../common/lifetch/hot_score_partition.h"
 #include "../../common/lifetch/cold_score_partition.h"
+#include "../../common/lifetch/dedicated_cold_schedule.h"
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_hot_partitioned(uint32_t,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_threshold_cold_partitioned(uint32_t,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_partitioned(uint32_t,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_score_t2(uint32_t,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_t2(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_threshold_dedicated_service(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_dedicated_service(uint32_t,void*,void*);
 #endif
 enum class ParallelTailStage { Hot, Threshold, ColdService, Terminal };
 
@@ -211,6 +214,24 @@ extern "C" uint32_t kvip_parallel_tail_profile_forward(void* bindings,void* term
 #endif
 
 #if KVIP_HOT_SCORE_PARTITION
+extern "C" uint32_t kvip_dedicated_cold_supported(const rotating::RuntimeShape* shape) {
+    using namespace kvip_dedicated_cold;
+    return kvip_parallel_tail_supported(shape) && shape->batch == kBatch && shape->rounds == kRounds &&
+        shape->history == kHistory && shape->resident == kResident && shape->indexHeads == 32 &&
+        shape->aicCount == kMixGroups && shape->liCores == kMixGroups && shape->serviceLanes == kServiceLanes;
+}
+
+extern "C" uint32_t kvip_parallel_tail_dedicated_service_forward(
+    void* bindings, void* terminal, void* stream, const rotating::RuntimeShape* shape) {
+    if (!bindings || !terminal || !stream || !kvip_dedicated_cold_supported(shape)) return 100000;
+    const uint32_t groups = shape->liCores;
+    uint32_t result = aclrtlaunch_v9_li_kernel(groups, stream, bindings);
+    if (!result) result = aclrtlaunch_v9_li_kernel_threshold_dedicated_service(groups, stream, bindings);
+    if (!result) result = aclrtlaunch_v9_li_kernel_cold_dedicated_service(groups, stream, bindings);
+    if (!result) result = aclrtlaunch_v9_parallel_terminal(shape->batch * 4, stream, terminal);
+    return result;
+}
+
 extern "C" uint32_t kvip_partitioned_hot_score_parts(const rotating::RuntimeShape* shape) {
     return kvip_parallel_tail_supported(shape) ? kvip_hot_score::Parts(shape->batch,shape->resident,shape->aicCount) : 0;
 }
