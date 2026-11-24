@@ -265,7 +265,7 @@ __simd_vf__ inline void FinalBuild(uint32_t rt_tokenBytes,__ubuf__ uint32_t* rem
 }
 
 __aicore__ inline bool SubmitWqesAt(uint32_t rt_tokenBytes,uint64_t entityAddress,uint64_t queueAddress,uint64_t output,LocalTensor<uint32_t> slots,LocalTensor<uint32_t> words,
-    LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize,bool final,__gm__ Row* row) {
+    LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize,bool final,__gm__ Row* row KVIP_PIPE_PARAM_DEFAULT) {
     auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(queueAddress);
     // Intermediate service exclusively owns this queue; CQ draining starts
     // after LI completes. Keep its state on the DMA path, like the batch row.
@@ -308,13 +308,16 @@ __aicore__ inline bool SubmitWqesAt(uint32_t rt_tokenBytes,uint64_t entityAddres
     // 1024 WQEs, halving the dispatch/DMA fences for the usual final batch.
     for(uint32_t begin=0;begin<count;begin+=bankSize) {
         uint32_t n=count-begin<bankSize?count-begin:bankSize;
+        KVIP_PIPE_SAMPLE(buildScope, pipeSample, PrefetchBuildVf);
         FinalBuild(rt_tokenBytes,reinterpret_cast<__ubuf__ uint32_t*>(remoteLow.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(remoteHigh.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(slots.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(words.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),begin,n,count);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        KVIP_TRACE_END(buildScope);
         uint32_t start=uint32_t(head+begin)&(sqDepth-1),first=n<sqDepth-start?n:sqDepth-start;
+        KVIP_PIPE_SAMPLE(sqScope, pipeSample, PrefetchSqMte3);
         DataCopy(sq[start*16],words,first*16);
         if(first!=n)DataCopy(sq,words[first*16],(n-first)*16);
         SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
@@ -350,7 +353,7 @@ __aicore__ inline bool SubmitWqesAt(uint32_t rt_tokenBytes,uint64_t entityAddres
 }
 #if KVIP_PARALLEL_TERMINAL
 __aicore__ inline bool WriteReservedWqes(uint32_t rt_tokenBytes,uint64_t entityAddress,uint64_t queueAddress,uint64_t output,LocalTensor<uint32_t> slots,LocalTensor<uint32_t> words,
-    LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize,bool final,__gm__ Row* row,uint32_t offset,uint32_t total,__gm__ uint32_t* boundTemplate,uint64_t originalHead) {
+    LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize,bool final,__gm__ Row* row,uint32_t offset,uint32_t total,__gm__ uint32_t* boundTemplate,uint64_t originalHead KVIP_PIPE_PARAM_DEFAULT) {
     if(!count)return false;
     auto cfg64=cfg.ReinterpretCast<uint64_t>();uint64_t head=originalHead+offset;
 #ifdef KVIP_KVAF_URMA_REGISTERED_BASE
@@ -364,26 +367,32 @@ __aicore__ inline bool WriteReservedWqes(uint32_t rt_tokenBytes,uint64_t entityA
     // selected and locations are both dead: their contiguous 64KiB holds
     // 1024 WQEs, halving the dispatch/DMA fences for the usual final batch.
     if(count<=bankSize){
+        KVIP_PIPE_SAMPLE(buildScope, pipeSample, TerminalWqeVf);
         FinalBuild(rt_tokenBytes,reinterpret_cast<__ubuf__ uint32_t*>(remoteLow.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(remoteHigh.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(slots.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(words.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),0,count,total-offset);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        KVIP_TRACE_END(buildScope);
         uint32_t start=uint32_t(head)&(sqDepth-1),first=count<sqDepth-start?count:sqDepth-start;
+        KVIP_PIPE_SAMPLE(sqScope, pipeSample, TerminalSqMte3);
         DataCopy(sq[start*16],words,first*16);
         if(first!=count)DataCopy(sq,words[first*16],(count-first)*16);
         SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     }else{
     for(uint32_t begin=0;begin<count;begin+=bankSize) {
         uint32_t n=count-begin<bankSize?count-begin:bankSize;
+        KVIP_PIPE_SAMPLE(buildScope, pipeSample, TerminalWqeVf);
         FinalBuild(rt_tokenBytes,reinterpret_cast<__ubuf__ uint32_t*>(remoteLow.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(remoteHigh.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(slots.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(words.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),begin,n,total-offset);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        KVIP_TRACE_END(buildScope);
         uint32_t start=uint32_t(head+begin)&(sqDepth-1),first=n<sqDepth-start?n:sqDepth-start;
+        KVIP_PIPE_SAMPLE(sqScope, pipeSample, TerminalSqMte3);
         DataCopy(sq[start*16],words,first*16);
         if(first!=n)DataCopy(sq,words[first*16],(n-first)*16);
         SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
@@ -653,10 +662,13 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
             SetFlag<HardEvent::V_MTE2>(EVENT_ID5);WaitFlag<HardEvent::V_MTE2>(EVENT_ID5);
             DataCopyExtParams copy;copy.blockCount=4;copy.blockLen=width*4;copy.srcStride=(2048-width)*4;copy.dstStride=0;
             DataCopyPadExtParams<uint32_t> pad{false,0,0,0};
+            KVIP_TRACE_BEGIN(candidateMteScope, stageTrace, Cold, ServiceInputMte2, epoch, kvip_trace::PipeDetail(b));
             DataCopyPad(input,compact[start],copy,pad);
             SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
+            KVIP_TRACE_END(candidateMteScope);
             SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
             uint32_t n[4];for(uint32_t q=0;q<4;++q)n[q]=counts[q]>start?((counts[q]-start)<width?counts[q]-start:width):0;
+            KVIP_TRACE_BEGIN(unionScope, stageTrace, Cold, ServiceUnionVf, epoch, kvip_trace::PipeDetail(b));
             Simt::VF_CALL<UnionColdTopk>(Simt::Dim3{256,1,1},
                 reinterpret_cast<__ubuf__ uint32_t*>(input.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),
@@ -710,15 +722,21 @@ if (rt_batchedRows) {
                 slots+=count;requests+=count;
 } else {
                 {
+#if KVIP_STAGE_TRACE
+                    const kvip_trace::ScanSample pipeSample{stageTrace, kvip_trace::Cold,
+                        epoch, kvip_trace::PipeDetail(b)};
+#endif
+                    KVIP_PIPE_SAMPLE(candidateScope, pipeSample, PrefetchBuildVf);
                     Simt::VF_CALL<PrepareCandidateWqes>(Simt::Dim3{256,1,1},rt_resident,
                         reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
                         reinterpret_cast<__ubuf__ uint32_t*>(work[512].GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work[1024].GetPhyAddr()),
                         map,reinterpret_cast<__gm__ uint64_t*>(addresses),count,rt_resident+slots,ctx,b,reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddress(ctx->incremental,rt_batch,rt_history,b)));
                     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+                    KVIP_TRACE_END(candidateScope);
                     KVIP_TRACE_END(prepareScope);
                     KVIP_TRACE_BEGIN(submitScope, stageTrace, Cold, PrefetchSubmit, epoch, b);
                     if(captureIo && !firstDoorbell)firstDoorbell=GetSystemCycle();
-                    SubmitWqesAt(rt_tokenBytes,entityAddress,queueAddress,output,work[1024],scratch,work,work[512],cfg,count,256,false,nullptr);
+                    SubmitWqesAt(rt_tokenBytes,entityAddress,queueAddress,output,work[1024],scratch,work,work[512],cfg,count,256,false,nullptr KVIP_PIPE_ARG);
                     ++pending;
                     if(captureIo)lastDoorbell=GetSystemCycle();
                     slots+=count;requests+=count;
@@ -755,6 +773,7 @@ if (rt_batchedRows) {
             uint32_t n=cfg.GetValue(256+(b/rt_serviceLanes)*80+64);if(n>maxCount)maxCount=n;
         }
         for(uint32_t start=0;start<maxCount;start+=rt_postBank) {
+            KVIP_TRACE_BEGIN(batchBuildScope, stageTrace, Cold, PrefetchBuildVf, epoch, kvip_trace::PipeDetail(lane, 14U));
             Simt::VF_CALL<BatchBuild<V9_BATCH_POST==1>>(Simt::Dim3{512,1,1},rt_batch,rt_history,rt_resident,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,ctx,epoch,lane,start,
                 reinterpret_cast<__ubuf__ uint64_t*>(work[512].GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
@@ -762,6 +781,7 @@ if (rt_batchedRows) {
                 reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()));
             SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
             SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            KVIP_TRACE_END(batchBuildScope);
             for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
                 uint32_t g=b/rt_serviceLanes;auto input=cfg[256+g*80];auto in64=input.ReinterpretCast<uint64_t>();
                 uint32_t count=input.GetValue(64);if(count<=start)continue;
@@ -769,13 +789,16 @@ if (rt_batchedRows) {
                 uint32_t depth=input.GetValue(19),offset=uint32_t(in64.GetValue(25)+start)&(depth-1);
                 uint32_t first=n<depth-offset?n:depth-offset;
 #if V9_BATCH_POST == 2
+                KVIP_TRACE_BEGIN(rowBuildScope, stageTrace, Cold, PrefetchBuildVf, epoch, kvip_trace::PipeDetail(b));
                 FinalBuild(rt_tokenBytes,reinterpret_cast<__ubuf__ uint32_t*>(work[512+g*rt_postBank].GetPhyAddr()),
                     reinterpret_cast<__ubuf__ uint32_t*>(work[1024+g*rt_postBank].GetPhyAddr()),
                     reinterpret_cast<__ubuf__ uint32_t*>(work[1536+g*rt_postBank].GetPhyAddr()),
                     reinterpret_cast<__ubuf__ uint32_t*>(scratch[g*rt_postBank*16].GetPhyAddr()),
                     reinterpret_cast<__ubuf__ uint32_t*>(work[g*32].GetPhyAddr()),0,n,count-start);
                 SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+                KVIP_TRACE_END(rowBuildScope);
 #endif
+                KVIP_TRACE_BEGIN(rowSqScope, stageTrace, Cold, PrefetchSqMte3, epoch, kvip_trace::PipeDetail(b));
                 GlobalTensor<uint32_t> sq;sq.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(in64.GetValue(7)));
                 DataCopy(sq[offset*16],scratch[g*rt_postBank*16],first*16);
                 if(first<n)DataCopy(sq,scratch[(g*rt_postBank+first)*16],(n-first)*16);

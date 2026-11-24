@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import ExitStack, contextmanager
 import ctypes
 import hashlib
@@ -18,7 +18,7 @@ from terminal_handoff import fixture_hash, request_counts
 MAGIC = 0x4B56495054524331
 VERSION = 1
 LANES = 96
-CAPACITY = 256
+CAPACITY = 512
 HEADER_BYTES = LANE_BYTES = 128
 EVENT = struct.Struct('<3Q8IQ')
 BINDING_OFFSET = 192
@@ -63,6 +63,46 @@ PHASES = {
     168: 'Join prefetch CQ',
     169: 'Request join and completion status',
 }
+PIPE_SCOPES = {
+    180: ('AIC', 'WAIT', 'Wait for AIV credit'),
+    181: ('AIC', 'MTE2', 'K GM to L1 with ready wait'),
+    182: ('AIC', 'MTE2', 'Q GM to L1 with ready wait'),
+    183: ('AIC', 'MTE1', 'L1 to L0A/L0B with ready wait'),
+    184: ('AIC', 'CUBE', 'MMAD issue'),
+    185: ('AIC', 'FIXP', 'Cube output issue'),
+    186: ('AIC', 'WAIT', 'Wait for FIXP output bank'),
+    188: ('AIV', 'MTE2', 'Query weights and scales with ready wait'),
+    189: ('AIV', 'MTE2', 'K scales with ready wait'),
+    190: ('AIV', 'WAIT', 'Wait for Cube result'),
+    191: ('AIV', 'VF', 'Score and classify SIMD VF'),
+    192: ('AIV', 'MTE3', 'Score, hit and progress writeback issue'),
+    193: ('AIV', 'WAIT', 'Wait for output bank'),
+    196: ('AIV', 'MTE2', 'Resident threshold input with fence'),
+    197: ('AIV', 'VF', 'Resident Top2048 and victim classification'),
+    198: ('AIV', 'MTE3', 'Resident threshold publication'),
+    200: ('AIV', 'MTE2', 'Service window inputs'),
+    201: ('AIV', 'VF', 'Service window TopK'),
+    202: ('AIV', 'MTE3', 'Service window publication'),
+    203: ('AIV', 'VF', 'Service candidate union issue'),
+    204: ('AIV', 'VF', 'Prefetch descriptors with fence'),
+    205: ('AIV', 'MTE3', 'Prefetch SQ write'),
+    206: ('AIV', 'MTE2', 'Service candidates with fence'),
+    210: ('AIV', 'MTE2', 'Terminal TopK inputs'),
+    211: ('AIV', 'VF', 'Terminal Top2048 and selection'),
+    212: ('AIV', 'MTE3', 'Terminal TopK scratch write'),
+    213: ('AIV', 'VF', 'Terminal resolve with fence'),
+    214: ('AIV', 'MTE3', 'Terminal output publication'),
+    215: ('AIV', 'MTE3', 'Terminal WQE writes with fence'),
+    216: ('AIV', 'VF', 'Index update with fence'),
+    217: ('AIV', 'VF', 'Final WQE assembly with fence'),
+}
+PHASES.update({phase: name for phase, (_, _, name) in PIPE_SCOPES.items()})
+NO_TILE, NO_QUERY, SERVICE_LANE = (1 << 20) - 1, 15, 14
+PIPE_SEMANTICS = ('Instrumented source scopes bracket instruction issue and existing fences. '
+                  'Lane counters count overlapping scopes per logical lane, with no PMU sampling. '
+                  'Score scan scopes sample the first and last tile of each active half-window. '
+                  'Core IDs are the raw device core-group '
+                  'values observed alongside logical block and subblock IDs.')
 # Stages that must appear on this P2/W4 route. Get submission may be
 # skipped without eligible requests. Extra capacity passes are conditional.
 REQUIRED = {
@@ -70,6 +110,12 @@ REQUIRED = {
     21: {1, 2, 23},
     22: {1, 2, 21, 22, 25, 150, 152},
     23: {1, 2, 160, 161, 163, 166, 169},
+}
+REQUIRED_PIPE = {
+    20: {183, 184, 191, 192},
+    21: {196, 197, 198},
+    22: {183, 184, 191, 192},
+    23: {211, 213, 214, 216},
 }
 CLOCK = ('Device GetSystemCycle relative to the first recorded scope, scaled by an independent '
          'NPU Event calibration. msprof host and device task timestamps are separate.')
@@ -168,6 +214,9 @@ def decode(raw):
                 raise ValueError(f'Incomplete or invalid stage trace event on lane {lane}, slot {i}')
             if kernel not in KERNELS or phase not in PHASES or block != lane % 64:
                 raise ValueError(f'Unexpected trace routing on lane {lane}, kernel={kernel}, phase={phase}, block={block}')
+            core_type = 'AIC' if lane >= 64 else 'AIV'
+            if phase in PIPE_SCOPES and PIPE_SCOPES[phase][0] != core_type:
+                raise ValueError(f'Unexpected core type for pipe scope {phase} on lane {lane}')
             events.append(dict(lane=lane, begin=begin, end=end, core=core, kernel=kernel, phase=phase,
                                block=block, subblock=subblock, iteration=iteration, detail=detail))
     if not events:
@@ -175,7 +224,7 @@ def decode(raw):
     return sorted(events, key=lambda e: (e['begin'], -e['end'], e['lane']))
 
 
-def verify_route(events, batch):
+def verify_route(events, batch, *, require_pipe_scopes=False):
     phases = defaultdict(set)
     bodies = defaultdict(set)
     for event in events:
@@ -192,6 +241,11 @@ def verify_route(events, batch):
                if not expected.issubset(phases[kernel])}
     if missing:
         raise ValueError(f'Missing required source stages: {missing}')
+    if require_pipe_scopes:
+        missing_pipe = {KERNELS[kernel][1]: sorted(expected - phases[kernel])
+                        for kernel, expected in REQUIRED_PIPE.items() if not expected.issubset(phases[kernel])}
+        if missing_pipe:
+            raise ValueError(f'Missing required pipe scopes: {missing_pipe}')
     four_aiv = set(range(4 * batch))
     two_aic = set(range(64, 64 + 2 * batch))
     expected = {20: four_aiv | two_aic, 21: four_aiv, 22: four_aiv | two_aic, 23: four_aiv}
@@ -199,6 +253,27 @@ def verify_route(events, batch):
         if bodies[kernel] != lanes:
             raise ValueError(f'{KERNELS[kernel][1]} expected {len(lanes)} marked lanes, '
                              f'got {len(bodies[kernel])}')
+
+
+def source_lane_counts(spans):
+    """Count distinct logical lanes, even when their source scopes overlap."""
+    changes = defaultdict(Counter)
+    for event in spans:
+        begin, end, lane = event['begin'], event['end'], event['lane']
+        if begin < end:
+            changes[begin][lane] += 1
+            changes[end][lane] -= 1
+    active = Counter()
+    result = []
+    last_count = 0
+    for tick, change in sorted(changes.items()):
+        active.update(change)
+        # Counter.update retains empty keys. Count only active source lanes.
+        count = sum(depth > 0 for depth in active.values())
+        if count != last_count:
+            result.append((tick, count))
+            last_count = count
+    return result
 
 
 def render(events, counter_mhz):
@@ -214,14 +289,17 @@ def render(events, counter_mhz):
         trace.append(dict(name=name, cat=cat, ph='X', pid=pid, tid=tid,
                           ts=(begin - origin) / counter_mhz, dur=(end - begin) / counter_mhz, args=args))
 
-    for pid, name in [(0, 'Kernel envelopes | source scopes'), (1, 'AIC lanes'), (2, 'AIV lanes')]:
+    for pid, name in [(0, 'Kernel envelopes | source scopes'), (1, 'AIC lanes'), (2, 'AIV lanes'),
+                      (3, 'Observed source lane counts')]:
         metadata('process_name', pid, 0, name)
     kernel_bodies = defaultdict(list)
     stage_sets = defaultdict(list)
+    lane_scopes = defaultdict(list)
     seen_lanes = set()
     for event in events:
         lane = event['lane']
         pid = 1 if lane >= 64 else 2
+        core_type = 'AIC' if pid == 1 else 'AIV'
         if lane not in seen_lanes:
             metadata('thread_name', pid, lane, f'{"AIC" if pid == 1 else "AIV"} logical lane {event["block"]}')
             seen_lanes.add(lane)
@@ -229,13 +307,30 @@ def render(events, counter_mhz):
         kernel = event['kernel']
         kernel_stage, entry = KERNELS[kernel]
         args = dict(kernel_entry=entry, phase_id=phase, block=event['block'], subblock=event['subblock'],
-                    raw_core_id=event['core'], iteration=event['iteration'], detail=event['detail'],
-                    begin_tick=begin, end_tick=end)
+                    core_type=core_type, raw_core_id=event['core'], raw_core_id_hex=hex(event['core']),
+                    iteration=event['iteration'], detail=event['detail'], begin_tick=begin, end_tick=end)
         window_epoch = None
-        if kernel in (20, 22) and phase in (21, 22, 25, *range(150, 156)):
+        category = kernel_stage
+        if kernel in (20, 22) and (phase in (21, 22, 25, *range(150, 156)) or phase in PIPE_SCOPES):
             window_epoch = event['iteration']
             args['window_epoch'] = window_epoch
-        if phase in (23, 155) or kernel == 23:
+        if phase in PIPE_SCOPES:
+            _, pipe, _ = PIPE_SCOPES[phase]
+            category = f'KVIP source {pipe}'
+            detail = event['detail']
+            query, tile = (detail >> 20) & NO_QUERY, detail & NO_TILE
+            args['pipe'] = pipe
+            if query == SERVICE_LANE:
+                args['service_lane'] = detail >> 24
+            else:
+                args['request_row'] = detail >> 24
+            if query not in (NO_QUERY, SERVICE_LANE):
+                args['query_start' if phase < 200 else 'query'] = query
+            if tile != NO_TILE:
+                args['tile_index'] = tile
+                args['sampled_scan_tile'] = True
+            lane_scopes[(core_type, pipe)].append(event)
+        elif phase in (23, 155) or kernel == 23:
             args.update(request_row=event['detail'] // 4, query=event['detail'] % 4)
         elif phase in (21, 22, 152, 153):
             args['request_row'] = event['detail']
@@ -243,9 +338,10 @@ def render(events, counter_mhz):
             args['service_lane'] = event['detail']
         elif phase == 154:
             args['request_or_service_lane'] = event['detail']
-        add_span(PHASES[phase], kernel_stage, pid, lane, begin, end, args)
+        add_span(PHASES[phase], category, pid, lane, begin, end, args)
         if phase == 1:
             kernel_bodies[kernel].append(event)
+            lane_scopes[(core_type, 'kernel body')].append(event)
         stage_sets[(kernel, phase, window_epoch)].append(event)
 
     def bounds(spans):
@@ -259,42 +355,86 @@ def render(events, counter_mhz):
                  dict(kernel_entry=entry, marked_lanes=len(spans), begin_tick=begin, end_tick=end))
 
     summaries = []
+    def lane_mapping(mapping):
+        return [dict(block=block, subblock=subblock, raw_core_ids=sorted(raw_ids))
+                for (block, subblock), raw_ids in sorted(mapping.items())]
+
     for (kernel, phase, window_epoch), spans in sorted(stage_sets.items()):
         begin, end = bounds(spans)
+        aic, aiv = defaultdict(set), defaultdict(set)
+        for span in spans:
+            mapping = aic if span['lane'] >= 64 else aiv
+            mapping[(span['block'], span['subblock'])].add(span['core'])
         summaries.append(dict(kernel_entry=KERNELS[kernel][1], phase=PHASES[phase], window_epoch=window_epoch,
+                              pipe=PIPE_SCOPES[phase][1] if phase in PIPE_SCOPES else None,
                               events=len(spans), logical_lanes=len({e['lane'] for e in spans}),
+                              logical_aic_lanes=len({block for block, _ in aic}),
+                              logical_aiv_lanes=len({block for block, _ in aiv}),
+                              observed_aic_lanes=lane_mapping(aic), observed_aiv_lanes=lane_mapping(aiv),
                               first_us=(begin - origin) / counter_mhz, last_us=(end - origin) / counter_mhz,
                               envelope_us=(end - begin) / counter_mhz,
                               sum_per_core_scope_us=sum(e['end'] - e['begin'] for e in spans) / counter_mhz))
-    document = dict(traceEvents=trace, displayTimeUnit='ms', metadata=dict(clock=CLOCK, counter_mhz=counter_mhz))
+    for tid, ((core_type, scope), spans) in enumerate(sorted(lane_scopes.items()), 1):
+        title = f'{core_type} {scope} source lanes'
+        for tick, count in source_lane_counts(spans):
+            trace.append(dict(name=title, cat='KVIP source lane count', ph='C', pid=3, tid=tid,
+                              ts=(tick - origin) / counter_mhz, args={'lanes': count}))
+    document = dict(traceEvents=trace, displayTimeUnit='ms',
+                    metadata=dict(clock=CLOCK, counter_mhz=counter_mhz, pipe_scope_semantics=PIPE_SEMANTICS))
     return document, summaries
+
+
+def replay_evidence(state, library, config, soc):
+    windows = state.rotating.runtime_shape.rounds
+    requests = request_counts(state.rotating.rows.cpu().numpy(), state.rotating.final_posts.cpu().numpy(),
+                              windows, config.prefetch_tokens)
+    fixture = Path(state.initial.source_paths[0])
+    with Path(library).open('rb') as binary:
+        library_sha256 = hashlib.file_digest(binary, 'sha256').hexdigest()
+    return dict(
+        correctness='PASS', execution='COMPLETED', route='Production P2 + four-AIV Terminal', soc=soc,
+        aics=32, geometry=state.initial.geometry, miss_percent=config.miss_percent,
+        warmup=config.warmup, windows=windows, requested_windows=config.intermediate_fetches,
+        prefetch_tokens=config.prefetch_tokens, prefetch_rank_start=config.prefetch_rank_start,
+        total_prefetch=sum(req['prefetch_requests'] for req in requests),
+        total_final_get=sum(req['final_get_requests'] for req in requests),
+        requests=requests, fixture_sha256=fixture_hash(fixture), library_sha256=library_sha256,
+    )
+
+
+def write_instruction_replay(directory, state, library, config, soc):
+    """Record the checked worker replay independently of msOpProf artifacts."""
+    report = replay_evidence(state, library, config, soc)
+    shape = state.rotating.runtime_shape
+    report.update(
+        invocations=1,
+        kernel_launch_plan=[dict(kernel_entry=KERNELS[kernel][1], launches=1,
+                                 blocks=4 * state.batch if kernel == 23 else shape.liCores)
+                            for kernel in REQUIRED],
+        bridge=str(Path(library).resolve()),
+        source_trace_enabled=False,
+        inner_profiler_enabled=False,
+    )
+    atomic_json(directory / 'instruction_replay_report.json', report)
+    return report
 
 
 def write_capture(directory, raw, counter_mhz, state, library, config, soc, msprof_capture):
     events = decode(raw)
-    verify_route(events, state.batch)
+    verify_route(events, state.batch, require_pipe_scopes=True)
     document, stages = render(events, counter_mhz)
-    windows = state.rotating.runtime_shape.rounds
-    requests = request_counts(state.rotating.rows.cpu().numpy(), state.rotating.final_posts.cpu().numpy(),
-                              windows, config.prefetch_tokens)
-    total_prefetch = sum(req['prefetch_requests'] for req in requests)
-    total_final_get = sum(req['final_get_requests'] for req in requests)
+    report = replay_evidence(state, library, config, soc)
     phases = {event['phase'] for event in events}
-    if ((total_prefetch and not {153, 154, 168}.issubset(phases))
-            or (total_final_get and not {164, 165, 167}.issubset(phases))):
+    if ((report['total_prefetch'] and not {153, 154, 168, 204, 205}.issubset(phases))
+            or (report['total_final_get'] and not {164, 165, 167, 215, 217}.issubset(phases))):
         raise ValueError('Observed Get counts have missing descriptor, submission or completion markers')
-    fixture = Path(state.initial.source_paths[0])
-    report = dict(
-        correctness='PASS', execution='COMPLETED', route='Production P2 + four-AIV Terminal', soc=soc,
-        aics=32, geometry=state.initial.geometry, miss_percent=config.miss_percent,
-        warmup=config.warmup, traced_invocations=1, windows=windows, requested_windows=config.intermediate_fetches,
-        prefetch_tokens=config.prefetch_tokens, prefetch_rank_start=config.prefetch_rank_start,
-        total_prefetch=total_prefetch, total_final_get=total_final_get, requests=requests,
-        fixture_sha256=fixture_hash(fixture), library_sha256=hashlib.sha256(Path(library).read_bytes()).hexdigest(),
+    report.update(
+        traced_invocations=1,
         clock=CLOCK, counter_mhz=counter_mhz, events=len(events), stages=stages,
         msprof_capture=msprof_capture,
         raw_trace='baseline_stage_trace.bin', visual_trace='baseline_stage_trace.json',
         observer_cost='Measured source scopes include marker overhead and existing synchronization',
+        pipe_scope_semantics=PIPE_SEMANTICS,
     )
     atomic_json(directory / 'baseline_stage_trace.json', document)
     atomic_json(directory / 'baseline_stage_report.json', report)

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 
+from lifetch_instruction_capture import STAGES, collect_instructions, instruction_plan
 from lifetch_msprof_timeline import publish_business_views, verified_vendor_timeline
 from run_mr25_handoff import KVAF, MAIN, ROOT, git, read, save
 
@@ -20,10 +21,18 @@ def parse_args(argv=None):
     parser.add_argument('--miss-percent', type=int, choices=range(101), metavar='0..100', default=10)
     parser.add_argument('--warmup', type=int, default=0, help='optional replays with the stage buffer disabled')
     parser.add_argument('--timeout-seconds', type=int, default=900, help='limit for capture, including first build')
+    parser.add_argument('--instructions', action='store_true', help='also collect on-board msOpProf artifacts')
+    parser.add_argument('--instruction-stage', choices=('all', *STAGES), default='all')
+    parser.add_argument('--instruction-pipes', default='mte1|mte2|mte3',
+                        help='pipe names separated by |, used with --instructions')
     parser.add_argument('--dry-run', action='store_true', help='print the capture plan without CANN or KVAF')
     args = parser.parse_args(argv)
     if args.warmup < 0 or args.timeout_seconds < 1:
         parser.error('warmup must be nonnegative and timeout must be positive')
+    try:
+        args.instruction_plan = instruction_plan(args.instruction_stage, args.instruction_pipes) if args.instructions else None
+    except ValueError as error:
+        parser.error(str(error))
     return args
 
 
@@ -100,6 +109,14 @@ def capture(args, output, kvaf, arguments, manifest):
     for row in intervals:
         print(f'  {row["name"]}: {row["duration_us"]:.2f} us', flush=True)
     print(f'Early prefetch / final Get: {report["total_prefetch"]} / {report["total_final_get"]}', flush=True)
+    manifest['business_status'] = 'PASS'
+    if args.instruction_plan:
+        instruction_output = output / 'instruction'
+        manifest['instruction_status_file'] = str(instruction_output / 'instruction_status.json')
+        save(output / 'manifest.json', manifest)
+        manifest['instruction_capture'] = collect_instructions(
+            profiler, instruction_output, kvaf, configuration(arguments), args.instruction_plan, report['fixture_sha256'],
+        )
 
 
 def main(argv=None):
@@ -112,6 +129,7 @@ def main(argv=None):
         kvaf_commit=KVAF, route='main_p2_parallel_terminal', local_counts=False,
         arguments=arguments, requested_stage_replays=1,
         collection='pyACL_prof_start_stop_around_fused_forward_only',
+        instruction_plan=args.instruction_plan,
         clocks='independent: msprof device task clock and calibrated source counter',
     )
     if args.dry_run:

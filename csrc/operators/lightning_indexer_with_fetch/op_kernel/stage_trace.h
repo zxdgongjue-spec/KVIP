@@ -35,7 +35,17 @@ enum Phase : uint32_t {
     TerminalTopK = 160, TerminalResolve = 161, TerminalCapacity = 162,
     TerminalOutput = 163, TerminalWqe = 164, TerminalDoorbell = 165,
     TerminalIndex = 166, TerminalGetCq = 167, TerminalPrefetchCq = 168,
-    TerminalFinish = 169
+    TerminalFinish = 169,
+    AicCreditWait = 180, AicKeyMte2 = 181, AicQueryMte2 = 182,
+    AicL0Mte1 = 183, AicCubeIssue = 184, AicFixpIssue = 185, AicFixpWait = 186,
+    AivQueryMte2 = 188, AivKeyScaleMte2 = 189, AivCubeWait = 190,
+    AivScoreVf = 191, AivScoreMte3 = 192, AivBankWait = 193,
+    ThresholdInputMte2 = 196, ThresholdTopKVf = 197, ThresholdOutputMte3 = 198,
+    WindowInputMte2 = 200, WindowTopKVf = 201, WindowOutputMte3 = 202,
+    ServiceUnionVf = 203, PrefetchBuildVf = 204, PrefetchSqMte3 = 205, ServiceInputMte2 = 206,
+    TerminalInputMte2 = 210, TerminalTopKVf = 211, TerminalTopKMte3 = 212,
+    TerminalResolveVf = 213, TerminalOutputMte3 = 214, TerminalSqMte3 = 215,
+    TerminalIndexVf = 216, TerminalWqeVf = 217
 };
 }
 
@@ -48,6 +58,18 @@ __aicore__ inline uint64_t WorkspaceAddress(GM_ADDR workspace) {
     return *reinterpret_cast<__gm__ uint64_t*>(workspace + kWorkspaceOffset);
 }
 
+// Detail holds the logical request row, local Q, and absolute 128-score tile.
+constexpr uint32_t kNoTile = (1U << 20) - 1;
+constexpr uint32_t kAllQueries = 15;
+__aicore__ inline uint32_t PipeDetail(uint32_t row, uint32_t query = kAllQueries, uint32_t tile = kNoTile) {
+    return (row << 24) | (query << 20) | tile;
+}
+struct ScanSample {
+    uint64_t base = 0;
+    uint32_t kernel = 0;
+    uint32_t epoch = 0;
+    uint32_t detail = 0;
+};
 __aicore__ inline uint32_t ScanPhase() {
     if ASCEND_IS_AIV { return LiScore; }
     return LiMatmul;
@@ -103,9 +125,20 @@ public:
 #define KVIP_TRACE_RECORD(n,b,k,p,i,d) kvip_trace::Scope n(b,k,p,i,d)
 #define KVIP_TRACE_BEGIN(n,b,k,p,i,d) KVIP_TRACE_RECORD(n,b,kvip_trace::k,kvip_trace::p,i,d)
 #define KVIP_TRACE_END(n) n.End()
+#define KVIP_PIPE_PARAM , const kvip_trace::ScanSample& pipeSample
+#define KVIP_PIPE_PARAM_DEFAULT KVIP_PIPE_PARAM = {}
+#define KVIP_PIPE_ARG , pipeSample
+#define KVIP_PIPE_SAMPLE(n,s,p) KVIP_TRACE_RECORD(n,(s).base,(s).kernel,kvip_trace::p,(s).epoch,(s).detail)
+#define KVIP_RANK_SAMPLE(n,s,w,t) KVIP_TRACE_RECORD(n,(s).base,(s).kernel, \
+    (s).kernel==kvip_trace::Terminal ? kvip_trace::t : kvip_trace::w,(s).epoch,(s).detail)
 #else
 #define KVIP_TRACE_WORKSPACE(w) uint64_t(0)
 #define KVIP_TRACE_RECORD(n,b,k,p,i,d)
 #define KVIP_TRACE_BEGIN(n,b,k,p,i,d)
 #define KVIP_TRACE_END(n)
+#define KVIP_PIPE_PARAM
+#define KVIP_PIPE_PARAM_DEFAULT
+#define KVIP_PIPE_ARG
+#define KVIP_PIPE_SAMPLE(n,s,p)
+#define KVIP_RANK_SAMPLE(n,s,w,t)
 #endif

@@ -92,6 +92,7 @@ public:
     rotating::RuntimeShape runtimeShape_;
 #if KVIP_STAGE_TRACE
     uint64_t stageTrace_ = 0;
+    uint32_t traceWindow_ = 0;
 #endif
     bool sequenceSplit_ = false;
     bool sequenceTopKOnly_ = false;
@@ -703,6 +704,17 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
 #if !V9_UBMEM
         info.reuseQuery = newQuery && tile == begin;
 #endif
+#if KVIP_STAGE_TRACE
+        // First and last tile preserve pipeline transitions without turning
+        // the full history scan into a trace of every individual submission.
+        kvip_trace::ScanSample pipeSample;
+        if (stageTrace_ && (tile == begin || tile + 1 == end)) {
+            uint32_t firstQ = kvip_trace::kAllQueries;
+            if ASCEND_IS_AIV { firstQ = (tmpBlockIdx % 2) * 2; }
+            pipeSample = {stageTrace_, traceWindow_ ? kvip_trace::Cold : kvip_trace::Hot,
+                traceWindow_, kvip_trace::PipeDetail(info.bIdx, firstQ, tile)};
+        }
+#endif
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
         if constexpr (Precomputed) {
             vectorService.ProcessPrecomputedVec1(info, shard, tile + 1 == end);
@@ -710,12 +722,12 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
 #endif
         {
             if ASCEND_IS_AIC {
-                matmulService.ComputeMm1(info);
+                matmulService.ComputeMm1(info KVIP_PIPE_ARG);
             } else {
 #if !V9_UBMEM
-                vectorService.ProcessVec1(info, shard, tile + 1 == end, scoreOnly);
+                vectorService.ProcessVec1(info, shard, tile + 1 == end, scoreOnly KVIP_PIPE_ARG);
 #else
-                vectorService.ProcessVec1(info, shard, tile + 1 == end);
+                vectorService.ProcessVec1(info, shard, tile + 1 == end KVIP_PIPE_ARG);
 #endif
             }
         }
@@ -869,6 +881,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(u
                     halfTokens, epoch, shard, parts);
 #endif
                 {
+#if KVIP_STAGE_TRACE
+                    traceWindow_ = epoch;
+#endif
                     KVIP_TRACE_RECORD(coldScanScope, stageTrace_, kvip_trace::Cold,
                         kvip_trace::ScanPhase(), epoch, batch);
                     ScanSequenceHalf<Phase == SequenceLiPhase::PrecomputedCold>(

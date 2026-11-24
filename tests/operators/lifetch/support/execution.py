@@ -244,9 +244,14 @@ def run_config(path, shared_pool=None):
     config.kvaf_root = Path(config.kvaf_root).resolve()
     config.output = path.parent
     use_pool = config.mode in ('bench', 'diagnose')
+    instruction_replay = getattr(config, 'msprof_instruction_replay', False)
+    if instruction_replay and not (use_pool and config.input == 'synthetic'):
+        raise ValueError('Instruction collection requires the synthetic benchmark worker')
     if use_pool and config.input == 'synthetic' and shared_pool is None:
         pool = BenchPool(config)
         misses = config.miss_percent if isinstance(config.miss_percent, list) else [config.miss_percent]
+        if instruction_replay and (len(misses) != 1 or len(config.batches) != 1):
+            raise ValueError('Instruction collection requires one miss rate and one batch size')
         failed = 0
         try:
             for miss in misses:
@@ -3945,6 +3950,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     cold_partition = getattr(config, 'mr25_cold_partition', None)
     unified_score = getattr(config, 'mr28_unified_score', None)
     baseline_trace = getattr(config, 'msprof_baseline', False)
+    instruction_replay = getattr(config, 'msprof_instruction_replay', False)
+    profile_replay = baseline_trace or instruction_replay
     msprof_output = getattr(config, 'msprof_output', None)
     partition_trial = hot_partition is not None or cold_partition is not None
     score_trial = partition_trial or unified_score is not None
@@ -3953,18 +3960,24 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         raise ValueError('The Score trial uses the dense synthetic URMA Terminal comparison')
     if partition_trial and unified_score is not None:
         raise ValueError('Windowed partition and unified Score are separate trials')
-    if baseline_trace and (not msprof_output or not fused or handoff or score_trial or config.transport != 'urma'
-                           or config.input != 'synthetic' or config.mode != 'bench'
-                           or config.iterations != 1 or len(config.batches) != 1
-                           or config.intermediate_fetches != 4 or config.prefetch_tokens <= 0):
-        raise ValueError('Baseline stage trace requires a profile output and one synthetic P2 URMA case with W4 and prefetch enabled')
+    if profile_replay and (not fused or handoff or score_trial or config.transport != 'urma'
+                          or config.input != 'synthetic' or config.mode != 'bench'
+                          or config.iterations != 1 or len(config.batches) != 1
+                          or config.intermediate_fetches != 4 or config.prefetch_tokens <= 0):
+        raise ValueError('Profiling requires one synthetic P2 URMA case with W4 and prefetch enabled')
+    if baseline_trace and (not msprof_output or instruction_replay):
+        raise ValueError('Baseline stage trace requires an exclusive profile output')
+    if instruction_replay:
+        instruction_library = Path(getattr(config, 'msprof_instruction_library', '')).resolve()
+        if config.warmup or msprof_output or not instruction_library.is_file():
+            raise ValueError('Instruction collection requires a prebuilt bridge, zero warmup and no inner profiler')
     torch.npu.set_device(config.device)
     device = torch.device(f'npu:{config.device}')
     stream = torch.npu.current_stream(device)
     cann, headers = kvaf_build_paths(build)
     soc = acl.get_soc_name()
     aics = query_device_resources(cann, config.device)['effective_aic']
-    if baseline_trace:
+    if profile_replay:
         if aics != 32 or 'Ascend950' not in soc:
             raise ValueError(f'Baseline stage trace targets A5 with 32 effective AICs; got {soc}, AICs={aics}')
     else:
@@ -4019,6 +4032,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                     replay_stage('building P2/Terminal with opt-in source trace')
                     library = build_library(directory / 'trace_build', cann, headers, soc,
                                             local_counts=False, stage_trace=True)
+                elif instruction_replay:
+                    library = instruction_library
                 elif handoff:
                     from terminal_handoff import build_library
 
@@ -4036,6 +4051,13 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
                 prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024))
+            if profile_replay:
+                shape = state.rotating.runtime_shape
+                if (state.forward.terminal is None or shape.liCores != 2 * g['batch']
+                        or shape.rounds != min(config.intermediate_fetches, shape.liCores)):
+                    raise RuntimeError('Profiling requires the P2 and four-AIV Terminal route')
+                if instruction_replay and hasattr(state.rotating.library, 'kvip_stage_trace_supported'):
+                    raise RuntimeError('Instruction collection requires the bridge with KVIP_STAGE_TRACE disabled')
             if handoff:
                 shape = state.rotating.runtime_shape
                 if state.forward.terminal is None or shape.liCores != 2 * g['batch']:
@@ -4079,13 +4101,17 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 raise
             else:
                 pending = False
+        if instruction_replay:
+            from baseline_stage_trace import write_instruction_replay
+
+            replay_stage('submitting exactly one stock P2/Terminal for external instruction collection')
+            pending = True
+            state.forward()
+            stream.synchronize()
+            validate(initial)
+            return write_instruction_replay(directory, state, library, config, soc)
         if baseline_trace:
             from baseline_stage_trace import StageBuffer, scoped_msprof, write_capture
-
-            shape = state.rotating.runtime_shape
-            if (state.forward.terminal is None or shape.liCores != 2 * g['batch']
-                    or shape.rounds != min(config.intermediate_fetches, shape.liCores)):
-                raise RuntimeError('Baseline stage trace requires the P2 and four-AIV Terminal route')
             trace = StageBuffer(state)
             replay_stage('calibrating device counter and warming up unmarked P2 kernels')
             pending = True
@@ -4314,7 +4340,7 @@ def run_synthetic_batch(config, directory, *, shared_pool=None):
             from workloads import payload
             pages.token_payload = lambda row, ids: payload(row, np.asarray(ids))
             folder = directory / f'case-b{batch}'
-            if getattr(config, 'msprof_baseline', False):
+            if getattr(config, 'msprof_baseline', False) or getattr(config, 'msprof_instruction_replay', False):
                 run_path(config, folder, sequence, pages, fused=True, shared_pool=pool)
                 continue
             if handoff:

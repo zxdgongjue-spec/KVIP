@@ -163,3 +163,47 @@ Under the printed `Run output` directory, open `lifetch_business_trace.json` fir
 | `manifest.json` | Revisions, fixture, command, exit status and paths |
 
 The two views describe the same capture and retain their measured clocks. The source view uses a measured device-counter frequency. `manifest.json` records whether CANN reports each task by kernel name or whether it was identified as the unique compute task between that stage’s device markers. Scope spans include existing waits and marker overhead.
+
+### Per-core MTE and VF stages
+
+In `lifetch_business_trace.json`, expand the individual AIC and AIV lanes and
+the `Observed source lane counts` counters. Device events carry the logical
+lane, subblock and raw AI Core group ID. The stage report's `stages` list
+also contains the distinct AIC/AIV lanes per stage and window. Group IDs may
+be shared by AIC/AIV subcores.
+
+The finer source scopes annotate AIC MTE2 loads, MTE1 staging, Cube and FIXP,
+AIV MTE2 input loads, VF/vector scoring, MTE3 writeback, and waits. The
+window and Terminal entries include TopK selection, candidate/descriptor
+handling, final Resolve, KV transfer and persistent Index publication.
+Hot/Cold tile details are sampled at the first and last tile per mapped
+shard/window. Submit intervals and existing fence/wait intervals retain
+their source semantics. Source lane counts measure overlap of those
+observed scopes and include observer overhead.
+
+### Optional on-board instruction pipeline
+
+Run the same command with `--instructions` for a separate native capture.
+It uses single-device application replay, with a fresh KVAF lease and one
+checked uninstrumented forward on each application pass. The vendor
+collector's operator filter targets the original four LIFetch kernels.
+
+```bash
+bash experiments/lifetch_mr23_service/run_mr28_baseline_msprof.sh --instructions
+```
+
+For a smaller instruction capture, use
+`--instructions --instruction-stage cold-service --instruction-pipes 'mte2|mte3'`.
+The default instruction pipes are MTE1, MTE2 and MTE3. An installation
+that advertises both `InstrTimeline` and application replay is required.
+Set `KVIP_MSOPPROF` to the path of a compatible standalone msopprof if it
+is installed. The CANN 9.1 container used for compilation did not advertise
+`InstrTimeline` in its bundled CLI.
+
+Open the listed `instruction/raw/OPPROF_*/**/visualize_data.bin` files in
+MindStudio Insight. `instruction/instruction_status.json` records the
+requested filters, replay report paths and native artifacts found. Verify
+the instruction tracks in Insight and correlate by kernel name and source
+location. Hardware instruction sampling covers a subset of cores. The
+generic InstrTimeline route gives no VF-body completeness guarantee. Use
+the per-core source trace for VF launch and dependency boundaries.
