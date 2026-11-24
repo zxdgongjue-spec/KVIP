@@ -107,7 +107,10 @@ def read_arm(root, group, arm, revision, owner, oracle, *, verify_library):
     runtime = proof['runtime']
     if runtime['host'] != (root/'host.txt').read_text().strip() or runtime['visible'] != '4':
         raise ValueError(f'G{group} {arm}: runtime used a different host or NPU')
+    # Varying physical geometry and launch-specific paths are checked separately.
+    varying = {'history', 'kvaf_server', 'output', 'trace_root', 'kvaf_root', 'production_root', 'production_revision'}
     controls = dict(capture=capture, runtime=runtime, library=proof['library_sha256'],
+                    config={k: v for k, v in cfg.items() if k not in varying},
                     operand_hashes=proof['capture_operand_hashes'], state_hashes=cap['capture_state_sha256'],
                     page_hash=cap['capture_page_table_sha256'], sdk_root=str(Path(cfg['kvaf_root']).resolve()),
                     cpu_registered_bytes=thp['bytes'])
@@ -190,6 +193,8 @@ def compare_active(root, archive, group, owner):
         phases[label] = {f"LI{i}": (mean(values), median(values)) for i, values in enumerate(zip(*durations), 1)}
     if controls['cap128k']['library'] != controls['cap512k']['library']:
         raise ValueError(f"G{group}: archived capacities used different binaries")
+    if controls['candidate']['library'] == controls['cap512k']['library']:
+        raise ValueError(f"G{group}: candidate loaded the old 512K binary")
     for label in CAPS:
         different = [key for key in controls[label] if key != 'library' and controls[label][key] != controls['candidate'][key]]
         if different:

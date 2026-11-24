@@ -127,12 +127,15 @@ def test_active_uses_archived_arms_and_rejects_partial_comparison(tmp_path, monk
     previous = report.measured_parallel
     calls = []
 
+    candidate_hash = 'candidate'
+    candidate_overrides = {}
     def measure(root, group, arm, revision_, *args, **kw):
         times, exact, thp, proof, cfg = previous(root, group, arm, revision_, *args, **kw)
         calls.append((root, arm, revision_, kw['verify_library']))
         if root == fresh:
             times = {k: tuple(v*.85 for v in row) for k, row in times.items()}
-            proof = dict(proof, library_sha256='candidate')
+            proof = dict(proof, library_sha256=candidate_hash)
+            cfg = {**cfg, **candidate_overrides}
         return times, exact, thp, proof, cfg
     monkeypatch.setattr(report, 'measured_parallel', measure)
     report.compare_active(fresh, archive, group, owner)
@@ -143,6 +146,14 @@ def test_active_uses_archived_arms_and_rejects_partial_comparison(tmp_path, monk
     assert 'candidate_minus_archived_cap512k graph_mean/P50_us=-18.00/-18.00' in text
     saved = report.read(fresh/'g2/active_comparison.json')
     assert saved['li_phases']['candidate']['LI3'] == [3., 3.]
+    candidate_hash = 'hash'
+    with pytest.raises(ValueError, match='loaded the old'):
+        report.compare_active(fresh, archive, group, owner)
+    candidate_hash = 'candidate'
+    candidate_overrides['level'] = 3
+    with pytest.raises(ValueError, match='config'):
+        report.compare_active(fresh, archive, group, owner)
+    candidate_overrides.clear()
     # The stored verified comparison must agree with the historical raw results.
     prior = report.read(archive/'g2/capacity_comparison.json')
     prior['timing']['cap512k']['graph'][0] += 10
