@@ -83,6 +83,7 @@ checkout() {
 }
 reader_src=$(checkout "$reader")
 main_src=$(checkout "$main")
+if [[ $mode == pr30-parity ]]; then pr30_src=$(checkout "$pr30"); fi
 entry="$reader_src/tests/operators/lifetch"
 support="$entry/support"
 printf '%s\n' "$main" >"$out/main.txt"
@@ -177,7 +178,6 @@ if [[ $mode == pr30-parity ]]; then
     done
     if (( ${#missing[@]} )); then
         ref_out=$(mktemp -d "$area/pr30-reference-five.XXXXXX")
-        pr30_src=$(checkout "$pr30")
         printf '%s\n' "$pr30" > "$ref_out/main.txt"
         for field in reader kvaf kvaf_tree host physical_npu boot_id machine_id; do
             if [[ -f $out/$field.txt ]]; then cp "$out/$field.txt" "$ref_out/$field.txt"; fi
@@ -295,7 +295,11 @@ PY_DEVICE
         sleep 1
     done
     if ! grep -Fq "LISTEN address=127.0.0.1 port=$port" "$arm/cpu.log"; then tail -20 "$arm/cpu.log" >&2; exit 1; fi
-    "$PYTHON" -B "$support/peer_thp.py" --unified-sdk --pid "$server" --log "$arm/cpu.log" --output "$arm/thp.json" --timeout 1800 >"$arm/thp.log" 2>&1 &
+    worker_timeout=1800
+    # The production-graph audit restores and validates 20 independent wide
+    # Index states outside the timed event. Allow for these host transfers.
+    if [[ $mode == pr30-parity ]]; then worker_timeout=7200; fi
+    "$PYTHON" -B "$support/peer_thp.py" --unified-sdk --pid "$server" --log "$arm/cpu.log" --output "$arm/thp.json" --timeout "$worker_timeout" >"$arm/thp.log" 2>&1 &
     monitor=$!
     args=()
     case $label in
@@ -306,7 +310,7 @@ PY_DEVICE
     display=$label
     if [[ $label == mainline ]]; then display=$name; fi
     echo "CASE_BEGIN G$g $display"
-    (cd "$arm" && timeout 1800 "$PYTHON" -B "$support/main_five_run.py" --main "$main_src" --revision "$main" \
+    (cd "$arm" && timeout "$worker_timeout" "$PYTHON" -B "$support/main_five_run.py" --main "$main_src" --revision "$main" \
          --trace "$trace" --group "$g" --owner-archive "$owner" --kvaf-root "$sdk_src" \
          --kvaf-server "127.0.0.1:$port" --output "$arm" "${args[@]}") >"$arm/worker.log" 2>&1 || {
         echo "FAILED_ARM=G$g/$display WORKER_LOG=$arm/worker.log" >&2
@@ -357,7 +361,7 @@ run_group() (
         run_arm "$g" cap512k "$trace" "$owner" "$placement"
         if [[ $g == 4 || $g == 7 ]]; then measure_pr30; fi
         printf '%s\n' "$local_ref" > "$out/g$g/pr30_reference.txt"
-        "$PYTHON" -B "$support/pr30_parity_group.py" "$out" "$g" "$local_ref" "$repo"
+        "$PYTHON" -B "$support/pr30_parity_group.py" "$out" "$g" "$local_ref" "$repo" "$archive"
         exit
     fi
     if [[ $mode == single ]]; then

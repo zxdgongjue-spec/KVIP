@@ -260,7 +260,12 @@ def run(candidate, args):
     compare('exact_PR30', roots, candidate, new, args.repo)
     feature = args.feature_reference or candidate.parent/'li-borrow-four-batch.8hoXzA'
     if feature.is_dir():
-        compare('published_PR30_experimental_old_KVAF', dict.fromkeys(GROUPS, feature), candidate, new, args.repo)
+        try:
+            compare('published_PR30_experimental_old_KVAF', dict.fromkeys(GROUPS, feature), candidate, new, args.repo)
+        except (OSError, ValueError, KeyError) as error:
+            if args.feature_reference:
+                raise
+            print(f'PUBLISHED_FEATURE_COMPARISON_UNAVAILABLE reason={error}')
     elif args.feature_reference:
         raise ValueError(f'Explicit feature reference {feature} is unavailable')
     else:

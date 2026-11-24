@@ -18,18 +18,6 @@ def close(left, right):
     return isclose(left, right, rel_tol=1e-9, abs_tol=1e-6)
 
 
-def sample_from_device(state, call):
-    """Optional hook inside synchronized detail validation; production batch writes this already."""
-    from diagnostics import decode_terminal_timeline
-
-    ticks = state.forward.terminal.times.cpu().tolist()
-    mhz = state.forward.counter_clock_mhz
-    if not mhz or not isfinite(mhz) or mhz <= 0:
-        raise ValueError('Terminal stamps require a measured device counter frequency')
-    return dict(round=call, source_round=1, streaming_cycles=[
-        dict(terminal_timeline=decode_terminal_timeline(ticks, mhz))])
-
-
 def inspect(timeline):
     cores = sorted(timeline['cores'], key=lambda core: core['block'])
     if [c['block'] for c in cores] != list(range(64)):

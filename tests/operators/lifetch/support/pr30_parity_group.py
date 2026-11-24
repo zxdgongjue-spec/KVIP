@@ -2,13 +2,30 @@
 """Verify one completed production graph against the exact pre-512K graph."""
 import sys
 from pathlib import Path
+from statistics import mean
 
 from main_five_report import case_folder, read
-from pr30_archive_compare import PACKED, find_arm, measure_arm, same_controls, same_work
+from pr30_archive_compare import INDIVIDUAL, PACKED, find_arm, measure_arm, same_controls, same_work
 from pr30_terminal_phases import print_terminal_detail, terminal_detail
 
 
-def report(candidate, group, baseline, repo):
+def protocol_delta(candidate, group, archived, new):
+    revision = (candidate/'main.txt').read_text().strip()
+    if (archived/'main.txt').read_text().strip() != revision:
+        raise ValueError('Single-call and packed candidate archives require identical native revisions')
+    single = measure_arm(archived, 'cap512k', revision, group)
+    if (single['protocol'] != INDIVIDUAL or
+            any(single[k] != new[k] for k in ('binary', 'geometry', 'oracle', 'capture', 'cap_state')) or
+            not same_controls(archived, candidate, single, new)):
+        raise ValueError('The single-call archive differs in input, placement or binary')
+    a, b = single['stats'], new['stats']
+    print(f'G{group} same_candidate_packed_minus_single '
+          f'event_mean_us={b["event_mean"]-a["event_mean"]:+.2f} '
+          f'four_kernel_span_mean_us={b["kernel_span"][0]-a["kernel_span"][0]:+.2f} '
+          f'tail_mean_us={b["final_topk_through_tail"][0]-a["final_topk_through_tail"][0]:+.2f}')
+
+
+def report(candidate, group, baseline, repo, single_archive):
     baseline_arm = find_arm(baseline, 'exact', repo, group)
     if not baseline_arm:
         raise ValueError(f'G{group}: no matching pre-512K PR30 binary in {baseline}')
@@ -36,8 +53,17 @@ def report(candidate, group, baseline, repo):
         pairs = [f'{k}_mean/P50_us={format(a, fmt)}/{format(b, fmt)}'
                  for k,a,b in zip(('graph', 'LI', 'tail'), values[::2], values[1::2])]
         print(f'G{group} {label}', *pairs)
+    for label, folder in (('PR30', ref_folder), ('active_512k', new_folder)):
+        requests = read(folder/'mainline_checks.json').get('history_cap', {}).get('measured_requests')
+        if requests:
+            print(f'G{group} {label} prefetch/final_tokens_per_call_mean='
+                  f'{mean(requests["prefetch"]):.2f}/{mean(requests["final"]):.2f}')
     print_terminal_detail(group, dict(PR30=terminal_detail(ref_folder), active_512k=terminal_detail(new_folder)))
+    try:
+        protocol_delta(candidate, group, single_archive, new)
+    except (OSError, KeyError, ValueError) as error:
+        print(f'G{group} same_candidate_packed_minus_single UNAVAILABLE reason={error}')
 
 
 if __name__ == '__main__':
-    report(Path(sys.argv[1]), int(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]))
+    report(Path(sys.argv[1]), int(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]), Path(sys.argv[5]))
