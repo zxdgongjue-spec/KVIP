@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from near512_worker import CAPACITY, audit_journal, geometry_check
+from near512_worker import CAPACITY, audit_journal, geometry_check, worker
 
 
 def test_require_all_rows_long_with_published_high_addresses():
@@ -46,3 +46,29 @@ def test_diagnostic_checks_exact_order_and_admission_count():
         audit_journal(state, inputs, np.array([[2, 3, 0, 1]]), valid, fetch, final)
     with pytest.raises(ValueError, match='admission counts'):
         audit_journal(state, inputs, updated, valid, fetch, final+1)
+
+
+@pytest.mark.parametrize('actual,donor,kind', [(7, 7, 'stitched'), (17, 7, 'stitched'), (17, 17, 'capture')])
+def test_worker_rejects_wrong_stitch_before_device(tmp_path, monkeypatch, actual, donor, kind):
+    sample = object()
+
+    class Sequence:
+        rounds = ((1,),)
+
+        def __iter__(self):
+            yield sample
+
+    args = SimpleNamespace(main=tmp_path, output=tmp_path/'out', trace=None, group=17,
+                           revision='x'*40, work=tmp_path, stitch_source=True,
+                           source_proof=tmp_path/'g17'/'mainline_checks.json')
+
+    def make_input(work, group, trace, output, *, stitch_source, source_proof):
+        assert (group, stitch_source, source_proof) == (17, True, args.source_proof)
+        return Sequence(), sample, dict(actual_group=actual, kind=kind, donor=dict(group=donor))
+
+    monkeypatch.setenv('ASCEND_RT_VISIBLE_DEVICES', '4')
+    monkeypatch.setattr('near512_input.make_input', make_input)
+    monkeypatch.setattr('near512_worker.subprocess.check_output',
+                        lambda command, **_: args.revision if 'rev-parse' in command else '')
+    with pytest.raises(ValueError, match='G17'):
+        worker(args)

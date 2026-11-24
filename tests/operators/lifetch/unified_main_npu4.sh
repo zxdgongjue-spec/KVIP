@@ -2,8 +2,8 @@
 # Five captured BS16/Q4 groups on one physical NPU4 with the unified KVAF SDK.
 set -eo pipefail
 if (( $# < 3 || $# > 5 )) || [[ ! $2 =~ ^[a-f0-9]{40}$ || ! $3 =~ ^[a-f0-9]{40}$ ||
-    ( $# == 4 && $4 != cap-pair ) || ( $# == 5 && $4 != active-history && $4 != pr30-parity && $4 != near512 ) ]]; then
-    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA [cap-pair | active-history ARCHIVED_CAP_PAIR | pr30-parity ARCHIVED_ACTIVE_HISTORY | near512 ARCHIVED_PR30_PARITY]" >&2
+    ( $# == 4 && $4 != cap-pair ) || ( $# == 5 && $4 != active-history && $4 != pr30-parity && $4 != near512 && $4 != near512-five ) ]]; then
+    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA [cap-pair | active-history ARCHIVED_CAP_PAIR | pr30-parity ARCHIVED_ACTIVE_HISTORY | {near512,near512-five} ARCHIVED_PR30_PARITY]" >&2
     exit 2
 fi
 repo=$1
@@ -44,14 +44,13 @@ elif [[ $mode == pr30-parity ]]; then
         exit 2
     fi
     prefix=pr30-parity-five
-elif [[ $mode == near512 ]]; then
+elif [[ $mode == near512* ]]; then
     archive=$(cd "$5" && pwd)
-    if [[ $(<"$archive/main.txt") != "$main" || $(<"$archive/physical_npu.txt") != 4 ||
-          ! -s "$archive/g4/cap512k/thp.json" ]]; then
+    if [[ $(<"$archive/main.txt") != "$main" || $(<"$archive/physical_npu.txt") != 4 ]]; then
         echo "Expected the local NPU4 parity archive for the same native build" >&2
         exit 2
     fi
-    prefix=near512-ten
+    if [[ $mode == near512-five ]]; then prefix=near512-five; else prefix=near512-ten; fi
 fi
 sdk=813f1750a50b7e6c92d5f5397f2fbc05befef6da
 patched_tree=1de18e8315137d7a0227c3ae4c82afd45b5fe743
@@ -101,7 +100,7 @@ printf '4\n' >"$out/physical_npu.txt"
 cat /proc/sys/kernel/hostname >"$out/host.txt"
 cat /proc/sys/kernel/random/boot_id >"$out/boot_id.txt"
 if [[ -r /etc/machine-id ]]; then cat /etc/machine-id >"$out/machine_id.txt"; fi
-if [[ $mode == active-history || $mode == pr30-parity || $mode == near512 ]]; then
+if [[ $mode == active-history || $mode == pr30-parity || $mode == near512* ]]; then
     printf '%s\n' "$archive" >"$out/reference.txt"
     for field in host machine_id; do
         if [[ -f "$archive/$field.txt" ]] && ! cmp -s "$archive/$field.txt" "$out/$field.txt"; then
@@ -197,6 +196,8 @@ elif [[ $mode == active-history ]]; then
     echo "CONFIG measured=active_512k archive=$archive native=$main sdk=$sdk NPU=4 BS=16 Q=4 warmup=4 calls=20"
 elif [[ $mode == cap-pair ]]; then
     echo "CONFIG measured=capacity_pair model_limit=131072/524288 bound_history=131328/524544 input=original_capture native=$main sdk=$sdk NPU=4 BS=16 Q=4 warmup=4 measured_per_arm=20"
+elif [[ $mode == near512-five ]]; then
+    echo "CONFIG model_limit=524288 physical_slots=524544 groups=10,4,17,7,2 input=stitched_per_group NPU=4 BS=16 Q=4 measured_calls_per_group=10"
 elif [[ $mode == near512 ]]; then
     echo "CONFIG model_limit=524288 bound_history=524544 NPU=4 BS=16 Q=4 measured_calls=10 placement_archive=$archive"
 else
@@ -308,7 +309,7 @@ PY_DEVICE
     worker_timeout=1800
     # The production-graph audit restores and validates 20 independent wide
     # Index states outside the timed event. Allow for these host transfers.
-    if [[ $mode == pr30-parity || $mode == near512 ]]; then worker_timeout=7200; fi
+    if [[ $mode == pr30-parity || $mode == near512* ]]; then worker_timeout=7200; fi
     "$PYTHON" -B "$support/peer_thp.py" --unified-sdk --pid "$server" --log "$arm/cpu.log" --output "$arm/thp.json" --timeout "$worker_timeout" >"$arm/thp.log" 2>&1 &
     monitor=$!
     args=()
@@ -321,9 +322,12 @@ PY_DEVICE
     if [[ $label == mainline ]]; then display=$name; fi
     if [[ $mode == near512 ]]; then echo "CASE_BEGIN near512"; else echo "CASE_BEGIN G$g $display"; fi
     worker="$support/main_five_run.py"
-    if [[ $mode == near512 ]]; then
+    if [[ $mode == near512* ]]; then
         worker="$support/near512_worker.py"
         args+=(--work "$work")
+        if [[ $mode == near512-five ]]; then
+            args+=(--stitch-source --source-proof "$archive/g$g/cap512k/results/mainline/cases/diagnose/fused/mainline_checks.json")
+        fi
     else
         args+=(--trace "$trace" --owner-archive "$owner")
     fi
@@ -336,7 +340,7 @@ PY_DEVICE
     }
     if ! wait "$monitor"; then cat "$arm/thp.log" >&2; exit 1; fi
     monitor=
-    if [[ $mode == near512 ]]; then
+    if [[ $mode == near512* ]]; then
         grep -E '^(INPUT|CONFIG|CHECK|TIMING|TRAFFIC|REPLAY_COMPLETE)( |$)' "$arm/worker.log"
         exit 0
     fi
@@ -361,6 +365,10 @@ PY_REPORT
 run_group() (
     set -euo pipefail
     g=$1
+    if [[ $mode == near512-five ]]; then
+        run_arm "$g" near512 "" "" "$archive/g$g/cap512k/thp.json"
+        exit
+    fi
     trace=$(bash "$entry/peer_g2_input.sh" "$work" "$g")
     owner=$(select_owner "$g")
     if [[ $mode == pr30-parity ]]; then
@@ -438,5 +446,26 @@ refs = {g: (root/f'g{g}/pr30_reference.txt').read_text().strip() for g in (10, 4
 (root/'pr30_references.json').write_text(json.dumps(refs, indent=2))
 PY_MAP
     "$PYTHON" -B "$compare" --candidate "$out" --reference-map "$out/pr30_references.json" --repo "$repo"
+elif [[ $mode == near512-five ]]; then
+    "$PYTHON" -B - "$out" <<'PY_NEAR512'
+import json
+from pathlib import Path
+from statistics import mean
+import sys
+
+root = Path(sys.argv[1])
+groups = (10, 4, 17, 7, 2)
+rows = []
+for group in groups:
+    path = root / f'g{group}/near512/near512_result.json'
+    row = json.loads(path.read_text())
+    if ((row['group'], row['donor']['group'], row['source_kind']) != (group, group, 'stitched_short_capture_pages')
+            or row['measured_calls'] != 10 or row['scores']['queries'] != 640):
+        raise ValueError(f'G{group}: incomplete or wrong-trace result in {path}')
+    rows.append(row)
+print('FIVE_GROUPS_COMPLETE groups=5 measured_calls=50 TopK_queries=3200',
+      *(f'{key}_mean_us={mean(row["mean_p50_us"][key][0] for row in rows):.2f}'
+        for key in ('graph', 'LI1_to_LI3', 'final_topk_through_tail')))
+PY_NEAR512
 fi
 echo "REPLAY_COMPLETE RESULT_ROOT=$out"

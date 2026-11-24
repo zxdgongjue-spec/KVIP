@@ -77,9 +77,17 @@ def worker(args):
             ['git', '-C', main, 'status', '--porcelain', '-uno'], text=True).strip():
         raise ValueError('The production checkout differs from the specified clean native revision')
     args.output.mkdir(parents=True, exist_ok=True)
-    sequence, inputs, provenance = make_input(args.work, args.group, args.trace, args.output)
+    sequence, inputs, provenance = make_input(
+        args.work, args.group, args.trace, args.output, stitch_source=args.stitch_source,
+        source_proof=args.source_proof,
+    )
     if len(sequence.rounds) != 1 or next(iter(sequence)) is not inputs:
         raise ValueError('The reference and all replays must share the same frozen round')
+    if provenance['actual_group'] != args.group:
+        raise ValueError(f"Expected G{args.group} input, received G{provenance['actual_group']}")
+    donor = provenance.get('donor')
+    if args.stitch_source and (provenance['kind'] != 'stitched' or not donor or donor['group'] != args.group):
+        raise ValueError(f'Expected a stitched input made from the selected G{args.group} trace')
     geometry_check(inputs)
     ends = inputs.query_ends
     support = activate_production(main)
@@ -95,10 +103,13 @@ def worker(args):
         if not Path(module.__file__).resolve().is_relative_to(root.resolve()):
             raise ValueError(f'Unexpected {module.__name__} at {module.__file__}')
     pages = ReplayPagePlan(sequence)
-    print(f"INPUT kind={provenance['source_kind']} source={provenance['source_root']} "
+    group_label = f" G{args.group}" if args.stitch_source else ""
+    source_label = (f"donor_round={donor['selector_round']} donor_sha256={donor['operand_sha256']} "
+                    if donor else '')
+    print(f"INPUT{group_label} kind={provenance['source_kind']} source={provenance['source_root']} {source_label}"
           f"Q1_min/max={ends[:, 0].min()}/{ends[:, 0].max()} Q4_min/max={ends[:, 3].min()}/{ends[:, 3].max()} "
           f"physical_slots={CAPACITY} registered_KV_pages={pages.page_count}", flush=True)
-    print('CONFIG physical_NPU=4 BS16 Q4 hot=16384 warmup=4 measured=10 individual_events=10 '
+    print(f'CONFIG{group_label} physical_NPU=4 BS16 Q4 hot=16384 warmup=4 measured=10 individual_events=10 '
           'restored_before_every_call=1 diagnostic_calls=1', flush=True)
     torch.npu.set_device(0)
     device = torch.device('npu:0')
@@ -192,17 +203,18 @@ def worker(args):
     values = [traffic[label] for label in labels]
     detail, = diagnostic.values()
     atomic_json(args.output / 'near512_result.json', dict(
-        native=actual, physical_npu=4, source_kind=provenance['source_kind'], bound_history=CAPACITY,
+        native=actual, physical_npu=4, group=args.group, donor=donor,
+        source_kind=provenance['source_kind'], bound_history=CAPACITY,
         scores=score_check, measured_calls=CALLS, measured_complete_KV_Index_rows=16*CALLS, diagnostic=detail,
         measured_requests=values, mean_p50_us=times, timing_protocol='restored_single_call_graph_events',
         source_root=provenance['source_root'], native_library=str(lib), library_sha256=sha))
-    print(f"CHECK TopK_score_vs_native=PASS queries={score_check['queries']}/640 "
+    print(f"CHECK{group_label} TopK_score_vs_native=PASS calls={CALLS}/{CALLS} queries={score_check['queries']}/640 "
           f"KV_and_Index=PASS rows=160/160 ordered_Index_diagnostic={detail['ordered_rows']}/16 private_CQ=PASS")
-    print('TIMING ' + fmt_times(times))
-    print(f"TRAFFIC prefetch/final_tokens_per_call_mean={mean(v['prefetch'] for v in values):.2f}/"
+    print(f'TIMING{group_label} ' + fmt_times(times))
+    print(f"TRAFFIC{group_label} prefetch/final_tokens_per_call_mean={mean(v['prefetch'] for v in values):.2f}/"
           f"{mean(v['final'] for v in values):.2f} "
           f"diagnostic_events_at_or_above_256K_prefetch/final={detail['prefetch_above_256k']}/{detail['final_above_256k']}")
-    print(f'REPLAY_COMPLETE measured_calls={CALLS} result={args.output / "near512_result.json"}')
+    print(f'REPLAY_COMPLETE{group_label} measured_calls={CALLS} result={args.output / "near512_result.json"}')
 
 
 if __name__ == '__main__':
@@ -213,4 +225,7 @@ if __name__ == '__main__':
     parser.add_argument('--kvaf-server', required=True)
     parser.add_argument('--revision', required=True)
     parser.add_argument('--group', type=int, default=4)
+    parser.add_argument('--stitch-source', action='store_true',
+                        help='Construct the long input from the selected 128K trace, even if a native long capture exists')
+    parser.add_argument('--source-proof', type=Path, help='Archived PR30 parity capture operand hashes for this group')
     worker(parser.parse_args())

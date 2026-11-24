@@ -11,11 +11,13 @@ import subprocess
 
 import numpy as np
 
+from native_li_reference import digest
 from workloads import ReplaySequence, checked_path
 
 CAPACITY = 524544
 MIN_CONTEXT = 510 * 1024
 PAGE = 128
+TRACE_ROUNDS = {10: 51, 4: 2, 17: 2, 7: 2, 2: 2}
 
 
 def _near_ends(ends, capacity):
@@ -218,11 +220,9 @@ def _need_native_oracle(selected):
     raise RuntimeError("Stitched input requires the independent native TopK oracle")
 
 
-def make_input(work, group, fallback_trace, report_dir):
-    """Return a cached one-round sequence, its ReplayRound and a printable provenance receipt."""
+def _find_long_input(work, group):
     override = os.environ.get("PEER_NEAR512_TRACE")
     roots = (Path(override),) if override else _long_capture_roots(Path(work).parent)
-    seq = None
     for root in roots:
         try:
             seq = next(_near_capture(root, group), None)
@@ -232,9 +232,46 @@ def make_input(work, group, fallback_trace, report_dir):
             print(f"NEAR512_CAPTURE_SKIPPED root={root} reason={error}", flush=True)
             continue
         if seq is not None:
-            break
-    if seq is None and override:
+            return seq, root
+    if override:
         raise ValueError(f"No complete BS16/Q4 G{group} near-512K DP capture in PEER_NEAR512_TRACE={override}")
+    return None, None
+
+
+def _verified_donor(seq, source, group, proof_path):
+    """Identify the short input before it is extended or its Index is remapped."""
+    refs, = seq.rounds
+    ranks = [ref.dp_rank for ref in refs]
+    identities = tuple((ref.dp_rank, request, owner) for ref in refs for request, owner in ref.request_signature)
+    if (ranks != list(range(8)) or len(identities) != 16 or identities != source.identities
+            or source.source_round != 1 or any(ref.group != group or ref.source_round != source.source_round
+                                              or ref.scheduler_round != source.scheduler_round for ref in refs)):
+        raise ValueError(f"G{group}: group, round or request identities differ from the prepared DP0–7 trace")
+
+    proof_path = Path(proof_path)
+    proof = json.loads(proof_path.read_text())
+    archived = proof["capture_operand_hashes"]
+    fields = ("query", "weights", "query_scale", "logical_keys", "logical_scales", "query_ends", "captured_layout")
+    hashes = {name: digest(getattr(source, name)) for name in fields}
+    mismatches = [name for name in fields if hashes[name] != archived.get(name)]
+    state = proof.get("history_cap", {}).get("capture_state_sha256", {})
+    for name in ("captured_lru", "captured_hot_valid", "logical_address_valid", "tail_bounds"):
+        hashes[name] = digest(getattr(source, name))
+        if name in state and hashes[name] != state[name]:
+            mismatches.append(name)
+    if mismatches:
+        raise ValueError(f"G{group}: 128K source differs from {proof_path}: {', '.join(mismatches)}")
+    return dict(group=group, selector_round=TRACE_ROUNDS[group], replay_round=source.source_round,
+                scheduler_round=source.scheduler_round, dp_ranks=ranks, requests=len(identities),
+                operand_sha256=hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest(),
+                field_sha256=hashes, archive_proof=str(proof_path))
+
+
+def make_input(work, group, fallback_trace, report_dir, *, stitch_source=False, source_proof=None):
+    """Return a cached one-round sequence, its ReplayRound and a printable provenance receipt."""
+    if stitch_source and (group not in TRACE_ROUNDS or source_proof is None):
+        raise ValueError("Five-trace stitching requires a supported group and its archived 128K input proof")
+    seq, root = (None, None) if stitch_source else _find_long_input(work, group)
     if seq is not None:
         seq, inputs = _native_input(seq)
         provenance = dict(
@@ -264,7 +301,8 @@ def make_input(work, group, fallback_trace, report_dir):
             source.geometry["resident"],
             source.geometry["token_bytes"],
         ) != (16, 32, 131328, 16384, 656):
-            raise ValueError("Expected the captured BS16/Q4 G4-sized 128K donor")
+            raise ValueError(f"G{group}: expected a captured BS16/Q4 128K donor with 32 heads and 656B tokens")
+        donor = _verified_donor(src_seq, source, group, source_proof) if stitch_source else None
         ends = 524280 - 17 * np.arange(16, dtype=np.int32)[:, None] + np.arange(4, dtype=np.int32)
         inputs, proof = _stitched(source, ends, CAPACITY)
         seq = copy(src_seq)
@@ -275,6 +313,8 @@ def make_input(work, group, fallback_trace, report_dir):
             source_root=str(fallback_trace),
             **proof,
         )
+        if donor is not None:
+            provenance["donor"] = donor
     provenance.update(
         actual_group=group,
         capacity=CAPACITY,
