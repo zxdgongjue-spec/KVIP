@@ -3816,7 +3816,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 from terminal_handoff import request_counts, terminal_stages
 
                 handoff_samples.extend(terminal_stages(
-                    measured, dynamic=getattr(config, 'mr28_dedicated_service', None) == 'dynamic'))
+                    measured, dynamic=getattr(config, 'mr28_dedicated_service', None) == 'dynamic',
+                    p2_w1_route=handoff if getattr(config, 'mr28_p2_w1_experiment', False) else None))
                 for index, state in enumerate(states):
                     rotating = state.rotating
                     records = request_counts(rotating.rows.cpu().numpy(), rotating.final_posts.cpu().numpy(),
@@ -3965,6 +3966,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     cold_partition = getattr(config, 'mr25_cold_partition', None)
     unified_score = getattr(config, 'mr28_unified_score', None)
     dedicated_service = getattr(config, 'mr28_dedicated_service', None)
+    p2_w1_experiment = getattr(config, 'mr28_p2_w1_experiment', False)
     prefetch_trial = handoff in ('baseline', 'ub', 'batch') and hasattr(config, 'service_post_chunk')
     ub_candidates = getattr(config, 'service_ub_candidates', False)
     post_chunk = getattr(config, 'service_post_chunk', 0)
@@ -4014,7 +4016,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     aics = device_resources['effective_aic']
     if (dedicated_service is not None or cold_route in dedicated_routes) and (
             aics != 32 or device_resources['aiv'] < 64 or 'Ascend950' not in soc):
-        raise ValueError(f"Dedicated Service targets A5 with 32 MIX groups, got {soc} "
+        raise ValueError(f"BS16 Service comparison targets A5 with 32 MIX groups, got {soc} "
                          f"with {aics} effective AICs and {device_resources['aiv']} AIVs")
     if profile_replay:
         if aics != 32 or 'Ascend950' not in soc:
@@ -4295,6 +4297,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         cold_service_aiv=2 * shape.liCores if dynamic else shape.serviceLanes,
                         scheduler_aic=int(dynamic), resident_aiv=g['batch'] * 4,
                     )
+                if p2_w1_experiment:
+                    result['handoff_route'].update(w1_prescore=dedicated_service == 'p2_w1')
             atomic_json(directory / 'path_result.json', result)
             return result
         state.reset()

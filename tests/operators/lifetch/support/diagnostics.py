@@ -919,12 +919,13 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
     if any(e.get("name", "").lower().startswith("v9_early_fetch_kernel") for e in events):
         kernels["early_fetch"] = "v9_early_fetch_kernel"
     groups = {stage: [] for stage in kernels}
+    kernel_intervals = {stage: [] for stage in kernels}
     for event in events:
         n = event.get("name", "").lower()
         if "li" in groups and re.fullmatch(
             r"v9_li_kernel_(?:(?:hot|cold|threshold_cold)_partitioned|"
             r"(?:score|cold)_t2|(?:threshold|cold)_dedicated_service|hot_ready_service|"
-            r"cold_static_ready_service|dynamic_service)(?:_\d+)*", n
+            r"cold_static_ready_service|dynamic_service|(?:threshold|cold)_p2_w1)(?:_\d+)*", n
         ):
             n = kernels["li"]
         cat = (event.get("cat") or "").lower()
@@ -945,6 +946,7 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
         if not start <= timestamp or finish > end:
             continue
         groups[stage].append((timestamp, finish))
+        kernel_intervals[stage].append((timestamp, finish, event["name"]))
     # Current URMA streaming starts with hot LI; older captures have Init.
     if fused_final and 'resolve_update' in groups and not groups.get('init'):
         groups.pop('init', None)
@@ -968,6 +970,7 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
         kernel_span_us=span,
         stages_us=durations,
         intervals_us=groups,
+        kernel_intervals=kernel_intervals,
         inter_kernel_gap_us=span - busy,
         boundary_residual_us=residual,
         note="Boundary residual includes event-to-kernel edges and clock measurement error; not proven CPU idle",

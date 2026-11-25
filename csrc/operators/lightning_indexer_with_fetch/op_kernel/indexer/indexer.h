@@ -28,6 +28,10 @@
 #include "indexer_cube.h"
 #include "../../../common/lifetch/hot_score_partition.h"
 
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+#include "../p2_w1_schedule.h"
+#endif
+
 namespace QLIKernel {
 using namespace QLICommon;
 using namespace matmul;
@@ -35,7 +39,7 @@ using AscendC::CacheMode;
 using AscendC::CrossCoreSetFlag;
 using AscendC::CrossCoreWaitFlag;
 
-enum class SequenceLiPhase { Hot, Threshold, Cold, Final, UnifiedScore, PrecomputedCold, DedicatedCold, DynamicScore, DynamicService };
+enum class SequenceLiPhase { Hot, Threshold, Cold, Final, UnifiedScore, PrecomputedCold, DedicatedCold, DynamicScore, DynamicService, W1Score, ColdW1 };
 
 // 由于S2循环前，RunInfo还没有赋值，使用TempLoopInfo临时存放B、N、S1轴相关的信息；同时减少重复计算
 struct TempLoopInfo {
@@ -723,7 +727,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
         if (stageTrace_ && (tile == begin || tile + 1 == end)) {
             uint32_t firstQ = kvip_trace::kAllQueries;
             if ASCEND_IS_AIV { firstQ = (tmpBlockIdx % 2) * 2; }
-            pipeSample = {stageTrace_, traceWindow_ ? kvip_trace::Cold : kvip_trace::Hot,
+            const uint32_t traceKernel = traceKernel_ == kvip_trace::Threshold ? kvip_trace::Threshold :
+                traceWindow_ ? kvip_trace::Cold : kvip_trace::Hot;
+            pipeSample = {stageTrace_, traceKernel,
                 traceWindow_, kvip_trace::PipeDetail(info.bIdx, firstQ, tile)};
         }
 #endif
@@ -829,7 +835,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(u
     } else {
 #if KVIP_STAGE_TRACE
         constexpr uint32_t traceKernel = (Phase == SequenceLiPhase::Hot || Phase == SequenceLiPhase::UnifiedScore)
-            ? kvip_trace::Hot : kvip_trace::Cold;
+            ? kvip_trace::Hot : Phase == SequenceLiPhase::W1Score ? kvip_trace::Threshold : kvip_trace::Cold;
 #endif
         KVIP_TRACE_RECORD(eventInit, stageTrace_, traceKernel, kvip_trace::LiEventsAcquire, 0, 0);
         if ASCEND_IS_AIV {
@@ -883,7 +889,20 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(u
 #else
             ScanSequenceHalf(tiles.begin, tiles.end, shard, loop, scaleLoop, true);
 #endif
-        } else {
+        }
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+        else if constexpr (Phase == SequenceLiPhase::W1Score) {
+            const uint32_t half = rotating::SequenceHalfWindow(runtimeShape_) / S2_BASE_SIZE;
+            const uint32_t begin = resident_ / S2_BASE_SIZE + shard * half;
+#if KVIP_STAGE_TRACE
+            traceWindow_ = 1;
+#endif
+            KVIP_TRACE_RECORD(early, stageTrace_, kvip_trace::Threshold, kvip_trace::ScanPhase(), 1, batch);
+            ScanSequenceHalf(begin, begin + kvip_p2_w1::kPrefixTiles, shard, loop, scaleLoop,
+                true, false, true);
+        }
+#endif
+        else {
             uint32_t halfTokens = rotating::SequenceHalfWindow(runtimeShape_);
             uint32_t half = halfTokens / S2_BASE_SIZE;
             uint32_t serviceCore = aiCoreIdx;
@@ -918,6 +937,32 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(u
 #endif
                     KVIP_TRACE_RECORD(coldScanScope, stageTrace_, kvip_trace::Cold,
                         kvip_trace::ScanPhase(), epoch, batch);
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+                    if constexpr (Phase == SequenceLiPhase::ColdW1) {
+                        if (epoch == 1) {
+                            const uint32_t suffix = tiles.begin + kvip_p2_w1::kPrefixTiles;
+                            if ASCEND_IS_AIV {
+                                splitCoreInfo.s2Start = tiles.begin;
+                                tempLoopInfo.s2LoopEnd = tiles.end - 1;
+                                tempLoopInfo.validS2Len = tiles.end * S2_BASE_SIZE;
+                                for (uint32_t tile = tiles.begin; tile < suffix; ++tile) {
+                                    QLICommon::RunInfo info{};
+                                    CalcRunInfo(tile - tiles.begin, tile, info, 0, 0);
+#if KVIP_STAGE_TRACE
+                                    const kvip_trace::ScanSample pipeSample{
+                                        stageTrace_, kvip_trace::Cold, epoch,
+                                        kvip_trace::PipeDetail(batch, (tmpBlockIdx % 2) * 2, tile)};
+#endif
+                                    // The replay uses vector banks. The suffix starts
+                                    // both peers' native FIXP counters at zero.
+                                    vectorService.ProcessPrecomputedVec1(info, shard, false KVIP_PIPE_ARG);
+                                }
+                                PipeBarrier<PIPE_MTE3>();
+                            }
+                            tiles.begin = suffix;
+                        }
+                    }
+#endif
                     ScanSequenceHalf<Phase == SequenceLiPhase::PrecomputedCold>(
                         tiles.begin, tiles.end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
                 }
@@ -943,12 +988,19 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(u
         } else {
             matmulService.FreeEventID();
             KVIP_TRACE_END(eventDrain);
-            KVIP_TRACE_RECORD(cubeTailScope, stageTrace_,
-                (Phase == SequenceLiPhase::Hot || Phase == SequenceLiPhase::UnifiedScore)
-                    ? kvip_trace::Hot : kvip_trace::Cold,
+            KVIP_TRACE_RECORD(cubeTailScope, stageTrace_, traceKernel,
                 kvip_trace::LiCubeWait, runtimeShape_.rounds, batch);
             CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT);
             CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT + 1);
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+            if constexpr (Phase == SequenceLiPhase::W1Score) {
+                constexpr uint32_t peer = QLICommon::ConstInfo::AIV0_AIV1_OFFSET;
+                CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
+                    QLICommon::ConstInfo::CROSS_VC_EVENT + peer);
+                CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
+                    QLICommon::ConstInfo::CROSS_VC_EVENT + peer + 1);
+            }
+#endif
         }
     }
 }

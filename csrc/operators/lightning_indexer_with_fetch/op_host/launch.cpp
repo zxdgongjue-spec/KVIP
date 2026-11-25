@@ -133,6 +133,7 @@ extern "C" uint32_t kvip_parallel_tail_supported(const rotating::RuntimeShape* s
 #include "../../common/lifetch/hot_score_partition.h"
 #include "../../common/lifetch/cold_score_partition.h"
 #include "../../common/lifetch/dedicated_cold_schedule.h"
+#include "../op_kernel/p2_w1_schedule.h"
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_hot_partitioned(uint32_t,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_threshold_cold_partitioned(uint32_t,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_partitioned(uint32_t,void*,void*,uint32_t);
@@ -143,6 +144,8 @@ extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_dedicated_service(uint32_t,voi
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_hot_ready_service(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_static_ready_service(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_dynamic_service(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_threshold_p2_w1(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_p2_w1(uint32_t,void*,void*);
 #endif
 enum class ParallelTailStage { Hot, Threshold, ColdService, Terminal };
 
@@ -171,7 +174,7 @@ static uint32_t LaunchTailStage(void* stream, ParallelTailStage stage, Launch la
 
 template<bool Profile = false>
 static uint32_t LaunchParallelTail(void* bindings,void* terminal,
-    void* stream,const rotating::RuntimeShape* shape,uint32_t hotParts,uint32_t coldParts=2) {
+    void* stream,const rotating::RuntimeShape* shape,uint32_t hotParts,uint32_t coldParts=2,bool earlyW1=false) {
     if(!bindings || !terminal || !stream || !kvip_parallel_tail_supported(shape))return 100000;
     uint32_t result;
 #if KVIP_HOT_SCORE_PARTITION
@@ -182,7 +185,14 @@ static uint32_t LaunchParallelTail(void* bindings,void* terminal,
         return aclrtlaunch_v9_li_kernel(shape->liCores,stream,bindings);
     });
 #if KVIP_HOT_SCORE_PARTITION
-    if(coldParts>2){
+    if (earlyW1) {
+        if (!result) result = LaunchTailStage<Profile>(stream, ParallelTailStage::Threshold, [&] {
+            return aclrtlaunch_v9_li_kernel_threshold_p2_w1(shape->liCores, stream, bindings);
+        });
+        if (!result) result = LaunchTailStage<Profile>(stream, ParallelTailStage::ColdService, [&] {
+            return aclrtlaunch_v9_li_kernel_cold_p2_w1(shape->liCores, stream, bindings);
+        });
+    } else if(coldParts>2){
         if(!result)result=LaunchTailStage<Profile>(stream,ParallelTailStage::Threshold,[&] {
             return aclrtlaunch_v9_li_kernel_threshold_cold_partitioned(shape->liCores,stream,bindings,coldParts);
         });
@@ -217,6 +227,16 @@ extern "C" uint32_t kvip_parallel_tail_profile_forward(void* bindings,void* term
 #endif
 
 #if KVIP_HOT_SCORE_PARTITION
+extern "C" uint32_t kvip_p2_w1_supported(const rotating::RuntimeShape* shape) {
+    return kvip_parallel_tail_supported(shape) && kvip_p2_w1::Supports(*shape);
+}
+
+extern "C" uint32_t kvip_parallel_tail_p2_w1_forward(
+    void* bindings, void* terminal, void* stream, const rotating::RuntimeShape* shape) {
+    if (!kvip_p2_w1_supported(shape)) return 100000;
+    return LaunchParallelTail(bindings, terminal, stream, shape, 2, 2, true);
+}
+
 extern "C" uint32_t kvip_dedicated_cold_supported(const rotating::RuntimeShape* shape) {
     using namespace kvip_dedicated_cold;
     return kvip_parallel_tail_supported(shape) && shape->batch == kBatch && shape->rounds == kRounds &&

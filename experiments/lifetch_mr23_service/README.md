@@ -454,3 +454,53 @@ and sampled MTE/VF scopes. `dynamic_trace_comparison.json` reports the first
 W1 prefetch doorbell, native elapsed spans and per-window Get counts.
 `dynamic_trace_scopes.csv` summarizes the instrumented scopes. Native task
 timestamps and source-scope timestamps use separate clock domains.
+
+## MR28 P2 and early W1 Score on A5
+
+The opt-in route keeps one BS16 batch, the original rotating P2 Service
+and the existing Parallel Terminal. While the other AIVs compute resident
+thresholds, four MIX groups score the first two tiles of each W1 half
+for B14 and B15. Their AIVs then compute their own resident thresholds.
+The original Cold producer AIVs read back and classify the eight scored
+tiles before continuing with the native suffix. The prefetch budget and
+window order are unchanged.
+
+Fetch the MR on the **host** and use the existing shared checkout.
+Prepare KVAF sources here only if the pinned checkout is missing.
+
+```bash
+cd /home/w00568585/li-aligned-a5/KVIP-mr28
+git status --short
+git fetch origin refs/merge-requests/28/head && git switch --detach FETCH_HEAD
+git rev-parse --short HEAD
+# If the pinned KVAF checkout is missing
+# bash experiments/lifetch_mr23_service/run_mr28_p2_w1.sh --prepare-deps
+docker exec -it -w "$PWD" lifetch-aligned-a5 bash
+```
+
+In the **container**, use the logical NPU ID visible to the container.
+Build dependencies only if the existing KVAF or LIDU artifacts are missing.
+The paired runner builds the candidate bridge with the experiment enabled.
+
+```bash
+runner=experiments/lifetch_mr23_service/run_mr28_p2_w1.sh
+export KVIP_A5_DEVICE=0
+# bash "$runner" --build-deps
+bash "$runner" --route p2_w1 --staged-eager --warmup 0 --iterations 1
+bash "$runner" --route both --warmup 2 --iterations 10
+```
+
+The comparison uses Q4, history 128K, resident 16K, W4, miss 10%, seed 43,
+and prefetch budget 512 on BS16. Each measured replay verifies KV and
+Index and checks the actual device kernels. Read `summary.csv` for
+Hot, Threshold, Cold+Service, Terminal and KV-ready latency. Read
+`requests.csv` for prefetch by window and final Get by query. The runner
+also reports whether request-level counts match between routes. A separate
+`--prefetch-trace` run collects prefetch diagnostics.
+When total Get counts differ, the ratio is labeled as a raw observation
+and the CSV sets `timing_eligible` to false.
+
+In the H7168/resident 4096 CANN model, the candidate shortened Hot through
+Cold+Service from 238,125 to 229,244 device ticks. Prefetch declined from
+2,612 to 2,368 WQEs and the first W1 doorbell moved 16,266 ticks later.
+This A5 runner measures the remaining Terminal and KV-ready effects.

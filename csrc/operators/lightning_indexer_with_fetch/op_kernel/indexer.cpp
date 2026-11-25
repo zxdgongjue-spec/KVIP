@@ -13,6 +13,7 @@ struct QLITilingData {
 #include "../../lightning_indexer_with_fetch/op_kernel/indexer/indexer.h"
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
 #include "indexer/dynamic_mailbox.h"
+#include "p2_w1_schedule.h"
 #endif
 namespace {
 using QLIKernel::SequenceLiPhase;
@@ -34,13 +35,13 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, uint32_t job 
 #if KVIP_STAGE_TRACE
     constexpr bool traceHotSlot = Phase == SequenceLiPhase::Hot || Phase == SequenceLiPhase::UnifiedScore;
     constexpr bool traceColdSlot = Phase == SequenceLiPhase::Cold || Phase == SequenceLiPhase::PrecomputedCold ||
-        Phase == SequenceLiPhase::DedicatedCold ||
+        Phase == SequenceLiPhase::DedicatedCold || Phase == SequenceLiPhase::ColdW1 ||
         Phase == SequenceLiPhase::DynamicScore || Phase == SequenceLiPhase::DynamicService;
     const uint64_t stageTrace = (parts == 2 || Phase == SequenceLiPhase::Cold ||
         Phase == SequenceLiPhase::UnifiedScore)
         ? KVIP_TRACE_WORKSPACE(P(15)) : 0;
     constexpr uint32_t traceKernel = traceHotSlot ? kvip_trace::Hot :
-        Phase == SequenceLiPhase::Threshold ? kvip_trace::Threshold :
+        (Phase == SequenceLiPhase::Threshold || Phase == SequenceLiPhase::W1Score) ? kvip_trace::Threshold :
         traceColdSlot ? kvip_trace::Cold : kvip_trace::Final;
 #endif
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
@@ -118,6 +119,28 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, uint32_t job 
 }
 
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+__aicore__ inline bool UseEarlyW1(GM_ADDR bindings, uint32_t group) {
+    if (!kvip_p2_w1::EarlyGroup(group)) return false;
+    const auto args = reinterpret_cast<__gm__ const uint64_t*>(bindings);
+    const auto ctx = reinterpret_cast<__gm__ const rotating::Context*>(args[14]);
+    const auto shape = rotating::LoadRuntimeShape(ctx);
+    if (!kvip_p2_w1::Supports(shape)) return false;
+    const uint32_t batch = group / 2;
+    const auto bounds = reinterpret_cast<__gm__ const uint32_t*>(ctx->tailBounds);
+    if (bounds && bounds[batch * 2] != bounds[batch * 2 + 1]) return false;
+    const auto ends = reinterpret_cast<__gm__ const uint32_t*>(ctx->queryEnds);
+    for (uint32_t q = 0; ends && q < SIM_Q; ++q) {
+        if (ends[batch * SIM_Q + q] != shape.history) return false;
+    }
+    return true;
+}
+
+__aicore__ inline uint32_t P2W1Group() {
+    const uint32_t block = AscendC::GetBlockIdx();
+    if ASCEND_IS_AIV { return block / 2; }
+    return block;
+}
+
 __aicore__ inline void ResetPartitionedColdProgress(GM_ADDR bindings, uint32_t parts) {
     using namespace AscendC;
     auto a = reinterpret_cast<__gm__ uint64_t*>(bindings);
@@ -359,3 +382,30 @@ extern "C" __global__ __aicore__ void v9_li_kernel_3(GM_ADDR bindings) {
     if ASCEND_IS_AIV { RunLi<SequenceLiPhase::Final>(bindings); }
 #endif
 }
+
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+extern "C" __global__ __aicore__ void v9_li_kernel_threshold_p2_w1(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    const bool early = UseEarlyW1(bindings, P2W1Group());
+    if ASCEND_IS_AIC { if (!early) return; }
+    const auto args = reinterpret_cast<__gm__ const uint64_t*>(bindings);
+    KVIP_TRACE_BEGIN(body, KVIP_TRACE_WORKSPACE(reinterpret_cast<GM_ADDR>(args[15])),
+        Threshold, KernelBody, 0, 0);
+    if (early) RunLi<SequenceLiPhase::W1Score, true>(bindings);
+    // Prescore vector lanes drain and destroy their own pipe before Top2048.
+    if ASCEND_IS_AIV { RunLi<SequenceLiPhase::Threshold, true>(bindings); }
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_li_kernel_cold_p2_w1(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    if (UseEarlyW1(bindings, P2W1Group())) {
+        RunLi<SequenceLiPhase::ColdW1>(bindings);
+    } else {
+        RunLi<SequenceLiPhase::Cold>(bindings);
+    }
+#endif
+}
+#endif

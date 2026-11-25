@@ -3,6 +3,7 @@
 
 import ctypes
 import hashlib
+import re
 import subprocess
 from pathlib import Path
 
@@ -11,6 +12,11 @@ ROOT = Path(__file__).resolve().parents[4]
 STAGES = ('hot_us', 'threshold_us', 'cold_service_us', 'terminal_us')
 DYNAMIC_STAGES = ('hot_us', 'resident_cold_service_us', 'terminal_us')
 READY_SERVICE_MODES = ('static_ready', 'dynamic')
+P2_W1_KERNELS = {
+    'p2': ('v9_li_kernel', 'v9_li_kernel_1', 'v9_li_kernel_2', 'v9_parallel_terminal'),
+    'p2_w1': ('v9_li_kernel', 'v9_li_kernel_threshold_p2_w1',
+              'v9_li_kernel_cold_p2_w1', 'v9_parallel_terminal'),
+}
 DYNAMIC_MAILBOX_BYTES = 192 * 128
 COUNT_COLUMNS = ('prefetch_requests', 'final_get_requests', 'total_get_requests')
 
@@ -124,9 +130,23 @@ def bind_unified_score(state, mode):
 
 
 def bind_dedicated_service(state, mode):
-    """Bind the opt-in Cold scheduler to the existing fused Terminal."""
+    """Bind an opt-in P2 or Cold scheduler route to the existing fused Terminal."""
     forward = dense_terminal(state)
     if mode == 'p2':
+        return
+    if mode == 'p2_w1':
+        workspace = state.workspace
+        if not (workspace.tail_bounds.eq(0).all().item()
+                and workspace.inputs.query_ends.eq(state.history).all().item()):
+            raise ValueError('P2 W1 requires full query bounds and no recent tail')
+        library = forward.rotating.library
+        supported = library.kvip_p2_w1_supported
+        supported.argtypes, supported.restype = [ctypes.c_void_p], ctypes.c_uint32
+        if supported(forward.shape_pointer) != 1:
+            raise ValueError('P2 W1 is unsupported for this Terminal shape')
+        function = library.kvip_parallel_tail_p2_w1_forward
+        function.argtypes, function.restype = [ctypes.c_void_p] * 4, ctypes.c_uint32
+        forward.terminal_function = function
         return
     if mode not in ('dedicated', *READY_SERVICE_MODES):
         raise ValueError(f'Unknown dedicated Service mode {mode!r}')
@@ -171,6 +191,7 @@ def run_staged_eager(state, mode, progress):
     else:
         threshold, cold = {
             'p2': ('_1', '_2'),
+            'p2_w1': ('_threshold_p2_w1', '_cold_p2_w1'),
             'dedicated': ('_threshold_dedicated_service', '_cold_dedicated_service'),
             'static_ready': ('_threshold_dedicated_service', '_cold_static_ready_service'),
         }[mode]
@@ -203,10 +224,19 @@ def fixture_hash(path):
     return digest.hexdigest()
 
 
-def terminal_stages(measured, *, dynamic=False):
+def terminal_stages(measured, *, dynamic=False, p2_w1_route=None):
     """Measure the actual launch boundaries within each checked graph invocation."""
     names = DYNAMIC_STAGES if dynamic else STAGES
     rows = []
+    if p2_w1_route is not None:
+        intervals = measured['accounting']['kernel_intervals']
+        seen = sorted((*intervals['li'], *intervals['topk_resolve_update']))
+        expected = P2_W1_KERNELS[p2_w1_route] * len(measured['samples'])
+        actual = tuple(name.lower() for _, _, name in seen)
+        if len(actual) != len(expected) or any(
+                not re.fullmatch(symbol + r'(?:_\d+)*', name)
+                for name, symbol in zip(actual, expected)):
+            raise ValueError(f'Profiler did not execute the {p2_w1_route} kernels: {actual}')
     for sample in measured['samples']:
         intervals = sample['intervals_us']
         li = intervals.get('li', ())
