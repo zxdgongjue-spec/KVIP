@@ -49,6 +49,12 @@ int main() {
         }
         assert(helper<=budget && lowerHelper>=budget);
     }
+    // 890 cold pages on a pair of owners plus their helper.
+    const uint32_t expected[] = {98,117,117};
+    for(uint32_t e=1;e<=3;++e) {
+        auto span=large_li::Window(128,1018,4,e);
+        assert(large_li::LaterSuffix(span,128,890,296,2,e)==expected[e-1]);
+    }
     for (uint32_t b : {20,24,28,32}) for (uint32_t history : {131328,524544}) {
         rotating::RuntimeShape s{};
         s.batch=b; s.aicCount=32; s.splitQ=1; s.rounds=4; s.history=history;
@@ -78,16 +84,21 @@ int main() {
             const auto budget=large_li::OwnerBudget(cost,fixed,shares?shares:1);
             uint32_t quota=helpers?large_li::SuffixQuota(tiles-s.resident/128,0,budget):0;
             for(uint32_t rounds: {2,4,8,32}) {
-                uint32_t cursor=s.resident/128, posted=0;
+                uint32_t cursor=s.resident/128, baseSum=0, assigned=0;
                 for(uint32_t e=1;e<rounds;++e) {
                     const auto span=large_li::Window(s.resident/128,tiles,rounds,e);
-                    uint32_t suffix=large_li::SuffixInWindow(span,s.resident/128,tiles-s.resident/128,quota);
+                    const uint32_t base=large_li::SuffixInWindow(span,s.resident/128,tiles-s.resident/128,quota);
+                    const uint32_t suffix=large_li::LaterSuffix(span,s.resident/128,tiles-s.resident/128,quota,shares,e);
+                    assert(suffix>=base);
+                    if (e==1 || !shares || shares>3 || !base) assert(suffix==base);
+                    assert(suffix-base<=(span.end-span.begin)/16 && suffix-base<=base/(shares+1));
                     assert(cursor==span.begin && suffix<=span.end-span.begin);
                     if(!helpers) assert(!suffix);
                     cursor=span.end;
-                    posted+=suffix;
+                    baseSum+=base;
+                    assigned+=suffix+(span.end-suffix-span.begin);
                 }
-                assert(cursor==tiles && posted==quota);
+                assert(cursor==tiles && baseSum==quota && assigned==tiles-s.resident/128);
             }
         }
     }

@@ -332,9 +332,9 @@ __aicore__ inline void JoinThreshold(const Inputs& input, uint32_t row) {
     }
 }
 
-__aicore__ inline void ColdHelper(const Inputs& input, const RowPlan& plan, uint32_t epoch) {
+__aicore__ inline void ColdHelper(const Inputs& input, const RowPlan& plan, uint32_t epoch, uint32_t planCount) {
     const auto span = large_li::Window(plan.start, plan.end, input.shape.rounds, epoch);
-    const uint32_t suffix = large_li::SuffixInWindow(span, plan.start, plan.tiles, plan.quota);
+    const uint32_t suffix = large_li::LaterSuffix(span, plan.start, plan.tiles, plan.quota, planCount, epoch);
     if (suffix) {
         Score(input, plan.row, {span.end - suffix, span.end}, true);
         if ASCEND_IS_AIV {
@@ -371,7 +371,7 @@ __aicore__ inline void FinishPair(const Inputs& input, const RowPlan& plan, Inde
     vec.PostWindow(epoch, 0);
 }
 
-__aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan) {
+__aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint32_t planCount) {
     JoinThreshold(input, plan.row);
     TPipe pipe;
     Indexer op;
@@ -393,7 +393,7 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan) {
     bool thresholdLoaded = false;
     for (uint32_t epoch = 1; epoch < input.shape.rounds; ++epoch) {
         const auto span = large_li::Window(plan.start, plan.end, input.shape.rounds, epoch);
-        const uint32_t suffix = large_li::SuffixInWindow(span, plan.start, plan.tiles, plan.quota);
+        const uint32_t suffix = large_li::LaterSuffix(span, plan.start, plan.tiles, plan.quota, planCount, epoch);
         const uint32_t cut = span.end - suffix;
         if (span.begin != cut) {
             op.ProcessLargeScore(span.begin, cut, true, !thresholdLoaded);
@@ -454,7 +454,7 @@ extern "C" __global__ __aicore__ void v9_li_large_threshold_cold(GM_ADDR binding
     uint32_t own;
     uint32_t planCount = Plan<true>(input, helper, plans, own);
     if (!helper) {
-        ColdOwner(input, plans[own]);
+        ColdOwner(input, plans[own], planCount);
     } else {
         // Finish the current window for every assigned row before moving to
         // the next window. Rows with no suffix never wait for this helper.
@@ -468,7 +468,7 @@ extern "C" __global__ __aicore__ void v9_li_large_threshold_cold(GM_ADDR binding
                     JoinThreshold(input, plans[i].row);
                     ready[i] = true;
                 }
-                ColdHelper(input, plans[i], epoch);
+                ColdHelper(input, plans[i], epoch, planCount);
             }
         }
     }

@@ -713,6 +713,14 @@ def run(args):
     print(f"TIMING {tag}", *(f"{k}_mean/P50_us={times[k][0]:.2f}/{times[k][1]:.2f}" for k in ("graph", "LI", "tail")))
     if previous is not None:
         print(
+            f"TIMING {tag} graph_boundaries",
+            *(
+                f"{name}_{key}_mean/P50_us={v[key][0]:.2f}/{v[key][1]:.2f}"
+                for name, v in (("previous", previous["mean_p50_us"]), ("candidate", times))
+                for key in ("inter_kernel_gap", "event_minus_span")
+            ),
+        )
+        print(
             f"TRAFFIC {tag}",
             *(
                 f"{name}_prefetch/final_tokens_per_call={v['prefetch']:.2f}/{v['final']:.2f}"

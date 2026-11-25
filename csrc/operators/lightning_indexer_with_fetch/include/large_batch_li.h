@@ -92,6 +92,20 @@ LARGE_LI_DEVICE constexpr uint32_t SuffixInWindow(Slice span, uint32_t resident,
                     uint64_t(span.begin - resident) * quota / total);
 }
 
+// Give a shared helper a small extra suffix after the initial cold window.
+// All terms are in this window's tiles. Groups of four or more keep their original
+// owner/helper split. A zero suffix still costs no helper visit.
+LARGE_LI_DEVICE constexpr uint32_t LaterSuffix(Slice span, uint32_t resident, uint32_t total,
+                                                uint32_t quota, uint32_t rows, uint32_t epoch) {
+    const uint32_t base = SuffixInWindow(span, resident, total, quota);
+    if (epoch < 2 || !rows || rows > 3 || !base) return base;
+    const uint32_t length = span.end - span.begin;
+    const uint32_t extraLimit = length / 16;
+    const uint32_t extraShare = base / (rows + 1);
+    const uint32_t extra = extraLimit < extraShare ? extraLimit : extraShare;
+    return base + (extra < length - base ? extra : length - base);
+}
+
 LARGE_LI_DEVICE constexpr Slice Window(uint32_t residentTile, uint32_t scanTile, uint32_t rounds,
                                        uint32_t epoch) {
     const uint32_t n = scanTile - residentTile;
