@@ -67,6 +67,30 @@ def test_handoffs_split_at_device_marks_and_include_only_owner_stream_tasks():
     assert sum(event.get('cat') == 'KVIP kernel handoff' for event in view['traceEvents']) == 3
 
 
+def test_timed_handoff_attribution_clips_tasks_and_keeps_overlap_disjoint(tmp_path):
+    raw = fused_replay()
+    next(event for event in raw if event['name'] == 'KVIP_LIFETCH_HOT_END'
+         and 'Physic Stream Id' in event['args'])['dur'] = 6
+    raw.extend([
+        hardware('partly enclosed', 1_022, 90, 4, task_type='EVENT'),
+        hardware('overlap with mark', 1_034, 91, 4, task_type='EVENT'),
+        hardware('unrelated stream', 1_024, 92, 20, task_type='EVENT', stream=19),
+    ])
+    raw_path = tmp_path / 'msprof_capture.json'
+    report_path = tmp_path / 'handoff_only.json'
+    raw_path.write_text(json.dumps(raw))
+    main([str(raw_path), '--handoff-report', str(report_path)])
+    report = json.loads(report_path.read_text())['native_device_handoffs'][0]
+    activity = report['timed_task_activity']
+    assert (activity['profile_mark_only_us'], activity['other_task_only_us'],
+            activity['overlap_us'], activity['no_timed_task_us']) == (4, 4, 2, 10)
+    segments = activity['segments']
+    assert sum(segment['duration_us'] for segment in segments) == report['duration_us']
+    assert segments[0]['tasks'] == [{'name': 'partly enclosed', 'task_id': '90'}]
+    overlap = next(segment for segment in segments if segment['status'] == 'overlap')
+    assert {task['task_id'] for task in overlap['tasks']} == {'2', '91'}
+
+
 def test_labels_existing_scoped_trace_without_overwriting_it(tmp_path):
     raw_path = tmp_path / 'msprof_old.json'
     output = tmp_path / 'annotated.json'

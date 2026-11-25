@@ -174,6 +174,18 @@ The small handoff report contains both views, so it can be shared without
 exporting the full trace. Refresh the source and capture again to include
 the new device scopes.
 
+Open `Handoff activity and dependencies | source clock` to see which
+recorded scope and logical lane cover each part of a handoff. Each slice
+shows one representative scope and lists the observed lanes. The
+dependency track names the device-visible state and the stage ordering
+gate. The dynamic route uses request-local readiness between Resident
+and Cold within the same device kernel.
+
+On the native view, `Handoff device task activity` splits each same-stream
+gap by timed profiling marks, other timed device tasks, overlap, and
+time with no timed task record. A mark without duration remains a
+boundary timestamp. Use the separate source and native clocks.
+
 Open the logical AIC and AIV lanes to see `Handoff gap` spans during those
 same intervals. Each span marks time without a recorded LIFetch source
 scope on that lane, after excluding kernel bodies and other recorded work
@@ -182,6 +194,9 @@ evidence. To get the lane view from an existing capture, re-render its
 `baseline_stage_trace.bin` with
 `tests/operators/lifetch/support/baseline_stage_trace.py`, passing the
 recorded `counter_mhz` and route. That rendering runs offline.
+Both offline decoders accept `--handoff-report` for sharing only the
+handoff evidence. The native decoder can produce this report without
+writing a second copy of the full msprof JSON.
 
 ### Per-core MTE and VF stages
 

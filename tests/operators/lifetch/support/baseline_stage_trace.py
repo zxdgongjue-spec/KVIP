@@ -490,11 +490,14 @@ LI_ENTRY_SCOPES = (2, 226, 234, 235, 236)
 LI_EXIT_SCOPES = (27, 227, 228, 237)
 SOURCE_HANDOFFS = (
     ('Hot score to Resident Top2048', 20, (21, 22), 21, (23,),
-     (*LI_EXIT_SCOPES, COLD_PROGRESS_RESET, *LI_ENTRY_SCOPES, 245)),
+     (*LI_EXIT_SCOPES, COLD_PROGRESS_RESET, *LI_ENTRY_SCOPES, 245),
+     'BF16 score rows in GM'),
     ('Resident Top2048 to Cold or W0 Service', 21, (23,), 22, (21, 22, 150),
-     (*LI_EXIT_SCOPES, *LI_ENTRY_SCOPES, 230, 231, 232)),
+     (*LI_EXIT_SCOPES, *LI_ENTRY_SCOPES, 230, 231, 232),
+     'Resident cutoff, hit bitmap and Top2048 window state'),
     ('Cold and Service to first Resolve', 22, (21, 22, 150), 23, (161,),
-     (*LI_EXIT_SCOPES, 2, 160, 233)),
+     (*LI_EXIT_SCOPES, 2, 160, 233),
+     'Cold score, predicates, window state and submitted prefetch mapping'),
 )
 
 
@@ -526,13 +529,13 @@ def split_recorded_bodies(begin, end, left_end, right_begin, counter_mhz, observ
     return pieces
 
 
-def source_handoffs(events, counter_mhz):
+def source_handoffs(events, counter_mhz, *, cold_route='p2'):
     """Measure business boundaries on the source clock, with work on any lane."""
     by_phase = defaultdict(list)
     for event in events:
         by_phase[event['kernel'], event['phase']].append(event)
     result = []
-    for label, left, previous, right, following, phases in SOURCE_HANDOFFS:
+    for label, left, previous, right, following, phases, data in SOURCE_HANDOFFS:
         ends = {PHASES[phase]: max(e['end'] for e in by_phase[left, phase])
                 for phase in previous if by_phase[left, phase]}
         starts = {PHASES[phase]: min(e['begin'] for e in by_phase[right, phase])
@@ -560,7 +563,9 @@ def source_handoffs(events, counter_mhz):
             coverage.append(dict(phase=PHASES[phase],
                                  duration_on_any_lane_us=covered_ticks(spans) / counter_mhz))
         duration = max(0, end - begin)
+        gate = 'Request-local readiness' if cold_route == 'dynamic' and left == 21 else 'Same-stream stage gate'
         result.append(dict(name=label, begin_tick=begin, end_tick=end,
+                           dependency=dict(gate=gate, data=data, producer_stage=left, consumer_stage=right),
                            boundaries=dict(previous_business_end=boundary(previous_event, 'end'),
                                            previous_body_end=boundary(left_body, 'end') if left_body else None,
                                            following_body_begin=boundary(right_body, 'begin') if right_body else None,
@@ -599,6 +604,50 @@ def unrecorded_lane_spans(begin, end, sorted_spans):
         yield cursor, end
 
 
+def handoff_activity(events, begin, end):
+    """Partition the interval at observed source edges without double-counting lanes."""
+    if end <= begin:
+        return []
+    changes = defaultdict(list, {begin: [], end: []})
+    for index, event in enumerate(events):
+        start, stop = max(begin, event['begin']), min(end, event['end'])
+        if start < stop:
+            changes[start].append((index, event))
+            changes[stop].append((index, None))
+
+    active = {}
+    pieces = []
+    cuts = sorted(changes)
+    for start, stop in zip(cuts, cuts[1:]):
+        for index, event in changes[start]:
+            if event is None:
+                active.pop(index)
+            else:
+                active[index] = event
+
+        per_lane = {}
+        for event in active.values():
+            lane = event['lane']
+            priority = (event['phase'] == 1, event['end'] - event['begin'], event['phase'])
+            if lane not in per_lane or priority < per_lane[lane][0]:
+                per_lane[lane] = (priority, event)
+        scoped = [event for priority, event in per_lane.values() if not priority[0]]
+        ordered = sorted(scoped, key=lambda e: (-e['end'], e['lane']))
+        owners = [dict(lane=e['lane'], block=e['block'], raw_core_id=e['core'],
+                       core_type='AIC' if e['lane'] >= 64 else 'AIV',
+                       kernel_id=e['kernel'], phase_id=e['phase'], phase=PHASES[e['phase']])
+                  for e in ordered[:4]]
+        status = 'recorded_scope' if scoped else 'kernel_body_only' if active else 'no_recorded_scope'
+        details = dict(status=status, scope_owners=owners, scoped_lane_count=len(scoped),
+                       aic_blocks=sorted(lane % 64 for lane in per_lane if lane >= 64),
+                       aiv_blocks=sorted(lane for lane in per_lane if lane < 64))
+        if pieces and pieces[-1]['details'] == details:
+            pieces[-1]['end_tick'] = stop
+        else:
+            pieces.append(dict(begin_tick=start, end_tick=stop, details=details))
+    return pieces
+
+
 def render(events, counter_mhz, *, cold_route='p2'):
     if not math.isfinite(counter_mhz) or counter_mhz <= 0:
         raise ValueError('A positive measured device counter frequency is required')
@@ -622,7 +671,8 @@ def render(events, counter_mhz, *, cold_route='p2'):
                           ts=(begin - origin) / counter_mhz, dur=(end - begin) / counter_mhz, args=args))
 
     for pid, name in [(0, 'Kernel envelopes | source scopes'), (1, 'AIC lanes'), (2, 'AIV lanes'),
-                      (3, 'Observed source lane counts'), (4, 'Business handoffs | source clock')]:
+            (3, 'Observed source lane counts'), (4, 'Business handoffs | source clock'),
+            (5, 'Handoff activity and dependencies | source clock')]:
         metadata('process_name', pid, 0, name)
     kernel_bodies = defaultdict(list)
     stage_sets = defaultdict(list)
@@ -730,12 +780,41 @@ def render(events, counter_mhz, *, cold_route='p2'):
         for tick, count in source_lane_counts(spans):
             trace.append(dict(name=title, cat='KVIP source lane count', ph='C', pid=3, tid=tid,
                               ts=(tick - origin) / counter_mhz, args={'lanes': count}))
-    handoffs = source_handoffs(events, counter_mhz)
+    handoffs = source_handoffs(events, counter_mhz, cold_route=cold_route)
     for spans in recorded_lane_spans.values():
         spans.sort()
     for tid, handoff in enumerate(handoffs, 1):
         metadata('thread_name', 4, tid, handoff['name'])
+        activity = handoff_activity(events, handoff['begin_tick'], handoff['end_tick'])
+        totals = dict.fromkeys(('recorded_scope', 'kernel_body_only', 'no_recorded_scope'), 0)
+        for piece in activity:
+            totals[piece['details']['status']] += piece['end_tick'] - piece['begin_tick']
+        longest = sorted((piece for piece in activity if piece['details']['scope_owners']),
+                         key=lambda x: x['begin_tick'] - x['end_tick'])[:5]
+        handoff['activity'] = dict(
+            **{status + '_us': ticks / counter_mhz for status, ticks in totals.items()},
+            longest_observed_spans=[
+                dict(**piece, duration_us=(piece['end_tick'] - piece['begin_tick']) / counter_mhz)
+                for piece in longest
+            ])
         if handoff['duration_us']:
+            metadata('thread_name', 5, tid, handoff['name'] + ' · activity')
+            dependency_tid = tid + len(handoffs)
+            metadata('thread_name', 5, dependency_tid, handoff['name'] + ' · dependency')
+            dependency = handoff['dependency']
+            add_span(dependency['gate'] + ' · ' + dependency['data'], 'KVIP handoff dependency',
+                     5, dependency_tid, handoff['begin_tick'], handoff['end_tick'],
+                     dict(**dependency, boundaries=handoff['boundaries']))
+            for piece in activity:
+                details = piece['details']
+                if details['scope_owners']:
+                    owner = details['scope_owners'][0]
+                    text = f"{owner['core_type']}{owner['block']} · {owner['phase']}"
+                else:
+                    text = ('Kernel body only' if details['status'] == 'kernel_body_only'
+                            else 'No source scope recorded')
+                add_span(text, 'KVIP handoff observed activity', 5, tid,
+                         piece['begin_tick'], piece['end_tick'], details)
             add_span(handoff['name'], 'KVIP business handoff', 4, tid, handoff['begin_tick'],
                      handoff['end_tick'], handoff)
         if handoff['body_segments']:
@@ -762,7 +841,10 @@ def render(events, counter_mhz, *, cold_route='p2'):
                                   'Observed scopes can overlap and their durations are not additive.',
                                   lane_handoff_semantics='Derived handoff gaps on observed logical lanes '
                                   'exclude all recorded source scopes. Hardware idle time requires a '
-                                  'device-side measurement.'))
+                                  'device-side measurement.',
+                                  handoff_activity_semantics='One shortest recorded scope per logical lane. '
+                                  'The label shows the sampled scope with the latest end in that slice. '
+                                  'Stage gates describe code dependencies, not a point-to-point transfer.'))
     return document, summaries
 
 
@@ -852,11 +934,18 @@ def main():
     parser.add_argument('raw', type=Path, help='captured baseline_stage_trace.bin')
     parser.add_argument('--counter-mhz', type=float, required=True, help='use the measured value from the capture report')
     parser.add_argument('--output', type=Path, required=True, help='output Chrome/Perfetto trace JSON')
+    parser.add_argument('--handoff-report', type=Path, help='optional compact handoff report on the source clock')
     parser.add_argument('--cold-route', choices=ROUTE_KERNELS, default='p2',
                         help='kernel aliases used by the recorded replay')
     args = parser.parse_args()
+    if args.handoff_report and args.handoff_report.resolve() == args.output.resolve():
+        parser.error('Use different paths for --output and --handoff-report')
     document, _ = render(decode(args.raw.read_bytes()), args.counter_mhz, cold_route=args.cold_route)
     atomic_json(args.output, document)
+    if args.handoff_report:
+        atomic_json(args.handoff_report, dict(clock=CLOCK, counter_mhz=args.counter_mhz,
+                                             cold_route=args.cold_route,
+                                             source_business_handoffs=document['metadata']['source_handoffs']))
 
 
 if __name__ == '__main__':

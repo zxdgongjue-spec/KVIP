@@ -144,6 +144,30 @@ def require_fused_replay(document, *, cold_route='p2'):
     return result
 
 
+def timed_gap_activity(begin, end, tasks):
+    """Split a device gap by positive-duration tasks on its measured stream."""
+    cuts = sorted({begin, end, *(edge for task in tasks for edge in (task['begin_us'], task['end_us']))})
+    totals = dict.fromkeys(('profile_mark_only', 'other_task_only', 'overlap', 'no_timed_task'), 0.0)
+    segments = []
+    for start, stop in zip(cuts, cuts[1:]):
+        active = [task for task in tasks if task['begin_us'] <= start and stop <= task['end_us']]
+        mark = any(task['name'] in MARKERS for task in active)
+        other = any(task['name'] not in MARKERS for task in active)
+        if mark and other:
+            status, label = 'overlap', 'Overlapping mark and device task'
+        elif mark:
+            status, label = 'profile_mark_only', 'Profiling mark'
+        elif other:
+            status, label = 'other_task_only', 'Other same-stream device task'
+        else:
+            status, label = 'no_timed_task', 'No timed device task recorded'
+        duration = stop - start
+        totals[status] += duration
+        segments.append(dict(name=label, status=status, begin_us=start, end_us=stop, duration_us=duration,
+                             tasks=[dict(name=task['name'], task_id=task['task_id']) for task in active]))
+    return dict(**{status + '_us': value for status, value in totals.items()}, segments=segments)
+
+
 def device_handoffs(vendor, intervals):
     """Partition same-stream kernel gaps at the existing device markers."""
     device_tasks = []
@@ -158,7 +182,7 @@ def device_handoffs(vendor, intervals):
             continue
         interval = get_interval(event)
         if interval is not None:
-            device_tasks.append((name, args, interval))
+            device_tasks.append((name, args, interval, event.get('ph') == 'X'))
 
     result = []
     dependencies = (DEPENDENCIES[0], DEPENDENCIES[2]) if len(intervals) == 3 else DEPENDENCIES
@@ -178,18 +202,24 @@ def device_handoffs(vendor, intervals):
                 ('BEGIN mark to next kernel start', begin_mark, end),
             )
         ]
-        enclosed = {}
-        for name, args, (start, stop) in device_tasks:
+        enclosed, timed = {}, {}
+        for name, args, (start, stop), complete in device_tasks:
+            if str(args['Physic Stream Id']) != stream:
+                continue
             start, stop = float(start), float(stop)
-            if str(args['Physic Stream Id']) == stream and begin <= start <= stop <= end:
-                task_id = str(args['Task Id'])
-                enclosed[name, task_id, start, stop] = dict(
-                    name=name, task_id=task_id, task_type=args.get('Task Type'),
-                    begin_us=start, end_us=stop)
+            task_id = str(args['Task Id'])
+            task = dict(name=name, task_id=task_id, task_type=args.get('Task Type'),
+                        begin_us=start, end_us=stop)
+            if begin <= start <= stop <= end:
+                enclosed[name, task_id, start, stop] = task
+            clip_start, clip_stop = max(begin, start), min(end, stop)
+            if complete and clip_start < clip_stop:
+                timed[name, task_id, clip_start, clip_stop] = dict(task, begin_us=clip_start, end_us=clip_stop)
         result.append(dict(name=f"{left['name']} to {right['name']}", stream=stream,
                            previous_kernel=left['kernel'], following_kernel=right['kernel'],
                            begin_us=begin, end_us=end, duration_us=end-begin,
                            dependency=dependency, segments=segments,
+                           timed_task_activity=timed_gap_activity(begin, end, list(timed.values())),
                            observed_stream_tasks=sorted(enclosed.values(), key=lambda row: row['begin_us'])))
     return result
 
@@ -207,6 +237,7 @@ def device_business_view(vendor, intervals):
         dict(name='thread_name', ph='M', pid=pid, tid=1, args={'name': 'Business kernel phases'}),
         dict(name='thread_name', ph='M', pid=pid, tid=2, args={'name': 'Same-stream kernel handoffs'}),
         dict(name='thread_name', ph='M', pid=pid, tid=3, args={'name': 'Handoffs split by device marks'}),
+        dict(name='thread_name', ph='M', pid=pid, tid=4, args={'name': 'Handoff device task activity'}),
     ))
     for interval in intervals:
         raw.append(dict(name=interval['name'], cat='KVIP fused kernel', ph='X', pid=pid, tid=1,
@@ -222,6 +253,10 @@ def device_business_view(vendor, intervals):
                 raw.append(dict(name=segment['name'], cat='KVIP device marks', ph='X', pid=pid, tid=3,
                                 ts=segment['begin_us'], dur=segment['duration_us'],
                                 args=dict(segment, handoff=handoff['name'])))
+        for segment in handoff['timed_task_activity']['segments']:
+            raw.append(dict(name=segment['name'], cat='KVIP device handoff activity', ph='X', pid=pid, tid=4,
+                            ts=segment['begin_us'], dur=segment['duration_us'],
+                            args=dict(segment, handoff=handoff['name'])))
     result['traceEvents'] = raw
     result['kvip_inter_kernel_handoffs'] = handoffs
     return result
@@ -277,16 +312,29 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='Label a previously exported, marked LIFetch msprof timeline.')
     parser.add_argument('native_trace', type=Path, help='CANN msprof_*.json export')
     parser.add_argument('--route', choices=ROUTE_PHASES, default='p2')
-    parser.add_argument('--out', type=Path, required=True, help='new JSON file with handoff tracks')
+    parser.add_argument('--out', type=Path, help='new JSON file with handoff tracks')
+    parser.add_argument('--handoff-report', type=Path, help='compact report in the native device clock')
     args = parser.parse_args(argv)
+    if args.out is None and args.handoff_report is None:
+        parser.error('Set --out or --handoff-report')
+    if args.out and args.handoff_report and args.out.resolve() == args.handoff_report.resolve():
+        parser.error('Use different paths for --out and --handoff-report')
     try:
         _, vendor, intervals = verified_vendor_timeline([args.native_trace], cold_route=args.route)
-        labeled = device_business_view(vendor, intervals)
-        with args.out.open('x') as output:
-            json.dump(labeled, output, ensure_ascii=False)
+        if args.out is not None:
+            labeled = device_business_view(vendor, intervals)
+            handoffs = labeled['kvip_inter_kernel_handoffs']
+            with args.out.open('x') as output:
+                json.dump(labeled, output, ensure_ascii=False)
+        else:
+            handoffs = device_handoffs(vendor, intervals)
+        if args.handoff_report is not None:
+            with args.handoff_report.open('x') as output:
+                json.dump(dict(clock='CANN device timestamps in microseconds', cold_route=args.route,
+                               native_device_handoffs=handoffs), output, ensure_ascii=False, indent=2)
     except (OSError, ValueError) as error:
         parser.error(str(error))
-    for handoff in labeled['kvip_inter_kernel_handoffs']:
+    for handoff in handoffs:
         print(f"{handoff['name']}  {handoff['duration_us']:.2f} us")
 
 

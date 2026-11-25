@@ -142,6 +142,30 @@ def test_handoff_gaps_are_drawn_on_each_logical_lane_without_covering_work():
     assert intervals('Hot score', 0) == [(3800, 3865), (3865, 3900), (3910, 4000)]
 
 
+def test_handoff_activity_shows_scope_owners_and_uncovered_time():
+    events = decode(sample_buffer())
+    cold = next(e for e in events if e['kernel'] == 22 and e['lane'] == 0)
+    events.extend([
+        dict(cold, phase=2, begin=5001, end=5013),
+        dict(cold, phase=230, begin=5004, end=5009),
+        dict(cold, phase=234, begin=5010, end=5020, lane=1, block=1),
+    ])
+    document, _ = render(events, counter_mhz=1000)
+    handoff = document['metadata']['source_handoffs'][1]
+    activity = handoff['activity']
+    assert sum(activity[key] for key in ('recorded_scope_us', 'kernel_body_only_us',
+                                         'no_recorded_scope_us')) == pytest.approx(handoff['duration_us'])
+    assert activity['no_recorded_scope_us'] == pytest.approx(0.197)
+    slices = [e for e in document['traceEvents'] if e.get('cat') == 'KVIP handoff observed activity']
+    cutoff = next(e for e in slices if e['name'] == 'AIV0 · Read resident thresholds into Cold UB')
+    assert cutoff['args']['scoped_lane_count'] == 1
+    overlap = next(e for e in slices if e['args']['scoped_lane_count'] == 2)
+    assert [e['block'] for e in overlap['args']['scope_owners']] == [1, 0]
+    gate = next(e for e in document['traceEvents'] if e.get('cat') == 'KVIP handoff dependency'
+                and e['args']['producer_stage'] == 21)
+    assert gate['args']['gate'] == 'Same-stream stage gate'
+
+
 def test_handoff_window_state_reports_epoch_lane_and_resident_query():
     events = decode(sample_buffer())
     template = next(e for e in events if e['kernel'] == 22 and e['lane'] == 0)
@@ -167,6 +191,7 @@ def test_dynamic_service_job_and_handoff_detail_share_source_timeline():
     job = next(e for e in document['traceEvents'] if e.get('name') == 'Dynamically assigned Service window')
     assert (job['args']['request_row'], job['args']['window_epoch'], job['args']['job_ticket']) == (3, 2, 9)
     assert any(e.get('cat') == 'KVIP source handoff breakdown' for e in document['traceEvents'])
+    assert document['metadata']['source_handoffs'][1]['dependency']['gate'] == 'Request-local readiness'
 
 
 def test_fresh_capture_requires_handoff_scopes_but_old_capture_still_decodes():
