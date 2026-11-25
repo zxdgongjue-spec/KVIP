@@ -166,3 +166,79 @@ def test_archive_compiler_drift_and_fresh_comparisons(tmp_path, monkeypatch, cap
     (archive/'host.txt').write_text('different-node')
     with pytest.raises(ValueError, match='different host'):
         report.report(out, 7, tmp_path/'owner')
+
+
+def test_live_three_arms_measurements_and_reverse_order(tmp_path, monkeypatch, capsys):
+    from pr30_feature_repeats import summarize
+
+    common = dict(physical_npu='4', host='b20', kvaf=report.SDK, kvaf_tree=report.SDK_TREE,
+                  live_main='1', **report.REVISIONS)
+    runtime = {'host': 'b20', 'visible': '4'}
+    thp = dict(coverage_min_pct=100, ub_device='u0', numa_pages_overlapping_vmas={'3': 1}, bytes=4096)
+
+    def measured(root, group, arm, revision, owner, *, verify_library, expected_calls):
+        assert verify_library and expected_calls == 10 and revision == report.REVISIONS[arm]
+        base = {'mainline': 300, 'dualcut': 292, 'paced': 287}[arm]
+        if root.name == 'block2' and arm == 'mainline':
+            base += 2
+        timing = {k: [base, base] for k in report.METRICS}
+        timing.update({k: base for k in report.PER_CALL_MEANS}, event_total_us=base * 10)
+        return (timing, report.np.zeros(640, dtype=bool), thp,
+                dict(runtime=runtime, loaded_library=arm, capture_operand_hashes={}), {})
+
+    def hashes(arm):
+        image = dict(report.EXPECTED_TEXT)
+        if arm != 'mainline':
+            image[report.LI_TEXT[0]] = 'dualcut'
+        if arm == 'paced':
+            image[report.TERMINAL] = 'paced'
+        return image
+
+    def diag(folder, policy, count, detail):
+        assert len(detail) == count == 10 and policy == ('paced' if folder.name == 'paced' else 'single')
+        return dict(prefetch=0, final=511, first_post_peak_4us_tokens=0, peak_pending_queries=0,
+                    last_worker_mean_us={})
+
+    monkeypatch.setattr(report, 'oracle_for', lambda owner, group: ())
+    monkeypatch.setattr(report, 'case_folder', lambda root, group, arm: root/f'g{group}'/arm)
+    monkeypatch.setattr(report, 'measured_parallel', measured)
+    monkeypatch.setattr(report, 'text_hashes', hashes)
+    monkeypatch.setattr(report, 'feature_times', lambda profile, times: times)
+    monkeypatch.setattr(report, 'diagnostic', diag)
+    arms = tuple(report.REVISIONS)
+    for n, order in [(1, arms), (2, arms[::-1])]:
+        root = tmp_path / f'block{n}'
+        root.mkdir()
+        for k, val in common.items():
+            (root/f'{k}.txt').write_text(val)
+        for g in report.GROUPS:
+            group = root/f'g{g}'
+            group.mkdir()
+            (group/'order.txt').write_text(' '.join(order))
+            atomic_json(group/'replay_input.json', dict(geometry={}, identities={}, page_count=32))
+            for arm in order:
+                folder = group/arm
+                atomic_json(folder/'diagnose/round-1/full_attribution.json', {})
+                policy = 'paced' if arm == 'paced' else 'single'
+                values = receipts(policy)
+                atomic_json(folder/'ablation_receipts.json', dict(
+                    policy=policy, independent_status_allocations=10, measured=values, detail=values))
+            report.report(root, g, tmp_path/'oracle')
+        report.summary(root)
+    summarize(tmp_path)
+    result = report.read(tmp_path/'feature_comparison.json')
+    assert result['groups']['7']['B_vs_main']['event_mean_us'] == [13, 15]
+    assert result['groups']['7']['A_vs_main']['span'] == [8, 10]
+    assert result['equal_weight']['B_vs_main']['span'] == [13, 15]
+    assert result['calls_per_graph'] == dict.fromkeys(arms, 10)
+    stdout = capsys.readouterr().out
+    assert 'G7 CHECK arm=mainline TopK_score_vs_strong_serial=PASS calls=10/10 queries=640/640' in stdout
+    assert 'G7 mainline measured prefetch/final_tokens_per_call=0.00/511.00' in stdout
+    assert 'FIVE_GROUP_EQUAL_WEIGHT paced_vs_mainline span_saved_mean_us=+13.000' in stdout
+    assert 'historical_main' not in stdout
+    (tmp_path/'block2/g7/order.txt').write_text(' '.join(arms))
+    with pytest.raises(ValueError, match='reverse order'):
+        summarize(tmp_path)
+    monkeypatch.setattr(report, 'text_hashes', lambda arm: {**hashes(arm), report.TERMINAL: 'unexpected'})
+    with pytest.raises(ValueError, match='upstream device binary'):
+        report.report(tmp_path/'block1', 7, tmp_path/'oracle')

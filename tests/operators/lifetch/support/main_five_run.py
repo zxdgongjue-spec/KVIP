@@ -41,6 +41,11 @@ def case_path(args):
     return args.output / 'results/mainline/cases/diagnose'
 
 
+def oracle_source(args, receipt):
+    origin = 'native-only-oracle' if receipt.get('reference_kind') == 'native-only' else 'completed-owner-archive'
+    return {**receipt['native_reference'], 'origin': origin, 'archive_path': str(args.owner_archive)}
+
+
 class FeatureReplayChecks:
     """Use the single-round reset boundary to reduce warmup host transfers."""
 
@@ -90,12 +95,18 @@ def worker(args):
     sequence = ArchiveSequence(args.trace, args.group, (1, 1))
     sequence.cache_ranked_round()
     inputs = next(iter(sequence))
-    _, receipt = archived_oracle(args.owner_archive, args.group)
+    serial, receipt = archived_oracle(args.owner_archive, args.group)
     operand_hashes = {}
     for name in ('query', 'weights', 'query_scale', 'logical_keys', 'logical_scales', 'query_ends', 'captured_layout'):
         operand_hashes[name] = digest(getattr(inputs, name))
     if operand_hashes != receipt['native_reference']['identity']['inputs']:
         raise ValueError(f'G{args.group}: captured mainline operands do not match the archived strong serial')
+    if args.ablation_policy:
+        from correctness import topk_fingerprint
+        from score_equivalence import CapturedScoreOracle, save_checked
+        inputs.validate_topk = CapturedScoreOracle(inputs, serial).validate
+        # Subsequent production imports must see their own correctness module.
+        sys.modules.pop('correctness')
     # native_li_reference imports the archived reporting module for its cache
     # writer. Start the production imports with an independent module namespace.
     for module_name in ('workloads', 'reporting'):
@@ -176,6 +187,9 @@ def worker(args):
     cq_status_ranges = []
     if args.ablation_policy:
         from terminal_batch_checks import ablation_receipt, check_status_binding
+        from feature_input_restore import FeatureInputRestore
+        feature_restore = FeatureInputRestore(inputs, pages)
+        feature_restore.install(ex)
     if args.borrow_audit:
         import last_window_borrow as borrow
         from terminal_batch_checks import audit_queues, check_status_binding
@@ -353,6 +367,8 @@ def worker(args):
     if feature_checks is not None:
         check_times = feature_checks.receipt()
         device_proof['validation'] = check_times
+        device_proof['input_restore'] = feature_restore.stats
+        print('FEATURE_INPUT_RESTORE', json.dumps(feature_restore.stats, sort_keys=True), flush=True)
         print(f'FEATURE_VALIDATION full_state_checks={check_times["full_state_checks"]} '
               f'completion_and_private_CQ_checks={check_times["completion_and_private_CQ_checks"]} '
               f'full_state_check_s={check_times["full_state_check_seconds"]:.3f} '
@@ -419,7 +435,19 @@ def worker(args):
             fields=['available','done','arrival','begin','end','topk_calls','scanned','candidates',
                     'assigned','ready_packed','covered_empty','snapshot'],
             calls=[spare_workers[i] for i in call_ids]))
-    np.save(fused / 'measured_ids.npy', np.stack([outputs[i] for i in call_ids]), allow_pickle=False)
+    measured = np.stack([outputs[i] for i in call_ids])
+    if args.ablation_policy:
+        # The worker already holds the full decoded capture and verified native
+        # reference. Certify each raw output here before releasing those arrays.
+        started = perf_counter()
+        save_checked(fused, args.group, inputs, serial, oracle_source(args, receipt), measured,
+                     expected_calls=args.iterations)
+        result['topk_set_digests'] = [topk_fingerprint(value) for value in measured]
+        atomic_json(fused / 'path_result.json', result)
+        print(f'FEATURE_SCORE_CHECK measured_queries={measured.shape[0] * BATCH * 4} '
+              f'archive_seconds={perf_counter() - started:.3f}', flush=True)
+    else:
+        np.save(fused / 'measured_ids.npy', measured, allow_pickle=False)
 
 
 def main(args):
@@ -433,12 +461,13 @@ def main(args):
             subprocess.check_output(['git', '-C', args.main, 'rev-parse', 'HEAD'], text=True).strip() != args.revision or
             subprocess.check_output(['git', '-C', args.main, 'status', '--porcelain', '-uno'], text=True).strip()):
         raise ValueError('Expected clean pinned production mainline on physical NPU4')
-    serial, receipt = archived_oracle(args.owner_archive, args.group)
-    origin = 'native-only-oracle' if receipt.get('reference_kind') == 'native-only' else 'completed-owner-archive'
-    source = {**receipt['native_reference'], 'origin': origin, 'archive_path': str(args.owner_archive)}
     # The reader and mainline have different modules named execution,
     # performance, correctness, etc. Keep the production process independent.
     subprocess.run([sys.executable, '-B', __file__, *sys.argv[1:], '--worker'], check=True)
+    if args.ablation_policy:
+        return
+    serial, receipt = archived_oracle(args.owner_archive, args.group)
+    source = oracle_source(args, receipt)
     fused = case_path(args) / 'fused'
     ids_file = fused / ('diagnostic_ids.npy' if args.availability_only else 'measured_ids.npy')
     outputs = np.load(ids_file, allow_pickle=False)

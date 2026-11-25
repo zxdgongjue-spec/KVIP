@@ -6,6 +6,41 @@ from native_li_reference import native_ends
 from reporting import atomic_json
 
 
+class CapturedScoreOracle:
+    """Bind the cutoff and number of strict winners once for an immutable replay round."""
+
+    def __init__(self, inputs, serial):
+        # This is the full capture oracle, including a partition of every valid
+        # population. It must run before we install the faster selection check.
+        inputs.validate_topk(serial)
+        self.ends = native_ends(inputs)[..., None]
+        if np.any(serial >= self.ends):
+            raise ValueError('Archived serial token exceeds its logical query bound')
+        self.keys = inputs.logical_score_keys
+        self.valid = inputs.logical_score_valid
+        self.shape = serial.shape
+        scores = np.take_along_axis(self.keys, serial, axis=-1)
+        self.cutoff = scores.min(axis=-1, keepdims=True)
+        self.strict_count = (scores > self.cutoff).sum(axis=-1)
+
+    def validate(self, selected):
+        ids = np.asarray(selected)
+        if ids.shape != self.shape or ids.dtype.kind not in 'iu':
+            raise AssertionError('Replay TopK shape/type differs from Q4 contract')
+        if np.any(ids < 0) or np.any(ids >= self.keys.shape[-1]) or np.any(ids >= self.ends):
+            raise AssertionError('Replay TopK token outside logical query bound')
+        ordered = np.sort(ids, axis=-1)
+        if np.any(ordered[..., 1:] == ordered[..., :-1]) or not np.take_along_axis(self.valid, ids, axis=-1).all():
+            raise AssertionError('Replay TopK duplicates or exceeds causal prefix')
+        scores = np.take_along_axis(self.keys, ids, axis=-1)
+        # IDs are distinct and admissible. Matching the population's strict count
+        # means every strict winner is present, even if the tie IDs change.
+        wrong = (scores.min(axis=-1) != self.cutoff[..., 0]) | ((scores > self.cutoff).sum(axis=-1) != self.strict_count)
+        if np.any(wrong):
+            row, query = np.argwhere(wrong)[0]
+            raise AssertionError(f'Replay TopK ranking differs: request={row} Q={query + 1}')
+
+
 def check_scores(inputs, serial, outputs):
     # The replay oracle checks cardinality, uniqueness, valid positions, the exact
     # cutoff score and complete coverage of every token strictly above the cutoff.

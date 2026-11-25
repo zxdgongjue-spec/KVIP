@@ -2,14 +2,19 @@
 # Five captured BS16/Q4 groups on one physical NPU4 with the unified KVAF SDK.
 set -eo pipefail
 if (( $# < 3 || $# > 5 )) || [[ ! $2 =~ ^[a-f0-9]{40}$ || ! $3 =~ ^[a-f0-9]{40}$ ||
-    ( $# == 4 && $4 != cap-pair ) || ( $# == 5 && $4 != active-history && $4 != pr30-parity && $4 != near512 && $4 != near512-five && $4 != near512-locality && $4 != pr30-feature-steps ) ]]; then
-    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA [cap-pair | active-history ARCHIVED_CAP_PAIR | pr30-parity ARCHIVED_ACTIVE_HISTORY | {near512,near512-five} ARCHIVED_PR30_PARITY | near512-locality ARCHIVED_ACTIVE_HISTORY | pr30-feature-steps {ARCHIVED_UNIFIED_MAIN,auto-local}]" >&2
+    ( $# == 4 && $4 != cap-pair ) || ( $# == 5 && $4 != active-history && $4 != pr30-parity && $4 != near512 && $4 != near512-five && $4 != near512-locality && $4 != pr30-feature-steps && $4 != pr30-feature-live-main ) ]]; then
+    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA [cap-pair | active-history ARCHIVED_CAP_PAIR | pr30-parity ARCHIVED_ACTIVE_HISTORY | {near512,near512-five} ARCHIVED_PR30_PARITY | near512-locality ARCHIVED_ACTIVE_HISTORY | {pr30-feature-steps,pr30-feature-live-main} {ARCHIVED_UNIFIED_MAIN,auto-local}]" >&2
     exit 2
 fi
 repo=$1
 reader=$2
 main=$3
 mode=${4:-single}
+live_feature_main=0
+if [[ $mode == pr30-feature-live-main ]]; then
+    live_feature_main=1
+    mode=pr30-feature-steps
+fi
 upstream=d6cfd392f722dd3f96ef6e05175f503aac511dbb
 name=unified_main
 prefix=unified-main-five
@@ -43,6 +48,7 @@ if [[ $mode == pr30-feature-steps ]]; then
         exit 2
     fi
     prefix=pr30-feature-fast
+    if (( live_feature_main )); then prefix=pr30-feature-live-main-ten; fi
     if [[ -n ${PEER_FEATURE_PRIOR:-} ]]; then feature_prior=$(cd "$PEER_FEATURE_PRIOR" && pwd -P); fi
 elif [[ $mode == cap-pair ]]; then
     if [[ $main != cfe2b52f6403d5edd612c314bc7110525a5f5789 ]]; then
@@ -240,14 +246,19 @@ elif [[ $mode == pr30-feature-steps ]]; then
     printf '%s\n' "$main" >"$out/mainline.txt"
     printf '%s\n' "$dualcut" >"$out/dualcut.txt"
     printf '%s\n' "$paced" >"$out/paced.txt"
+    if (( live_feature_main )); then printf '1\n' >"$out/live_main.txt"; fi
     for block in 1 2; do
         mkdir -p "$out/block$block"
-        for field in mainline dualcut paced reader physical_npu host boot_id machine_id kvaf kvaf_tree reference; do
+        for field in live_main mainline dualcut paced reader physical_npu host boot_id machine_id kvaf kvaf_tree reference; do
             if [[ -f "$out/$field.txt" ]]; then cp "$out/$field.txt" "$out/block$block/"; fi
         done
     done
-    echo "CONFIG baseline=$archive measured=dualcut,paced blocks=2 reverse_order=1 groups=10,4,17,7,2 physical_NPU=4 BS16_Q4 warmup=4 calls_per_arm_per_block=10 archived_main_calls=20"
-    if [[ -n $feature_prior ]]; then echo "REUSE_COMPLETE_PAIRS_FROM=$feature_prior"; fi
+    if (( live_feature_main )); then
+        echo "CONFIG measured=mainline,dualcut,paced blocks=2 reverse_order=1 groups=10,4,17,7,2 physical_NPU=4 BS16_Q4 warmup=4 calls_per_arm_per_block=10 placement_and_oracle_archive=$archive"
+    else
+        echo "CONFIG baseline=$archive measured=dualcut,paced blocks=2 reverse_order=1 groups=10,4,17,7,2 physical_NPU=4 BS16_Q4 warmup=4 calls_per_arm_per_block=10 archived_main_calls=20"
+        if [[ -n $feature_prior ]]; then echo "REUSE_COMPLETE_PAIRS_FROM=$feature_prior"; fi
+    fi
 elif [[ $mode == active-history ]]; then
     echo "CONFIG measured=active_512k archive=$archive native=$main sdk=$sdk NPU=4 BS=16 Q=4 warmup=4 calls=20"
 elif [[ $mode == cap-pair ]]; then
@@ -390,13 +401,13 @@ PY_DEVICE
     if [[ $mode == pr30-parity ]]; then args+=(--production-graph); fi
     if [[ $mode == pr30-feature-steps ]]; then
         case $label in
-            dualcut) args+=(--ablation-policy single);;
+            mainline|dualcut) args+=(--ablation-policy single);;
             paced) args+=(--ablation-policy paced);;
             *) exit 2;;
         esac
     fi
     display=$label
-    if [[ $label == mainline ]]; then display=$name; fi
+    if [[ $label == mainline && $live_feature_main == 0 ]]; then display=$name; fi
     if [[ $mode == near512 ]]; then echo "CASE_BEGIN near512"; else echo "CASE_BEGIN G$g $display"; fi
     worker="$support/main_five_run.py"
     if [[ $mode == near512* ]]; then
@@ -451,7 +462,10 @@ run_group() (
     if [[ $mode == pr30-feature-steps ]]; then
         group_reference=$archive
         if (( auto_feature_reference )); then
-            group_reference=$("$PYTHON" -B "$support/feature_host_reference.py" "$area" "$g" baseline)
+            group_reference=
+            if (( !live_feature_main )); then
+                group_reference=$("$PYTHON" -B "$support/feature_host_reference.py" "$area" "$g" baseline)
+            fi
         fi
         if [[ -n $group_reference ]]; then
             owner=$("$PYTHON" -B - "$support" "$group_reference" "$g" <<'PY_OWNER'
@@ -464,7 +478,11 @@ print(read(folder / 'score_topk_check.json')['native_reference']['archive_path']
 PY_OWNER
             )
             placement="$group_reference/g$g/mainline/thp.json"
-            echo "G$g MAIN_REFERENCE=$group_reference"
+            if (( live_feature_main )); then
+                echo "G$g PLACEMENT_AND_ORACLE_REFERENCE=$group_reference"
+            else
+                echo "G$g MAIN_REFERENCE=$group_reference"
+            fi
         else
             owner=$("$PYTHON" -B "$support/feature_host_reference.py" "$area" "$g" owner)
             if [[ -z $owner ]]; then
@@ -473,18 +491,31 @@ PY_OWNER
                     "$PYTHON" -B "$support/feature_score_oracle.py" "$trace" "$g" "$owner"
             fi
             placement=$("$PYTHON" -B "$support/feature_host_reference.py" "$area" "$g" placement)
-            echo "G$g MAIN_REFERENCE=unavailable measured=dualcut,paced oracle=$owner"
+            if (( live_feature_main )); then
+                echo "G$g ORACLE_REFERENCE=$owner"
+            else
+                echo "G$g MAIN_REFERENCE=unavailable measured=dualcut,paced oracle=$owner"
+            fi
         fi
         result_root=$out
         for block in 1 2; do
             out="$result_root/block$block"
-            order=(dualcut paced)
-            if [[ $g == 4 || $g == 7 ]]; then order=(paced dualcut); fi
-            if [[ $block == 2 ]]; then order=("${order[1]}" "${order[0]}"); fi
+            if (( live_feature_main )); then
+                case $g in
+                    10|2) order=(mainline dualcut paced);;
+                    4|7)  order=(dualcut paced mainline);;
+                    17)   order=(paced mainline dualcut);;
+                esac
+                if [[ $block == 2 ]]; then order=("${order[2]}" "${order[1]}" "${order[0]}"); fi
+            else
+                order=(dualcut paced)
+                if [[ $g == 4 || $g == 7 ]]; then order=(paced dualcut); fi
+                if [[ $block == 2 ]]; then order=("${order[1]}" "${order[0]}"); fi
+            fi
             mkdir -p "$out/g$g"
             printf '%s\n' "${group_reference:-unavailable}" >"$out/g$g/reference.txt"
             printf '%s\n' "${order[*]}" >"$out/g$g/order.txt"
-            if [[ -n $feature_prior ]]; then
+            if [[ -n $feature_prior && $live_feature_main == 0 ]]; then
                 reuse_rc=0
                 "$PYTHON" -B "$support/pr30_reuse_block.py" "$feature_prior" "$out" "$g" "$owner" || reuse_rc=$?
                 case $reuse_rc in
@@ -504,7 +535,7 @@ PY_OWNER
                     started=$SECONDS
                     run_arm "$g" "$label" "$trace" "$owner" "$placement"
                     echo "ARM_COMPLETE G$g $label block=$block wall_s=$((SECONDS-started))"
-                    grep '^FEATURE_VALIDATION ' "$out/g$g/$label/worker.log" || true
+                    grep -E '^FEATURE_(INPUT_RESTORE|VALIDATION|SCORE_CHECK)( |$)' "$out/g$g/$label/worker.log" || true
                 )
                 if [[ -z $placement ]]; then placement="$out/g$g/$label/thp.json"; fi
             done

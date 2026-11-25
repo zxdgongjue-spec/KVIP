@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent / 'support'))
-from score_equivalence import check_scores, save_checked
+from score_equivalence import CapturedScoreOracle, check_scores, save_checked
 from workloads import ReplayRound
 
 
@@ -67,6 +67,33 @@ def test_ten_scored_calls_verifiably_bound_to_ten_measured_outputs(tmp_path):
         measured_sets(tmp_path, 4, current, serial, receipt)
     with pytest.raises(ValueError, match='Expected 10'):
         save_checked(tmp_path, 4, data, serial, {}, outputs[:9], expected_calls=10)
+
+
+def test_cached_score_oracle_checks_every_selection_against_verified_population():
+    inputs, serial = example(16)
+    inputs.logical_score_valid[-1, -1, 2051] = False
+    inputs.logical_score_keys[0, 0] = 0  # Every admissible token ties in this query.
+    good = serial.copy()
+    good[:, :, -1] = 2048
+    outputs = [good] * 9 + [good.copy()]
+    reference = check_scores(inputs, serial, outputs)
+    oracle = CapturedScoreOracle(inputs, serial)
+    inputs.validate_topk = oracle.validate
+    assert check_scores(inputs, serial, outputs) == reference
+    for position, token, error in [(0, 2049, 'ranking'), (-1, 2054, 'ranking'),
+                                   (-1, 2046, 'duplicates'), (-1, 2051, 'causal prefix'),
+                                   (-1, -1, 'logical query bound'), (-1, 2055, 'logical query bound')]:
+        bad = good.copy()
+        bad[-1, -1, position] = token
+        with pytest.raises(AssertionError, match=f'Call 10: .*{error}'):
+            check_scores(inputs, serial, [*outputs[:9], bad])
+    for bad in (good[..., :-1], good.astype(np.float32)):
+        with pytest.raises(AssertionError, match='shape/type'):
+            oracle.validate(bad)
+    inputs, bad_serial = example()
+    bad_serial[0, 0, 0] = 2048
+    with pytest.raises(AssertionError, match='ranking'):
+        CapturedScoreOracle(inputs, bad_serial)
 
 
 def test_report_binds_score_checked_ids_to_measured_and_archive(tmp_path, monkeypatch, capsys):

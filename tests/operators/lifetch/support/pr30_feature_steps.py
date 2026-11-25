@@ -183,8 +183,8 @@ def feature_times(profile, checked):
 
 def collect_arm(root, group, arm, owner, oracle, host):
     folder = case_folder(root, group, arm)
-    archived = arm == 'mainline'
-    calls = CALLS_PER_GRAPH[arm]
+    archived = arm == 'mainline' and marker(root, 'live_main') != '1'
+    calls = CALLS_PER_GRAPH[arm] if archived else FRESH_CALLS
     times, exact, thp, proof, cfg = measured_parallel(
         root, group, arm, REVISIONS[arm], owner, *oracle, verify_library=not archived, expected_calls=calls)
     timing = feature_times(read(folder/'diagnose/round-1/full_attribution.json'), times)
@@ -192,10 +192,10 @@ def collect_arm(root, group, arm, owner, oracle, host):
         raise ValueError(f'G{group} {arm}: wrong measured host or device')
     if archived:
         text = proof['device_text_sha256']
-        if text != EXPECTED_TEXT:
-            raise ValueError(f'G{group}: upstream archive reported a different device binary')
     else:
         text = text_hashes(proof['loaded_library'])
+    if arm == 'mainline' and text != EXPECTED_TEXT:
+        raise ValueError(f'G{group}: upstream device binary differs from the pinned mainline')
     measurements = None
     policy = 'paced' if arm == 'paced' else 'single'
     detail_receipts = None
@@ -232,13 +232,18 @@ def format_times(times, signed=False):
 
 
 def report(root, group, owner):
-    archive = group_reference(root, group)
+    live_main = marker(root, 'live_main') == '1'
+    archive = None if live_main else group_reference(root, group)
     check_roots(root, archive)
     oracle = oracle_for(owner, group)
     timing, measured, diagnostics, images, exact = {}, {}, {}, {}, {}
-    arms = tuple(REVISIONS) if archive is not None else ('dualcut', 'paced')
+    arms = tuple(REVISIONS) if live_main or archive is not None else ('dualcut', 'paced')
+    counts = {a: FRESH_CALLS if live_main else CALLS_PER_GRAPH[a] for a in arms}
+    order = (root/f'g{group}/order.txt').read_text().split()
+    if sorted(order) != sorted(arms if live_main else ('dualcut', 'paced')):
+        raise ValueError(f'G{group}: invalid arm order {order}')
     for arm in arms:
-        source = archive if arm == 'mainline' else root
+        source = archive if archive is not None and arm == 'mainline' else root
         timing[arm], receipts, diagnostics[arm], images[arm], controls, thp, exact[arm] = collect_arm(
             source, group, arm, owner, oracle, marker(root, 'host'))
         if arm == arms[0]:
@@ -246,22 +251,19 @@ def report(root, group, owner):
         else:
             if (controls != base_controls or pair_placement(base_thp, thp, local_baseline=True) != 'matched'):
                 raise ValueError(f'G{group} {arm}: input, runtime or CPU transport placement differs')
-        if arm != 'mainline':
+        if live_main or arm != 'mainline':
             measured[arm] = receipts
     code_check = dict(main_tail_equals_dualcut=(
-                          images['mainline'][TERMINAL] == images['dualcut'][TERMINAL] if archive else None),
+                          images['mainline'][TERMINAL] == images['dualcut'][TERMINAL] if 'mainline' in images else None),
                       dualcut_li_equals_paced=all(images['dualcut'][k] == images['paced'][k] for k in LI_TEXT))
-    order = (root/f'g{group}/order.txt').read_text().split()
-    if sorted(order) != ['dualcut', 'paced']:
-        raise ValueError(f'G{group}: invalid arm order {order}')
     atomic_json(root/f'g{group}/feature_steps.json', dict(
-        group=group, calls_per_graph={a: CALLS_PER_GRAPH[a] for a in arms},
+        group=group, live_main=live_main, calls_per_graph=counts,
         timing=timing, measured=measured, diagnostic=diagnostics,
         device_text=code_check, executable_sha256=images, native=REVISIONS,
         reference=str(archive) if archive is not None else None, order=order,
         runtime=base_controls['runtime'], exact_id_sets=exact))
     for arm in arms:
-        calls = CALLS_PER_GRAPH[arm]
+        calls = counts[arm]
         rows, queries = calls * 16, calls * 16 * 4
         print(f'G{group} CHECK arm={arm} TopK_score_vs_strong_serial=PASS calls={calls}/{calls} '
               f'queries={queries}/{queries} KV_and_Index=PASS rows={rows}/{rows} '
@@ -285,16 +287,24 @@ def report(root, group, owner):
             print(f'G{group} {arm}_vs_{prior} UNAVAILABLE reason=no_matching_local_main_archive')
             continue
         print(f'G{group} {arm}_vs_{prior} saved', format_times(saved(timing[prior], timing[arm]), signed=True),
-              'historical_main' if prior == 'mainline' else 'fresh_same_block',
-              f'calls_per_graph={CALLS_PER_GRAPH[prior]}/{CALLS_PER_GRAPH[arm]}',
+              'historical_main' if prior == 'mainline' and not live_main else 'fresh_same_block',
+              f'calls_per_graph={counts[prior]}/{counts[arm]}',
               f'unmodified_stage_binary={"MATCH" if code_matched else "DIFF"}')
+
+    if live_main:
+        print(f'G{group} paced_vs_mainline saved', format_times(saved(timing['mainline'], timing['paced']), signed=True),
+              f'fresh_same_block calls_per_graph={FRESH_CALLS}/{FRESH_CALLS}')
 
 
 def summary(root):
     rows = [read(root/f'g{g}/feature_steps.json') for g in GROUPS]
+    live_main = marker(root, 'live_main') == '1'
     for group, row in zip(GROUPS, rows):
-        archive = group_reference(root, group)
-        expected = CALLS_PER_GRAPH if archive is not None else {'dualcut': FRESH_CALLS, 'paced': FRESH_CALLS}
+        archive = None if live_main else group_reference(root, group)
+        expected = dict.fromkeys(REVISIONS, FRESH_CALLS) if live_main else {
+            a: n for a, n in CALLS_PER_GRAPH.items() if a != 'mainline' or archive is not None}
+        if row.get('live_main', False) != live_main:
+            raise ValueError('Mixed live and archived measurements')
         if (row['group'] != group or row['calls_per_graph'] != expected or set(row['timing']) != set(expected)
                 or row['native'] != REVISIONS or row['reference'] != (str(archive) if archive else None)
                 or row['runtime'] != rows[0]['runtime']):
@@ -302,11 +312,13 @@ def summary(root):
     print('TIMING span=first_LI_start_to_last_tail_end span_mean=LI_mean+tail_mean+kernel_gaps_mean '
           'event_mean=span_mean+between_calls_per_call+event_edge_residual_per_call '
           'window10=first_LI_to_tenth_tail_divided_by_10 '
-          'P50=median_of_individual_samples mainline_archive_graph_calls=20 candidate_graph_calls=10')
+          'P50=median_of_individual_samples',
+          'all_live_arms_graph_calls=10' if live_main else 'mainline_archive_graph_calls=20 candidate_graph_calls=10')
     print('DIAGNOSTIC_SEPARATE_REPLAY first_post_peak=first_doorbell_tokens_in_busiest_4us '
           'peak_pending=overlapping_submit_to_software_CQ_observation_intervals '
           'hardware_conflict_counter=unavailable')
-    for prior, arm in PAIRS:
+    comparisons = (*PAIRS, ('mainline', 'paced')) if live_main else PAIRS
+    for prior, arm in comparisons:
         missing = [str(row['group']) for row in rows if prior not in row['timing']]
         if missing:
             print(f'FIVE_GROUP_EQUAL_WEIGHT {arm}_vs_{prior} UNAVAILABLE missing_groups={",".join(missing)}')
