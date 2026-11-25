@@ -10,7 +10,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "support"))
 from large_batch_input import BATCHES, FrozenRound, expand, input_digest
-from large_batch_pair import check_scores, large_account, li_intervals, stage_sample, tail_team_intervals, verify_abc, verify_assignments
+from large_batch_pair import check_scores, large_account, last_row_windows, li_intervals, stage_sample, tail_team_intervals, verify_abc, verify_assignments
 from workloads import ReplayPagePlan, ReplayRound
 
 
@@ -43,6 +43,25 @@ def fixture():
 
 
 class LargeBatchReplay(unittest.TestCase):
+    def test_last_row_window_clock_partition(self):
+        stamps = np.zeros((20, 4, 4), dtype=np.uint64)
+        stamps[:, :, 2:] = (100, 200)
+        stamps[7, :, 2:] = (100, 210)
+        li = dict(per_query_cycle_stamps=stamps, clock_mhz=2)
+        events = np.zeros((4, 20, 16), dtype=np.uint64)
+        events[:, 7, 2] = np.arange(4, dtype=np.uint64) << 32
+        events[:, 7, 3] = 1
+        events[0, 7, 1] = 110
+        for epoch in (1, 2, 3):
+            start = 110 + 30 * (epoch - 1)
+            events[epoch, 7, [4, 13, 14, 1]] = [start + 12, start + 15, start + 24, start + 30]
+        result = last_row_windows(events, li)
+        self.assertEqual((result["row"], result["span_us"]), (7, 55))
+        self.assertEqual(result["segments_us"], dict(initial_window=5, cold_to_window=18, predecessor_wait=4.5,
+                                                     rank_and_join=13.5, service_and_post=9, retire=5))
+        events[1, 7, 13] = 0
+        self.assertEqual(last_row_windows(events, li)["reason"], "cold_window_clock")
+
     def test_tail_teams_two_waves_with_one_slow_query(self):
         stamps = np.zeros((20, 4, 32), dtype=np.int64)
         stamps[:16, :, 0], stamps[:16, :, 10] = 100, 200

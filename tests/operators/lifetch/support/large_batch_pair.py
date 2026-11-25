@@ -334,6 +334,41 @@ def li_intervals(words, batch, mhz):
     return dict(clock_mhz=mhz, spans=details, per_query_cycle_stamps=stamps.tolist())
 
 
+def last_row_windows(events, li):
+    """Partition the last row owner's LI3 interval, using stamps from the same diagnostic replay."""
+    stamps = np.asarray(li["per_query_cycle_stamps"], dtype=np.int64)
+    batch = len(stamps)
+    words = np.asarray(events, dtype=np.uint64)
+    # The first two uint64s are service entry/exit. The pad holds rank entry/join.
+    if words.size != 4 * batch * 16 or stamps.shape != (batch, 4, 4):
+        return {"available": False, "reason": "window_record_shape"}
+    events = words.reshape(4, batch, 16)
+    row = int(stamps[:, 0, 3].argmax())
+    start, finish = map(int, stamps[row, 0, 2:4])
+    windows = events[:, row]
+    if any(int(record[2]) >> 32 != epoch or (int(record[3]) & 0xffffffff) != 1
+           for epoch, record in enumerate(windows)):
+        return {"available": False, "reason": "window_epoch_or_completion"}
+    previous = int(windows[0, 1])
+    if not 0 < start <= previous <= finish:
+        return {"available": False, "reason": "initial_window_clock"}
+    segments = dict(initial_window=previous - start, cold_to_window=0, predecessor_wait=0, rank_and_join=0,
+                    service_and_post=0)
+    for record in windows[1:]:
+        wait, rank, joined, service_end = map(int, record[[4, 13, 14, 1]])
+        if not previous <= wait <= rank <= joined <= service_end <= finish:
+            return {"available": False, "reason": "cold_window_clock"}
+        segments["cold_to_window"] += wait - previous
+        segments["predecessor_wait"] += rank - wait
+        segments["rank_and_join"] += joined - rank
+        segments["service_and_post"] += service_end - joined
+        previous = service_end
+    segments["retire"] = finish - previous
+    mhz = li["clock_mhz"]
+    return dict(available=True, row=row, span_us=(finish - start) / mhz,
+                segments_us={name: ticks / mhz for name, ticks in segments.items()})
+
+
 def tail_team_intervals(stamps, mhz):
     # One row holds one four-Q team until its last Q retires. Queue waits are
     # inside this interval; the time between row assignments is outside it.
@@ -673,6 +708,9 @@ def run(args):
             100 * (a - b) / a for a, b in zip(old["mean_p50_us"]["graph"], times["graph"])
         ]
         if previous is not None:
+            summary["last_row_LI3_windows"] = last_row_windows(
+                proofs["separate_window_event_u64"], proofs["separate_LI_diagnostic"]
+            )
             summary["comparison_archive"] = str(args.serial_result.parent)
             old_times = previous["mean_p50_us"]
             summary["vs_previous_fused_saved_mean_p50_us"] = {
@@ -739,6 +777,12 @@ def run(args):
         spans = proofs["separate_LI_diagnostic"]["spans"]
         print(f"DIAGNOSTIC {tag} separate_calls=1", *(f"{k}={v:.2f}" for k, v in spans.items()))
         if previous is not None:
+            windows = summary["last_row_LI3_windows"]
+            if windows["available"]:
+                print(f"DIAGNOSTIC {tag} LI3_last_row={windows['row']} span_us={windows['span_us']:.2f}",
+                      *(f"{k}_us={v:.2f}" for k, v in windows["segments_us"].items()))
+            else:
+                print(f"DIAGNOSTIC {tag} LI3_last_row_unavailable={windows['reason']}")
             teams = proofs["separate_terminal_teams"]
             print(
                 f"DIAGNOSTIC {tag} tail separate_calls=1 "
