@@ -1,3 +1,7 @@
+#if !V9_UBMEM && KVIP_STREAMING_LI
+// Only the URMA LI kernel uses the shared window rank selection.
+#define KVIP_URMA_WINDOW_LI 1
+#endif
 #include "kernel_operator.h"
 #if defined(__CCE_AICORE__)
 #include "context.h"
