@@ -106,13 +106,22 @@ def test_large_archive_uses_same_input_host_and_raw_timings(tmp_path):
     for arm, workers in (("fused", 32), ("serial", 2)):
         path = pair / arm
         (path / "path").mkdir(parents=True)
-        record = dict(identity=baseline, arm=arm, get_workers=workers, checked_queries=1280,
-                      checked_rows=320, samples=[sample] * 10, mean_p50_us={k: [v, v] for k, v in sample.items()})
+        record = dict(
+            identity=baseline,
+            arm=arm,
+            get_workers=workers,
+            checked_queries=1280,
+            checked_rows=320,
+            samples=[sample] * 10,
+            traffic=[{"prefetch": 20, "final": 40}] * 10,
+            mean_p50_us={k: [v, v] for k, v in sample.items()},
+        )
         (path / "ARM_RESULT.json").write_text(json.dumps(record))
         proof = dict(path=arm, transport="urma", correctness="PASS", failures=[], runtime_workers=workers)
         (path / "path/path_result.json").write_text(json.dumps(proof))
-    base, times = ref.compute_reference(pair, identity, output)
-    assert base == baseline and times["graph"] == [4, 4]
+    base, fused = ref.compute_reference(pair, identity, output)
+    assert base == baseline and fused["mean_p50_us"]["graph"] == [4, 4]
+    assert len(fused["traffic"]) == 10
     with pytest.raises(ValueError, match="input"):
         ref.compute_reference(pair, dict(identity, sequence_sha256="changed"), output)
     (new / "machine_id.txt").write_text("other")

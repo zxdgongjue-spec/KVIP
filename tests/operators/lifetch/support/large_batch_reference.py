@@ -31,9 +31,13 @@ def compute_reference(directory, identity, output):
         record = json.loads((path / "ARM_RESULT.json").read_text())
         proof = json.loads((path / "path/path_result.json").read_text())
         if (
-            record["arm"] != arm or proof["path"] != arm or proof["transport"] != "urma"
-            or proof["correctness"] != "PASS" or proof["failures"]
-            or record["get_workers"] != workers or proof["runtime_workers"] != workers
+            record["arm"] != arm
+            or proof["path"] != arm
+            or proof["transport"] != "urma"
+            or proof["correctness"] != "PASS"
+            or proof["failures"]
+            or record["get_workers"] != workers
+            or proof["runtime_workers"] != workers
             or record["checked_queries"] != identity["calls"] * identity["batch"] * 4
             or record["checked_rows"] != identity["calls"] * identity["batch"]
             or len(record["samples"]) != identity["calls"]
@@ -46,7 +50,9 @@ def compute_reference(directory, identity, output):
                 raise ValueError(f"Archived {arm} {key} timing disagrees with samples")
         if arm == "fused" and record["identity"] != base:
             raise ValueError("Previous fused input, runtime or protocol differs")
-    return base, record["mean_p50_us"]
+    if len(record["traffic"]) != identity["calls"]:
+        raise ValueError("Incomplete previous fused traffic measurements")
+    return base, record
 
 
 def serial_identity(identity, repo):

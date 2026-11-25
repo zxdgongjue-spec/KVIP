@@ -674,13 +674,17 @@ def run(args):
         ]
         if previous is not None:
             summary["comparison_archive"] = str(args.serial_result.parent)
+            old_times = previous["mean_p50_us"]
             summary["vs_previous_fused_saved_mean_p50_us"] = {
-                k: [a - b for a, b in zip(previous[k], times[k])]
-                for k in ("graph", "LI1", "LI23", "LI", "tail")
+                k: [a - b for a, b in zip(old_times[k], times[k])] for k in ("graph", "LI1", "LI23", "LI", "tail")
             }
             summary["vs_previous_fused_graph_gain_pct"] = [
-                100 * (a - b) / a for a, b in zip(previous["graph"], times["graph"])
+                100 * (a - b) / a for a, b in zip(old_times["graph"], times["graph"])
             ]
+            summary["transfer_tokens_per_call"] = {
+                name: {key: mean(call[key] for call in record["traffic"]) for key in ("prefetch", "final")}
+                for name, record in (("previous", previous), ("candidate", proofs))
+            }
     else:
         del summary["exact"]
     atomic_json(args.output / "ARM_RESULT.json", summary)
@@ -707,19 +711,33 @@ def run(args):
         )
     )
     print(f"TIMING {tag}", *(f"{k}_mean/P50_us={times[k][0]:.2f}/{times[k][1]:.2f}" for k in ("graph", "LI", "tail")))
-    print(
-        f"TRAFFIC {tag}",
-        *(f"{k}_tokens_per_call={mean(v[k] for v in proofs['traffic']):.2f}" for k in proofs["traffic"][0]),
-    )
+    if previous is not None:
+        print(
+            f"TRAFFIC {tag}",
+            *(
+                f"{name}_prefetch/final_tokens_per_call={v['prefetch']:.2f}/{v['final']:.2f}"
+                for name, v in summary["transfer_tokens_per_call"].items()
+            ),
+        )
+    else:
+        print(
+            f"TRAFFIC {tag}",
+            *(
+                f"{k}_tokens_per_call={mean(v[k] for v in proofs['traffic']):.2f}"
+                for k in (("prefetch", "final") if fused else ("fetch",))
+            ),
+        )
     if fused:
         spans = proofs["separate_LI_diagnostic"]["spans"]
         print(f"DIAGNOSTIC {tag} separate_calls=1", *(f"{k}={v:.2f}" for k, v in spans.items()))
         if previous is not None:
             teams = proofs["separate_terminal_teams"]
-            print(f"DIAGNOSTIC {tag} tail separate_calls=1 "
-                  f"mean_assigned_teams={teams['mean_assigned_teams']:.2f}/16 "
-                  f"row_mean/max_us={teams['row_mean_us']:.2f}/{teams['row_max_us']:.2f} "
-                  f"last_row={teams['last_row']} last_Q={teams['last_q']}")
+            print(
+                f"DIAGNOSTIC {tag} tail separate_calls=1 "
+                f"mean_assigned_teams={teams['mean_assigned_teams']:.2f}/16 "
+                f"row_mean/max_us={teams['row_mean_us']:.2f}/{teams['row_max_us']:.2f} "
+                f"last_row={teams['last_row']} last_Q={teams['last_q']}"
+            )
         print(
             f"SAVED {tag} vs_strong_serial",
             *(
@@ -729,10 +747,14 @@ def run(args):
             "graph_gain_mean/P50_pct=%+.2f/%+.2f" % tuple(summary["vs_strong_serial_graph_gain_pct"]),
         )
         if previous is not None:
-            print(f"SAVED {tag} vs_previous_fused", *(
-                f"{k}_mean/P50_us={a:+.2f}/{b:+.2f}"
-                for k, (a, b) in summary["vs_previous_fused_saved_mean_p50_us"].items()
-            ), "graph_gain_mean/P50_pct=%+.2f/%+.2f" % tuple(summary["vs_previous_fused_graph_gain_pct"]))
+            print(
+                f"SAVED {tag} vs_previous_fused",
+                *(
+                    f"{k}_mean/P50_us={a:+.2f}/{b:+.2f}"
+                    for k, (a, b) in summary["vs_previous_fused_saved_mean_p50_us"].items()
+                ),
+                "graph_gain_mean/P50_pct=%+.2f/%+.2f" % tuple(summary["vs_previous_fused_graph_gain_pct"]),
+            )
 
 
 if __name__ == "__main__":

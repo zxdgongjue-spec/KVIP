@@ -1,4 +1,5 @@
 """Exercise the production event retirement code independently of the transport driver."""
+
 from pathlib import Path
 import shutil
 import subprocess
@@ -65,6 +66,5 @@ int main() {
     operators = Path(__file__).resolve().parents[3] / "csrc/operators"
     include = operators / "lightning_indexer_with_fetch/op_kernel/terminal"
     binary = tmp_path / "events"
-    subprocess.run([compiler, "-std=c++17", "-O2", "-I", str(include), str(source), "-o", str(binary)],
-                   check=True)
+    subprocess.run([compiler, "-std=c++17", "-O2", "-I", str(include), str(source), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

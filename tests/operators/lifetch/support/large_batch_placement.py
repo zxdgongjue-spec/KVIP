@@ -50,7 +50,7 @@ if __name__ == '__main__':
     args = cli.parse_args()
     if args.mode == 'find':
         print(*find(args.out))
-    elif args.mode == 'get':
+    elif args.mode == "get":
         print(*placement(args.thp))
     else:
         first, second = placement(args.serial), placement(args.fused)

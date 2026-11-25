@@ -109,7 +109,8 @@ def test_cube_vector_flags_drain_between_rows(tmp_path):
     begin = native.rindex("template <class T>", 0, native.index("::ProcessLargeScore("))
     range_impl = native[begin:finish]
     source = tmp_path / "mixed_flags.cpp"
-    source.write_text(r"""
+    source.write_text(
+        r"""
 #include <atomic>
 #include <cassert>
 #include <cstdint>
@@ -159,7 +160,9 @@ template<class T> struct QuantLightningIndexerKernel {
         }
     }
 };
-""" + range_impl + r"""
+"""
+        + range_impl
+        + r"""
 int main() {
     std::vector<std::thread> workers;
     for(int worker=-1;worker<2;++worker) workers.emplace_back([=]{
@@ -177,7 +180,8 @@ int main() {
     for(auto& worker:workers) worker.join();
     for(auto& flag:flags) assert(flag.load()==0);
 }
-""")
+"""
+    )
     exe = tmp_path / "mixed_flags"
     subprocess.run([compiler, "-pthread", "-O2", "-std=c++17", str(source), "-o", str(exe)], check=True)
     subprocess.run([str(exe)], timeout=15, check=True)

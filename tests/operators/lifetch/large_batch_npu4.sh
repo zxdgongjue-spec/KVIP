@@ -188,7 +188,7 @@ for group in 10 4 17 7 2; do
             set_cpu_placement "$node" "$adapter" archived
             run_arm "$group" "$batch" "$trace" fused "$pair"
             "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref/fused/thp.json" "$pair/fused/thp.json"
-            grep -E '^(CHECK|TIMING|DIAGNOSTIC|SAVED) ' "$pair/fused/worker.log" | tee -a "$out/summary.txt" >&3
+            grep -E '^(CHECK|TIMING|TRAFFIC|DIAGNOSTIC|SAVED) ' "$pair/fused/worker.log" | tee -a "$out/summary.txt" >&3
             rm -f -- "$pair/fused/worker.log" "$pair/fused/cpu.log"
             continue
         fi
@@ -222,7 +222,7 @@ from statistics import mean
 import json
 import sys
 root = Path(sys.argv[1])
-gains, incremental_gains = [], []
+gains, incremental_gains, trace_means = [], [], []
 for group in (10, 4, 17, 7, 2):
     cases = [json.loads((root / f"g{group}/bs{bs}/fused/ARM_RESULT.json").read_text())
              for bs in (20, 24, 28, 32)]
@@ -230,11 +230,13 @@ for group in (10, 4, 17, 7, 2):
     since_previous = [c["vs_previous_fused_graph_gain_pct"][0] for c in cases]
     gains.extend(row)
     incremental_gains.extend(since_previous)
+    trace_means.append(mean(row))
     print(f"GROUP G{group} mean_graph_gain_vs_serial_pct={mean(row):+.2f} "
           f"mean_graph_gain_vs_previous_fused_pct={mean(since_previous):+.2f} "
           f"cases_over_20pct_vs_serial={sum(x > 20 for x in row)}/4")
 print(f"ALL equal_weight_mean_graph_gain_vs_serial_pct={mean(gains):+.2f} "
       f"mean_graph_gain_vs_previous_fused_pct={mean(incremental_gains):+.2f} "
+      f"trace_means_over_20pct_vs_serial={sum(x > 20 for x in trace_means)}/5 "
       f"cases_over_20pct_vs_serial={sum(x > 20 for x in gains)}/20")
 PY
 fi
