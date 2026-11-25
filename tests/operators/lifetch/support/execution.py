@@ -740,10 +740,14 @@ def native_payload(torch: Any, batch: int, tokens: int) -> Any:
     return torch.stack(rows)
 
 
-def create_kvaf_runtime(sdk, get_kernel, put_kernel, token_bytes, block_size, device_id, workers, transport, *, jettys=2):
+def create_kvaf_runtime(sdk, get_kernel, put_kernel, token_bytes, block_size, device_id, workers, transport,
+                        *, get_jettys=2):
     put = sdk.PutExecutionConfig(transport, "aiv")
     get = sdk.GetExecutionConfig(transport, "aiv", "direct")
-    jets = {"jettys": jettys} if transport == "urma" else {}
+    # The URMA Put provider admits at most two jettys per worker. Only Get
+    # needs extra queues for the independent prefetch and per-query reads.
+    put_jets = {"jettys": 2} if transport == "urma" else {}
+    get_jets = {"jettys": get_jettys} if transport == "urma" else {}
     return sdk.NpuRuntime(
         batch_get_token_bytes=token_bytes,
         batch_get_tokens_per_block=block_size,
@@ -751,8 +755,8 @@ def create_kvaf_runtime(sdk, get_kernel, put_kernel, token_bytes, block_size, de
         transport_mode=transport,
         default_put=put,
         default_get=get,
-        put_resources=[(put, sdk.ExecutionResources(cores=workers, kernel_path=str(put_kernel), **jets))],
-        get_resources=[(get, sdk.ExecutionResources(cores=workers, kernel_path=str(get_kernel), **jets))],
+        put_resources=[(put, sdk.ExecutionResources(cores=workers, kernel_path=str(put_kernel), **put_jets))],
+        get_resources=[(get, sdk.ExecutionResources(cores=workers, kernel_path=str(get_kernel), **get_jets))],
     )
 
 
@@ -3960,14 +3964,14 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     g = initial.geometry
     width = g['token_bytes']
     workers = 40 if fused and config.transport == 'urma' else 2
-    jettys = 2
+    get_jettys = 2
     if fused and config.transport == 'urma' and g['batch'] > 16:
         workers = 32
-        jettys = (5 * g['batch'] + workers - 1) // workers
+        get_jettys = (5 * g['batch'] + workers - 1) // workers
     borrowed = shared_pool.borrow(torch, device, g['batch'], g['history'], workers) if shared_pool else None
     runtime = borrowed.runtime if borrowed else create_kvaf_runtime(
         kvaf, build / 'bin/kvaf_execute_batch_get_kernels.o', build / 'bin/kvaf_execute_batch_put_kernels.o',
-        width, 128, config.device, workers, config.transport, jettys=jettys)
+        width, 128, config.device, workers, config.transport, get_jettys=get_jettys)
     state = graph = table = resources = None
     batch_states = []
     pending = False

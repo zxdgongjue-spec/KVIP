@@ -4,6 +4,14 @@
 set -eo pipefail
 root=$(cd "$(dirname "$0")/../../.." && pwd)
 work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold}
+reuse_serial=
+if (( $# )); then
+    if [[ $# != 2 || $1 != --reuse-g10-bs20-serial ]]; then
+        echo "Usage: $0 [--reuse-g10-bs20-serial RESULT_ROOT]" >&2
+        exit 2
+    fi
+    reuse_serial=$2
+fi
 area="$work/peer-baseline"
 sources="$work/fused-scan-sources"
 mkdir -p "$area" "$sources"
@@ -88,28 +96,40 @@ if [[ -r /etc/machine-id ]]; then cat /etc/machine-id > "$out/machine_id.txt"; f
 printf '4\n' > "$out/physical_npu.txt"
 # Use the same registered CPU memory placement for the serial and fused arms.
 placement=$("$PYTHON" -B "$workers/large_batch_placement.py" find "$out")
-read -r node adapter <<<"$placement"
-ub_device=${KVAF_CPU_UB_DEVICE:-$adapter}
-command=("$cpu")
-if [[ $node == auto ]]; then
-    for node_dir in /sys/devices/system/node/node[0-9]*; do
-        [[ -r $node_dir/cpulist ]] || continue
-        cpus=$(<"$node_dir/cpulist")
-        if [[ -n $cpus ]] && taskset -c "$cpus" true >/dev/null 2>&1; then
-            node=${node_dir##*node}
-            break
-        fi
-    done
-fi
-if [[ $node != auto ]]; then
-    if command -v numactl >/dev/null && numactl "--membind=$node" true >/dev/null 2>&1; then
-        command=(numactl "--membind=$node" "$cpu")
-    elif [[ -r /sys/devices/system/node/node$node/cpulist ]]; then
-        cpus=$(<"/sys/devices/system/node/node$node/cpulist")
-        if taskset -c "$cpus" true >/dev/null 2>&1; then command=(taskset -c "$cpus" "$cpu"); fi
+read -r planned_node planned_adapter <<<"$placement"
+set_cpu_placement() {
+    local node=$1 adapter=$2 ub_device cpus node_dir
+    ub_device=${KVAF_CPU_UB_DEVICE:-$adapter}
+    command=("$cpu")
+    if [[ $node == auto ]]; then
+        for node_dir in /sys/devices/system/node/node[0-9]*; do
+            [[ -r $node_dir/cpulist ]] || continue
+            cpus=$(<"$node_dir/cpulist")
+            if [[ -n $cpus ]] && taskset -c "$cpus" true >/dev/null 2>&1; then
+                node=${node_dir##*node}
+                break
+            fi
+        done
     fi
-fi
-if [[ -n $ub_device && $ub_device != auto ]]; then command+=(--ub-device "$ub_device"); fi
+    if [[ $node != auto ]]; then
+        if command -v numactl >/dev/null && numactl "--membind=$node" true >/dev/null 2>&1; then
+            command=(numactl "--membind=$node" "$cpu")
+        elif [[ -r /sys/devices/system/node/node$node/cpulist ]]; then
+            cpus=$(<"/sys/devices/system/node/node$node/cpulist")
+            if taskset -c "$cpus" true >/dev/null 2>&1; then command=(taskset -c "$cpus" "$cpu"); fi
+        fi
+    fi
+    if [[ ${3:-} == archived ]] && {
+        [[ $ub_device != "$adapter" || ${#command[@]} == 1 ]] ||
+        [[ $planned_node != auto && $planned_node != "$node" ]] ||
+        [[ $planned_adapter != auto && $planned_adapter != "$adapter" ]]
+    }; then
+        echo "Archived NUMA=$node UB=$adapter conflicts with current placement or binding permissions" >&2
+        return 1
+    fi
+    if [[ -n $ub_device && $ub_device != auto ]]; then command+=(--ub-device "$ub_device"); fi
+}
+set_cpu_placement "$planned_node" "$planned_adapter"
 run_arm() (
     set -euo pipefail
     local group=$1 batch=$2 trace=$3 arm=$4 pair=$5
@@ -148,7 +168,21 @@ for group in 10 4 17 7 2; do
         pair="$out/g$group/bs$batch"
         mkdir -p "$pair"
         echo "CASE_BEGIN G$group BS$batch" >&3
-        run_arm "$group" "$batch" "$trace" serial "$pair"
+        if [[ -n $reuse_serial && $group == 10 && $batch == 20 ]]; then
+            staged=$(mktemp -d "$pair/serial-import.XXXXXX")
+            if "$PYTHON" -B "$workers/large_batch_pair.py" --arm serial --trace "$trace" --group 10 --batch 20 \
+                --kvaf-root "$sdk" --output "$staged" --reuse-serial-archive "$reuse_serial" >"$staged/worker.log" 2>&1 &&
+                read -r archived_node archived_adapter < <("$PYTHON" -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["node"],r["adapter"])' "$staged/serial_reference.json") &&
+                set_cpu_placement "$archived_node" "$archived_adapter" archived >>"$staged/worker.log" 2>&1; then
+                mv "$staged" "$pair/serial"
+                echo "REUSED G10 BS20 serial source=$reuse_serial NUMA=$archived_node UB=$archived_adapter" >&3
+            else
+                printf 'REMEASURE G10 BS20 serial reason=%s\n' "$(tail -1 "$staged/worker.log")" >&3
+                rm -rf -- "$staged"
+                set_cpu_placement "$planned_node" "$planned_adapter"
+            fi
+        fi
+        if [[ ! -d $pair/serial ]]; then run_arm "$group" "$batch" "$trace" serial "$pair"; fi
         run_arm "$group" "$batch" "$trace" fused "$pair"
         "$PYTHON" -B "$workers/large_batch_placement.py" compare "$pair/serial/thp.json" "$pair/fused/thp.json"
         for arm in serial fused; do

@@ -17,6 +17,7 @@ import subprocess
 import numpy as np
 
 from large_batch_input import BATCHES, GROUPS, input_digest, load
+from large_batch_reference import reference_identity, stage_serial
 from reporting import atomic_json
 from workloads import ReplayPagePlan, configuration
 
@@ -539,13 +540,21 @@ def run(args):
         f"Q_ends_min/max={inputs.query_ends.min()}/{inputs.query_ends.max()}",
         flush=True,
     )
+    if args.reuse_serial_archive:
+        if args.arm != "serial":
+            raise ValueError("Only the completed serial arm can be reused")
+        stage_serial(args.reuse_serial_archive, args.output, identity, repo)
+        return
+    if not args.kvaf_server:
+        raise ValueError("A KVAF server is required for a live measurement")
     fused = args.arm == "fused"
     serial = None
     if fused:
+        expected, reference = reference_identity(args.serial_result, identity, repo)
         old = json.loads((args.serial_result / "ARM_RESULT.json").read_text())
         path = args.serial_result / "selected.npy"
         if (
-            old["identity"] != identity
+            old["identity"] != expected
             or old["arm"] != "serial"
             or old["get_workers"] != 2
             or old["checked_queries"] != CALLS * args.batch * 4
@@ -622,6 +631,8 @@ def run(args):
         **proofs,
     )
     if fused:
+        if reference is not None:
+            summary["serial_reference"] = reference
         summary["vs_strong_serial_saved_mean_p50_us"] = {
             k: [a - b for a, b in zip(old["mean_p50_us"][k], times[k])] for k in ("graph", "LI", "tail")
         }
@@ -679,7 +690,8 @@ if __name__ == "__main__":
     parser.add_argument("--round", type=int, default=1)
     parser.add_argument("--batch", type=int, choices=BATCHES, required=True)
     parser.add_argument("--kvaf-root", type=Path, required=True)
-    parser.add_argument("--kvaf-server", required=True)
+    parser.add_argument("--kvaf-server")
+    parser.add_argument("--reuse-serial-archive", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--serial-result", type=Path)
     parser.add_argument(
