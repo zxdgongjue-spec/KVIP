@@ -133,6 +133,8 @@ def worker(args):
     detail_ids = {}
     mailboxes = set()
     cq_status_ranges = []
+    if args.ablation_policy:
+        from terminal_batch_checks import ablation_receipt, check_status_binding
     if args.borrow_audit:
         import last_window_borrow as borrow
         from terminal_batch_checks import audit_queues, check_status_binding
@@ -166,7 +168,7 @@ def worker(args):
                 if (self.history != args.history_cap or self.workspace.block_history != args.history_cap
                         or not np.all(key_lengths == args.history_cap) or not np.array_equal(ends, inputs.query_ends)):
                     raise ValueError('Device binding did not retain full configured capacity and original Q ends')
-            if args.production_graph:
+            if args.production_graph or args.ablation_policy:
                 for name, buffer in (('index', self.storage.keys), ('kv', self.output),
                                      ('winners', self.workspace.topk), ('window', self.rotating.rank_progress)):
                     address = buffer.data_ptr()
@@ -176,6 +178,8 @@ def worker(args):
             if self.forward.terminal is None:
                 raise RuntimeError('Production operator selected the legacy tail')
             lib = Path(self.rotating.library._name).resolve()
+            if args.ablation_policy:
+                check_status_binding(self.forward.terminal, cq_status_ranges)
             if args.borrow_audit:
                 borrow.check_workspace(self.forward)
                 if args.revision == borrow.COMBINED:
@@ -197,6 +201,11 @@ def worker(args):
                 prefetched = self.rotating.rows[:, 9].cpu().numpy()
                 final = self.rotating.final_posts[:, :, 0].cpu().numpy()
                 measured_requests[call] = (int(prefetched.sum()), int(final.sum()))
+            if args.ablation_policy and current:
+                phase, call = current[1], int(current[2])
+                if call in cq_calls[phase]:
+                    raise ValueError(f'Repeated queue observations for {phase}/{call}')
+                cq_calls[phase][call] = ablation_receipt(self, args.ablation_policy, diagnostic=phase == 'detail')
             if args.borrow_audit and current:
                 phase, call = current[1], int(current[2])
                 borrow.check_flags(*borrow.options(self.forward), phase == 'detail')
@@ -305,7 +314,7 @@ def worker(args):
             key: [measured_requests[i][column] for i in range(CALLS)]
             for column, key in enumerate(('prefetch', 'final'))}
         device_proof['history_cap'] = history_cap
-    if args.production_graph:
+    if args.production_graph or args.ablation_policy:
         from main_five_report import main_times
         main_times(fused, result['all_rounds'])
         counts = {name: len(addresses) for name, addresses in private_buffers.items()}
@@ -322,6 +331,12 @@ def worker(args):
         production_terminal=True, profiled_terminal_kernel='v9_parallel_terminal',
         measured_calls=len(outputs), measured_kv_index_rows=len(outputs) * BATCH,
         ordered_diagnostic_calls=len(ordered), ordered_diagnostic_rows=sum(ordered.values())))
+    if args.ablation_policy:
+        if len(cq_status_ranges) != CALLS or any(set(calls) != set(range(CALLS)) for calls in cq_calls.values()):
+            raise ValueError('Incomplete independent measured or diagnostic queue receipts')
+        atomic_json(fused / 'ablation_receipts.json', dict(
+            policy=args.ablation_policy, independent_status_allocations=len(cq_status_ranges),
+            **{phase: [calls[i] for i in range(CALLS)] for phase, calls in cq_calls.items()}))
     if args.borrow_audit:
         if len(mailboxes) < CALLS:
             raise ValueError('Missing independent window mailbox storage')
@@ -416,6 +431,8 @@ if __name__ == '__main__':
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--availability-only', action='store_true')
     modes.add_argument('--borrow-audit', action='store_true')
+    modes.add_argument('--ablation-policy', choices=('single', 'paced'),
+                       help='Audit each Q’s actual GET/CQ receipts after a normal timed graph and its diagnostic replay')
     modes.add_argument('--history-cap', type=int, choices=(131328, 524544),
                        help='Physical Q4 history capacity for the same 128K captured input')
     parser.add_argument('--production-graph', action='store_true',

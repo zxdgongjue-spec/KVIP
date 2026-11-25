@@ -67,3 +67,35 @@ def test_captured_status_must_be_private_to_each_replay_state():
     args[0, 0, 7] += size
     with pytest.raises(ValueError, match='different status allocation'):
         check_status_binding(terminal, [])
+
+
+def test_single_policy_and_pressure_for_partial_and_overlapping_batches():
+    from terminal_batch_checks import diagnostic_pressure, submission_pressure
+
+    counts = np.zeros((16, 4), np.int32)
+    counts[0] = [64, 64, 64, 64]
+    pending = np.zeros((16, 4, 2), np.int32)
+    status = np.zeros((16, 4, 4), np.uint64)
+    status[:, :, 0] = STATUS_MAGIC
+    status[:, :, 1] = counts
+    status[:, :, 3] = counts != 0
+    assert check_receipts(counts, pending, status, policy='single') == [60, 4, 0, 0, 0]
+    with pytest.raises(ValueError, match='expected 4 CQEs'):
+        check_receipts(counts, pending, status, policy='paced')
+    stamps = np.zeros((16, 4, 32), np.int64)
+    stamps[0, :, 4] = [100, 200, 400, 500]
+    stamps[0, :, 24] = [300, 400, 700, 600]
+    single = submission_pressure(counts, status[:, :, 3], stamps, 100.)
+    assert single == dict(first_post_peak_4us_tokens=192, peak_pending_queries=2)
+    status[0, :, 3] = 4
+    assert check_receipts(counts, pending, status, policy='paced') == [60, 0, 0, 0, 4]
+    assert submission_pressure(counts, status[:, :, 3], stamps, 100.) == dict(
+        first_post_peak_4us_tokens=12, peak_pending_queries=2)
+    with pytest.raises(ValueError, match='expected 1 CQEs'):
+        check_receipts(counts, pending, status, policy='single')
+    rows = [dict(batch=b, final_counts=[{'total': int(n)} for n in counts[b]]) for b in range(16)]
+    cores = [dict(block=b*4+q, stages=[dict(name=name, end_cycles=int(stamps[b, q, index]))
+                                       for name, index in (('WQE_and_publish', 4), ('final_CQ_join', 24))])
+             for b, q in np.ndindex(16, 4)]
+    rows[0]['terminal_timeline'] = dict(cores=cores, clock_mhz=100.)
+    assert diagnostic_pressure(dict(streaming_cycles=rows), 'single') == single

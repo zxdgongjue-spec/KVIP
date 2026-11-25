@@ -2,8 +2,8 @@
 # Five captured BS16/Q4 groups on one physical NPU4 with the unified KVAF SDK.
 set -eo pipefail
 if (( $# < 3 || $# > 5 )) || [[ ! $2 =~ ^[a-f0-9]{40}$ || ! $3 =~ ^[a-f0-9]{40}$ ||
-    ( $# == 4 && $4 != cap-pair ) || ( $# == 5 && $4 != active-history && $4 != pr30-parity && $4 != near512 && $4 != near512-five && $4 != near512-locality ) ]]; then
-    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA [cap-pair | active-history ARCHIVED_CAP_PAIR | pr30-parity ARCHIVED_ACTIVE_HISTORY | {near512,near512-five} ARCHIVED_PR30_PARITY | near512-locality ARCHIVED_ACTIVE_HISTORY]" >&2
+    ( $# == 4 && $4 != cap-pair ) || ( $# == 5 && $4 != active-history && $4 != pr30-parity && $4 != near512 && $4 != near512-five && $4 != near512-locality && $4 != pr30-feature-steps ) ]]; then
+    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA [cap-pair | active-history ARCHIVED_CAP_PAIR | pr30-parity ARCHIVED_ACTIVE_HISTORY | {near512,near512-five} ARCHIVED_PR30_PARITY | near512-locality ARCHIVED_ACTIVE_HISTORY | pr30-feature-steps ARCHIVED_UNIFIED_MAIN]" >&2
     exit 2
 fi
 repo=$1
@@ -21,7 +21,19 @@ if [[ $main != "$upstream" ]]; then
     name=long_history_candidate
     prefix=long-history-five
 fi
-if [[ $mode == cap-pair ]]; then
+if [[ $mode == pr30-feature-steps ]]; then
+    dualcut=bba4372065e549d0f2291bc08458d6250d4fa161
+    paced=b261b4885edd79dabac822a2e6e3790c7f226ad6
+    archive=$(cd "$5" && pwd)
+    if [[ $main != "$upstream" || $(<"$archive/main.txt") != "$upstream" ||
+          $(<"$archive/physical_npu.txt") != 4 ||
+          $(git -C "$repo" rev-parse "$dualcut^") != "$main" ||
+          $(git -C "$repo" rev-parse "$paced^") != "$dualcut" ]]; then
+        echo "Expected the NPU4 main archive and the matching main -> dualcut -> paced experiment commits" >&2
+        exit 2
+    fi
+    prefix=pr30-feature-steps
+elif [[ $mode == cap-pair ]]; then
     if [[ $main != cfe2b52f6403d5edd612c314bc7110525a5f5789 ]]; then
         echo "The capacity comparison requires the candidate with 512K support" >&2
         exit 2
@@ -91,6 +103,10 @@ checkout() {
 }
 reader_src=$(checkout "$reader")
 main_src=$(checkout "$main")
+if [[ $mode == pr30-feature-steps ]]; then
+    dualcut_src=$(checkout "$dualcut")
+    paced_src=$(checkout "$paced")
+fi
 if [[ $mode == pr30-parity ]]; then pr30_src=$(checkout "$pr30"); fi
 entry="$reader_src/tests/operators/lifetch"
 support="$entry/support"
@@ -101,7 +117,7 @@ printf '4\n' >"$out/physical_npu.txt"
 cat /proc/sys/kernel/hostname >"$out/host.txt"
 cat /proc/sys/kernel/random/boot_id >"$out/boot_id.txt"
 if [[ -r /etc/machine-id ]]; then cat /etc/machine-id >"$out/machine_id.txt"; fi
-if [[ $mode == active-history || $mode == pr30-parity || $mode == near512* ]]; then
+if [[ $mode == active-history || $mode == pr30-parity || $mode == near512* || $mode == pr30-feature-steps ]]; then
     printf '%s\n' "$archive" >"$out/reference.txt"
     for field in host machine_id; do
         if [[ -f "$archive/$field.txt" ]] && ! cmp -s "$archive/$field.txt" "$out/$field.txt"; then
@@ -118,7 +134,7 @@ baseline="$work/adaptive-sources/peer-serial-da318bdb"
 peer_physical_npu=4
 source "$support/peer_node_prepare.sh"
 dependency_mode=full
-if [[ $name == long_history_candidate ]]; then dependency_mode=fused-only; fi
+if [[ $name == long_history_candidate || $mode == pr30-feature-steps ]]; then dependency_mode=fused-only; fi
 peer_prepare_node "$repo" "$baseline" "$clean" "$work" "$out" "$dependency_mode"
 sdk_src="$sources/unified-sdk-${sdk:0:8}-${upstream:0:8}"
 if ! git -C "$clean" cat-file -e "$sdk^{commit}" 2>/dev/null; then
@@ -193,6 +209,17 @@ if [[ $mode == pr30-parity ]]; then
         printf 'PR30_MISSING_GROUPS=%s REFERENCE_ROOT=%s\n' "${missing[*]}" "$ref_out"
         for g in "${missing[@]}"; do reference[$g]=$ref_out; done
     fi
+elif [[ $mode == pr30-feature-steps ]]; then
+    printf '%s\n' "$main" >"$out/mainline.txt"
+    printf '%s\n' "$dualcut" >"$out/dualcut.txt"
+    printf '%s\n' "$paced" >"$out/paced.txt"
+    for block in 1 2; do
+        mkdir -p "$out/block$block"
+        for field in mainline dualcut paced reader physical_npu host boot_id machine_id kvaf kvaf_tree reference; do
+            if [[ -f "$out/$field.txt" ]]; then cp "$out/$field.txt" "$out/block$block/"; fi
+        done
+    done
+    echo "CONFIG baseline=$archive measured=dualcut,paced blocks=2 reverse_order=1 groups=10,4,17,7,2 physical_NPU=4 BS16_Q4 warmup=4 calls_per_arm_per_block=20"
 elif [[ $mode == active-history ]]; then
     echo "CONFIG measured=active_512k archive=$archive native=$main sdk=$sdk NPU=4 BS=16 Q=4 warmup=4 calls=20"
 elif [[ $mode == cap-pair ]]; then
@@ -312,7 +339,7 @@ PY_DEVICE
     worker_timeout=1800
     # The production-graph audit restores and validates 20 independent wide
     # Index states outside the timed event. Allow for these host transfers.
-    if [[ $mode == pr30-parity || $mode == near512* ]]; then worker_timeout=7200; fi
+    if [[ $mode == pr30-parity || $mode == near512* || $mode == pr30-feature-steps ]]; then worker_timeout=7200; fi
     "$PYTHON" -B "$support/peer_thp.py" --unified-sdk --pid "$server" --log "$arm/cpu.log" --output "$arm/thp.json" --timeout "$worker_timeout" >"$arm/thp.log" 2>&1 &
     monitor=$!
     args=()
@@ -321,6 +348,13 @@ PY_DEVICE
         cap512k) args+=(--history-cap 524544);;
     esac
     if [[ $mode == pr30-parity ]]; then args+=(--production-graph); fi
+    if [[ $mode == pr30-feature-steps ]]; then
+        case $label in
+            dualcut) args+=(--ablation-policy single);;
+            paced) args+=(--ablation-policy paced);;
+            *) exit 2;;
+        esac
+    fi
     display=$label
     if [[ $label == mainline ]]; then display=$name; fi
     if [[ $mode == near512 ]]; then echo "CASE_BEGIN near512"; else echo "CASE_BEGIN G$g $display"; fi
@@ -374,6 +408,37 @@ run_group() (
         exit
     fi
     trace=$(bash "$entry/peer_g2_input.sh" "$work" "$g")
+    if [[ $mode == pr30-feature-steps ]]; then
+        owner=$("$PYTHON" -B - "$support" "$archive" "$g" <<'PY_OWNER'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from main_five_report import case_folder, read
+folder = case_folder(Path(sys.argv[2]), int(sys.argv[3]), 'mainline')
+print(read(folder / 'score_topk_check.json')['native_reference']['archive_path'])
+PY_OWNER
+        )
+        placement="$archive/g$g/mainline/thp.json"
+        for block in 1 2; do (
+            out="$out/block$block"
+            order=(dualcut paced)
+            if [[ $g == 4 || $g == 7 ]]; then order=(paced dualcut); fi
+            if [[ $block == 2 ]]; then order=("${order[1]}" "${order[0]}"); fi
+            mkdir -p "$out/g$g"
+            printf '%s\n' "${order[*]}" >"$out/g$g/order.txt"
+            echo "BLOCK_BEGIN G$g block=$block order=${order[*]}"
+            for label in "${order[@]}"; do (
+                case $label in
+                    dualcut) main=$dualcut; main_src=$dualcut_src;;
+                    paced) main=$paced; main_src=$paced_src;;
+                esac
+                export PYTHONPATH="$main_src/python:$PYTHONPATH"
+                run_arm "$g" "$label" "$trace" "$owner" "$placement"
+            ); done
+            "$PYTHON" -B "$support/pr30_feature_steps.py" "$out" "$g" "$owner"
+        ); done
+        exit
+    fi
     owner=$(select_owner "$g")
     if [[ $mode == pr30-parity ]]; then
         local_ref=${reference[$g]}
@@ -437,7 +502,13 @@ for g in 10 4 17 7 2; do
     if (( code )); then failed+=("$g"); fi
 done
 if ((${#failed[@]})); then echo "REPLAY_FAILED groups=${failed[*]} RESULT_ROOT=$out" >&2; exit 1; fi
-if [[ $mode == cap-pair ]]; then
+if [[ $mode == pr30-feature-steps ]]; then
+    for block in 1 2; do
+        echo "BLOCK_SUMMARY block=$block"
+        "$PYTHON" -B "$support/pr30_feature_steps.py" "$out/block$block" --summary
+    done
+    "$PYTHON" -B "$support/pr30_feature_repeats.py" "$out"
+elif [[ $mode == cap-pair ]]; then
     "$PYTHON" -B "$support/cap_pair_report.py" "$out" --summary
 elif [[ $mode == active-history ]]; then
     "$PYTHON" -B "$support/cap_pair_report.py" "$out" --reference "$archive" --summary
