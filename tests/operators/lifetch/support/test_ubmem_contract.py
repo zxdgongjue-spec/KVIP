@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Host checks for the fusion lease and static-shape contract; no NPU required."""
 
-import ctypes
 from pathlib import Path
 import shutil
 import subprocess
@@ -22,62 +21,51 @@ def test_host_copy_and_launch_models():
     script = Path(__file__).parent / "host_ubmem/run_host_models.py"
     subprocess.run([sys.executable, str(script)], check=True, timeout=180)
 
-def lease_fixture(token_bytes=656):
+def lease_fixture(monkeypatch, token_bytes=656):
     device = SimpleNamespace(type="npu", index=1)
     output = SimpleNamespace(
         device=device, data_ptr=lambda: 0x800000, numel=lambda: 128 * token_bytes, element_size=lambda: 1
     )
     stream = SimpleNamespace(npu_stream=17)
     slot_bytes = (128 * token_bytes + 4095) // 4096 * 4096
-    context = dict(
-        abi_version=1,
-        lease_id=9,
-        device_id=1,
-        region_base=0x100000,
-        mapped_base=0x400000,
-        region_bytes=slot_bytes * 4,
-        slot_bytes=slot_bytes,
-        output_address=output.data_ptr(),
-        output_bytes=output.numel(),
-        token_bytes=token_bytes,
-        tokens_per_block=128,
-    )
     runtime = SimpleNamespace(
-        transport="ubmem",
-        acquire_ubmem_fused_context=Mock(return_value=context),
-        release_ubmem_fused_context=Mock(),
-        retain_ubmem_fused_graph=Mock(),
+        device_id=1, batch_get_token_bytes=token_bytes, batch_get_tokens_per_block=128,
+        remote_region=dict(base=0x100000, length=slot_bytes * 4, slot_size=slot_bytes),
+        begin_get_graph=Mock(return_value=9),
+        get_graph_mapped_base=Mock(return_value=0x400000),
+        end_get_graph=Mock(),
     )
+    monkeypatch.setitem(sys.modules, "kvaf", SimpleNamespace(GetExecutionConfig=Mock(return_value="ubmem-get")))
     torch = SimpleNamespace(npu=SimpleNamespace(current_stream=Mock(return_value=stream), synchronize=Mock()))
     return torch, runtime, output, stream
 
 @pytest.mark.parametrize("token_bytes", (656, 2624))
-def test_padded_kvaf_slots_and_failed_release_retain_owners(token_bytes):
-    torch, runtime, output, stream = lease_fixture(token_bytes)
+def test_padded_kvaf_slots_and_failed_release_retain_owners(monkeypatch, token_bytes):
+    torch, runtime, output, stream = lease_fixture(monkeypatch, token_bytes)
     lease = UbmemLease(torch, runtime, output, stream)
+    runtime.begin_get_graph.assert_called_once_with("ubmem-get", output, 1, stream)
     binding = object()
     lease.bindings.append(binding)
     graph = object()
     lease.retain_graph(graph)
-    runtime.release_ubmem_fused_context.side_effect = RuntimeError("device fence failed")
+    runtime.end_get_graph.side_effect = RuntimeError("device fence failed")
     with pytest.raises(RuntimeError, match="fence"):
         lease.close()
     assert not lease.closed and lease.bindings == [binding] and lease.graphs == [graph]
     assert lease.outputs
-    runtime.release_ubmem_fused_context.side_effect = None
+    runtime.end_get_graph.side_effect = None
     lease.close()
     assert lease.closed and not lease.outputs and not lease.bindings and not lease.graphs
 
-def test_invalid_native_lease_descriptor_releases_acquired_lease():
-    torch, runtime, output, stream = lease_fixture()
-    context = runtime.acquire_ubmem_fused_context.return_value
-    context["device_id"] = 7
+def test_invalid_native_lease_descriptor_releases_acquired_lease(monkeypatch):
+    torch, runtime, output, stream = lease_fixture(monkeypatch)
+    runtime.device_id = 7
     with pytest.raises(ValueError, match="ABI/device"):
         UbmemLease(torch, runtime, output, stream)
-    runtime.release_ubmem_fused_context.assert_called_once_with(context, stream)
+    runtime.end_get_graph.assert_called_once_with(9, stream, discard_result=True)
 
-def test_peer_and_device_mapping_bases_are_kept_distinct():
-    torch, runtime, output, stream = lease_fixture()
+def test_peer_and_device_mapping_bases_are_kept_distinct(monkeypatch):
+    torch, runtime, output, stream = lease_fixture(monkeypatch)
 
     class Wrapped:
         def __init__(self, array):
@@ -91,10 +79,10 @@ def test_peer_and_device_mapping_bases_are_kept_distinct():
     words = lease.region(output).view("<u8")
     assert words[2] == 0x100000  # addresses supplied by CPU service
     assert words[3] == 0x400000  # actual imported NPU mapping
-    assert words[4] == runtime.acquire_ubmem_fused_context.return_value["region_bytes"]
+    assert words[4] == runtime.remote_region["length"]
 
-def test_capture_stream_only_allowed_inside_fenced_scope():
-    torch, runtime, output, stream = lease_fixture()
+def test_capture_stream_only_allowed_inside_fenced_scope(monkeypatch):
+    torch, runtime, output, stream = lease_fixture(monkeypatch)
     lease = UbmemLease(torch, runtime, output, stream)
     capture = SimpleNamespace(npu_stream=23)
     with lease.capture_scope():
@@ -109,7 +97,7 @@ def test_capture_stream_only_allowed_inside_fenced_scope():
             pass
     with pytest.raises(RuntimeError, match="unknown"):
         lease.close()
-    runtime.release_ubmem_fused_context.assert_not_called()
+    runtime.end_get_graph.assert_not_called()
 
 def test_static_shape_and_ubmem_scratch_contract():
     for batch in (1, 2):
@@ -217,14 +205,19 @@ def test_service_update_arguments_use_matching_layer_group_buffers():
     from kvip.adapters.vllm.selector import index_update_arguments
 
     storage = SimpleNamespace(keys=object(), scales=object(), addresses=object(), logical_ids=object())
-    workspace = SimpleNamespace(inputs=SimpleNamespace(row_owners=object()))
-    policy = SimpleNamespace(fused_errors=[object(), object()], fused_outputs=[object(), object()])
+    workspace = SimpleNamespace(inputs=SimpleNamespace(batch=2, row_owners=object()))
+    group_outputs = np.arange(24).reshape(2, 12)
+    output_buffer = Mock()
+    output_buffer.unbind.return_value = tuple(group_outputs)
+    policy = SimpleNamespace(fused_errors=np.arange(6).reshape(2, 3), fused_outputs=[object(), output_buffer])
     rotating = object()
     values = index_update_arguments(policy, workspace, storage, rotating, 1)
+    np.testing.assert_array_equal(values.pop("status"), policy.fused_errors[1, :2])
+    np.testing.assert_array_equal(values.pop("outputs"), group_outputs[:, :8])
+    output_buffer.unbind.assert_called_once_with(0)
     assert values == dict(keys=storage.keys, scales=storage.scales, addresses=storage.addresses,
                           logical_ids=storage.logical_ids, row_owners=workspace.inputs.row_owners,
-                          rotating=rotating, status=policy.fused_errors[1], query_inputs=workspace.inputs,
-                          outputs=policy.fused_outputs[1])
+                          rotating=rotating, query_inputs=workspace.inputs)
 
 def test_unique_active_owners_accepts_repeated_padding_without_device_read():
     inputs = object.__new__(UbmemQueryInputs)
@@ -248,13 +241,16 @@ def test_public_selector_dispatches_transport(transport):
             pass
 
     torch = SimpleNamespace(inference_mode=InferenceMode)
-    policy = object()
+    setup, workspace = object(), object()
+    policy = SimpleNamespace(fused_setup=setup, fused_workspace=workspace, writer=object())
     config = SimpleNamespace(transport=transport)
     with patch("kvip.adapters.vllm.binding._bind_selectors") as urma, \
          patch("kvip.adapters.vllm.binding._bind_ubmem_selectors") as ubmem:
-        kvip.bind_selectors(torch, policy, config)
-        (ubmem if transport == "ubmem" else urma).assert_called_once_with(torch, policy, config)
-        (urma if transport == "ubmem" else ubmem).assert_not_called()
+        selected, other = (ubmem, urma) if transport == "ubmem" else (urma, ubmem)
+        assert kvip.bind_selectors(torch, policy, config) is selected.return_value
+        assert policy.indexer_selectors is selected.return_value
+        selected.assert_called_once_with(torch, policy, config, setup, workspace)
+        other.assert_not_called()
 
 @pytest.mark.parametrize("percent", [10, 30, 50])
 def test_controlled_fixture_matches_urma(percent):

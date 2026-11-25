@@ -5,6 +5,10 @@
 constexpr uint32_t kParallelIndexWords=223232/4;
 constexpr uint32_t kIndexRowWords=38;
 constexpr uint32_t kParallelSet=4096;
+constexpr uint32_t kSmallIndexChanges=2048;
+constexpr uint32_t kSnapshotWordsPerRow=19;
+// Largest supported resident bitmap plus both (source,destination) plans.
+static_assert(128+2*(131072/32)+4*10240<=kParallelIndexWords,"Index plan exceeds UB");
 __simt_callee__ inline bool ParallelInsert(__ubuf__ uint32_t* set,uint32_t key,uint32_t size){
  uint32_t h=key*0x9e3779b9U,slot=(h^(h>>16))&(size-1);
  for(uint32_t i=0;i<size;++i){uint32_t old=asc_atomic_cas(set+slot,UINT32_MAX,key);
@@ -17,33 +21,42 @@ __simt_callee__ inline bool ParallelContains(__ubuf__ uint32_t* set,uint32_t key
   if(old==key)return true;if(old==UINT32_MAX)return false;slot=(slot+1)&(size-1);}
  return false;
 }
+template<bool Large=false>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void ApplyParallelIndex(
  __gm__ uint32_t* sources,__gm__ uint32_t* destinations,uint32_t count,
  uint32_t resident,uint32_t history,uint32_t q,uint32_t generation,
  __gm__ uint64_t* keys,__gm__ uint32_t* scales,__gm__ uint64_t* addresses,
  __gm__ uint64_t* logical,__gm__ uint32_t* valid,__gm__ uint32_t* flags,
- __gm__ int32_t* inverse,__ubuf__ uint32_t* work){
+ __gm__ int32_t* inverse,__ubuf__ uint32_t* work,__gm__ uint64_t* snapshot=nullptr){
  uint32_t t=threadIdx.x,words=128;
+ if constexpr(Large){if(count>resident || count>10240){if(!t)work[0]=1U;return;}}
  while(words<count*2 && words<kParallelSet)words*=2;
+ const bool bitmap=Large && count>kParallelSet;
+ if(bitmap)words=(resident+31)/32;
  auto ctl=work;auto sourceBits=work+128;auto destBits=sourceBits+words;
  auto ps=destBits+words;auto pd=ps+2*count;
  auto payload=pd+2*count;
  if(!t){ctl[0]=0;ctl[1]=0;ctl[2]=0;}
- for(uint32_t i=t;i<(inverse?words:2*words);i+=512)sourceBits[i]=UINT32_MAX;
+ for(uint32_t i=t;i<(inverse?words:2*words);i+=512)sourceBits[i]=bitmap?0U:UINT32_MAX;
  asc_syncthreads();
  for(uint32_t i=t;i<count;i+=512){
   uint32_t src=asc_ldcg(sources+i),dst=asc_ldcg(destinations+i);
   ps[i]=src;pd[i]=dst;
   if(src>=history || dst>=resident){asc_atomic_or(ctl,1U);continue;}
-  if(src<resident && !ParallelInsert(sourceBits,src,words))asc_atomic_or(ctl,1U);
-  if(!inverse && !ParallelInsert(destBits,dst,words))asc_atomic_or(ctl,1U);
+  if(bitmap){
+   if(src<resident && (asc_atomic_or(sourceBits+src/32,1U<<(src%32))&(1U<<(src%32))))asc_atomic_or(ctl,1U);
+   if(!inverse && (asc_atomic_or(destBits+dst/32,1U<<(dst%32))&(1U<<(dst%32))))asc_atomic_or(ctl,1U);
+  }else{
+   if(src<resident && !ParallelInsert(sourceBits,src,words))asc_atomic_or(ctl,1U);
+   if(!inverse && !ParallelInsert(destBits,dst,words))asc_atomic_or(ctl,1U);
+  }
  }
  asc_syncthreads();
  if(ctl[0])return;
  for(uint32_t base=0;base<count;base+=512){
   uint32_t i=base+t;
-  uint32_t out=i<count && !ParallelContains(sourceBits,pd[i],words);
-  uint32_t freed=i<count && (ps[i]>=resident || (inverse?uint32_t(asc_ldcg(inverse+ps[i]))>=count:!ParallelContains(destBits,ps[i],words)));
+  uint32_t out=i<count && !(bitmap?bool(sourceBits[pd[i]/32]&(1U<<(pd[i]%32))):ParallelContains(sourceBits,pd[i],words));
+  uint32_t freed=i<count && (ps[i]>=resident || (inverse?uint32_t(asc_ldcg(inverse+ps[i]))>=count:!(bitmap?bool(destBits[ps[i]/32]&(1U<<(ps[i]%32))):ParallelContains(destBits,ps[i],words))));
   uint32_t packed=prefix(out|(freed<<16),ctl+32);
   if(out)ps[count+ctl[1]+(packed&65535U)]=pd[i];
   if(freed)pd[count+ctl[2]+(packed>>16)]=ps[i];
@@ -52,9 +65,40 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void ApplyParallelIndex(
   asc_syncthreads();
  }
  uint32_t moves=count+ctl[1],begin=moves*q/4,end=moves*(q+1)/4;
- if(ctl[1]!=ctl[2] || uint32_t(payload-work)+((moves+3)/4)*kIndexRowWords>kParallelIndexWords){
-  if(!t)ctl[0]=2U;return;
+ if(ctl[1]!=ctl[2]){if(!t)ctl[0]=2U;return;}
+ if constexpr(Large){
+  // All source rows must be captured before ANY destination is overwritten.
+  // Chunking the swaps themselves would corrupt cross-chunk cycles.
+  if(!snapshot){if(!t)ctl[0]=4U;return;}
+  auto savedScales=snapshot+uint64_t(moves)*16;
+  auto savedAddresses=savedScales+moves;
+  auto savedLogical=savedAddresses+moves;
+  if(t<448){
+   for(uint32_t x=t;x<(end-begin)*16;x+=448){uint32_t i=begin+x/16;
+    asc_stcg(snapshot+uint64_t(i)*16+x%16,asc_ldcg(keys+uint64_t(ps[i])*16+x%16));}
+  }else{
+   for(uint32_t i=begin+t-448;i<end;i+=64){uint32_t src=ps[i];
+    asc_stcg(savedScales+i,uint64_t(asc_ldcg(scales+src)));
+    asc_stcg(savedAddresses+i,asc_ldcg(addresses+src));
+    asc_stcg(savedLogical+i,asc_ldcg(logical+src));}
+  }
+  asc_threadfence();asc_syncthreads();
+  if(!t){asc_atomic_add(flags+7*32,1U);asc_threadfence();}
+  if(t<32){uint32_t done;do{done=asc_ballot(t!=0 || asc_ldcg(flags+7*32)==generation*4);}while(done!=UINT32_MAX);}
+  asc_syncthreads();
+  if(t<448){
+   for(uint32_t x=t;x<(end-begin)*16;x+=448){uint32_t i=begin+x/16;
+    asc_stcg(keys+uint64_t(pd[i])*16+x%16,asc_ldcg(snapshot+uint64_t(i)*16+x%16));}
+  }else{
+   for(uint32_t i=begin+t-448;i<end;i+=64){uint32_t dst=pd[i];
+    asc_stcg(scales+dst,uint32_t(asc_ldcg(savedScales+i)));
+    asc_stcg(addresses+dst,asc_ldcg(savedAddresses+i));
+    asc_stcg(logical+dst,asc_ldcg(savedLogical+i));}
+  }
+  for(uint32_t i=begin+t;i<end;i+=512)if(i>=count && pd[i]<resident)asc_stcg(valid+pd[i],0U);
+  asc_threadfence();asc_syncthreads();return;
  }
+ if(uint32_t(payload-work)+((moves+3)/4)*kIndexRowWords>kParallelIndexWords){if(!t)ctl[0]=4U;return;}
  auto keyData=reinterpret_cast<__ubuf__ uint64_t*>(payload);
  auto scaleData=payload+(end-begin)*32;
  auto addressData=reinterpret_cast<__ubuf__ uint64_t*>(scaleData+((end-begin+1)/2)*2);

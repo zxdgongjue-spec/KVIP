@@ -1,5 +1,5 @@
 """Independent Get preserves descriptors, restores outside events, and checks copies."""
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -71,14 +71,19 @@ def test_get_graph_excludes_li_lidu_and_restores_each_sample(count, width, copy_
 
     device = SimpleNamespace(npu=SimpleNamespace(
         current_stream=lambda: stream, Stream=lambda: stream, NPUGraph=Graph,
-        Event=Event, graph=capture))
+        Event=Event, graph=capture, stream=lambda stream: nullcontext()))
+    resources = SimpleNamespace(prepare=lambda stream: nullcontext(), capture=lambda stream: nullcontext(),
+                                close=lambda: log.append('graph_resources_close'))
+    runtime = SimpleNamespace(graph_resources=lambda: resources)
     native = SimpleNamespace(output=output, total=torch.tensor([count]), outputs=destinations,
-                             fetch=fetch, verify=verify)
+                             fetch=fetch, verify=verify,
+                             owner=SimpleNamespace(session=SimpleNamespace(runtime=runtime)))
     state = SimpleNamespace(native=native, selected='retained-topk')
     result = measure_serial_get(device, state, warmup=1, iterations=3)
     assert result['correctness'] == ('FAIL' if count and not copy_payload else 'PASS')
     assert result['timing']['samples_us'] == [12.] * 3
     assert result['timing']['timing_protocol'] == 'independent_get_graph_events'
+    assert log[-2:] == ['destroy', 'graph_resources_close']
     torch.testing.assert_close(output, expected)
     for index, item in enumerate(log):
         if item == 'replay':
@@ -130,6 +135,10 @@ def test_batch_runner_samples_get_for_each_round_after_serial_graph(tmp_path, mo
     device, log = fake_device()
     stream = device.npu.Stream()
     device.npu.current_stream = lambda device=None: stream
+    device.npu.stream = lambda stream: nullcontext()
+    resources = SimpleNamespace(prepare=lambda stream: nullcontext(), capture=lambda stream: nullcontext(),
+                                close=lambda: log.append('graph_resources_close'))
+    runtime = SimpleNamespace(graph_resources=lambda: resources)
     inputs = [SimpleNamespace(source_round=n) for n in (1, 2)]
 
     class Sequence:
@@ -144,7 +153,8 @@ def test_batch_runner_samples_get_for_each_round_after_serial_graph(tmp_path, mo
         prepare=lambda item: current.append(item.source_round),
         forward=lambda: log.append('full_native'),
         validate=lambda item: log.append(('validate', item.source_round)),
-        native=SimpleNamespace(counts=torch.tensor([2, 2])))
+        native=SimpleNamespace(counts=torch.tensor([2, 2]),
+                               owner=SimpleNamespace(session=SimpleNamespace(runtime=runtime))))
 
     def profile(torch, graph, **kwargs):
         assert kwargs['serial'] and kwargs['calls'] == 1
@@ -171,6 +181,7 @@ def test_batch_runner_samples_get_for_each_round_after_serial_graph(tmp_path, mo
     assert result['correctness'] == 'PASS'
     assert [item for item in log if isinstance(item, tuple) and item[0] == 'get_only'] == [
         ('get_only', 1), ('get_only', 2)]
+    assert log[-2:] == ['destroy', 'graph_resources_close']
     for n in (1, 2):
         data = json.loads((tmp_path / f'diagnose/round-{n}/serial_get_only.json').read_text())
         assert data['source_round'] == n and data['timing']['samples'] == 2

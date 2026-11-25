@@ -165,8 +165,10 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  }
  if(profile)ts[11]=GetSystemCycle();
  uint32_t own=postScratch.GetValue(bitmapWords);
- uint32_t slotBase=postScratch.GetValue(bitmapWords+1),all=own,offset=0;
- if(profile){ts[20]=own;ts[21]=all;ts[22]=slotBase;}
+ uint32_t total=postScratch.GetValue(bitmapWords+13);
+ const auto batches=rotating::PlanTerminalBatches(own,total,priorSlots);
+ uint32_t slotBase=postScratch.GetValue(bitmapWords+1);
+ if(profile){ts[20]=own;ts[21]=own;ts[22]=slotBase;}
  if(profile)ts[12]=GetSystemCycle();
  auto ids=op.TerminalIds();
  GlobalTensor<uint32_t> output,slots;
@@ -178,15 +180,21 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  if(profile)ts[7]=GetSystemCycle();
  auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args->queue_state);
  uint64_t originalHead=uint64_t(postWork.GetValue(6144+18))|(uint64_t(postWork.GetValue(6144+19))<<32);
- uint64_t remote=(reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+uint64_t(b)*1)->addresses;
  if(own){
   if(profile)ts[13]=GetSystemCycle();
-  rotating::WriteReservedWqes(s.tokenBytes,args->channel_entity,args->queue_state,args->output,postWork[4096],postScratch,postWork,postWork[2048],postWork[6144],own,256,false,nullptr,offset,all,reinterpret_cast<__gm__ uint32_t*>(runtime->templates)+query*32,originalHead);
+  rotating::WriteReservedWqes(s.tokenBytes,args->channel_entity,args->queue_state,args->output,postWork[4096],postScratch,postWork,postWork[2048],postWork[6144],own,256,false,nullptr,0,own,reinterpret_cast<__gm__ uint32_t*>(runtime->templates)+query*32,originalHead);
+  if (batches.count > 1) {
+   auto cfg = postWork[6144];
+   auto sq = reinterpret_cast<__gm__ uint32_t*>(cfg.ReinterpretCast<uint64_t>().GetValue(12));
+   Simt::VF_CALL<rotating::MarkTerminalPrefixes>(Simt::Dim3{32,1,1}, sq, cfg.GetValue(17), originalHead,
+       batches.ends[0], batches.ends[1], batches.ends[2], batches.count - 1);
+   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+  }
  }
  if(profile)ts[14]=GetSystemCycle();
  // Logical IDs are emitted with slots after all admissions are visible.
  if(profile)ts[15]=GetSystemCycle();
- rotating::CommitTerminalPost(args,originalHead,own,post);
+ rotating::CommitTerminalPost(args,originalHead,batches.ends[0],post);
  if(profile)ts[4]=GetSystemCycle();
 
  op.FreeEventID();
@@ -198,7 +206,6 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),64);
  if(profile && !q)ts[30]=(reinterpret_cast<__gm__ volatile rotating::MappingJournal*>(ctx->mappingJournal)+uint64_t(b)*1)->count;
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->rows)+uint64_t(b)*sizeof(rotating::Row),128);
- uint32_t total=postScratch.GetValue(bitmapWords+13);
  // Include the actual prior-prefetch Index work, after all output readers join.
  uint32_t first=total*q/4,last=total*(q+1)/4,n=total<=rotating::kChangeCapacity?last-first:0;
  auto src=(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity)+first;auto dst=(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+uint64_t(b)*rotating::kChangeCapacity)+first;
@@ -223,14 +230,28 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
   pipe.InitBuffer(parallelScratch,kParallelIndexWords*sizeof(uint32_t));
   auto parallelLocal=parallelScratch.Get<uint32_t>();
   work=reinterpret_cast<__ubuf__ uint32_t*>(parallelLocal.GetPhyAddr());
-  Simt::VF_CALL<ApplyParallelIndex>(Simt::Dim3{512,1,1},allSources,dst-first,total,
+  if(total>kSmallIndexChanges){
+  const uint64_t snapshotChanges=s.resident<rotating::kChangeCapacity?s.resident:rotating::kChangeCapacity;
+  const uint64_t snapshotWords=snapshotChanges*2*kSnapshotWordsPerRow;
+  const uint64_t snapshotStride=uint64_t(s.history)*3>snapshotWords?uint64_t(s.history)*3:snapshotWords;
+  Simt::VF_CALL<ApplyParallelIndex<true>>(Simt::Dim3{512,1,1},allSources,dst-first,total,
    s.resident,s.history,q,1U,
    reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*s.history*16,
    reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*s.history,
    reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride,
    reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history,
    reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*s.resident,
-   flags,ctx->reservedHot?reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+uint64_t(b)*s.resident:nullptr,work);
+   flags,ctx->reservedHot?reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+uint64_t(b)*s.resident:nullptr,work,reinterpret_cast<__gm__ uint64_t*>(a->denseShadow)+uint64_t(b)*snapshotStride);
+  }else{
+  Simt::VF_CALL<ApplyParallelIndex<false>>(Simt::Dim3{512,1,1},allSources,dst-first,total,
+   s.resident,s.history,q,1U,
+   reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*s.history*16,
+   reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*s.history,
+   reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride,
+   reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history,
+   reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*s.resident,
+   flags,ctx->reservedHot?reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+uint64_t(b)*s.resident:nullptr,work,static_cast<__gm__ uint64_t*>(nullptr));
+  }
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
   indexError=parallelLocal.GetValue(0);
   // Retirement is shared with the normal path; skip the already applied swap.
@@ -243,7 +264,7 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  }
  ownError|=(indexError<<4);
  if(profile)ts[16]=GetSystemCycle();
- uint64_t cqError=rotating::CompleteTerminalPost(args,post);
+ uint64_t cqError=rotating::CompleteTerminalPost(args,post,batches,originalHead);
  if(profile)ts[24]=GetSystemCycle();
  if(q==1)rotating::CompleteTerminalPrefetch(ctx,b);
  ownError|=uint32_t(cqError);

@@ -38,7 +38,11 @@ def test_initialization_acquires_and_releases_selected_lease(monkeypatch, tmp_pa
                               access_table_view=Mock(return_value=SimpleNamespace(addresses='addresses', valid='valid')))
     lease = SimpleNamespace(check_stream=Mock(), close=Mock(), region=Mock())
     constructor = Mock(return_value=runtime)
-    kvaf = SimpleNamespace(__file__=str(tmp_path / 'build-npu/python/kvaf/__init__.py'), NpuRuntime=constructor)
+    kvaf = SimpleNamespace(
+        __file__=str(tmp_path / 'build-npu/python/kvaf/__init__.py'), NpuRuntime=constructor,
+        PutExecutionConfig=Mock(return_value='put'), GetExecutionConfig=Mock(return_value='get'),
+        ExecutionResources=SimpleNamespace,
+    )
     monkeypatch.setitem(sys.modules, 'kvaf', kvaf)
     monkeypatch.setitem(sys.modules, 'acl', SimpleNamespace(get_soc_name=lambda: 'Ascend950PR_9599'))
     monkeypatch.setitem(sys.modules, 'torch_npu', SimpleNamespace())
@@ -66,7 +70,9 @@ def test_initialization_acquires_and_releases_selected_lease(monkeypatch, tmp_pa
     runtime.shutdown.assert_called_once()
     runtime.release_access_table.assert_called_once_with('table')
     runtime.batch_get.assert_called_once()
-    assert constructor.call_args.kwargs.get('transport', 'urma') == transport
+    kvaf.PutExecutionConfig.assert_called_once_with(transport, 'aiv')
+    kvaf.GetExecutionConfig.assert_called_once_with(transport, 'aiv', 'direct')
+    assert constructor.call_args.kwargs['transport_mode'] == transport
     if transport == 'ubmem':
         lease.region.assert_called_once()
         assert lease.region.call_args.args[0].shape == (128, 656)

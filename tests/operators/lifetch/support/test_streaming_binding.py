@@ -146,7 +146,8 @@ def test_runtime_workspace_scales_without_recompilation(history, resident, heads
     forward = LIFetchForward(rotating, update)
     assert forward.query_bitmaps.values.shape == (1, 4, resident // 32)
     assert forward.events_src.values.shape == (1, 10240)
-    assert forward.dense_shadow.values.shape == (1, 3 * history)
+    snapshot_words = 2 * min(resident, 10240) * 19
+    assert forward.dense_shadow.values.shape == (1, max(3 * history, snapshot_words))
     assert np.frombuffer(forward.workspace.values, dtype="<u4", count=1, offset=96)[0] & 0xFFFF == 2048
 
 

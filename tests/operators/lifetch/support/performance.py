@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import ctypes
+from contextlib import ExitStack
 from types import SimpleNamespace
 
 import numpy as np
+from correctness import FETCH_AB_MAGIC
 from reporting import CorrectnessRecorder, timing_summary
-
-FETCH_AB_MAGIC = 0x4B5641464247444F
 
 TOKEN_BYTES = 656
 
@@ -146,7 +146,8 @@ def split_graph_invocations(accounting, calls, *, serial=False):
                 outside_invocations_us=event-sum(sample['us'] for sample in samples))
 
 
-def measure_graph(torch, call, reset, validate, *, warmup, iterations, diagnose=None, validate_each=True):
+def measure_graph(torch, call, reset, validate, *, warmup, iterations, diagnose=None, validate_each=True,
+                  native_runtime=None):
     """Restore outside events; preserve completed samples on numerical failures.
 
     validate must raise RuntimeError/ValueError for unsafe completion or invalid
@@ -159,6 +160,7 @@ def measure_graph(torch, call, reset, validate, *, warmup, iterations, diagnose=
     graph = torch.npu.NPUGraph()
     checks = CorrectnessRecorder()
     samples = []
+    graph_resources = None
     try:
         reset()
         call()
@@ -166,8 +168,15 @@ def measure_graph(torch, call, reset, validate, *, warmup, iterations, diagnose=
         checks.check('eager', validate)
         reset()
         stream.synchronize()
-        with torch.npu.graph(graph, stream=capture):
-            call()
+        with ExitStack() as scopes:
+            if native_runtime is not None:
+                from execution import capture_native_get
+
+                scopes.enter_context(torch.npu.stream(capture))
+                graph_resources = scopes.enter_context(capture_native_get(native_runtime, capture, call))
+                reset()
+            with torch.npu.graph(graph, stream=capture):
+                call()
         capture.synchronize()
         for step in range(warmup + iterations):
             reset()
@@ -188,6 +197,8 @@ def measure_graph(torch, call, reset, validate, *, warmup, iterations, diagnose=
                     failures=checks.failures)
     finally:
         graph.reset()
+        if graph_resources is not None:
+            graph_resources.close()
 
 
 def measure_serial_get(torch, state, *, warmup, iterations):
@@ -216,7 +227,7 @@ def measure_serial_get(torch, state, *, warmup, iterations):
             raise
 
     result = measure_graph(torch, lambda: native.fetch(scale_offsets=False), reset, validate,
-                           warmup=warmup, iterations=iterations)
+                           warmup=warmup, iterations=iterations, native_runtime=native.owner.session.runtime)
     # Restore only after known completion. Unsafe errors propagate to quarantine.
     native.output.copy_(baseline)
     result['timing']['timing_protocol'] = 'independent_get_graph_events'

@@ -18,14 +18,14 @@ import time
 import traceback
 from collections import deque
 from collections.abc import Callable
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import kvip
 import numpy as np
-from correctness import check_sfa
+from correctness import check_sfa, validate_terminal_receipts
 from diagnostics import actual_reads, collect_core, completion_failures, core_summary, score_rows, selected_bounds
 from kvip.adapters.kvaf import UbmemLease
 from kvip.cache.index_storage import IndexCacheStorage
@@ -593,14 +593,11 @@ class BenchPool:
             self.torch = torch
             self.workers = 40 if self.config.transport == 'urma' else 2
             build = self.config.kvaf_root / 'build-npu'
-            options = dict(device_id=int(device.index or 0), npu_core_count=self.workers,
-                           batch_put_kernel_object_path=str(build / 'bin/kvaf_execute_batch_put_kernels.o'))
-            if self.config.transport == 'urma':
-                options['jettys_per_core'] = 2
-            else:
-                options['transport'] = 'ubmem'
             with self.phase('transport_create_link'):
-                self.runtime = kvaf.NpuRuntime(str(build / 'bin/kvaf_execute_batch_get_kernels.o'), 656, 128, **options)
+                self.runtime = create_kvaf_runtime(
+                    kvaf, build / 'bin/kvaf_execute_batch_get_kernels.o',
+                    build / 'bin/kvaf_execute_batch_put_kernels.o', 656, 128,
+                    int(device.index or 0), self.workers, self.config.transport)
                 self.runtime.link_to(self.config.kvaf_server)
             capacity = max(self.config.batches) * history // 128
             block_bytes = 128 * 656
@@ -740,6 +737,40 @@ def native_payload(torch: Any, batch: int, tokens: int) -> Any:
     return torch.stack(rows)
 
 
+def create_kvaf_runtime(sdk, get_kernel, put_kernel, token_bytes, block_size, device_id, workers, transport):
+    put = sdk.PutExecutionConfig(transport, "aiv")
+    get = sdk.GetExecutionConfig(transport, "aiv", "direct")
+    jets = {"jettys": 2} if transport == "urma" else {}
+    return sdk.NpuRuntime(
+        batch_get_token_bytes=token_bytes,
+        batch_get_tokens_per_block=block_size,
+        device_id=device_id,
+        transport_mode=transport,
+        default_put=put,
+        default_get=get,
+        put_resources=[(put, sdk.ExecutionResources(cores=workers, kernel_path=str(put_kernel), **jets))],
+        get_resources=[(get, sdk.ExecutionResources(cores=workers, kernel_path=str(get_kernel), **jets))],
+    )
+
+
+def check_urma_get_queue(runtime, output, stream):
+    import kvaf
+
+    execution = kvaf.GetExecutionConfig("urma", "aiv", "direct")
+    lease = runtime.begin_get_graph(execution, output, 1, stream)
+    runtime.end_get_graph(lease, stream, discard_result=True)
+
+
+@contextmanager
+def capture_native_get(runtime, stream, call):
+    resources = runtime.graph_resources()
+    with resources.prepare(stream):
+        call()
+    stream.synchronize()
+    with resources.capture(stream):
+        yield resources
+
+
 class NativeFetchSession:
     @classmethod
     def open(cls, *args: Any, **kwargs: Any) -> NativeFetchSession:
@@ -792,14 +823,6 @@ class NativeFetchSession:
             if not kernel.is_file():
                 raise ValueError(f"native_kvaf_kernel_missing:{kernel}")
         kvaf = importlib.import_module("kvaf")
-        doc = str(kvaf.NpuRuntime.batch_get.__doc__)
-        if "miss_count" not in doc or "mask" in doc:
-            raise ValueError("native_kvaf_requires_verified_service_prefix_binding_no_abi_guess")
-        if any(
-            not hasattr(kvaf.NpuRuntime, method)
-            for method in ("acquire_fused_batch_get_context", "release_fused_batch_get_context")
-        ):
-            raise ValueError("matching_kvaf_queue_health_lease_api_missing")
         qcap = candidate_tokens // BLOCK_SIZE
         self.shared_pool = shared_pool
         if shared_pool is not None:
@@ -808,15 +831,8 @@ class NativeFetchSession:
             self.cpu_payload, self.device_table = borrowed.cpu_payload, borrowed.device_table
             self.reference = borrowed.reference
         else:
-            self.runtime = kvaf.NpuRuntime(
-                str(get_kernel),
-                batch_get_token_bytes=TOKEN_BYTES,
-                batch_get_tokens_per_block=BLOCK_SIZE,
-                device_id=int(device.index or 0),
-                npu_core_count=npu_core_count,
-                batch_put_kernel_object_path=str(put_kernel),
-                jettys_per_core=2,
-            )
+            self.runtime = create_kvaf_runtime(
+                kvaf, get_kernel, put_kernel, TOKEN_BYTES, BLOCK_SIZE, int(device.index or 0), npu_core_count, "urma")
             self.runtime.link_to(server)
             capacity = batch * qcap
             block_bytes = BLOCK_SIZE * TOKEN_BYTES
@@ -994,14 +1010,7 @@ class NativeFetchSession:
             self.quarantine("uncertain_stream_completion", error)
         if self.runtime is not None and self.batch_get_attempted:
             try:
-                # An enqueue-only BatchGet can return from its kernel after
-                # CQ timeout while DMA completion remains unknown. The real
-                # fused-lease acquire/release validates persistent GET queue
-                # health, unlike an ACL stream fence alone. No launches occur
-                # during this setup-only probe; keep all graphs/tables alive.
-                stream = self.torch.npu.current_stream()
-                probe = self.runtime.acquire_fused_batch_get_context(self.output, stream)
-                self.runtime.release_fused_batch_get_context(probe, stream)
+                check_urma_get_queue(self.runtime, self.output, self.torch.npu.current_stream())
             except BaseException as error:
                 self.quarantine("unhealthy_batch_get_queue", error)
         for graph in self.graphs:
@@ -1150,6 +1159,7 @@ class RealFetchSession:
         self.closed = False
         self.keepalive = []
         self.graphs = []
+        self.native_graph_resources = {}
 
     def _prepare(self, server, get_kernel, put_kernel, python_dir, root, workers):
         config = discover(
@@ -1242,7 +1252,15 @@ class RealFetchSession:
         self.leased_output = self.output.reshape(self.geometry["output_tokens"], TOKEN_BYTES)
         if self.leased_output.data_ptr() != self.output.data_ptr():
             raise ValueError("real-fetch lease view must not copy output storage")
-        self.lease = self.session.runtime.acquire_fused_batch_get_context(self.leased_output, self.lease_stream)
+        import kvaf
+
+        runtime = self.session.runtime
+        execution = kvaf.GetExecutionConfig("urma", "aiv", "direct")
+        lease_id = runtime.begin_get_graph(execution, self.leased_output, 1, self.lease_stream)
+        self.lease = {"lease_id": lease_id}
+        self.lease.update(runtime.get_graph_urma_resources(lease_id))
+        self.lease.update(output_address=self.output.data_ptr(), output_bytes=self.geometry["output_bytes"],
+                          token_bytes=runtime.batch_get_token_bytes, tokens_per_block=runtime.batch_get_tokens_per_block)
         for name in (
             "device_channel_entity",
             "device_queue_state",
@@ -1352,7 +1370,7 @@ class RealFetchSession:
         if self.lease is not None:
             try:
                 self.torch.npu.synchronize()
-                self.session.runtime.release_fused_batch_get_context(self.lease, self.lease_stream)
+                self.session.runtime.end_get_graph(self.lease["lease_id"], self.lease_stream, discard_result=True)
                 self.lease = None
             except BaseException as error:
                 self.quarantine("real_fetch_release_failed", error)
@@ -1371,6 +1389,9 @@ class RealFetchSession:
                 for graph in self.graphs:
                     graph.reset()
                 self.graphs.clear()
+                for resources in self.native_graph_resources.values():
+                    resources.close()
+                self.native_graph_resources.clear()
                 self.session.close()
                 self.session = None
         except BaseException as error:
@@ -1889,20 +1910,24 @@ def run_urma_case(
     )
     atomic_json(folder / 'sampling_protocol.json', sampling_protocol)
 
-    def capture_graph(call, reset):
+    def capture_graph(call, reset, *, native_get=False):
         reset()
         stream.synchronize()
         graph = torch.npu.NPUGraph()
         owner.graphs.append(graph)
-        with torch.npu.graph(graph, stream=capture):
-            call()
+        scope = capture_native_get(owner.session.runtime, capture, call) if native_get else nullcontext()
+        with torch.npu.stream(capture), scope as resources:
+            if resources is not None:
+                owner.native_graph_resources[id(graph)] = resources
+                reset()
+            with torch.npu.graph(graph, stream=capture):
+                call()
         capture.synchronize()
         return graph
 
     def check_native_completion():
         runtime = owner.session.runtime
-        probe = runtime.acquire_fused_batch_get_context(native.output, stream)
-        runtime.release_fused_batch_get_context(probe, stream)
+        check_urma_get_queue(runtime, native.output, stream)
 
     def measure(call, reset, check, *, timing_name, completion_check=None, keep_graph=False):
         costs = dict(reset_s=0., validation_s=0., replay_wait_s=0., completion_s=0., reads_s=0.)
@@ -1923,7 +1948,7 @@ def run_urma_case(
         call()
         stream.synchronize()
         check()
-        graph = capture_graph(call, reset)
+        graph = capture_graph(call, reset, native_get=timing_name.startswith("native_"))
         graph.replay()
         stream.synchronize()
         check()
@@ -1974,6 +1999,9 @@ def run_urma_case(
             return graph
         graph.reset()
         owner.graphs.remove(graph)
+        resources = owner.native_graph_resources.pop(id(graph), None)
+        if resources is not None:
+            resources.close()
 
     native.reset()
     native_call()
@@ -2399,6 +2427,9 @@ def run_urma_case(
             update.set_order(next_orders)
         graph.reset()
         owner.graphs.remove(graph)
+        resources = owner.native_graph_resources.pop(id(graph), None)
+        if resources is not None:
+            resources.close()
     forward = np.full((b, h), -1, np.int32)
     logical = update.logical.cpu().numpy()
     for row in range(b):
@@ -2446,11 +2477,14 @@ def run_urma_case(
         native_check()
         measure(native.fetch, lambda: native.output.copy_(native.initial_payload), native_check,
                 timing_name="native_get_only", completion_check=native_completion)
-        graph = capture_graph(native_call, native.reset)
+        graph = capture_graph(native_call, native.reset, native_get=True)
         collect_native(torch, graph, native.reset,
                        lambda: correctness.check('profile native', native_check), args.trace_rounds, folder)
         graph.reset()
         owner.graphs.remove(graph)
+        resources = owner.native_graph_resources.pop(id(graph), None)
+        if resources is not None:
+            resources.close()
     return dict(
         status=correctness.status.lower(),
         correctness=correctness.status,
@@ -2512,12 +2546,7 @@ def initialize_transport(transport, argv=None):
     for path in (get, put):
         if not path.is_file():
             raise FileNotFoundError(f'KVAF kernel missing: {path}')
-    kwargs = dict(device_id=args.device, npu_core_count=2, batch_put_kernel_object_path=str(put))
-    if transport == 'urma':
-        kwargs['jettys_per_core'] = 2
-    else:
-        kwargs['transport'] = 'ubmem'
-    runtime = kvaf.NpuRuntime(str(get), 656, 128, **kwargs)
+    runtime = create_kvaf_runtime(kvaf, get, put, 656, 128, args.device, 2, transport)
     lease = None
     table = None
     in_flight = False
@@ -2679,10 +2708,9 @@ def run_ubmem_case(
     else:
         source_cpu = np.concatenate([layer_payload(owner, np.arange(history), token_bytes) for owner in range(1, batch + 1)])
         source = torch.from_numpy(source_cpu).to(device)
-        runtime = kvaf.NpuRuntime(
-            str(build / "bin/kvaf_execute_batch_get_kernels.o"), token_bytes, 128,
-            device_id=device_id, npu_core_count=2,
-            batch_put_kernel_object_path=str(build / "bin/kvaf_execute_batch_put_kernels.o"), transport="ubmem")
+        runtime = create_kvaf_runtime(kvaf, build / "bin/kvaf_execute_batch_get_kernels.o",
+                                      build / "bin/kvaf_execute_batch_put_kernels.o",
+                                      token_bytes, 128, device_id, 2, "ubmem")
     try:
         if shared_pool is None:
             runtime.link_to(args_server)
@@ -3456,6 +3484,11 @@ class FusedReplayState:
 
     def validate(self, inputs):
         self.check_completion()
+        terminal = self.forward.terminal
+        if terminal is not None:
+            counts = self.rotating.final_posts[:, :, 0].cpu().numpy()
+            statuses = terminal.owner.core_status.cpu().numpy().view(np.uint64)
+            validate_terminal_receipts(counts, statuses, terminal.queue_views)
         ids = self.update.logical_output.cpu().numpy().reshape(self.batch, 4, 2048)
         slots = self.update.slot_output.cpu().numpy().reshape(self.batch, 4, 2048)
         invalid = (ids < 0) | (ids >= self.history) | (slots < 0) | (slots >= self.stride)
@@ -3686,7 +3719,6 @@ class NativeReplayState:
 
 def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
     """One graph contains iterations independent cache states, reused per round."""
-    from contextlib import ExitStack
     from diagnostics import algorithm_before, algorithm_after
     from performance import measure_serial_get, profile_graph_batch
     directory = Path(directory)
@@ -3721,6 +3753,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             elif fused:
                 state.check_completion()
         pending = False
+    native_graph_resources = None
     try:
         for state in states:
             state.reset()
@@ -3742,16 +3775,26 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             pending = False
             state.reset()
         stream.synchronize()
+        def forward_batch():
+            for state in states:
+                state.forward()
+
         with ExitStack() as scopes:
+            pending = True
             if fused:
                 for lease in {id(state.lease): state.lease for state in states}.values():
                     scopes.enter_context(lease.capture_scope())
-            pending = True
-            with torch.npu.graph(graph, stream=capture):
+            scopes.enter_context(torch.npu.stream(capture))
+            if not fused:
+                native_graph_resources = scopes.enter_context(
+                    capture_native_get(states[0].native.owner.session.runtime, capture, forward_batch)
+                )
                 for state in states:
-                    state.forward()
+                    state.reset()
+            with torch.npu.graph(graph, stream=capture):
+                forward_batch()
             capture.synchronize()
-            pending = False
+        pending = False
         if fused:
             for lease in {id(state.lease): state.lease for state in states}.values():
                 if hasattr(lease, "retain_graph"):
@@ -3929,6 +3972,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 for state in states:
                     state.forward.set_diagnostics(False)
             graph.reset()
+            if native_graph_resources is not None:
+                native_graph_resources.close()
 
 
 def run_path(config, directory, sequence, pages, *, fused, round_check=None, shared_pool=None):
@@ -3955,16 +4000,11 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     g = initial.geometry
     width = g['token_bytes']
     workers = 40 if fused and config.transport == 'urma' else 2
-    kwargs = dict(device_id=config.device, npu_core_count=workers,
-                  batch_put_kernel_object_path=str(build / 'bin/kvaf_execute_batch_put_kernels.o'))
-    if config.transport == 'ubmem':
-        kwargs['transport'] = 'ubmem'
-    else:
-        kwargs['jettys_per_core'] = 2
     borrowed = shared_pool.borrow(torch, device, g['batch'], g['history'], workers) if shared_pool else None
-    runtime = borrowed.runtime if borrowed else kvaf.NpuRuntime(
-        str(build / 'bin/kvaf_execute_batch_get_kernels.o'), width, 128, **kwargs)
-    state = graph = table = None
+    runtime = borrowed.runtime if borrowed else create_kvaf_runtime(
+        kvaf, build / 'bin/kvaf_execute_batch_get_kernels.o', build / 'bin/kvaf_execute_batch_put_kernels.o',
+        width, 128, config.device, workers, config.transport)
+    state = graph = table = resources = None
     batch_states = []
     pending = False
     def replay_stage(label):
@@ -4076,10 +4116,17 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         stream.synchronize()
         graph = torch.npu.NPUGraph()
         capture_stream = torch.npu.Stream()
-        scope = state.lease.capture_scope() if fused else nullcontext()
+        scope = state.lease.capture_scope() if fused else capture_native_get(runtime, capture_stream, state.forward)
         pending = True
         replay_stage('graph capture')
-        with scope:
+
+        with ExitStack() as scopes:
+            if fused:
+                scopes.enter_context(scope)
+            scopes.enter_context(torch.npu.stream(capture_stream))
+            if not fused:
+                resources = scopes.enter_context(scope)
+                state.reset()
             with torch.npu.graph(graph, stream=capture_stream):
                 state.forward()
             capture_stream.synchronize()
@@ -4133,6 +4180,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         if not pending:
             if graph is not None:
                 graph.reset()
+            if not fused and resources is not None:
+                resources.close()
             for replica in reversed(batch_states[1:]):
                 replica.close()
             if state is not None:

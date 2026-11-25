@@ -8,13 +8,27 @@ import torch
 from execution import BenchPool
 
 
+def fake_kvaf(runtime):
+    return SimpleNamespace(
+        NpuRuntime=runtime,
+        PutExecutionConfig=lambda transport, engine: (transport, engine),
+        GetExecutionConfig=lambda transport, engine, mode: (transport, engine, mode),
+        ExecutionResources=SimpleNamespace,
+    )
+
+
 @pytest.mark.parametrize('transport,workers', [('urma', 40), ('ubmem', 2)])
 def test_pool_puts_once_and_retains_tables_until_all_cases_complete(tmp_path, monkeypatch, transport, workers):
     events = []
 
     class Runtime:
         def __init__(self, *args, **kwargs):
-            assert kwargs['npu_core_count'] == workers
+            assert kwargs['transport_mode'] == transport
+            for operation in ('put', 'get'):
+                [(config, resources)] = kwargs[f'{operation}_resources']
+                assert config == kwargs[f'default_{operation}']
+                assert resources.cores == workers
+                assert getattr(resources, 'jettys', None) == (2 if transport == 'urma' else None)
             events.append('create')
 
         def link_to(self, server):
@@ -41,7 +55,7 @@ def test_pool_puts_once_and_retains_tables_until_all_cases_complete(tmp_path, mo
         def shutdown(self):
             events.append('shutdown')
 
-    monkeypatch.setitem(sys.modules, 'kvaf', SimpleNamespace(NpuRuntime=Runtime))
+    monkeypatch.setitem(sys.modules, 'kvaf', fake_kvaf(Runtime))
     monkeypatch.setattr(torch, 'npu', SimpleNamespace(synchronize=lambda: None), raising=False)
     pool = BenchPool(SimpleNamespace(batches=(1, 2), history=256, transport=transport,
                                     kvaf_root=tmp_path, kvaf_server='test:1'))
@@ -104,7 +118,7 @@ def test_put_chunks_keep_one_registered_source_and_global_offsets(tmp_path, monk
             pass
         def shutdown(self):
             pass
-    monkeypatch.setitem(sys.modules, 'kvaf', SimpleNamespace(NpuRuntime=Runtime))
+    monkeypatch.setitem(sys.modules, 'kvaf', fake_kvaf(Runtime))
     monkeypatch.setattr(torch, 'npu', SimpleNamespace(synchronize=lambda: None), raising=False)
     pool = BenchPool(SimpleNamespace(batches=(2,), history=16384, transport='urma',
                                     kvaf_root=tmp_path, kvaf_server='test:1'))

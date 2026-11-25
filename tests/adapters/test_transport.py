@@ -1,11 +1,12 @@
 import ctypes
 import struct
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
-from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, LeasedRuntime
+from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, LeasedRuntime, UbmemLease
 
 
 class Function:
@@ -46,8 +47,15 @@ class TransportTest(unittest.TestCase):
             device_core_status=200,
             device_queue_state=300,
         )
-        self.runtime.acquire_fused_batch_get_context.return_value = self.context
-        self.npu = SimpleNamespace(current_stream=lambda device: self.stream)
+        self.runtime.get_graph_urma_resources.return_value = self.context
+        self.runtime.begin_get_graph.side_effect = iter(range(1, 100))
+        self.runtime.batch_get_token_bytes = 656
+        self.runtime.batch_get_tokens_per_block = 128
+        sdk = SimpleNamespace(GetExecutionConfig=Mock(return_value="urma-get"))
+        imports = patch.dict(sys.modules, {"kvaf": sdk})
+        imports.start()
+        self.addCleanup(imports.stop)
+        self.npu = SimpleNamespace(current_stream=lambda device: self.stream, synchronize=Mock())
         self.torch = SimpleNamespace(
             npu=self.npu,
             tensor=torch.tensor,
@@ -62,6 +70,61 @@ class TransportTest(unittest.TestCase):
             patch("kvip.adapters.kvaf.load_native_get", return_value=(object(), self.native_get)),
         ):
             self.owner = KvafGetLease(self.torch, self.runtime, "test", self.output, self.stream)
+
+    def test_unified_urma_keeps_each_output_lease_until_close(self):
+        class Runtime(Mock):
+            def get_graph_urma_resources(self, lease):
+                return dict(self.resources, device_channel_entity=lease * 100)
+
+        runtime = Runtime()
+        runtime.resources = self.context
+        runtime.batch_get_token_bytes = 656
+        runtime.batch_get_tokens_per_block = 128
+        runtime.begin_get_graph.side_effect = [1, 2]
+        self.npu.synchronize = Mock()
+        sdk = SimpleNamespace(GetExecutionConfig=Mock(return_value="urma-get"))
+        with (
+            patch.dict(sys.modules, {"kvaf": sdk}),
+            patch("kvip.adapters.kvaf.load_lifetch_library", return_value=self.library),
+            patch("kvip.adapters.kvaf.load_native_get", return_value=(object(), self.native_get)),
+        ):
+            owner = KvafGetLease(self.torch, runtime, "test", self.output, self.stream)
+            other = self.output.clone()
+            self.assertEqual(owner.register_output(other)["device_channel_entity"], 200)
+            owner.register_output(other)
+        self.assertEqual(runtime.begin_get_graph.call_count, 2)
+        owner.close()
+        self.assertEqual(
+            [call.args[0] for call in runtime.end_get_graph.call_args_list], [2, 1]
+        )
+        self.npu.synchronize.assert_called_once_with(self.output.device)
+
+    def test_unified_ubmem_reuses_one_mapping_for_multiple_outputs(self):
+        class Runtime(Mock):
+            def get_graph_mapped_base(self, lease):
+                return 8192
+
+        runtime = Runtime()
+        runtime.device_id = self.output.device.index
+        runtime.remote_region = dict(base=4096, length=131072, slot_size=131072)
+        runtime.batch_get_token_bytes = 656
+        runtime.batch_get_tokens_per_block = 128
+        runtime.begin_get_graph.return_value = 17
+        self.npu.synchronize = Mock()
+        sdk = SimpleNamespace(GetExecutionConfig=Mock(return_value="ubmem-get"))
+        with patch.dict(sys.modules, {"kvaf": sdk}):
+            owner = UbmemLease(self.torch, runtime, self.output, self.stream)
+            other = self.output.clone()
+            view = owner.register_output(other)
+            self.assertEqual(view["output_address"], other.data_ptr())
+            self.assertEqual(view["mapped_base"], 8192)
+            table = SimpleNamespace(addresses=torch.zeros(4, dtype=torch.int64), valid=torch.zeros(4, dtype=torch.uint8))
+            owner.register_table(table)
+            self.assertIs(owner.tables[id(table)][0], table)
+        runtime.begin_get_graph.assert_called_once_with("ubmem-get", self.output, 1, self.stream)
+        owner.close()
+        runtime.end_get_graph.assert_called_once_with(17, self.stream, discard_result=True)
+        self.assertFalse(owner.tables)
 
     def inputs(self):
         return (
@@ -84,10 +147,9 @@ class TransportTest(unittest.TestCase):
             plan()
             plan()
         self.assertEqual(self.launches, [(plan.arguments, 123)] * 2)
-        self.runtime.register_fused_batch_get_output.assert_not_called()
         self.owner.close()
         self.owner.close()
-        self.runtime.release_fused_batch_get_context.assert_called_once_with(self.context, self.stream)
+        self.runtime.end_get_graph.assert_called_once_with(1, self.stream, discard_result=True)
         with self.assertRaisesRegex(RuntimeError, "released"):
             plan()
 
@@ -131,22 +193,13 @@ class TransportTest(unittest.TestCase):
         self.assertIs(launch.restype, ctypes.c_int32)
         self.owner.close()
 
-    def test_output_registration_is_cached_and_shares_owner(self):
-        other = torch.empty((256, 656), dtype=torch.uint8)
-        self.runtime.register_fused_batch_get_output.return_value = dict(self.context, output_address=other.data_ptr())
-        self.owner.register_output(other)
-        self.owner.register_output(other)
-        self.runtime.register_fused_batch_get_output.assert_called_once()
-        self.assertIs(self.runtime.register_fused_batch_get_output.call_args.args[0], self.context)
-        self.owner.close()
-
     def test_failed_release_keeps_storage_and_wrong_stream_is_rejected(self):
         plan = self.owner.prepare_get(*self.inputs())
         self.npu.current_stream = lambda device: SimpleNamespace(npu_stream=124)
         with self.assertRaisesRegex(RuntimeError, "lease stream"):
             plan()
         self.assertFalse(self.launches)
-        self.runtime.release_fused_batch_get_context.side_effect = RuntimeError("uncertain DMA")
+        self.runtime.end_get_graph.side_effect = RuntimeError("uncertain DMA")
         with self.assertRaisesRegex(RuntimeError, "uncertain DMA"):
             self.owner.close()
         self.assertFalse(self.owner.closed)
@@ -167,8 +220,7 @@ class TransportTest(unittest.TestCase):
             self.assertEqual(fields[10:], (8, 8192, 128, 656, 128, 1, 1, 0))
         with patch.object(self.torch, "tensor", side_effect=AssertionError("must reuse arguments")):
             self.assertIs(view.build_device_args("same ABI library"), arguments)
-        self.runtime.acquire_fused_batch_get_context.assert_called_once()
-        self.runtime.register_fused_batch_get_output.assert_not_called()
+        self.runtime.begin_get_graph.assert_called_once()
         self.owner.close()
 
     def test_descriptor_capacity_mismatch(self):
@@ -199,7 +251,7 @@ class TransportTest(unittest.TestCase):
             pass
         with self.assertRaisesRegex(RuntimeError, "remains retained"):
             self.owner.close()
-        self.runtime.release_fused_batch_get_context.assert_not_called()
+        self.runtime.end_get_graph.assert_not_called()
 
     def test_runtime_routes_table_and_tensor_views_without_new_upload(self):
         runtime = LeasedRuntime(self.owner)
@@ -219,7 +271,7 @@ class TransportTest(unittest.TestCase):
     def test_runtime_does_not_destroy_transport_after_failed_release(self):
         runtime = LeasedRuntime(self.owner)
         runtime.batch_get(*self.inputs())
-        self.runtime.release_fused_batch_get_context.side_effect = RuntimeError("outstanding DMA")
+        self.runtime.end_get_graph.side_effect = RuntimeError("outstanding DMA")
         with self.assertRaisesRegex(RuntimeError, "outstanding DMA"):
             runtime.shutdown()
         self.runtime.shutdown.assert_not_called()
