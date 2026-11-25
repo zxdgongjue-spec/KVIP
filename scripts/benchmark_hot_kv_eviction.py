@@ -40,9 +40,50 @@ def read_round(path):
     return logical, valid, oldest, tails, np.take_along_axis(logical[:, None, :], topk, axis=2)
 
 
+class Associations:
+    """Bounded logical-token co-occurrence, local to one request and Index group."""
+
+    def __init__(self, neighbors, anchors, candidates, budget, seed):
+        self.neighbors = neighbors
+        self.anchors = anchors
+        self.candidates = candidates
+        self.budget = budget
+        self.rng = np.random.default_rng(seed)
+        self.edges = {}
+
+    def sample(self, tokens, limit):
+        if len(tokens) <= limit:
+            return tokens
+        return [tokens[i] for i in self.rng.choice(len(tokens), limit, replace=False)]
+
+    def update(self, demand, mapping):
+        active = set(demand)
+        votes = {}
+        candidates = self.sample(demand, self.candidates)
+        for anchor in self.sample(demand, self.anchors):
+            neighbors = self.edges.setdefault(anchor, {})
+            # Only previously learned links vote. This round trains the next one.
+            for token, score in list(neighbors.items()):
+                if token not in active and token in mapping and score >= 2:
+                    votes[token] = votes.get(token, 0) + score
+                score += 1 if token in active else -1
+                if score:
+                    neighbors[token] = min(score, 255)
+                else:
+                    del neighbors[token]
+            for token in candidates:
+                if len(neighbors) >= self.neighbors:
+                    break
+                if token != anchor and token not in neighbors:
+                    neighbors[token] = 1
+        return set(sorted(votes, key=lambda token: (-votes[token], token))[: self.budget])
+
+
 class Cache:
-    def __init__(self, policy, granularity, initial, oldest, budget, half_life, grace):
+    def __init__(self, policy, granularity, initial, oldest, budget, half_life, grace, associations=None):
         self.policy = policy
+        self.associations = associations
+        self.weak = set()
         self.g = granularity
         self.slots = initial.copy()
         self.mapping = {int(token): slot for slot, token in enumerate(initial) if token != EMPTY}
@@ -60,8 +101,14 @@ class Cache:
         self.born = np.full(len(initial) // self.g, -grace - 1, dtype=np.int64)
 
     def select(self):
-        if self.policy == "lru":
-            return np.argsort(self.last, kind="stable")[: self.budget]
+        if self.policy in ("lru", "assoc_lru"):
+            order = np.argsort(self.last, kind="stable")
+            if self.weak:
+                mask = np.zeros(len(self.slots), dtype=bool)
+                mask[[self.mapping[token] for token in self.weak]] = True
+                protected = mask[order]
+                order = np.concatenate((order[~protected], order[protected]))
+            return order[: self.budget]
         size = len(self.born) * self.g
         recency = self.last[:size].reshape(-1, self.g).max(axis=1)
         if self.policy == "r1":
@@ -104,6 +151,13 @@ class Cache:
                 self.clock += 1
                 self.last[slot] = self.clock
                 self.count[slot] += 1
+        predictions = len(self.weak)
+        predicted_hits = sum(token in current_hits for token in self.weak)
+        update_ns = 0
+        if self.associations is not None:
+            began = time.perf_counter_ns()
+            self.weak = self.associations.update(demand, self.mapping)
+            update_ns = time.perf_counter_ns() - began
         self.round += 1
         runs = int(1 + np.count_nonzero(np.diff(victims) != 1)) if len(victims) else 0
         return (
@@ -115,6 +169,9 @@ class Cache:
             protected_hits,
             runs,
             selection_ns,
+            predictions,
+            predicted_hits,
+            update_ns,
         )
 
 
@@ -141,6 +198,7 @@ def simulate(args, references):
     summaries = {}
     first_eviction = {}
     measured_evictions = {}
+    avoided_misses = added_misses = 0
     header = (
         "dp",
         "round",
@@ -157,6 +215,9 @@ def simulate(args, references):
         "evicted_current_hits",
         "destination_runs",
         "select_ns",
+        "weak_from_previous_round",
+        "weak_next_round_hits",
+        "association_update_ns",
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("x", newline="") as output:
@@ -182,11 +243,27 @@ def simulate(args, references):
                         (p, g): Cache(p, g, initial, initial_oldest, args.victims, args.half_life, args.grace)
                         for p, g in choices
                     }
+                    if args.association:
+                        model = Associations(
+                            args.assoc_neighbors,
+                            args.assoc_anchors,
+                            args.assoc_candidates,
+                            args.assoc_budget,
+                            args.assoc_seed,
+                        )
+                        caches[key]["assoc_lru", 1] = Cache(
+                            "assoc_lru", 1, initial, initial_oldest, args.victims, args.half_life, args.grace, model
+                        )
                     sample_counts[key] = 0
                 begin, end = tails[row]
                 demand = list(dict.fromkeys(int(token) for token in topk[row].flat if not begin <= token < end))
                 scored = sample_counts[key] >= args.warmup_rounds
                 sample_counts[key] += 1
+                if args.association and scored:
+                    baseline = caches[key]["lru", 1].mapping
+                    candidate = caches[key]["assoc_lru", 1].mapping
+                    avoided_misses += sum(token not in baseline and token in candidate for token in demand)
+                    added_misses += sum(token in baseline and token not in candidate for token in demand)
                 for (policy, g), cache in caches[key].items():
                     if len(cache.slots) != capacity:
                         raise ValueError("Hot capacity changed during a request")
@@ -204,7 +281,7 @@ def simulate(args, references):
     print(f"Measured request-rounds per policy: {len(next(iter(summaries.values())))}")
     print(
         "Policy | Extent | Demand | Misses | Miss% | Writes | Bypass | Evicted | Hit evictions | "
-        "Dest runs | First eviction round | Eviction request-rounds | Select p50 us"
+        "Dest runs | First eviction round | Eviction request-rounds | Select p50 us | Weak | Weak hits"
     )
     for (policy, g), results in summaries.items():
         values = np.asarray(results, dtype=np.int64)
@@ -212,11 +289,19 @@ def simulate(args, references):
         rate = 100 * misses / demand if demand else 0
         select = values[:, 7]
         median = np.median(select[select > 0]) / 1000 if np.any(select > 0) else 0
+        weak, weak_hits = values[:, 8:10].sum(axis=0)
         print(
             f"{policy:>6} | {g:6} | {demand} | {misses} | {rate:.2f} | {writes} | {bypass} | "
             f"{evicted} | {hits} | {runs} | {first_eviction.get((policy, g), '-')} | "
-            f"{measured_evictions.get((policy, g), 0)} | {median:.2f}"
+            f"{measured_evictions.get((policy, g), 0)} | {median:.2f} | {weak} | {weak_hits}"
         )
+        if policy == "assoc_lru":
+            hit_rate = 100 * weak_hits / weak if weak else 0
+            update_us = np.median(values[:, 10]) / 1000
+            print(
+                f"Association vs LRU: avoided misses={avoided_misses}, added misses={added_misses}, "
+                f"next-round weak hit rate={hit_rate:.2f}%, model update p50={update_us:.2f} us"
+            )
     print(f"Per-round CSV: {args.output}")
 
 
@@ -232,6 +317,12 @@ def main():
     parser.add_argument("--half-life", type=float, default=64)
     parser.add_argument("--grace", type=int, default=2)
     parser.add_argument("--warmup-rounds", type=int, default=1)
+    parser.add_argument("--association", action="store_true", help="Compare LRU with one-round association protection")
+    parser.add_argument("--assoc-neighbors", type=int, default=128, help="Maximum neighbors per logical token")
+    parser.add_argument("--assoc-anchors", type=int, default=128, help="Active anchors sampled per round")
+    parser.add_argument("--assoc-candidates", type=int, default=128, help="Active candidates sampled per round")
+    parser.add_argument("--assoc-budget", type=int, default=128, help="Maximum weak protections per round")
+    parser.add_argument("--assoc-seed", type=int, default=43)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     try:
@@ -243,6 +334,8 @@ def main():
             or args.grace < 0
             or not 0 <= args.warmup_rounds <= last - first
             or (args.hot_capacity is not None and args.hot_capacity <= 0)
+            or min(args.assoc_neighbors, args.assoc_anchors, args.assoc_candidates, args.assoc_budget) <= 0
+            or args.assoc_seed < 0
             or len(set(args.extents)) != len(args.extents)
         ):
             raise ValueError("Require consecutive rounds, positive half-life, distinct extents and valid warmup/grace")
