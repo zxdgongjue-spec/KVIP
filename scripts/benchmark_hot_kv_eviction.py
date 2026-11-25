@@ -118,10 +118,29 @@ class Cache:
         )
 
 
+def resize_initial(initial, oldest, capacity):
+    """Keep in-range slots and move live overflow tokens into free slots."""
+    if capacity >= len(initial):
+        return initial, oldest
+    occupied = np.flatnonzero(initial != EMPTY)
+    if len(occupied) > capacity:
+        raise ValueError(f"Hot capacity {capacity} cannot hold {len(occupied)} captured live tokens")
+    resized = initial[:capacity].copy()
+    overflow = occupied[occupied >= capacity]
+    free = np.flatnonzero(resized == EMPTY)[: len(overflow)]
+    resized[free] = initial[overflow]
+    remap = np.arange(len(initial))
+    remap[overflow] = free
+    oldest_live = oldest[initial[oldest] != EMPTY]
+    return resized, remap[oldest_live]
+
+
 def simulate(args, references):
     caches = {}
     sample_counts = {}
     summaries = {}
+    first_eviction = {}
+    measured_evictions = {}
     header = (
         "dp",
         "round",
@@ -129,6 +148,7 @@ def simulate(args, references):
         "policy",
         "extent",
         "scored",
+        "hot_capacity",
         "demand",
         "misses",
         "writes",
@@ -144,16 +164,22 @@ def simulate(args, references):
         writer.writerow(header)
         for ref in references:
             logical, valid, oldest, tails, topk = read_round(ref.manifest_path)
-            capacity = valid.shape[1]
+            captured_capacity = valid.shape[1]
+            capacity = args.hot_capacity or captured_capacity
+            if capacity > captured_capacity:
+                raise ValueError(f"Hot capacity {capacity} exceeds captured capacity {captured_capacity}")
             if not 0 < args.victims <= capacity or any(args.victims % g for g in args.extents):
-                raise ValueError("Victim budget must fit captured capacity and be divisible by all extent sizes")
+                raise ValueError("Victim budget must fit replay capacity and be divisible by all extent sizes")
             for row, signature in enumerate(ref.request_signature):
                 key = (ref.dp_rank, signature)
                 if key not in caches:
-                    initial = np.where(valid[row], logical[row, :capacity], EMPTY)
+                    initial = np.where(valid[row], logical[row, :captured_capacity], EMPTY)
+                    initial, initial_oldest = resize_initial(initial, oldest[row], capacity)
+                    live = np.count_nonzero(initial != EMPTY)
+                    print(f"DP {ref.dp_rank} request row {row}: {live}/{capacity} hot slots occupied initially")
                     choices = [("lru", 1)] + [(policy, g) for g in args.extents for policy in POLICIES[1:]]
                     caches[key] = {
-                        (p, g): Cache(p, g, initial, oldest[row], args.victims, args.half_life, args.grace)
+                        (p, g): Cache(p, g, initial, initial_oldest, args.victims, args.half_life, args.grace)
                         for p, g in choices
                     }
                     sample_counts[key] = 0
@@ -165,7 +191,12 @@ def simulate(args, references):
                     if len(cache.slots) != capacity:
                         raise ValueError("Hot capacity changed during a request")
                     result = cache.step(demand)
-                    writer.writerow((ref.dp_rank, ref.source_round, signature[0], policy, g, int(scored), *result))
+                    writer.writerow(
+                        (ref.dp_rank, ref.source_round, signature[0], policy, g, int(scored), capacity, *result)
+                    )
+                    if result[4]:
+                        first_eviction.setdefault((policy, g), ref.source_round)
+                        measured_evictions[policy, g] = measured_evictions.get((policy, g), 0) + int(scored)
                     if scored:
                         summaries.setdefault((policy, g), []).append(result)
     if not summaries:
@@ -173,7 +204,7 @@ def simulate(args, references):
     print(f"Measured request-rounds per policy: {len(next(iter(summaries.values())))}")
     print(
         "Policy | Extent | Demand | Misses | Miss% | Writes | Bypass | Evicted | Hit evictions | "
-        "Dest runs | Select p50 us"
+        "Dest runs | First eviction round | Eviction request-rounds | Select p50 us"
     )
     for (policy, g), results in summaries.items():
         values = np.asarray(results, dtype=np.int64)
@@ -183,7 +214,8 @@ def simulate(args, references):
         median = np.median(select[select > 0]) / 1000 if np.any(select > 0) else 0
         print(
             f"{policy:>6} | {g:6} | {demand} | {misses} | {rate:.2f} | {writes} | {bypass} | "
-            f"{evicted} | {hits} | {runs} | {median:.2f}"
+            f"{evicted} | {hits} | {runs} | {first_eviction.get((policy, g), '-')} | "
+            f"{measured_evictions.get((policy, g), 0)} | {median:.2f}"
         )
     print(f"Per-round CSV: {args.output}")
 
@@ -194,6 +226,7 @@ def main():
     parser.add_argument("--group", type=int, required=True)
     parser.add_argument("--round-range", required=True, help="Inclusive source rounds, e.g. 1:101")
     parser.add_argument("--dp", type=int, nargs="+", help="Only score these DP ranks")
+    parser.add_argument("--hot-capacity", type=int, help="Hot slots per request (default: captured capacity)")
     parser.add_argument("--victims", type=int, default=2048)
     parser.add_argument("--extents", type=int, nargs="+", choices=(1, 4, 8, 16), default=(8, 16))
     parser.add_argument("--half-life", type=float, default=64)
@@ -209,6 +242,7 @@ def main():
             or args.half_life <= 0
             or args.grace < 0
             or not 0 <= args.warmup_rounds <= last - first
+            or (args.hot_capacity is not None and args.hot_capacity <= 0)
             or len(set(args.extents)) != len(args.extents)
         ):
             raise ValueError("Require consecutive rounds, positive half-life, distinct extents and valid warmup/grace")
