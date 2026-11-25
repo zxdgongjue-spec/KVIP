@@ -106,9 +106,6 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query, uint32_t scanHis
 }
 
 #endif
-#if KVIP_URMA_WINDOW_LI
-#include "last_window_row.h"
-#endif
     __aicore__ inline void RotateFetch(uint32_t epoch, uint32_t sequenceHalfWindow = 0) {
 #if !V9_UBMEM
         AdvanceWindow(epoch,sequenceHalfWindow);
