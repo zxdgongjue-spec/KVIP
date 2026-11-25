@@ -45,6 +45,7 @@ peer_physical_npu=4
 baseline="$work/adaptive-sources/peer-serial-da318bdb"
 clean="$area/KVAF-de4fd37e"
 peer_prepare_node "$root" "$baseline" "$clean" "$work" "$out"
+"$PYTHON" -B -c 'import os; print(os.uname().nodename)' > "$out/host.txt"
 if [[ ! -e "$sdk" ]]; then
     if ! git -C "$clean" cat-file -e "$sdk_rev^{commit}" 2>/dev/null; then
         git -C "$clean" fetch -q --no-tags https://gitcode.com/CacheOS/KVAF.git refs/heads/main
@@ -83,7 +84,6 @@ export KVAF_BATCH_PUT_KERNEL="$sdk/build-npu/bin/kvaf_execute_batch_put_kernels.
 cpu="$sdk/build-cpu/runtime/kvaf_cpu_service"
 export PEER_PHYSICAL_NPU=4
 printf '%s\n' "$(git -C "$root" rev-parse HEAD)" > "$out/native.txt"
-hostname > "$out/host.txt"
 if [[ -r /etc/machine-id ]]; then cat /etc/machine-id > "$out/machine_id.txt"; fi
 printf '4\n' > "$out/physical_npu.txt"
 # Use the same registered CPU memory placement for the serial and fused arms.
