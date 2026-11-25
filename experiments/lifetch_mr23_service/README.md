@@ -174,6 +174,15 @@ The small handoff report contains both views, so it can be shared without
 exporting the full trace. Refresh the source and capture again to include
 the new device scopes.
 
+Open the logical AIC and AIV lanes to see `Handoff gap` spans during those
+same intervals. Each span marks time without a recorded LIFetch source
+scope on that lane, after excluding kernel bodies and other recorded work
+such as cursor resets. Device-side utilization requires separate hardware
+evidence. To get the lane view from an existing capture, re-render its
+`baseline_stage_trace.bin` with
+`tests/operators/lifetch/support/baseline_stage_trace.py`, passing the
+recorded `counter_mhz` and route. That rendering runs offline.
+
 ### Per-core MTE and VF stages
 
 In `lifetch_business_trace.json`, expand the individual AIC and AIV lanes and

@@ -118,6 +118,30 @@ def test_overlapping_recorded_kernel_bodies_are_counted_once():
     assert not source_trace.split_recorded_bodies(90, 10, 60, 40, 10, [])
 
 
+def test_handoff_gaps_are_drawn_on_each_logical_lane_without_covering_work():
+    # Raw group IDs can be shared. The per-lane comparison uses logical IDs.
+    events = [dict(event, core=0) for event in decode(sample_buffer())]
+    resident = next(e for e in events if e['kernel'] == 21 and e['lane'] == 0)
+    events.append(dict(resident, phase=source_trace.COLD_PROGRESS_RESET, begin=3900, end=3910))
+    document, _ = render(events, counter_mhz=1000)
+    gaps = [e for e in document['traceEvents'] if e.get('cat') == 'KVIP source lane handoff']
+    assert gaps and all(e['dur'] > 0 and e['args']['derived'] for e in gaps)
+    for gap in gaps:
+        args = gap['args']
+        assert gap['pid'] == (1 if gap['tid'] >= 64 else 2)
+        assert not any(e['lane'] == gap['tid'] and
+                       max(e['begin'], args['begin_tick']) < min(e['end'], args['end_tick'])
+                       for e in events)
+
+    def intervals(handoff, lane):
+        return [(e['args']['begin_tick'], e['args']['end_tick']) for e in gaps
+                if e['args']['handoff'].startswith(handoff) and e['tid'] == lane]
+
+    assert intervals('Resident Top2048', 64) == [(4500, 4803), (4803, 5000), (5000, 5027)]
+    assert intervals('Resident Top2048', 0) == [(4800, 4803), (4803, 5000)]
+    assert intervals('Hot score', 0) == [(3800, 3865), (3865, 3900), (3910, 4000)]
+
+
 def test_handoff_window_state_reports_epoch_lane_and_resident_query():
     events = decode(sample_buffer())
     template = next(e for e in events if e['kernel'] == 22 and e['lane'] == 0)

@@ -582,6 +582,23 @@ def covered_ticks(spans):
     return covered
 
 
+def unrecorded_lane_spans(begin, end, sorted_spans):
+    """Complement of recorded source scopes on one logical lane."""
+    cursor = begin
+    for start, stop in sorted_spans:
+        if start >= end:
+            break
+        if stop <= cursor or stop <= start:
+            continue
+        if start > cursor:
+            yield cursor, start
+        cursor = max(cursor, stop)
+        if cursor >= end:
+            return
+    if cursor < end:
+        yield cursor, end
+
+
 def render(events, counter_mhz, *, cold_route='p2'):
     if not math.isfinite(counter_mhz) or counter_mhz <= 0:
         raise ValueError('A positive measured device counter frequency is required')
@@ -610,6 +627,7 @@ def render(events, counter_mhz, *, cold_route='p2'):
     kernel_bodies = defaultdict(list)
     stage_sets = defaultdict(list)
     lane_scopes = defaultdict(list)
+    recorded_lane_spans = defaultdict(list)
     seen_lanes = set()
     for event in events:
         lane = event['lane']
@@ -619,6 +637,7 @@ def render(events, counter_mhz, *, cold_route='p2'):
             metadata('thread_name', pid, lane, f'{"AIC" if pid == 1 else "AIV"} logical lane {event["block"]}')
             seen_lanes.add(lane)
         begin, end, phase = event['begin'], event['end'], event['phase']
+        recorded_lane_spans[lane].append((begin, end))
         kernel = event['kernel']
         kernel_stage, entry = kernels[kernel]
         args = dict(kernel_entry=entry, phase_id=phase, block=event['block'], subblock=event['subblock'],
@@ -712,6 +731,8 @@ def render(events, counter_mhz, *, cold_route='p2'):
             trace.append(dict(name=title, cat='KVIP source lane count', ph='C', pid=3, tid=tid,
                               ts=(tick - origin) / counter_mhz, args={'lanes': count}))
     handoffs = source_handoffs(events, counter_mhz)
+    for spans in recorded_lane_spans.values():
+        spans.sort()
     for tid, handoff in enumerate(handoffs, 1):
         metadata('thread_name', 4, tid, handoff['name'])
         if handoff['duration_us']:
@@ -723,12 +744,25 @@ def render(events, counter_mhz, *, cold_route='p2'):
             for segment in handoff['body_segments']:
                 add_span(segment['name'], 'KVIP source handoff breakdown', 4, detail_tid,
                          segment['begin_tick'], segment['end_tick'], segment)
+                for lane, spans in recorded_lane_spans.items():
+                    gaps = unrecorded_lane_spans(segment['begin_tick'], segment['end_tick'], spans)
+                    for begin, end in gaps:
+                        core_type = 'AIC' if lane >= 64 else 'AIV'
+                        add_span('Handoff gap · ' + segment['name'], 'KVIP source lane handoff',
+                                 1 if lane >= 64 else 2, lane, begin, end,
+                                 dict(handoff=handoff['name'], body_segment=segment['name'],
+                                      core_type=core_type, block=lane % 64, derived=True,
+                                      begin_tick=begin, end_tick=end,
+                                      coverage='No LIFetch source scope recorded on this logical lane'))
     document = dict(traceEvents=trace, displayTimeUnit='ms',
                     metadata=dict(clock=CLOCK, counter_mhz=counter_mhz, cold_route=cold_route,
                                   pipe_scope_semantics=PIPE_SEMANTICS, source_handoffs=handoffs,
                                   handoff_semantics='Body segments partition the source handoff at recorded '
                                   'KernelBody boundaries. Between bodies may still contain source work. '
-                                  'Observed scopes can overlap and their durations are not additive.'))
+                                  'Observed scopes can overlap and their durations are not additive.',
+                                  lane_handoff_semantics='Derived handoff gaps on observed logical lanes '
+                                  'exclude all recorded source scopes. Hardware idle time requires a '
+                                  'device-side measurement.'))
     return document, summaries
 
 
