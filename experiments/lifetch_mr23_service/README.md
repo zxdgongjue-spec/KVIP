@@ -157,12 +157,22 @@ Under the printed `Run output` directory, open `lifetch_business_trace.json` fir
 | --- | --- |
 | `lifetch_business_trace.json` | Detailed kernel scopes grouped by logical AIC/AIV lane, with window and request/query tags |
 | `lifetch_msprof_trace.json` | CANN trace with a `KVIP fused LIFetch` track for its four marker-verified device kernel phases |
+| `lifetch_handoff_report.json` | Compact source handoff anchors, body segments and observed scopes, plus native same-stream gaps |
 | `msprof/PROF_*/mindstudio_profiler_output/msprof_*.json` | Unmodified native CANN export with the original `KVIP_LIFETCH_*_BEGIN/END` markers |
 | `worker/miss*/case-b*/baseline_stage_report.json` | Coverage, stage timing summary, Top2048/KV/Index verification and prefetch/final Get counts |
 | `worker/miss*/case-b*/baseline_stage_trace.bin` | Original source-cycle records used for the stage timeline |
 | `manifest.json` | Revisions, fixture, command, exit status and paths |
 
 The two views describe the same capture and retain their measured clocks. The source view uses a measured device-counter frequency. `manifest.json` records whether CANN reports each task by kernel name or whether it was identified as the unique compute task between that stage’s device markers. Scope spans include existing waits and marker overhead.
+
+For Hot to Resident and Resident to Cold, open the corresponding source
+`breakdown` tracks. These split the business interval at the last recorded
+previous kernel body end and the first following body start. Read the
+Score output-bank drain, cutoff and window state scopes on the AIV lanes.
+Use the native handoff track to measure the same-stream device task gap.
+The small handoff report contains both views, so it can be shared without
+exporting the full trace. Refresh the source and capture again to include
+the new device scopes.
 
 ### Per-core MTE and VF stages
 

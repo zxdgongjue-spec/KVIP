@@ -272,7 +272,11 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
                                               GlobalTensor<int32_t> blockTableGm);
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
     __aicore__ inline void AllocEventID();
-    __aicore__ inline void FreeEventID();
+    __aicore__ inline void FreeEventID(
+#if KVIP_STAGE_TRACE
+        uint64_t trace = 0, uint32_t traceKernel = 0
+#endif
+    );
 
 protected:
     GlobalTensor<SCORE_T> scoreGm;
@@ -473,7 +477,7 @@ private:
 #endif
         auto src = (__local_mem__ uint16_t *)scoreOutLocal_.GetPhyAddr();
         auto dst = (__local_mem__ uint16_t *)prefixThreshold_.GetPhyAddr() + (query % 2) * 128;
-        KVIP_TRACE_BEGIN(reduceScope, residentTrace, Threshold, ThresholdTopKVf, 0, residentDetail);
+        KVIP_TRACE_BEGIN(reduceScope, residentTrace, Threshold, ResidentMinVf, 0, residentDetail);
         __VEC_SCOPE__ {
             MicroAPI::RegTensor<uint16_t> minimum, values, reduced;
             auto mask = MicroAPI::CreateMask<uint16_t, MicroAPI::MaskPattern::ALL>();
@@ -485,10 +489,10 @@ private:
             MicroAPI::ReduceMin(reduced, minimum, mask);
             MicroAPI::StoreAlign(dst, reduced, mask);
         }
-        KVIP_TRACE_END(reduceScope);
-        KVIP_TRACE_BEGIN(prefixScope, residentTrace, Threshold, ThresholdOutputMte3, 0, residentDetail);
         SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
+        KVIP_TRACE_END(reduceScope);
+        KVIP_TRACE_BEGIN(prefixScope, residentTrace, Threshold, ThresholdOutputMte3, 0, residentDetail);
         constexpr uint32_t count = SIM_Q * 2048;
         constexpr uint32_t rowBytes = count * 6 + SIM_Q * 256;
         uint32_t batch = query / SIM_Q, q = query % SIM_Q;
@@ -516,11 +520,11 @@ private:
             uint32_t validEnd = context->queryEnds ?
                 reinterpret_cast<__gm__ uint32_t*>(context->queryEnds)[query] : runtimeShape_.history;
             if (validEnd > runtimeShape_.resident) validEnd = runtimeShape_.resident;
-            KVIP_TRACE_BEGIN(victimScope, residentTrace, Threshold, ThresholdInputMte2, 0, residentDetail);
+            KVIP_TRACE_BEGIN(victimScope, residentTrace, Threshold, ResidentVictimIdsMte2, 0, residentDetail);
             DataCopy(reservedChunk.template ReinterpretCast<uint32_t>(), victims, 2048);
             SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
             KVIP_TRACE_END(victimScope);
-            KVIP_TRACE_BEGIN(classifyScope, residentTrace, Threshold, ThresholdTopKVf, 0, residentDetail);
+            KVIP_TRACE_BEGIN(classifyScope, residentTrace, Threshold, ResidentVictimClassifyVf, 0, residentDetail);
 #if !V9_UBMEM
             // One SIMT invocation covers both paths; zero selects GM only.
             Simt::VF_CALL<rotating::GatherVictimScoresUb>(Simt::Dim3{256,1,1},
@@ -545,7 +549,7 @@ private:
                 reinterpret_cast<__ubuf__ uint16_t*>(hitChunk.GetPhyAddr()), validEnd);
             SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
             KVIP_TRACE_END(classifyScope);
-            KVIP_TRACE_BEGIN(hitScope, residentTrace, Threshold, ThresholdOutputMte3, 0, residentDetail);
+            KVIP_TRACE_BEGIN(hitScope, residentTrace, Threshold, ResidentHitBitmapMte3, 0, residentDetail);
             DataCopyExtParams copy;
             copy.blockCount = 16; copy.blockLen = 32;
             copy.srcStride = 7; copy.dstStride = 0;
@@ -554,6 +558,7 @@ private:
         }
 #if !V9_UBMEM
         // Private incremental TopK state, shared by all prefetch windows.
+        KVIP_TRACE_BEGIN(windowScope, residentTrace, Threshold, ResidentWindowSeed, 0, residentDetail);
         auto windowMeta=reinterpret_cast<__gm__ uint64_t*>(rotating::TopKHeader(context))+query*16;
         windowMeta[0]=reinterpret_cast<uint64_t>(scoreGm.GetPhyAddr())+uint64_t(scoreRow)*runtimeShape_.history*2;
         windowMeta[1]=uint64_t(runtimeShape_.resident)|(uint64_t(runtimeShape_.resident)<<32);windowMeta[2]=0;windowMeta[3]=0;
@@ -562,7 +567,6 @@ private:
         GlobalTensor<uint16_t> windowScores;GlobalTensor<uint32_t> windowIds;
         windowScores.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(privatePrefix)+q*2048);
         windowIds.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(privatePrefix+count*2)+q*2048);
-        KVIP_TRACE_BEGIN(windowScope, residentTrace, Threshold, ThresholdOutputMte3, 0, residentDetail);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
         DataCopy(windowScores,scoreOutLocal_,2048);DataCopy(windowIds,indicesOutLocal_,2048);
         SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
@@ -784,12 +788,18 @@ __aicore__ inline void QLIVector<QLIT>::AllocEventID()
 }
 
 template <typename QLIT>
-__aicore__ inline void QLIVector<QLIT>::FreeEventID()
+__aicore__ inline void QLIVector<QLIT>::FreeEventID(
+#if KVIP_STAGE_TRACE
+    uint64_t trace, uint32_t traceKernel
+#endif
+)
 {
     WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + 0);
     WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + 1);
+    KVIP_TRACE_RECORD(scoreDrain, trace, traceKernel, kvip_trace::LiScoreOutputDrain, 0, 0);
     WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + 0);
     WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + 1);
+    KVIP_TRACE_END(scoreDrain);
     WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_QSCALE + 0);
     WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_QSCALE + 1);
 

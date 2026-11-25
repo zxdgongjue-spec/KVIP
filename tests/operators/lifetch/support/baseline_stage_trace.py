@@ -109,6 +109,14 @@ PHASES = {
     231: 'Drain and rebind Dedicated Cold query',
     232: 'Prepare Cold progress staging in UB',
     233: 'Publish final TopK generation and prepare Resolve',
+    234: 'Read LI shape and select split',
+    235: 'Initialize local LI buffers',
+    236: 'Bind LI prefix and progress workspace',
+    237: 'Wait for Score output banks to retire',
+    242: 'Publish initial window Top2048 state',
+    243: 'Stage window state and ready cursors',
+    244: 'Drain and publish window state',
+    245: 'Prepare LI per-query run info',
     DYNAMIC_SCORE_JOB: 'Dynamically assigned Score fragment',
     DYNAMIC_SERVICE_JOB: 'Dynamically assigned Service window',
 }
@@ -127,7 +135,7 @@ PIPE_SCOPES = {
     192: ('AIV', 'MTE3', 'Score, hit and progress writeback issue'),
     193: ('AIV', 'WAIT', 'Wait for output bank'),
     196: ('AIV', 'MTE2', 'Resident threshold input with fence'),
-    197: ('AIV', 'VF', 'Resident Top2048 and victim classification'),
+    197: ('AIV', 'VF', 'Resident Top2048 VF (legacy includes victim classification)'),
     198: ('AIV', 'MTE3', 'Resident threshold publication'),
     200: ('AIV', 'MTE2', 'Service window inputs'),
     201: ('AIV', 'VF', 'Service window TopK'),
@@ -150,6 +158,10 @@ PIPE_SCOPES = {
     221: ('AIV', 'VF', 'Cold T2 resident-threshold predicate'),
     222: ('AIV', 'MTE3', 'Cold T2 predicate and progress publication'),
     223: ('AIV', 'STORE', 'Prefetch doorbell'),
+    238: ('AIV', 'VF', 'Reduce Resident Top2048 to cutoff and fence'),
+    239: ('AIV', 'MTE2', 'Load Resident victim IDs'),
+    240: ('AIV', 'VF', 'Gather and classify Resident victims'),
+    241: ('AIV', 'MTE3', 'Publish Resident hit bitmap'),
 }
 PHASES.update({phase: name for phase, (_, _, name) in PIPE_SCOPES.items()})
 NO_TILE, NO_QUERY, SERVICE_LANE = (1 << 20) - 1, 15, 14
@@ -173,9 +185,9 @@ REQUIRED_PIPE = {
     23: {211, 213, 214, 216},
 }
 REQUIRED_HANDOFF = {
-    20: {226, 227, 228},
-    21: {226, 227, 228},
-    22: {226, 227, 228, 230, 232},
+    20: {226, 227, 228, 234, 235, 236, 237},
+    21: {226, 227, 228, 234, 235, 236, 238, 242, 245},
+    22: {226, 227, 228, 230, 232, 234, 235, 236, 237, 243, 244},
     23: {233},
 }
 CLOCK = ('Device GetSystemCycle relative to the first recorded scope, scaled by an independent '
@@ -474,14 +486,44 @@ def source_lane_counts(spans):
     return result
 
 
+LI_ENTRY_SCOPES = (2, 226, 234, 235, 236)
+LI_EXIT_SCOPES = (27, 227, 228, 237)
 SOURCE_HANDOFFS = (
     ('Hot score to Resident Top2048', 20, (21, 22), 21, (23,),
-     (27, 227, 228, COLD_PROGRESS_RESET, 2, 226)),
+     (*LI_EXIT_SCOPES, COLD_PROGRESS_RESET, *LI_ENTRY_SCOPES, 245)),
     ('Resident Top2048 to Cold or W0 Service', 21, (23,), 22, (21, 22, 150),
-     (227, 228, 2, 226, 230, 231, 232)),
+     (*LI_EXIT_SCOPES, *LI_ENTRY_SCOPES, 230, 231, 232)),
     ('Cold and Service to first Resolve', 22, (21, 22, 150), 23, (161,),
-     (27, 227, 228, 2, 160, 233)),
+     (*LI_EXIT_SCOPES, 2, 160, 233)),
 )
+
+
+def boundary(event, edge):
+    return dict(tick=event[edge], phase_id=event['phase'], lane=event['lane'],
+                block=event['block'], raw_core_id=event['core'], iteration=event['iteration'])
+
+
+def split_recorded_bodies(begin, end, left_end, right_begin, counter_mhz, observed):
+    """Disjoint pieces on the source clock, even if recorded bodies overlap."""
+    if end <= begin or left_end is None or right_begin is None:
+        return []
+    cuts = sorted({begin, end, *(tick for tick in (left_end, right_begin) if begin < tick < end)})
+    pieces = []
+    for a, b in zip(cuts, cuts[1:]):
+        previous, following = a < left_end, b > right_begin
+        if previous and following:
+            name = 'Overlapping recorded kernel bodies'
+        elif previous:
+            name = 'Previous kernel tail'
+        elif following:
+            name = 'Following kernel entry'
+        else:
+            name = 'Between recorded kernel bodies'
+        covered = covered_ticks([(max(a, start), min(b, stop)) for start, stop in observed
+                                 if max(a, start) < min(b, stop)])
+        pieces.append(dict(name=name, begin_tick=a, end_tick=b, duration_us=(b-a)/counter_mhz,
+                           uncovered_source_us=(b-a-covered)/counter_mhz))
+    return pieces
 
 
 def source_handoffs(events, counter_mhz):
@@ -498,6 +540,14 @@ def source_handoffs(events, counter_mhz):
         if not ends or not starts:
             continue
         begin, end = max(ends.values()), min(starts.values())
+        previous_event = max((e for phase in previous for e in by_phase[left, phase]),
+                             key=lambda e: e['end'])
+        following_event = min((e for phase in following for e in by_phase[right, phase]),
+                              key=lambda e: e['begin'])
+        left_body = max(by_phase[left, 1], key=lambda e: e['end'], default=None)
+        right_body = min(by_phase[right, 1], key=lambda e: e['begin'], default=None)
+        left_end = left_body['end'] if left_body else None
+        right_begin = right_body['begin'] if right_body else None
         coverage = []
         all_spans = []
         for phase in phases:
@@ -511,6 +561,12 @@ def source_handoffs(events, counter_mhz):
                                  duration_on_any_lane_us=covered_ticks(spans) / counter_mhz))
         duration = max(0, end - begin)
         result.append(dict(name=label, begin_tick=begin, end_tick=end,
+                           boundaries=dict(previous_business_end=boundary(previous_event, 'end'),
+                                           previous_body_end=boundary(left_body, 'end') if left_body else None,
+                                           following_body_begin=boundary(right_body, 'begin') if right_body else None,
+                                           following_business_begin=boundary(following_event, 'begin')),
+                           body_segments=split_recorded_bodies(begin, end, left_end, right_begin,
+                                                               counter_mhz, all_spans),
                            last_previous_scope_end_ticks=ends, first_following_scope_begin_ticks=starts,
                            duration_us=duration / counter_mhz,
                            uncovered_source_us=(duration - covered_ticks(all_spans)) / counter_mhz,
@@ -570,7 +626,7 @@ def render(events, counter_mhz, *, cold_route='p2'):
                     iteration=event['iteration'], detail=event['detail'], begin_tick=begin, end_tick=end)
         window_epoch = None
         category = kernel_stage
-        if kernel in (20, 22) and (phase in (21, 22, 25, *range(150, 156),
+        if kernel in (20, 22) and (phase in (21, 22, 25, *range(150, 156), 243, 244,
                                              DEDICATED_DRIVER_WAIT, DEDICATED_READY_SNAPSHOT, 230, 231,
                                              DYNAMIC_SCORE_JOB, DYNAMIC_SERVICE_JOB)
                                    or phase in PIPE_SCOPES):
@@ -599,11 +655,13 @@ def render(events, counter_mhz, *, cold_route='p2'):
             args.update(request_row=row, window_epoch=window, job_ticket=event['detail'] >> 8)
             if phase == DYNAMIC_SCORE_JOB:
                 args['fragment'] = fragment
-        elif phase in (23, 155, DEDICATED_READY_SNAPSHOT, COLD_PROGRESS_RESET) or kernel == 23:
+        elif phase in (23, 155, 245, DEDICATED_READY_SNAPSHOT, COLD_PROGRESS_RESET) or kernel == 23:
             args.update(request_row=event['detail'] // 4, query=event['detail'] % 4)
+        elif phase == 242:
+            args.update(request_row=event['detail'] >> 24, query=(event['detail'] >> 20) & NO_QUERY)
         elif phase in (21, 22, 152, 153, 230, 231):
             args['request_row'] = event['detail']
-        elif phase in (25, 150, 151, DEDICATED_DRIVER_WAIT):
+        elif phase in (25, 150, 151, 243, 244, DEDICATED_DRIVER_WAIT):
             args['service_lane'] = event['detail']
         elif phase == 154:
             args['request_or_service_lane'] = event['detail']
@@ -659,11 +717,18 @@ def render(events, counter_mhz, *, cold_route='p2'):
         if handoff['duration_us']:
             add_span(handoff['name'], 'KVIP business handoff', 4, tid, handoff['begin_tick'],
                      handoff['end_tick'], handoff)
+        if handoff['body_segments']:
+            detail_tid = tid + len(handoffs)
+            metadata('thread_name', 4, detail_tid, handoff['name'] + ' breakdown')
+            for segment in handoff['body_segments']:
+                add_span(segment['name'], 'KVIP source handoff breakdown', 4, detail_tid,
+                         segment['begin_tick'], segment['end_tick'], segment)
     document = dict(traceEvents=trace, displayTimeUnit='ms',
                     metadata=dict(clock=CLOCK, counter_mhz=counter_mhz, cold_route=cold_route,
                                   pipe_scope_semantics=PIPE_SEMANTICS, source_handoffs=handoffs,
-                                  handoff_semantics='Source scopes can overlap across phases and lanes; '
-                                  'observed scope durations do not partition the handoff.'))
+                                  handoff_semantics='Body segments partition the source handoff at recorded '
+                                  'KernelBody boundaries. Between bodies may still contain source work. '
+                                  'Observed scopes can overlap and their durations are not additive.'))
     return document, summaries
 
 

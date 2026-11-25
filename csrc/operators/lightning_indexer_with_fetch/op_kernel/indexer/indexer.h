@@ -97,6 +97,7 @@ public:
     rotating::RuntimeShape runtimeShape_;
 #if KVIP_STAGE_TRACE
     uint64_t stageTrace_ = 0;
+    uint32_t traceKernel_ = 0;
     uint32_t traceWindow_ = 0;
 #endif
     bool sequenceSplit_ = false;
@@ -522,6 +523,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
         }
         matmulService.InitMm1GlobalTensor(blockTableGm, keyGm, queryGm);
     }
+    KVIP_TRACE_RECORD(bufferScope, stageTrace_, traceKernel_, kvip_trace::LiBufferSetup, 0, 0);
     InitBuffers();
 }
 
@@ -810,7 +812,10 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(u
             vectorService.AllocEventID();
             KVIP_TRACE_END(eventInit);
             QLICommon::RunInfo info;
+            KVIP_TRACE_RECORD(queryScope, stageTrace_, traceKernel, kvip_trace::ResidentQuerySetup,
+                0, batch * SIM_Q + tmpBlockIdx % SIM_Q);
             CalcRunInfo(0, 0, info, 0, 0);
+            KVIP_TRACE_END(queryScope);
             if constexpr (Phase == SequenceLiPhase::Threshold) {
                 KVIP_TRACE_BEGIN(thresholdScope, stageTrace_, Threshold, LiHotTopK, 0, batch * SIM_Q + tmpBlockIdx % SIM_Q);
                 vectorService.ProcessResidentTopK(info, tmpBlockIdx % SIM_Q);
@@ -929,7 +934,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(u
 
         KVIP_TRACE_RECORD(eventDrain, stageTrace_, traceKernel, kvip_trace::LiEventsDrain, 0, 0);
         if ASCEND_IS_AIV {
+#if KVIP_STAGE_TRACE
+            vectorService.FreeEventID(stageTrace_, traceKernel);
+#else
             vectorService.FreeEventID();
+#endif
             KVIP_TRACE_END(eventDrain);
         } else {
             matmulService.FreeEventID();
@@ -1027,7 +1036,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessDedicatedCold(G
 
     KVIP_TRACE_BEGIN(eventDrain, stageTrace_, Cold, LiEventsDrain, 0, 0);
     if ASCEND_IS_AIV {
+#if KVIP_STAGE_TRACE
+        vectorService.FreeEventID(stageTrace_, kvip_trace::Cold);
+#else
         vectorService.FreeEventID();
+#endif
         KVIP_TRACE_END(eventDrain);
     } else {
         matmulService.FreeEventID();

@@ -53,7 +53,12 @@ enum Phase : uint32_t {
     PrefetchDoorbell = 223, DedicatedDriverWait = 224, DedicatedReadySnapshot = 225,
     LiEventsAcquire = 226, LiEventsDrain = 227, LiPipeDestroy = 228,
     ColdProgressReset = 229, ColdThresholdRead = 230, ColdQueryRebind = 231,
-    ColdProgressPrepare = 232, TerminalResolvePrepare = 233
+    ColdProgressPrepare = 232, TerminalResolvePrepare = 233,
+    LiShapeSetup = 234, LiBufferSetup = 235, LiWorkspaceBind = 236,
+    LiScoreOutputDrain = 237, ResidentMinVf = 238, ResidentVictimIdsMte2 = 239,
+    ResidentVictimClassifyVf = 240, ResidentHitBitmapMte3 = 241,
+    ResidentWindowSeed = 242, WindowReadyLoad = 243, WindowStateFlush = 244,
+    ResidentQuerySetup = 245
 };
 
 // Separate IDs for opt-in scheduling; leave the LI handoff range distinct.

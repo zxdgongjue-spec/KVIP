@@ -52,12 +52,14 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, uint32_t job 
 #endif
     KVIP_TRACE_RECORD(kernelScope, ExternalBody ? 0 : stageTrace, traceKernel, kvip_trace::KernelBody, 0, 0);
     KVIP_TRACE_RECORD(setupScope, stageTrace, traceKernel, kvip_trace::Setup, 0, 0);
+    KVIP_TRACE_RECORD(shapeScope, stageTrace, traceKernel, kvip_trace::LiShapeSetup, 0, 0);
     auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(a[14]));
     bool splitSequence = rotating::UseSequenceSplit(shape) && HasUniformLengths(shape, P(5), P(6));
     if constexpr (Phase != SequenceLiPhase::Hot) {
         if (!splitSequence) return;
     }
     if (parts > 2 && !splitSequence) return;
+    KVIP_TRACE_END(shapeScope);
     TPipe pipe;
     using Type=QLIType<fp8_e4m3fn_t,fp8_e4m3fn_t,int32_t,true,LI_LAYOUT::BSND,LI_LAYOUT::PA_BSND,
         bfloat16_t,float,float,uint16_t>;
@@ -65,6 +67,7 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, uint32_t job 
     op.runtimeShape_ = shape;
 #if KVIP_STAGE_TRACE
     op.stageTrace_ = stageTrace;
+    op.traceKernel_ = traceKernel;
 #endif
 #if !V9_UBMEM
     op.rotationContext_ = P(14);
@@ -77,6 +80,7 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, uint32_t job 
     if ASCEND_IS_AIV { op.vectorService.SetStreamingWorkspace(P(15)); }
     op.Init(P(0),P(1),P(2),P(3),P(4),P(5),P(6),P(7),P(9),P(12),&tiling,&pipe,parts);
     if ASCEND_IS_AIV {
+        KVIP_TRACE_RECORD(bindingScope, stageTrace, traceKernel, kvip_trace::LiWorkspaceBind, 0, 0);
         op.vectorService.SetPrefixStorage(P(13));
         op.vectorService.SetRotationContext(P(14));
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM

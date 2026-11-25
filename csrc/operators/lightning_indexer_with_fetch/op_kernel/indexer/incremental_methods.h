@@ -571,6 +571,7 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half,uint32_t lane)
         do {kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ rotating::Event*>(previous)),64);}while(!previous->complete);
     }
     KVIP_TRACE_BEGIN(windowScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_), Cold, LiWindow, epoch, lane);
+    KVIP_TRACE_BEGIN(readyScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_), Cold, WindowReadyLoad, epoch, lane);
     uint64_t begin=trace?GetSystemCycle():0;
     exportWindowCold_=true;rankedEpoch_=epoch;rankTrace_=trace;
     incrementalCalls_=0;incrementalScanned_=0;incrementalCandidates_=0;
@@ -636,6 +637,7 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half,uint32_t lane)
         }
     }
 #endif
+    KVIP_TRACE_END(readyScope);
     for(uint32_t b=lane;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes) for(uint32_t q=0;q<4;++q) {
         // Init clears covered; the posting path records every admission in
         // requests. The predecessor fence makes the row and bitmap visible.
@@ -668,6 +670,7 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half,uint32_t lane)
             Cold, WindowQueryTopK, epoch, b * 4 + q);
         AdvanceIncremental(b*4+q,end0,end1,half);
     }
+    KVIP_TRACE_BEGIN(flushScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_), Cold, WindowStateFlush, epoch, lane);
     JoinColdOutput();
     if(incrementalInputPending_) {
         WaitFlag<HardEvent::MTE2_V>(EVENT_ID6);incrementalInputPending_=false;
@@ -690,6 +693,7 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half,uint32_t lane)
     if (!dedicatedProgress_)
 #endif
     PrepareRotationProgress();
+    KVIP_TRACE_END(flushScope);
     if(trace) {
         auto event=reinterpret_cast<__gm__ rotating::Event*>(ctx->events)+epoch*runtimeShape_.serviceLanes+lane;
         auto stamp=reinterpret_cast<__gm__ uint64_t*>(event->pad);

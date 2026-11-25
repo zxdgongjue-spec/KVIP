@@ -98,7 +98,51 @@ def test_handoff_counts_cold_cursor_reset_on_the_threshold_source_clock():
     reset = next(e for e in handoffs[0]['observed_scopes'] if e['phase'].startswith('Clear Cold progress'))
     assert reset['duration_on_any_lane_us'] == 0.14
     assert handoffs[0]['uncovered_source_us'] == pytest.approx(0.518 - 0.140 - 0.003)
+    assert [x['tick'] for x in handoffs[0]['boundaries'].values()] == [3500, 3865, 4000, 4018]
+    assert [x['duration_us'] for x in handoffs[0]['body_segments']] == pytest.approx([0.365, 0.135, 0.018])
+    assert sum(x['uncovered_source_us'] for x in handoffs[0]['body_segments']) == pytest.approx(
+        handoffs[0]['uncovered_source_us'])
     assert any(e.get('cat') == 'KVIP business handoff' for e in document['traceEvents'])
+    assert any(e.get('cat') == 'KVIP source handoff breakdown' for e in document['traceEvents'])
+
+
+def test_overlapping_recorded_kernel_bodies_are_counted_once():
+    pieces = source_trace.split_recorded_bodies(10, 90, 60, 40, 10, [(10, 50), (45, 60)])
+    assert [(x['name'], x['begin_tick'], x['end_tick'], x['uncovered_source_us']) for x in pieces] == [
+        ('Previous kernel tail', 10, 40, 0),
+        ('Overlapping recorded kernel bodies', 40, 60, 0),
+        ('Following kernel entry', 60, 90, 3),
+    ]
+    assert sum(x['duration_us'] for x in pieces) == 8
+    assert not source_trace.split_recorded_bodies(10, 90, None, 40, 10, [])
+    assert not source_trace.split_recorded_bodies(90, 10, 60, 40, 10, [])
+
+
+def test_handoff_window_state_reports_epoch_lane_and_resident_query():
+    events = decode(sample_buffer())
+    template = next(e for e in events if e['kernel'] == 22 and e['lane'] == 0)
+    events.append(dict(template, phase=243, iteration=2, detail=7))
+    resident = next(e for e in events if e['kernel'] == 21 and e['lane'] == 0)
+    events.append(dict(resident, phase=242, detail=(3 << 24) | (2 << 20) | source_trace.NO_TILE))
+    document, _ = render(events, counter_mhz=1000)
+    scope = next(e for e in document['traceEvents'] if e.get('name') == 'Stage window state and ready cursors')
+    assert scope['args']['window_epoch'] == 2
+    assert scope['args']['service_lane'] == 7
+    seed = next(e for e in document['traceEvents'] if e.get('name') == 'Publish initial window Top2048 state')
+    assert (seed['args']['request_row'], seed['args']['query']) == (3, 2)
+
+
+def test_dynamic_service_job_and_handoff_detail_share_source_timeline():
+    events = decode(sample_buffer())
+    template = next(e for e in events if e['kernel'] == 22 and e['lane'] == 0)
+    events.extend([
+        dict(template, phase=source_trace.DYNAMIC_SERVICE_JOB, detail=(3 << 4) | (2 << 2) | (9 << 8)),
+        dict(template, phase=243, iteration=2, detail=3),
+    ])
+    document, _ = render(events, counter_mhz=1000, cold_route='dynamic')
+    job = next(e for e in document['traceEvents'] if e.get('name') == 'Dynamically assigned Service window')
+    assert (job['args']['request_row'], job['args']['window_epoch'], job['args']['job_ticket']) == (3, 2, 9)
+    assert any(e.get('cat') == 'KVIP source handoff breakdown' for e in document['traceEvents'])
 
 
 def test_fresh_capture_requires_handoff_scopes_but_old_capture_still_decodes():
@@ -106,6 +150,12 @@ def test_fresh_capture_requires_handoff_scopes_but_old_capture_still_decodes():
     verify_route(events, batch=1)
     with pytest.raises(ValueError, match='Missing required handoff scopes'):
         verify_route(events, batch=1, require_handoff_scopes=True)
+    for kernel, phases in source_trace.REQUIRED_HANDOFF.items():
+        template = next(e for e in events if e['kernel'] == kernel and e['lane'] == 0)
+        events.extend(dict(template, phase=phase) for phase in phases)
+    verify_route(events, batch=1, require_handoff_scopes=True)
+    with pytest.raises(ValueError, match=r'245'):
+        verify_route([e for e in events if e['phase'] != 245], batch=1, require_handoff_scopes=True)
 
 def test_overflow_and_incomplete_events_are_rejected():
     raw = sample_buffer()
