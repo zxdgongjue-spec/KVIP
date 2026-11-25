@@ -8,6 +8,7 @@ import platform
 import re
 import subprocess
 import sys
+from time import perf_counter
 
 import numpy as np
 
@@ -38,6 +39,43 @@ def verify_assignments(start, layout, before_valid, valid, sources, destinations
 
 def case_path(args):
     return args.output / 'results/mainline/cases/diagnose'
+
+
+class FeatureReplayChecks:
+    """Use the single-round reset boundary to reduce warmup host transfers."""
+
+    def __init__(self, calls, warmup, policy):
+        self.policy = policy
+        self.setup = {f'pre_capture/input{i}' for i in range(calls)}
+        self.setup.update(f'warmup{w}/input{i}/round1' for w in range(warmup) for i in range(calls))
+        self.full = {'eager'} | {f'{stage}/input{i}/round1'
+                                 for stage in ('measured', 'detail') for i in range(calls)}
+        self.checked = set()
+        self.full_seconds = self.completion_seconds = 0.
+
+    def validate(self, label, state, inputs, full_validate):
+        if label in self.checked:
+            raise ValueError(f'Duplicate feature replay validation: {label}')
+        start = perf_counter()
+        if label in self.setup:
+            # The next reset recreates hot KV, Index and CPU LRU from the capture.
+            # Private queues survive reset, so check every completion before reuse.
+            from terminal_batch_checks import audit_queues
+            state.check_completion()
+            audit_queues(state.forward.terminal, state.rotating, policy=self.policy)
+            self.completion_seconds += perf_counter() - start
+        elif label in self.full:
+            full_validate(inputs)
+            self.full_seconds += perf_counter() - start
+        else:
+            raise ValueError(f'Unexpected feature replay validation: {label}')
+        self.checked.add(label)
+
+    def receipt(self):
+        if self.checked != self.setup | self.full:
+            raise ValueError('Incomplete feature replay validation')
+        return dict(full_state_checks=len(self.full), completion_and_private_CQ_checks=len(self.setup),
+                    full_state_check_seconds=self.full_seconds, completion_check_seconds=self.completion_seconds)
 
 
 def worker(args):
@@ -116,6 +154,9 @@ def worker(args):
     # The official recorder gives each uninstrumented measured state and each
     # separate diagnostic state a unique label. Neither hook runs inside a graph.
     current = None
+    current_label = None
+    feature_checks = (FeatureReplayChecks(args.iterations, cfg.warmup, args.ablation_policy)
+                      if args.ablation_policy else None)
     outputs = {}
     ordered = {}
     window_workers = {}
@@ -152,12 +193,14 @@ def worker(args):
 
     class Recorder(ex.CorrectnessRecorder):
         def check(self, label, callback):
-            nonlocal current
+            nonlocal current, current_label
+            current_label = label
             current = label_pattern.fullmatch(label)
             try:
                 return super().check(label, callback)
             finally:
                 current = None
+                current_label = None
 
     class AuditedState(ex.FusedReplayState):
         def __init__(self, *arguments, **kwargs):
@@ -247,7 +290,10 @@ def worker(args):
             return layout, valid
 
         def validate(self, sample):
-            super().validate(sample)
+            if feature_checks is None:
+                super().validate(sample)
+            else:
+                feature_checks.validate(current_label, self, sample, super().validate)
             if args.borrow_audit and current and current[1] == 'detail':
                 detail_ids[int(current[2])] = fused_li_output(self)
             if current and current[1] == ('detail' if args.availability_only else 'measured'):
@@ -304,6 +350,13 @@ def worker(args):
         raise ValueError('Incomplete mainline profiler capture')
     library, = library_paths
     device_proof = {}
+    if feature_checks is not None:
+        check_times = feature_checks.receipt()
+        device_proof['validation'] = check_times
+        print(f'FEATURE_VALIDATION full_state_checks={check_times["full_state_checks"]} '
+              f'completion_and_private_CQ_checks={check_times["completion_and_private_CQ_checks"]} '
+              f'full_state_check_s={check_times["full_state_check_seconds"]:.3f} '
+              f'completion_check_s={check_times["completion_check_seconds"]:.3f}', flush=True)
     if args.revision == 'd6cfd392f722dd3f96ef6e05175f503aac511dbb':
         from unified_main_device import check
         device_proof['device_text_sha256'] = check(library)

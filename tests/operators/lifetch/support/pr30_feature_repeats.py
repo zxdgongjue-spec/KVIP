@@ -8,7 +8,8 @@ import sys
 from reporting import atomic_json
 
 GROUPS = (10, 4, 17, 7, 2)
-STAGES = ('graph', 'LI', 'tail')
+STAGES = ('span', 'LI', 'tail', 'kernel_gaps')
+SCALARS = ('window10_per_call_us', 'event_mean_us', 'between_calls_per_call_us', 'event_edge_residual_per_call_us')
 
 
 def summarize(root):
@@ -43,6 +44,8 @@ def summarize(root):
                 continue
             saved = {stage: [row['timing'][before][stage][0] - row['timing'][after][stage][0] for row in records]
                      for stage in STAGES}
+            saved.update({key: [row['timing'][before][key] - row['timing'][after][key] for row in records]
+                          for key in SCALARS})
             groups[group][label] = saved
             matched = [row['device_text'][check] for row in records]
             groups[group].setdefault('unmodified_stage_match', {})[label] = matched
@@ -58,7 +61,8 @@ def summarize(root):
             equal_weight[label] = None
             print(f'FIVE_GROUP_EQUAL_WEIGHT {label} UNAVAILABLE missing_groups={",".join(missing)}')
             continue
-        avg = {stage: [mean(groups[g][label][stage][i] for g in GROUPS) for i in range(2)] for stage in STAGES}
+        avg = {stage: [mean(groups[g][label][stage][i] for g in GROUPS) for i in range(2)]
+               for stage in (*STAGES, *SCALARS)}
         equal_weight[label] = avg
         matched = all(all(groups[g]['unmodified_stage_match'][label]) for g in GROUPS)
         print(f'FIVE_GROUP_EQUAL_WEIGHT {label} mean_saved_us_block1/block2 '

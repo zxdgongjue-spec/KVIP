@@ -1,5 +1,6 @@
 from copy import deepcopy
 from pathlib import Path
+from statistics import mean, median
 import sys
 
 import pytest
@@ -7,6 +8,43 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent/'support'))
 import pr30_feature_steps as report
 from reporting import atomic_json
+
+
+@pytest.mark.parametrize('count', (10, 20))
+def test_same_call_spans_and_whole_event_accounting(count):
+    # A deliberately long gap at the boundary of the archived ten-call windows.
+    cursor = 4096
+    samples, spans, tails, gaps = [], [], [], []
+    for i in range(count):
+        if i:
+            cursor += 500 if i == 10 else 2
+        gap = i % 3
+        tail = 12 - gap
+        li = [(cursor, cursor + 1), (cursor + 1, cursor + 2), (cursor + 2, cursor + 3)]
+        end_li = li[-1][1]
+        cursor = end_li + gap + tail
+        spans.append(cursor - li[0][0])
+        tails.append(tail)
+        gaps.append(gap)
+        samples.append({'accounting': dict(intervals_us={'li': li, 'topk_resolve_update': [(end_li + gap, cursor)]},
+                                           stages_us={'li': 3, 'topk_resolve_update': tail},
+                                           inter_kernel_gap_us=gap)})
+    event = cursor - 4096 + 31
+    profile = dict(samples=samples, graph_calls=count, graph_accounting={'event_us': event})
+    checked = dict(graph=(event/count, median(spans)), LI1_to_LI3=(3, 3),
+                   final_topk_through_tail=(mean(tails), median(tails)))
+    timing = report.feature_times(profile, checked)
+    assert timing['span'] == (mean(spans), median(spans))
+    assert timing['kernel_gaps'] == (mean(gaps), median(gaps))
+    assert timing['event_mean_us'] == event / count
+    assert timing['event_total_us'] == event
+    assert timing['between_calls_per_call_us'] == (2 * (count - 1) + (498 if count == 20 else 0)) / count
+    assert timing['event_edge_residual_per_call_us'] == 31 / count
+    assert timing['window10_per_call_us'] == mean(spans) + 1.8
+    assert 'event_total_us' not in report.saved(timing, timing)
+    samples[0]['accounting']['inter_kernel_gap_us'] += 2
+    with pytest.raises(ValueError, match='Per-call span'):
+        report.feature_times(profile, checked)
 
 
 def receipts(policy):
@@ -74,6 +112,7 @@ def test_archive_compiler_drift_and_fresh_comparisons(tmp_path, monkeypatch, cap
         assert root == (archive if arm == 'mainline' else out)
         base = {'mainline':100., 'dualcut':90., 'paced':84.}[arm]
         metrics = {k: (base + i, base - 2 + i) for i, k in enumerate(report.METRICS)}
+        metrics.update({k: base for k in (*report.PER_CALL_MEANS, 'event_total_us')})
         sha = dict(report.EXPECTED_TEXT)
         if arm in ('dualcut','paced'):
             sha[report.LI_TEXT[0]] = 'changed LI'
@@ -96,13 +135,15 @@ def test_archive_compiler_drift_and_fresh_comparisons(tmp_path, monkeypatch, cap
     assert row['calls_per_graph'] == {'mainline': 20, 'dualcut': 10, 'paced': 10}
     assert set(row['measured']) == {'dualcut','paced'}
     text = capsys.readouterr().out
-    assert 'G7 dualcut_vs_mainline saved graph_mean/P50_us=+10.00/+10.00' in text
+    assert 'G7 dualcut_vs_mainline saved span_mean/P50_us=+10.00/+10.00' in text
+    assert 'event_mean_us=+10.00' in text
+    assert 'graph_mean/P50_us' not in text
     assert 'historical_main calls_per_graph=20/10 unmodified_stage_binary=DIFF' in text
     assert 'fresh_same_block calls_per_graph=10/10 unmodified_stage_binary=MATCH' in text
     assert 'G7 CHECK arm=mainline TopK_score_vs_strong_serial=PASS calls=20/20 queries=1280/1280' in text
     assert 'G7 CHECK arm=paced TopK_score_vs_strong_serial=PASS calls=10/10 queries=640/640' in text
     assert 'eligible_Q=20/640 split_Q=20/640 split_rows=10/160' in text
-    assert 'FIVE_GROUP_EQUAL_WEIGHT paced_vs_dualcut graph_saved_mean_us=+6.000' in text
+    assert 'FIVE_GROUP_EQUAL_WEIGHT paced_vs_dualcut span_saved_mean_us=+6.000' in text
     (out/'g7/reference.txt').write_text('unavailable')
     report.report(out, 7, tmp_path/'owner')
     report.summary(out)
@@ -112,7 +153,7 @@ def test_archive_compiler_drift_and_fresh_comparisons(tmp_path, monkeypatch, cap
     text = capsys.readouterr().out
     assert 'G7 dualcut_vs_mainline UNAVAILABLE' in text and 'G7 CHECK arm=mainline' not in text
     assert 'FIVE_GROUP_EQUAL_WEIGHT dualcut_vs_mainline UNAVAILABLE missing_groups=7' in text
-    assert 'FIVE_GROUP_EQUAL_WEIGHT paced_vs_dualcut graph_saved_mean_us=+6.000' in text
+    assert 'FIVE_GROUP_EQUAL_WEIGHT paced_vs_dualcut span_saved_mean_us=+6.000' in text
     def moved(root, group, arm, owner, oracle, host):
         values = list(collect(root, group, arm, owner, oracle, host))
         if arm == 'paced':

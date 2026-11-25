@@ -16,17 +16,24 @@ def test_reverse_order_and_stage_isolation(tmp_path):
             path.mkdir(parents=True)
             (path / 'order.txt').write_text('dualcut paced' if block == 1 else 'paced dualcut')
             timings = {
-                'mainline': {'graph': [300, 299], 'LI': [240, 240], 'tail': [55, 54]},
-                'dualcut': {'graph': [290, 290], 'LI': [226, 226], 'tail': [58, 58]},
-                'paced': {'graph': [290 - block, 288], 'LI': [226, 226], 'tail': [58 - block, 56]},
+                'mainline': {'span': [300, 299], 'LI': [240, 240], 'tail': [55, 54], 'kernel_gaps': [5, 5]},
+                'dualcut': {'span': [290, 290], 'LI': [226, 226], 'tail': [58, 58], 'kernel_gaps': [6, 6]},
+                'paced': {'span': [290 - block, 288], 'LI': [226, 226], 'tail': [58 - block, 56], 'kernel_gaps': [6, 6]},
             }
+            for arm, row in timings.items():
+                edge = 2 if arm == 'mainline' else 14
+                row.update(between_calls_per_call_us=1, event_edge_residual_per_call_us=edge,
+                           event_mean_us=row['span'][0] + 1 + edge, window10_per_call_us=row['span'][0] + 0.9)
             (path / 'feature_steps.json').write_text(json.dumps(dict(
                 group=group, reference='/same-machine/archive', timing=timings, measured={'paced': {'split_q': group}},
                 calls_per_graph={'mainline': 20, 'dualcut': 10, 'paced': 10},
                 device_text={'main_tail_equals_dualcut': True, 'dualcut_li_equals_paced': True})))
     summarize(tmp_path)
     result = json.loads((tmp_path / 'feature_comparison.json').read_text())
-    assert result['equal_weight']['A_vs_main'] == {'graph': [10, 10], 'LI': [14, 14], 'tail': [-3, -3]}
+    assert result['equal_weight']['A_vs_main'] == {
+        'span': [10, 10], 'LI': [14, 14], 'tail': [-3, -3], 'kernel_gaps': [-1, -1],
+        'event_mean_us': [-2, -2], 'between_calls_per_call_us': [0, 0],
+        'event_edge_residual_per_call_us': [-12, -12], 'window10_per_call_us': [10, 10]}
     assert result['groups']['7']['B_vs_A']['tail'] == [1, 2]
     assert result['groups']['7']['paced_split_Q_per_640'] == [7, 7]
 

@@ -14,6 +14,7 @@ upstream=d6cfd392f722dd3f96ef6e05175f503aac511dbb
 name=unified_main
 prefix=unified-main-five
 auto_feature_reference=0
+feature_prior=
 if [[ $main != "$upstream" ]]; then
     git -C "$repo" merge-base --is-ancestor 54acdb9c54853441d08898a2623407f4492a83a4 "$main" || {
         echo "Expected a native build containing the window-rank and paced-GET PR" >&2
@@ -41,7 +42,8 @@ if [[ $mode == pr30-feature-steps ]]; then
         echo "Expected the NPU4 main archive and the matching main -> dualcut -> paced experiment commits" >&2
         exit 2
     fi
-    prefix=pr30-feature-steps-ten
+    prefix=pr30-feature-fast
+    if [[ -n ${PEER_FEATURE_PRIOR:-} ]]; then feature_prior=$(cd "$PEER_FEATURE_PRIOR" && pwd -P); fi
 elif [[ $mode == cap-pair ]]; then
     if [[ $main != cfe2b52f6403d5edd612c314bc7110525a5f5789 ]]; then
         echo "The capacity comparison requires the candidate with 512K support" >&2
@@ -119,6 +121,22 @@ fi
 if [[ $mode == pr30-parity ]]; then pr30_src=$(checkout "$pr30"); fi
 entry="$reader_src/tests/operators/lifetch"
 support="$entry/support"
+if [[ -n $feature_prior ]]; then
+    active_rc=0
+    python3 -B "$support/pr30_reuse_block.py" --active "$feature_prior" || active_rc=$?
+    if (( active_rc == 0 )); then
+        echo "PREVIOUS_REPLAY_ACTIVE=$feature_prior Stop the earlier run in its original terminal before resuming." >&2
+        exit 1
+    elif (( active_rc != 3 )); then
+        exit "$active_rc"
+    fi
+    printf '%s\n' "$feature_prior" > "$out/prior_result_root.txt"
+fi
+if [[ $mode == pr30-feature-steps ]]; then
+    # Also serialize two invocations of this launcher on the same machine and card.
+    exec 9>"$sources/pr30-test-$(</proc/sys/kernel/random/boot_id)-npu4.lock"
+    flock -n 9 || { echo "A feature replay is already using physical NPU4" >&2; exit 1; }
+fi
 printf '%s\n' "$main" >"$out/main.txt"
 printf '%s\n' "$reader" >"$out/reader.txt"
 printf '%s\n' "$sdk" >"$out/kvaf.txt"
@@ -229,6 +247,7 @@ elif [[ $mode == pr30-feature-steps ]]; then
         done
     done
     echo "CONFIG baseline=$archive measured=dualcut,paced blocks=2 reverse_order=1 groups=10,4,17,7,2 physical_NPU=4 BS16_Q4 warmup=4 calls_per_arm_per_block=10 archived_main_calls=20"
+    if [[ -n $feature_prior ]]; then echo "REUSE_COMPLETE_PAIRS_FROM=$feature_prior"; fi
 elif [[ $mode == active-history ]]; then
     echo "CONFIG measured=active_512k archive=$archive native=$main sdk=$sdk NPU=4 BS=16 Q=4 warmup=4 calls=20"
 elif [[ $mode == cap-pair ]]; then
@@ -465,6 +484,15 @@ PY_OWNER
             mkdir -p "$out/g$g"
             printf '%s\n' "${group_reference:-unavailable}" >"$out/g$g/reference.txt"
             printf '%s\n' "${order[*]}" >"$out/g$g/order.txt"
+            if [[ -n $feature_prior ]]; then
+                reuse_rc=0
+                "$PYTHON" -B "$support/pr30_reuse_block.py" "$feature_prior" "$out" "$g" "$owner" || reuse_rc=$?
+                case $reuse_rc in
+                    0) continue;;
+                    3) ;;
+                    *) exit "$reuse_rc";;
+                esac
+            fi
             echo "BLOCK_BEGIN G$g block=$block order=${order[*]}"
             for label in "${order[@]}"; do
                 (
@@ -473,7 +501,10 @@ PY_OWNER
                         paced) main=$paced; main_src=$paced_src;;
                     esac
                     export PYTHONPATH="$main_src/python:$PYTHONPATH"
+                    started=$SECONDS
                     run_arm "$g" "$label" "$trace" "$owner" "$placement"
+                    echo "ARM_COMPLETE G$g $label block=$block wall_s=$((SECONDS-started))"
+                    grep '^FEATURE_VALIDATION ' "$out/g$g/$label/worker.log" || true
                 )
                 if [[ -z $placement ]]; then placement="$out/g$g/$label/thp.json"; fi
             done

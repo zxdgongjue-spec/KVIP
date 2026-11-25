@@ -66,8 +66,8 @@ def _queue_receipts(terminal, rotating):
     return posts[:, :, 0], posts[:, :, 1:3], words[views]
 
 
-def audit_queues(terminal, rotating):
-    return check_receipts(*_queue_receipts(terminal, rotating))
+def audit_queues(terminal, rotating, *, policy="paced"):
+    return check_receipts(*_queue_receipts(terminal, rotating), policy=policy)
 
 
 def ablation_receipt(state, policy, *, diagnostic):

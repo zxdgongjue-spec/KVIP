@@ -2,6 +2,7 @@
 """Compare the two incremental PR30 features on matched BS16/Q4 production replays."""
 import argparse
 import hashlib
+from math import isclose
 from pathlib import Path
 from statistics import mean
 
@@ -11,7 +12,7 @@ from cap_pair_report import SDK, SDK_TREE, oracle_for
 from check_isolated_device import extract
 from main_five_report import case_folder, measured_parallel, read
 from peer_delta import pair_placement
-from pr30_archive_compare import marker
+from pr30_archive_compare import decomposition, marker
 from pr30_terminal_phases import terminal_detail
 from reporting import atomic_json
 from terminal_batch_checks import diagnostic_pressure
@@ -26,7 +27,9 @@ REVISIONS = {
     'paced': 'b261b4885edd79dabac822a2e6e3790c7f226ad6',
 }
 PAIRS = (('mainline', 'dualcut'), ('dualcut', 'paced'))
-METRICS = ('graph', 'LI', 'tail')
+METRICS = ('span', 'LI', 'tail', 'kernel_gaps')
+PER_CALL_MEANS = ('window10_per_call_us', 'event_mean_us', 'between_calls_per_call_us',
+                  'event_edge_residual_per_call_us')
 TERMINAL = 'parallel_terminal_kernel/1'
 LI_TEXT = ('v9_kernel/0', 'v9_kernel/1')
 
@@ -139,13 +142,52 @@ def diagnostic(folder, policy, expected_calls, receipts=None):
     )
 
 
+def feature_times(profile, checked):
+    """Reconstruct timing from the measured four-kernel invocations, in microseconds."""
+    samples = profile['samples']
+    calls = len(samples)
+    if calls not in (10, 20) or calls != profile['graph_calls']:
+        raise ValueError('Expected one graph containing 10 or 20 complete calls')
+    event = profile['graph_accounting']['event_us']
+    event_mean = event / calls
+    if not isclose(event_mean, checked['graph'][0], abs_tol=.025):
+        raise ValueError('Event duration disagrees with the validated graph timing')
+    parts = decomposition(profile, {'event_mean_us': event_mean}, checked)
+    starts, finishes = [], []
+    for sample in samples:
+        accounting = sample['accounting']
+        intervals = accounting['intervals_us']
+        start = min(a for a, _ in intervals['li'])
+        finish = intervals['topk_resolve_update'][0][1]
+        if finishes and start < finishes[-1]:
+            raise ValueError('Adjacent measured invocations overlap or are out of order')
+        stages = accounting['stages_us']
+        if not isclose(finish - start, stages['li'] + stages['topk_resolve_update']
+                       + accounting['inter_kernel_gap_us'], abs_tol=.025):
+            raise ValueError('Per-call span differs from LI, tail and gaps')
+        starts.append(start)
+        finishes.append(finish)
+    between = sum(start - finish for start, finish in zip(starts[1:], finishes))
+    window = 10
+    averages = [(finishes[i + window - 1] - starts[i]) / window for i in range(0, calls, window)]
+    # Only the device event is available at the graph boundaries. Its offset
+    # from the profiler envelope cannot be assigned to individual calls.
+    edge_residual = event - (finishes[-1] - starts[0])
+    if not isclose(parts['event_outside_span_mean'], (between + edge_residual) / calls, abs_tol=.025):
+        raise ValueError('Between-call gaps and event residual do not reconcile')
+    return dict(span=parts['kernel_span'], LI=checked['LI1_to_LI3'], tail=checked['final_topk_through_tail'],
+                kernel_gaps=parts['inter_kernel_gap'], window10_per_call_us=mean(averages),
+                event_mean_us=event_mean, between_calls_per_call_us=between / calls,
+                event_edge_residual_per_call_us=edge_residual / calls, event_total_us=event)
+
+
 def collect_arm(root, group, arm, owner, oracle, host):
     folder = case_folder(root, group, arm)
     archived = arm == 'mainline'
     calls = CALLS_PER_GRAPH[arm]
     times, exact, thp, proof, cfg = measured_parallel(
         root, group, arm, REVISIONS[arm], owner, *oracle, verify_library=not archived, expected_calls=calls)
-    timing = dict(zip(METRICS, (times[k] for k in ('graph', 'LI1_to_LI3', 'final_topk_through_tail'))))
+    timing = feature_times(read(folder/'diagnose/round-1/full_attribution.json'), times)
     if proof['runtime']['host'] != host or proof['runtime']['visible'] != '4':
         raise ValueError(f'G{group} {arm}: wrong measured host or device')
     if archived:
@@ -176,12 +218,17 @@ def collect_arm(root, group, arm, owner, oracle, host):
 
 
 def saved(old, new):
-    return {k: [a - b for a, b in zip(old[k], new[k])] for k in METRICS}
+    return {**{k: [a - b for a, b in zip(old[k], new[k])] for k in METRICS},
+            **{k: old[k] - new[k] for k in PER_CALL_MEANS}}
 
 
 def format_times(times, signed=False):
     spec = '+.2f' if signed else '.2f'
-    return ' '.join(f'{k}_mean/P50_us={format(times[k][0], spec)}/{format(times[k][1], spec)}' for k in METRICS)
+    fields = [f'{k}_mean/P50_us={format(times[k][0], spec)}/{format(times[k][1], spec)}' for k in METRICS]
+    fields.extend(f'{k}={format(times[k], spec)}' for k in PER_CALL_MEANS)
+    if 'event_total_us' in times:
+        fields.append(f'event_total_us={times["event_total_us"]:.2f}')
+    return ' '.join(fields)
 
 
 def report(root, group, owner):
@@ -252,9 +299,10 @@ def summary(root):
                 or row['native'] != REVISIONS or row['reference'] != (str(archive) if archive else None)
                 or row['runtime'] != rows[0]['runtime']):
             raise ValueError('Mixed groups, baseline archives, revisions or runtimes')
-    print('TIMING graph_mean=graph_event_divided_by_calls mainline_archive_graph_calls=20 candidate_graph_calls=10 '
-          'graph_P50=median_first_LI_to_tail_end_span '
-          'LI=three_LI_kernels tail=final_TopK_through_last_CQ_and_retire')
+    print('TIMING span=first_LI_start_to_last_tail_end span_mean=LI_mean+tail_mean+kernel_gaps_mean '
+          'event_mean=span_mean+between_calls_per_call+event_edge_residual_per_call '
+          'window10=first_LI_to_tenth_tail_divided_by_10 '
+          'P50=median_of_individual_samples mainline_archive_graph_calls=20 candidate_graph_calls=10')
     print('DIAGNOSTIC_SEPARATE_REPLAY first_post_peak=first_doorbell_tokens_in_busiest_4us '
           'peak_pending=overlapping_submit_to_software_CQ_observation_intervals '
           'hardware_conflict_counter=unavailable')
@@ -264,8 +312,9 @@ def summary(root):
             print(f'FIVE_GROUP_EQUAL_WEIGHT {arm}_vs_{prior} UNAVAILABLE missing_groups={",".join(missing)}')
             continue
         diffs = [saved(r['timing'][prior], r['timing'][arm]) for r in rows]
-        stages = ' '.join(f'{k}_saved_mean_us={mean(d[k][0] for d in diffs):+.3f}' for k in METRICS)
-        print(f'FIVE_GROUP_EQUAL_WEIGHT {arm}_vs_{prior} {stages}')
+        stages = [f'{k}_saved_mean_us={mean(d[k][0] for d in diffs):+.3f}' for k in METRICS]
+        stages.extend(f'{k}_saved={mean(d[k] for d in diffs):+.3f}' for k in PER_CALL_MEANS)
+        print(f'FIVE_GROUP_EQUAL_WEIGHT {arm}_vs_{prior}', *stages)
 
 
 if __name__ == '__main__':
