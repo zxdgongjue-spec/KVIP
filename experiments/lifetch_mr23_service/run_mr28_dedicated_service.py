@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Compare native P2 with dedicated Cold Service or W1 prescore at BS16."""
+"""Compare native P2 with dedicated Cold Service or W1 prescore."""
 
 import argparse
 import csv
@@ -14,39 +14,67 @@ from run_mr25_handoff import KVAF, MAIN, ROOT, bench_arguments, collect, git, sa
 from run_mr25_score import PAIRED_KEYS, compare_reads, completed_reads
 from run_mr28_unified_score import prefetch_lead
 from terminal_handoff import P2_W1_KERNELS
+from kvip.operators.lifetch.geometry import li_geometry
 
 
-BATCH = 16
+BATCHES = (1, 2, 4, 8, 16)
 MODES = ('p2', 'dedicated')
 P2_W1_MODES = ('p2', 'p2_w1')
-COLD_ROLES = {
-    'p2': dict(cold_mixed_groups=32, cold_score_aic=32, cold_score_aiv=64,
-               cold_service_aiv=16, dedicated_service=False),
-    'dedicated': dict(cold_mixed_groups=32, cold_score_aic=24, cold_score_aiv=48,
-                      cold_service_aiv=16, dedicated_service=True),
-    'p2_w1': dict(cold_mixed_groups=32, cold_score_aic=32, cold_score_aiv=64,
-                  cold_service_aiv=16, dedicated_service=False),
-}
+WINDOWS = 4
 MATCH_FIELDS = (*PAIRED_KEYS, 'available_aiv', 'cold_mixed_groups', 'cold_service_aiv')
 
 
-def summarize(output, completed, trace_prefetch, modes=MODES, *, p2_w1=False):
-    rows = [collect(output, mode, BATCH) for mode in modes]
+def build_case(kvaf, batch, modes, args):
+    arguments = bench_arguments(kvaf, (batch,))
+    for option, value in (
+        ('--kvaf-server', os.environ.get('KVIP_KVAF_SERVER', '127.0.0.1:28986')),
+        ('--warmup', args.warmup), ('--iterations', args.iterations), ('--timeout-seconds', args.timeout_seconds),
+    ):
+        arguments[arguments.index(option) + 1] = str(value)
+    if args.prefetch_trace:
+        arguments[0] = 'diagnose'
+        arguments.extend(('--level', '2'))
+    geometry = li_geometry(batch, intermediate_fetches=WINDOWS, aic_count=32)
+    mixed_groups = geometry['rotating_aic']
+    roles = {}
+    for mode in modes:
+        dedicated = mode == 'dedicated'
+        score_groups = 24 if dedicated else mixed_groups
+        roles[mode] = dict(cold_mixed_groups=mixed_groups, cold_score_aic=score_groups,
+                           cold_score_aiv=2 * score_groups, dedicated_service=dedicated,
+                           cold_service_aiv=geometry['service_aivs_per_window'])
+    return dict(status='NOT_RUN', arguments=arguments, windows=geometry['intermediate_fetches'], cold_roles=roles,
+                early_w1_mixed_groups=min(4, mixed_groups // 2) if 'p2_w1' in modes else 0,
+                worker_exit_codes={})
+
+
+def write_summary(output, rows):
+    save(output / 'summary.json', rows)
+    columns = list(dict.fromkeys(key for row in rows for key in row))
+    with (output / 'summary.csv').open('w', newline='') as stream:
+        writer = csv.DictWriter(stream, columns)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f'Summary: {output / "summary.csv"}', flush=True)
+
+
+def summarize(output, batch, case, trace_prefetch, modes, *, p2_w1=False):
+    rows = [collect(output, mode, batch) for mode in modes]
+    completed = case['worker_exit_codes']
     counts = {}
     for row in rows:
         mode = row['variant']
         row['route_verified'] = (
             completed.get(mode) == 0 and row['accepted']
             and row.get('effective_aic') == 32 and row.get('available_aiv', 0) >= 64
-            and row.get('windows') == 4 and row.get('local_counts') is False
-            and all(row.get(key) == value for key, value in COLD_ROLES[mode].items())
-            and (not p2_w1 or (row.get('w1_prescore') is (mode == 'p2_w1')
-                              and row.get('prefetch_observed')))
+            and row.get('windows') == case['windows'] and row.get('local_counts') is False
+            and all(row.get(key) == value for key, value in case['cold_roles'][mode].items())
+            and (not p2_w1 or row.get('w1_prescore') is (mode == 'p2_w1'))
         )
         if row['route_verified']:
-            counts[mode] = completed_reads(output, mode, BATCH)
+            counts[mode] = completed_reads(output, mode, batch)
             if trace_prefetch:
-                row['prefetch_lead_to_terminal_us'] = prefetch_lead(output, mode, BATCH)
+                row['prefetch_lead_to_terminal_us'] = prefetch_lead(output, mode, batch)
         row.update(get_comparison='unavailable', paired=False, timing_eligible=False,
                    observed_kv_ready_ratio=None, get_vector_differences=None)
 
@@ -86,24 +114,19 @@ def summarize(output, completed, trace_prefetch, modes=MODES, *, p2_w1=False):
     elif mismatches:
         print(f'Pair rejected: different build or fixture fields ({", ".join(mismatches)})', flush=True)
 
-    save(output / 'summary.json', rows)
-    columns = list(dict.fromkeys(key for row in rows for key in row))
-    with (output / 'summary.csv').open('w', newline='') as stream:
-        writer = csv.DictWriter(stream, columns)
-        writer.writeheader()
-        writer.writerows(rows)
     if counts:
         with (output / 'requests.csv').open('w', newline='') as stream:
             writer = csv.writer(stream)
             writer.writerow(('variant', 'source_round', 'invocation', 'request', 'prefetch',
-                             'final_get', 'total_get', *(f'prefetch_w{i}' for i in range(4)),
+                             'final_get', 'total_get', *(f'prefetch_w{i}' for i in range(WINDOWS)),
                              *(f'final_get_q{i}' for i in range(4))))
             for mode, records in counts.items():
                 for identity, (early, final) in sorted(records.items()):
+                    unused_windows = (None,) * (WINDOWS - len(early))
                     writer.writerow((mode, *identity, sum(early), sum(final), sum(early) + sum(final),
-                                     *early, *final))
-    print(f'Summary: {output / "summary.csv"}', flush=True)
-    return comparable if len(rows) == 2 else len(counts) == 1
+                                     *early, *unused_windows, *final))
+    write_summary(output, rows)
+    return (comparable if len(rows) == 2 else len(counts) == 1), rows
 
 
 def main():
@@ -114,6 +137,8 @@ def main():
     parser.add_argument('--timeout-seconds', type=int, default=1800)
     parser.add_argument('--p2-w1', action='store_true',
                         help='compare native P2 with early W1 Score and rotating Service')
+    parser.add_argument('--batch', action='append', type=int, choices=BATCHES,
+                        help='repeat to compare multiple batch sizes with one build; default: 16')
     parser.add_argument('--route', choices=('both', *MODES, 'p2_w1'), default='both',
                         help='run a single checked route for diagnosis or both routes for comparison')
     parser.add_argument('--staged-eager', action='store_true',
@@ -130,27 +155,23 @@ def main():
         parser.error(f'--route expects both or one of {", ".join(trial_modes)} for this comparison')
     if args.legacy_credit_tail and args.route != 'dedicated':
         parser.error('--legacy-credit-tail requires --route dedicated for the diagnostic control')
+    batches = args.batch or (16,)
+    if len(set(batches)) != len(batches):
+        parser.error('Each batch can appear only once')
+    if not args.p2_w1 and any(batch != 16 for batch in batches):
+        parser.error('Dedicated Service supports only --batch 16')
 
     a5_root = Path(os.environ.get('KVIP_A5_ROOT', '/home/w00568585/li-aligned-a5'))
     kvaf = Path(os.environ.get('KVIP_KVAF_ROOT', a5_root / 'KVAF-unified-813f1750')).resolve()
-    arguments = bench_arguments(kvaf, (BATCH,))
-    for option, value in (
-        ('--kvaf-server', os.environ.get('KVIP_KVAF_SERVER', '127.0.0.1:28986')),
-        ('--warmup', args.warmup), ('--iterations', args.iterations), ('--timeout-seconds', args.timeout_seconds),
-    ):
-        arguments[arguments.index(option) + 1] = str(value)
-    if args.prefetch_trace:
-        arguments[0] = 'diagnose'
-        arguments.extend(('--level', '2'))
     modes = trial_modes if args.route == 'both' else (args.route,)
-    completed = {}
+    cases = {batch: build_case(kvaf, batch, modes, args) for batch in batches}
     manifest = dict(status='NOT_RUN', commit=git(ROOT, 'rev-parse', 'HEAD'), main_base=MAIN,
                     worktree_dirty=bool(git(ROOT, 'status', '--porcelain', '--untracked-files=no')),
-                    expected_kvaf=KVAF, arguments=arguments, variants=modes,
-                    cold_roles={mode: COLD_ROLES[mode] for mode in modes},
+                    expected_kvaf=KVAF, variants=modes, cases=cases,
                     local_counts=False, prefetch_trace=args.prefetch_trace, staged_eager=args.staged_eager,
-                    dedicated_drain_aiv1=not args.legacy_credit_tail,
-                    worker_exit_codes=completed)
+                    dedicated_drain_aiv1=not args.legacy_credit_tail)
+    if len(cases) == 1:
+        manifest.update(cases[batches[0]])
     if args.p2_w1:
         manifest['expected_graph_kernels'] = {mode: P2_W1_KERNELS[mode] for mode in modes}
     if args.dry_run:
@@ -171,20 +192,37 @@ def main():
     try:
         manifest['status'] = 'RUNNING'
         save(output / 'manifest.json', manifest)
-        for mode in modes:
-            config = configuration(arguments)
-            config.mr25_handoff = mode
-            config.mr28_dedicated_service = mode
-            config.mr28_p2_w1_experiment = args.p2_w1
-            config.mr28_staged_eager = args.staged_eager
-            config.mr28_dedicated_drain_aiv1 = not args.legacy_credit_tail
-            config.handoff_build_dir = output / 'build'
-            print(f'Running BS16 {mode}, local_counts OFF', flush=True)
-            completed[mode] = launch(config, output / mode)
+        passed = True
+        rows = []
+        for batch, case in cases.items():
+            case_output = output if len(cases) == 1 else output / f'bs{batch}'
+            case_output.mkdir(exist_ok=True)
+            case['status'] = 'RUNNING'
             save(output / 'manifest.json', manifest)
-            if completed[mode]:
+            completed = case['worker_exit_codes']
+            for mode in modes:
+                config = configuration(case['arguments'])
+                config.mr25_handoff = mode
+                config.mr28_dedicated_service = mode
+                config.mr28_p2_w1_experiment = args.p2_w1
+                config.mr28_staged_eager = args.staged_eager
+                config.mr28_dedicated_drain_aiv1 = not args.legacy_credit_tail
+                config.handoff_build_dir = output / 'build'
+                print(f'Running BS{batch} {mode}, local_counts OFF', flush=True)
+                completed[mode] = launch(config, case_output / mode)
+                save(output / 'manifest.json', manifest)
+                if completed[mode]:
+                    break
+            case_passed, case_rows = summarize(
+                case_output, batch, case, args.prefetch_trace, modes, p2_w1=args.p2_w1)
+            case['status'] = 'PASS' if case_passed else 'FAILED'
+            passed = passed and case_passed
+            rows.extend(case_rows)
+            save(output / 'manifest.json', manifest)
+            if any(completed.values()):
                 break
-        passed = summarize(output, completed, args.prefetch_trace, modes, p2_w1=args.p2_w1)
+        if len(cases) > 1:
+            write_summary(output, rows)
         manifest['status'] = 'PASS' if passed else 'FAILED'
         return int(not passed)
     except BaseException:

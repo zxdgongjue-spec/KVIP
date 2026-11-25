@@ -120,9 +120,9 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, uint32_t job 
 
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
 __aicore__ inline bool UseEarlyW1(GM_ADDR bindings, uint32_t group) {
-    if (!kvip_p2_w1::EarlyGroup(group)) return false;
     const auto args = reinterpret_cast<__gm__ const uint64_t*>(bindings);
     const auto ctx = reinterpret_cast<__gm__ const rotating::Context*>(args[14]);
+    if (!kvip_p2_w1::EarlyGroup(group, ctx->shape.liCores)) return false;
     const auto shape = rotating::LoadRuntimeShape(ctx);
     if (!kvip_p2_w1::Supports(shape)) return false;
     const uint32_t batch = group / 2;

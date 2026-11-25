@@ -457,13 +457,13 @@ timestamps and source-scope timestamps use separate clock domains.
 
 ## MR28 P2 and early W1 Score on A5
 
-The opt-in route keeps one BS16 batch, the original rotating P2 Service
-and the existing Parallel Terminal. While the other AIVs compute resident
-thresholds, four MIX groups score the first two tiles of each W1 half
-for B14 and B15. Their AIVs then compute their own resident thresholds.
-The original Cold producer AIVs read back and classify the eight scored
-tiles before continuing with the native suffix. The prefetch budget and
-window order are unchanged.
+The opt-in route keeps the original rotating P2 Service and Parallel
+Terminal. While the other AIVs compute resident thresholds, the last
+`min(4, liCores / 2)` MIX groups score the first two tiles of their W1
+halves. Their AIVs then compute their own resident thresholds. The
+original Cold producer AIVs read back and classify the scored tiles
+before continuing with the native suffix. BS16 still uses MIX 28–31
+for B14 and B15.
 
 Fetch the MR on the **host** and use the existing shared checkout.
 Prepare KVAF sources here only if the pinned checkout is missing.
@@ -486,16 +486,25 @@ The paired runner builds the candidate bridge with the experiment enabled.
 runner=experiments/lifetch_mr23_service/run_mr28_p2_w1.sh
 export KVIP_A5_DEVICE=0
 # bash "$runner" --build-deps
-bash "$runner" --route p2_w1 --staged-eager --warmup 0 --iterations 1
-bash "$runner" --route both --warmup 2 --iterations 10
+batches=(--batch 1 --batch 2 --batch 4 --batch 8 --batch 16)
+bash "$runner" "${batches[@]}" --route p2_w1 --staged-eager --warmup 0 --iterations 1
+bash "$runner" "${batches[@]}" --route both --warmup 2 --iterations 10
 ```
 
-The comparison uses Q4, history 128K, resident 16K, W4, miss 10%, seed 43,
-and prefetch budget 512 on BS16. Each measured replay verifies KV and
-Index and checks the actual device kernels. Read `summary.csv` for
-Hot, Threshold, Cold+Service, Terminal and KV-ready latency. Read
-`requests.csv` for prefetch by window and final Get by query. The runner
-also reports whether request-level counts match between routes. A separate
+Omitting `--batch` runs BS16. The comparison uses Q4, history 128K,
+resident 16K, miss 10%, seed 43, and a prefetch budget of 512 per request.
+Both arms request four windows and retain the 128-token per-window
+budget. Native P2 uses two effective windows on BS1 and four at all
+other supported batch sizes.
+
+Each measured replay verifies KV and Index and checks the actual device
+kernels. Read `summary.csv` for Hot, Threshold, Cold+Service, Terminal
+and KV-ready latency. A sweep compiles the bridge once, writes a combined
+`summary.csv`, and keeps the per-route logs and `requests.csv` in each
+`bs<N>` directory. The BS1 request file leaves W2 and W3 blank. Each
+request records prefetch by window and final Get by query. The runner
+reports whether request-level counts match between routes. A worker error
+stops the sweep and preserves completed cases. A separate
 `--prefetch-trace` run collects prefetch diagnostics.
 When total Get counts differ, the ratio is labeled as a raw observation
 and the CSV sets `timing_eligible` to false.
