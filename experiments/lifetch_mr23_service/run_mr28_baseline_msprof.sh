@@ -6,6 +6,10 @@ case ${1:-} in
     --prepare-deps|--build-deps)
         exec bash "$here/run_mr28_unified_score.sh" "$@"
         ;;
+    --redraw-latest)
+        shift
+        exec "${KVIP_PYTHON:-python3}" -B "$here/redraw_mr28_capture.py" "$@"
+        ;;
 esac
 for arg in "$@"; do
     if [[ $arg == --dry-run || $arg == --help || $arg == -h ]]; then

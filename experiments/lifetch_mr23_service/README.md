@@ -198,6 +198,19 @@ Both offline decoders accept `--handoff-report` for sharing only the
 handoff evidence. The native decoder can produce this report without
 writing a second copy of the full msprof JSON.
 
+To redraw an existing capture from the container checkout:
+
+```bash
+bash experiments/lifetch_mr23_service/run_mr28_baseline_msprof.sh --redraw-latest
+```
+
+The script selects the latest complete marked capture from the shared
+results root and prints the new `handoff-redraw.*` directory. It replays
+each arm of a completed comparison, and `--route p2` can select a specific
+route. The source activity and compact device activity timelines are
+written alongside the two small handoff reports. This operation uses
+saved artifacts and runs without starting a worker, KVAF or a new capture.
+
 ### Per-core MTE and VF stages
 
 In `lifetch_business_trace.json`, expand the individual AIC and AIV lanes and
