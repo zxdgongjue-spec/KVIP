@@ -62,24 +62,11 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(32) inline void AssignTerminalSuccessor(
 }
 
 __simt_vf__ __aicore__ LAUNCH_BOUND(32) inline void RetireTerminalTeam(
-    __gm__ TerminalRowSchedule* schedule, __gm__ pipeline_ab::Args* a, __gm__ rotating::Context* ctx) {
-    uint32_t retired = 0;
-    if (!threadIdx.x) retired = asc_atomic_add(&schedule->finishedTeams, 1U);
-    if (asc_shfl(retired, 0) != 15) return;
-    // The last team reaches here after all rows' four CQ and Index owners
-    // have retired. Each saved event is copied and cleared exactly once.
-    if (a->completedEvents) {
-        const uint32_t words = ctx->shape.rounds * ctx->shape.serviceLanes * (sizeof(rotating::Event)/4);
-        auto live = reinterpret_cast<__gm__ uint32_t*>(ctx->events);
-        auto saved = reinterpret_cast<__gm__ uint32_t*>(a->completedEvents);
-        for (uint32_t i = threadIdx.x; i < words; i += 32) {
-            asc_stcg(saved + i, asc_ldcg(live + i));
-            asc_stcg(live + i, 0U);
-        }
+    __gm__ TerminalRowSchedule* schedule) {
+    if (!threadIdx.x && asc_atomic_add(&schedule->finishedTeams, 1U) == 15) {
+        asc_stcg(&schedule->ready, 0U);
+        asc_threadfence();
     }
-    asc_threadfence();
-    asc_syncthreads();
-    if (!threadIdx.x) { asc_stcg(&schedule->ready, 0U); asc_threadfence(); }
 }
 
 __aicore__ inline uint32_t LoadScheduleWord(__gm__ uint32_t* word) {
@@ -108,7 +95,7 @@ __aicore__ inline void RunTerminalTeams(GM_ADDR binding, uint32_t team, uint32_t
         row = next - 1;
     }
     if (!q) {
-        Simt::VF_CALL<RetireTerminalTeam>(Simt::Dim3{32,1,1}, schedule, a, ctx);
+        Simt::VF_CALL<RetireTerminalTeam>(Simt::Dim3{32,1,1}, schedule);
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
     }
 }

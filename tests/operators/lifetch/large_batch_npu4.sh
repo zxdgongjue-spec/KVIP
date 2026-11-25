@@ -5,12 +5,16 @@ set -eo pipefail
 root=$(cd "$(dirname "$0")/../../.." && pwd)
 work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold}
 reuse_serial=
+archive=
 if (( $# )); then
-    if [[ $# != 2 || $1 != --reuse-g10-bs20-serial ]]; then
-        echo "Usage: $0 [--reuse-g10-bs20-serial RESULT_ROOT]" >&2
+    if [[ $# == 2 && $1 == --candidate-only ]]; then
+        archive=$(cd "$2" && pwd)
+    elif [[ $# == 2 && $1 == --reuse-g10-bs20-serial ]]; then
+        reuse_serial=$2
+    else
+        echo "Usage: $0 [--candidate-only RESULT_ROOT | --reuse-g10-bs20-serial RESULT_ROOT]" >&2
         exit 2
     fi
-    reuse_serial=$2
 fi
 area="$work/peer-baseline"
 sources="$work/fused-scan-sources"
@@ -95,7 +99,10 @@ printf '%s\n' "$(git -C "$root" rev-parse HEAD)" > "$out/native.txt"
 if [[ -r /etc/machine-id ]]; then cat /etc/machine-id > "$out/machine_id.txt"; fi
 printf '4\n' > "$out/physical_npu.txt"
 # Use the same registered CPU memory placement for the serial and fused arms.
-placement=$("$PYTHON" -B "$workers/large_batch_placement.py" find "$out")
+placement="auto auto"
+if [[ -z $archive ]]; then
+    placement=$("$PYTHON" -B "$workers/large_batch_placement.py" find "$out")
+fi
 read -r planned_node planned_adapter <<<"$placement"
 set_cpu_placement() {
     local node=$1 adapter=$2 ub_device cpus node_dir
@@ -157,7 +164,13 @@ run_arm() (
     monitor=$!
     args=(--trace "$trace" --group "$group" --batch "$batch" --arm "$arm" --kvaf-root "$sdk"
           --kvaf-server "127.0.0.1:$port" --output "$dir")
-    if [[ $arm == fused ]]; then args+=(--serial-result "$pair/serial"); fi
+    if [[ $arm == fused ]]; then
+        if [[ -n $archive ]]; then
+            args+=(--serial-result "$archive/g$group/bs$batch/serial" --compare-archived-pair)
+        else
+            args+=(--serial-result "$pair/serial")
+        fi
+    fi
     (cd "$dir" && timeout --kill-after=30s 7200s "$PYTHON" -B "$workers/large_batch_pair.py" "${args[@]}") >"$dir/worker.log" 2>&1 || { tail -20 "$dir/worker.log"; exit 1; }
     wait "$monitor"
     monitor=
@@ -168,6 +181,17 @@ for group in 10 4 17 7 2; do
         pair="$out/g$group/bs$batch"
         mkdir -p "$pair"
         echo "CASE_BEGIN G$group BS$batch" >&3
+        if [[ -n $archive ]]; then
+            ref="$archive/g$group/bs$batch"
+            "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref/serial/thp.json" "$ref/fused/thp.json"
+            read -r node adapter < <("$PYTHON" -B "$workers/large_batch_placement.py" get "$ref/fused/thp.json")
+            set_cpu_placement "$node" "$adapter" archived
+            run_arm "$group" "$batch" "$trace" fused "$pair"
+            "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref/fused/thp.json" "$pair/fused/thp.json"
+            grep -E '^(CHECK|TIMING|DIAGNOSTIC|SAVED) ' "$pair/fused/worker.log" | tee -a "$out/summary.txt" >&3
+            rm -f -- "$pair/fused/worker.log" "$pair/fused/cpu.log"
+            continue
+        fi
         if [[ -n $reuse_serial && $group == 10 && $batch == 20 ]]; then
             staged=$(mktemp -d "$pair/serial-import.XXXXXX")
             if "$PYTHON" -B "$workers/large_batch_pair.py" --arm serial --trace "$trace" --group 10 --batch 20 \
@@ -191,6 +215,29 @@ for group in 10 4 17 7 2; do
         done
     done
 done
+if [[ -n $archive ]]; then
+    "$PYTHON" -B - "$out" <<'PY' | tee -a "$out/summary.txt" >&3
+from pathlib import Path
+from statistics import mean
+import json
+import sys
+root = Path(sys.argv[1])
+gains, incremental_gains = [], []
+for group in (10, 4, 17, 7, 2):
+    cases = [json.loads((root / f"g{group}/bs{bs}/fused/ARM_RESULT.json").read_text())
+             for bs in (20, 24, 28, 32)]
+    row = [c["vs_strong_serial_graph_gain_pct"][0] for c in cases]
+    since_previous = [c["vs_previous_fused_graph_gain_pct"][0] for c in cases]
+    gains.extend(row)
+    incremental_gains.extend(since_previous)
+    print(f"GROUP G{group} mean_graph_gain_vs_serial_pct={mean(row):+.2f} "
+          f"mean_graph_gain_vs_previous_fused_pct={mean(since_previous):+.2f} "
+          f"cases_over_20pct_vs_serial={sum(x > 20 for x in row)}/4")
+print(f"ALL equal_weight_mean_graph_gain_vs_serial_pct={mean(gains):+.2f} "
+      f"mean_graph_gain_vs_previous_fused_pct={mean(incremental_gains):+.2f} "
+      f"cases_over_20pct_vs_serial={sum(x > 20 for x in gains)}/20")
+PY
+fi
 rm -rf -- "$host_tools"
 # The per-arm JSON and placement records contain the measurement. Setup and
 # import transcripts in this new output directory are only needed on failure.

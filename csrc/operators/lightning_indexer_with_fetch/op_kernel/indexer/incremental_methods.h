@@ -66,7 +66,8 @@ __aicore__ inline uint32_t WindowRank(__gm__ rotating::Context* ctx, uint32_t va
     covered = kvip_coverage::Covered(end0, end1, resident, valid, half, recent.begin, recent.end);
     return kvip_coverage::Rank(covered, initial, valid, ctx->prefetchRankStart ? uint32_t(ctx->prefetchRankStart) : 1024);
 }
-__aicore__ inline void ExportWindowCold(uint32_t query) {
+template<bool LargeFinal = false>
+__aicore__ inline void ExportWindowCold(uint32_t query, uint32_t cutoff = 0) {
     // Even a window with zero newly compacted scores exports the saved TopK.
     // Its output bank may still feed the preceding Q's asynchronous DMA.
     JoinColdOutput();
@@ -105,9 +106,15 @@ __aicore__ inline void ExportWindowCold(uint32_t query) {
     bitmapLength=valid?valid:runtimeShape_.history;
     rankCut=windowRankCut_;
 #endif
-    uint32_t count=kvip_prefetch_rank::SelectBitmap(indicesOutLocal_,scoreOutLocal_,compact,
-        topkSharedTmpLocal_[128],covered,bitmapLength,valid,rank,limit,rankTrace_?rankClocks:nullptr,minimum,
-        windowCoveredEmpty_,rankCut);
+    uint32_t count;
+    if (LargeFinal && cutoff && valid <= 131072) {
+        count = kvip_prefetch_rank::CollectPositiveFinalMisses(
+            indicesOutLocal_, compact, topkSharedTmpLocal_[128], covered, valid);
+    } else {
+        count = kvip_prefetch_rank::SelectBitmap(indicesOutLocal_, scoreOutLocal_, compact,
+            topkSharedTmpLocal_[128], covered, bitmapLength, valid, rank, limit,
+            rankTrace_ ? rankClocks : nullptr, minimum, windowCoveredEmpty_, rankCut);
+    }
     if(rankTrace_) {
         uint64_t delta[3]={rankClocks[1]-rankClocks[0],rankClocks[4]-rankClocks[1],1};
         for(uint32_t k=0;k<3;++k) {
@@ -243,6 +250,14 @@ __aicore__ inline void FlushIncremental(uint32_t count,uint32_t base,bool clearC
     DataCopy(mrgValueLocal_,scoreOutLocal_,2048);
     DataCopy(incrementalOld_,indicesOutLocal_,2048);
     PipeBarrier<PIPE_V>();
+#if KVIP_LARGE_BATCH_LI
+    if (count % 256) {
+        auto block = mrgValueLocal_[2048 + count / 256 * 256];
+        lifetch_incremental::PadFinalScoreBlock(
+            reinterpret_cast<__ubuf__ uint16_t*>(block.GetPhyAddr()), count % 256);
+        PipeBarrier<PIPE_V>();
+    }
+#endif
     topkOp_(mrgValueLocal_,indicesOutLocal_,scoreOutLocal_,2048+((count+255)/256)*256,0,1,true);
     PipeBarrier<PIPE_V>();
     // 32000-byte TopK scratch: 2048 old IDs plus at most 5952 added IDs.
@@ -259,7 +274,9 @@ __aicore__ inline void FlushIncremental(uint32_t count,uint32_t base,bool clearC
         reinterpret_cast<__ubuf__ uint16_t*>(incrementalNew_.GetPhyAddr()),base);
     }
     PipeBarrier<PIPE_V>();
+#if !KVIP_LARGE_BATCH_LI
     if(clearCandidates)Duplicate(mrgValueLocal_[2048],uint16_t(0),trunkLen_);
+#endif
 }
 // Skipped windows do not own state. Follow them to the last real service.
 __aicore__ inline bool PreviousServiceReady(uint32_t epoch,uint32_t lane) {
@@ -325,6 +342,7 @@ __aicore__ inline void PreloadIncremental(uint32_t half) {
     incrementalInputQuery_=query;incrementalInputBase_=base;incrementalInputCount_=n;
     incrementalInputPending_=true;
 }
+template<bool LargeFinal = false>
 __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t end1,uint32_t half) {
 #if KVIP_URMA_WINDOW_LI
     windowRank_=0; windowRankCut_=UINT32_MAX;
@@ -348,7 +366,8 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
             GlobalTensor<uint16_t> savedScores;
             savedScores.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(WindowTopkPrefix()+uint64_t(query/4)*prefixBytes)+(query%4)*2048);
             PipeBarrier<PIPE_ALL>();DataCopy(indicesOutLocal_,saved,2048);DataCopy(scoreOutLocal_,savedScores,2048);
-            SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);ExportWindowCold(query);
+            SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
+            ExportWindowCold<LargeFinal>(query, LargeFinal ? uint16_t(meta[2]) : 0U);
         }
         return;
     }
@@ -391,7 +410,9 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
     auto countLocal=maskLocal[rawCapacity/8].template ReinterpretCast<uint32_t>();
     uint32_t packed=0,packBase=0;
     const uint16_t cutoff=uint16_t(incrementalMetadataActive_?incrementalMetadata_.GetValue(mi+2):meta[2]);
+#if !KVIP_LARGE_BATCH_LI
     Duplicate(mrgValueLocal_[2048],uint16_t(0),trunkLen_);
+#endif
     for (uint32_t base=Min(prior[0],half?prior[1]:prior[0]);base<Max(end0,half?end1:end0);) {
         uint32_t shard=0,limit=end0;
         bool contiguous=!half || (prior[0]==prior[1] && end0==end1);
@@ -548,7 +569,7 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
         threshold=topkSharedTmpLocal_.template ReinterpretCast<uint16_t>().GetValue(0);
     }
     rankEnd0_=prior[0];rankEnd1_=prior[1];
-    if(exportWindowCold_)ExportWindowCold(query);
+    if(exportWindowCold_)ExportWindowCold<LargeFinal>(query,threshold);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
     if(incrementalPipeline_ && incrementalMetadataActive_) {
         if(incrementalOutputPending_) {
@@ -571,6 +592,16 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
     } else {
         meta[1]=uint64_t(prior[0])|(uint64_t(prior[1])<<32);meta[2]=threshold;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
+    }
+}
+__aicore__ inline void DrainWindowCopies() {
+    JoinColdOutput();
+    if(incrementalInputPending_) {
+        WaitFlag<HardEvent::MTE2_V>(EVENT_ID6);incrementalInputPending_=false;
+    }
+    incrementalHasNext_=false;
+    if(incrementalOutputPending_) {
+        WaitFlag<HardEvent::MTE3_V>(EVENT_ID6);incrementalOutputPending_=false;
     }
 }
 __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
@@ -647,14 +678,7 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
         }
         AdvanceIncremental(b*4+q,end0,end1,half);
     }
-    JoinColdOutput();
-    if(incrementalInputPending_) {
-        WaitFlag<HardEvent::MTE2_V>(EVENT_ID6);incrementalInputPending_=false;
-    }
-    incrementalHasNext_=false;
-    if(incrementalOutputPending_) {
-        WaitFlag<HardEvent::MTE3_V>(EVENT_ID6);incrementalOutputPending_=false;
-    }
+    DrainWindowCopies();
     if(incrementalMetadataActive_) {
         SetFlag<HardEvent::S_MTE3>(EVENT_ID5);WaitFlag<HardEvent::S_MTE3>(EVENT_ID5);
         for(uint32_t b=lane,i=0;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes,i+=64)

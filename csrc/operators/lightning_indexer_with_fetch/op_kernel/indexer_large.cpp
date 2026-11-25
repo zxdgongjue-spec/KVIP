@@ -20,7 +20,7 @@ template <class T> __aicore__ inline void QuantLightningIndexerKernel<T>::Proces
 }
 
 template <class T>
-__aicore__ inline void QuantLightningIndexerKernel<T>::ProcessLargeScore(uint32_t begin, uint32_t end, bool cold) {
+__aicore__ inline void QuantLightningIndexerKernel<T>::ProcessLargeScore(uint32_t begin, uint32_t end, bool cold, bool loadThreshold) {
     if (begin == end) {
         return;
     }
@@ -30,7 +30,7 @@ __aicore__ inline void QuantLightningIndexerKernel<T>::ProcessLargeScore(uint32_
     CalcS2LoopParams(assignedRow_, 0);
     if ASCEND_IS_AIV {
         vectorService.AllocEventID();
-        if (cold) {
+        if (cold && loadThreshold) {
             vectorService.LoadSequenceSplitThresholds(assignedRow_);
         }
         CrossCoreSetFlag<Flags::QLI_SYNC_MODE4, PIPE_V>(Flags::CROSS_VC_EVENT);
@@ -220,6 +220,31 @@ __aicore__ inline uint32_t Plan(const Inputs& input, bool helper, RowPlan* plans
         auto plan = RowCost<Cold>(input, row);
         costs[row] = plan.tiles + plan.recent.end - plan.recent.begin;
     }
+    uint32_t same = 1;
+    while (same < input.shape.batch && costs[same] == costs[0]) ++same;
+    if (same == input.shape.batch) {
+        const uint32_t first = helper ? input.core - input.shape.batch : input.core % input.helpers;
+        uint32_t count = 0, maxFixed = 0;
+        for (uint32_t row = first; row < input.shape.batch; row += input.helpers) {
+            auto& plan = plans[count];
+            if constexpr (Cold) {
+                plan = {};
+                plan.row = row;
+                plan.start = input.shape.resident / 128;
+                plan.tiles = costs[0];
+                plan.end = plan.start + plan.tiles;
+            } else {
+                plan = RowCost<false>(input, row);
+                maxFixed = Max(maxFixed, plan.recent.end - plan.recent.begin);
+            }
+            if (!helper && row == input.core) own = count;
+            ++count;
+        }
+        // For N equal totals T, the helper must process N*(T-owner) tiles.
+        const uint32_t budget = Max(maxFixed, large_li::CeilDiv(count * costs[0], count + 1));
+        for (uint32_t i = 0; i < count; ++i) plans[i].quota = costs[0] - budget;
+        return count;
+    }
     large_li::RankRows(costs, input.shape.batch, order);
     // A primary finds its rank so that it joins exactly its assigned helper.
     uint32_t rank = 0;
@@ -257,8 +282,15 @@ __aicore__ inline void Hot(const Inputs& input, const RowPlan& plan, bool helper
                 }
             }
         }
-        Score(input, plan.row, {0, cut}, false);
-        Score(input, plan.row, plan.recent, false);
+        if (cut || plan.recent.begin != plan.recent.end) {
+            // Hot and recent ranges share a Q row and the same UB/L1 layout.
+            TPipe pipe;
+            Indexer op;
+            input.Init(op, pipe, plan.row, false);
+            op.ProcessLargeScore(0, cut, false);
+            op.ProcessLargeScore(plan.recent.begin, plan.recent.end, false);
+            pipe.Destroy();
+        }
     } else {
         Score(input, plan.row, {cut, plan.end}, false);
     }
@@ -285,21 +317,13 @@ __aicore__ inline void Threshold(const Inputs& input, uint32_t row, bool helper)
     }
 }
 
-__aicore__ inline void Window(const Inputs& input, uint32_t row, uint32_t epoch, uint32_t end) {
-    // All four score rows and predicates have drained by this point. A single
-    // owner publishes the complete physical interval to the existing selector.
+__aicore__ inline void PublishProgress(const Inputs& input, uint32_t row, uint32_t first, uint32_t count,
+                                       uint32_t end) {
     auto progress = reinterpret_cast<__gm__ uint32_t*>(input.ctx->progress) + row * 4 * 32;
-    for (uint32_t q = 0; q < 4; ++q) {
+    for (uint32_t q = first; q < first + count; ++q) {
         progress[q * 32] = end * 128;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(progress + q * 32), 128);
     }
-    TPipe pipe;
-    Indexer op;
-    input.Init(op, pipe, row, false);
-    op.vectorService.AllocEventID();
-    op.vectorService.RotateFetch(epoch, 0);
-    op.vectorService.FreeEventID();
-    pipe.Destroy();
 }
 
 __aicore__ inline void JoinThreshold(const Inputs& input, uint32_t row) {
@@ -308,33 +332,50 @@ __aicore__ inline void JoinThreshold(const Inputs& input, uint32_t row) {
     }
 }
 
-__aicore__ inline void ColdWindow(const Inputs& input, const RowPlan& plan, uint32_t epoch, bool helper) {
-    auto span = large_li::Window(plan.start, plan.end, input.shape.rounds, epoch);
-    uint32_t suffix = large_li::SuffixInWindow(span, plan.start, plan.tiles, plan.quota);
-    if (helper && !suffix) {
-        return;
-    }
-    uint32_t cut = span.end - suffix;
-    Score(input, plan.row, helper ? large_li::Slice{cut, span.end} : large_li::Slice{span.begin, cut}, true);
-    if ASCEND_IS_AIV {
-        if (helper) {
+__aicore__ inline void ColdHelper(const Inputs& input, const RowPlan& plan, uint32_t epoch) {
+    const auto span = large_li::Window(plan.start, plan.end, input.shape.rounds, epoch);
+    const uint32_t suffix = large_li::SuffixInWindow(span, plan.start, plan.tiles, plan.quota);
+    if (suffix) {
+        Score(input, plan.row, {span.end - suffix, span.end}, true);
+        if ASCEND_IS_AIV {
             input.Signal(plan.row, 6 + input.vecLane, epoch);
-        } else {
-            input.Signal(plan.row, 4 + input.vecLane, epoch);
-            if (!input.vecLane) {
-                input.Wait(plan.row, 5, epoch);
-                if (suffix) {
-                    input.Wait(plan.row, 6, epoch);
-                    input.Wait(plan.row, 7, epoch);
-                }
-                Window(input, plan.row, epoch, span.end);
-            }
         }
     }
 }
 
+__aicore__ inline void FinishPair(const Inputs& input, const RowPlan& plan, Indexer& op, uint32_t epoch) {
+    // The posting core needs both winner lists and both metadata writes. The
+    // second vector may immediately start scoring its next range after this.
+    auto line = input.Line(plan.row, 5);
+    auto& vec = op.vectorService;
+    if (input.vecLane) {
+        if (input.Trace()) {
+            line[1] = vec.incrementalCalls_;
+            line[2] = vec.incrementalScanned_;
+            line[3] = vec.incrementalCandidates_;
+        }
+        input.Signal(plan.row, 5, epoch);
+        return;
+    }
+    input.Wait(plan.row, 5, epoch);
+    if (input.Trace()) {
+        auto event = reinterpret_cast<__gm__ rotating::Event*>(input.ctx->events) +
+                     epoch * input.shape.serviceLanes + plan.row;
+        auto stamp = reinterpret_cast<__gm__ uint64_t*>(event->pad);
+        stamp[3] = GetSystemCycle();
+        stamp[4] = uint64_t(vec.incrementalCalls_ + line[1]) |
+                   (uint64_t(vec.incrementalScanned_ + line[2]) << 16) |
+                   (uint64_t(vec.incrementalCandidates_ + line[3]) << 40);
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event), 128);
+    }
+    vec.PostWindow(epoch, 0);
+}
+
 __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan) {
     JoinThreshold(input, plan.row);
+    TPipe pipe;
+    Indexer op;
+    input.Init(op, pipe, plan.row, false);
     if ASCEND_IS_AIV {
         if (!input.vecLane) {
             if (input.Trace()) {
@@ -343,12 +384,35 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan) {
                     input.Stamp(plan.row, q, 2, start);
                 }
             }
-            Window(input, plan.row, 0, plan.start);
+            PublishProgress(input, plan.row, 0, 4, plan.start);
+            op.vectorService.AllocEventID();
+            op.vectorService.RotateFetch(0, 0);
+            op.vectorService.FreeEventID();
         }
     }
-    for (uint32_t e = 1; e < input.shape.rounds; ++e) {
-        ColdWindow(input, plan, e, false);
+    bool thresholdLoaded = false;
+    for (uint32_t epoch = 1; epoch < input.shape.rounds; ++epoch) {
+        const auto span = large_li::Window(plan.start, plan.end, input.shape.rounds, epoch);
+        const uint32_t suffix = large_li::SuffixInWindow(span, plan.start, plan.tiles, plan.quota);
+        const uint32_t cut = span.end - suffix;
+        if (span.begin != cut) {
+            op.ProcessLargeScore(span.begin, cut, true, !thresholdLoaded);
+            thresholdLoaded = true;
+        }
+        if ASCEND_IS_AIV {
+            // One scorer always produces Q0/Q1; its sibling produces Q2/Q3.
+            // Only the matching helper's suffix contributes to this pair.
+            if (suffix) {
+                input.Wait(plan.row, 6 + input.vecLane, epoch);
+            }
+            PublishProgress(input, plan.row, input.vecLane * 2, 2, span.end);
+            op.vectorService.AllocEventID();
+            op.vectorService.AdvanceLargeWindowPair(plan.row, epoch, span.end * 128);
+            FinishPair(input, plan, op, epoch);
+            op.vectorService.FreeEventID();
+        }
     }
+    pipe.Destroy();
     if ASCEND_IS_AIV {
         if (!input.vecLane && input.Trace()) {
             uint64_t end = GetSystemCycle();
@@ -404,7 +468,7 @@ extern "C" __global__ __aicore__ void v9_li_large_threshold_cold(GM_ADDR binding
                     JoinThreshold(input, plans[i].row);
                     ready[i] = true;
                 }
-                ColdWindow(input, plans[i], epoch, true);
+                ColdHelper(input, plans[i], epoch);
             }
         }
     }

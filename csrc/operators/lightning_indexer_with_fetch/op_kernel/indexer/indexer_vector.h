@@ -47,6 +47,9 @@ public:
     rotating::RuntimeShape runtimeShape_;
 #if !V9_UBMEM
 #include "incremental_methods.h"
+#if KVIP_LARGE_BATCH_LI
+#include "large_window_pair.h"
+#endif
 #endif
     __aicore__ inline void SetRotationContext(GM_ADDR p) {
         rotationContext_ = p;
@@ -77,7 +80,7 @@ public:
         // and covered-row addresses still use the bound physical history.
         uint32_t half=LargeBatch ? 0U : rotating::SequenceHalfWindow(runtimeShape_,scanHistory);
         rankHalf_=half;rankReady_=uint64_t(scanHistory)|(uint64_t(scanHistory)<<32);
-        AdvanceIncremental(query,scanHistory,half?scanHistory:0,half);
+        AdvanceIncremental<LargeBatch>(query,scanHistory,half?scanHistory:0,half);
         JoinColdOutput();
         if(incrementalOutputPending_){WaitFlag<HardEvent::MTE3_V>(EVENT_ID6);incrementalOutputPending_=false;}
         PipeBarrier<PIPE_ALL>();
@@ -110,8 +113,32 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query, uint32_t scanHis
 #endif
     __aicore__ inline void RotateFetch(uint32_t epoch, uint32_t sequenceHalfWindow = 0) {
 #if !V9_UBMEM
-        AdvanceWindow(epoch,sequenceHalfWindow);
+#if KVIP_LARGE_BATCH_LI
+        if (epoch == 0) {
+            // LI2 already produced the four lists while their winners were in UB.
+            if (streamingWorkspace_ &&
+                (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U)) {
+                auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+                uint32_t lane = rotating::ServiceLane(runtimeShape_.batch, runtimeShape_.splitQ,
+                    runtimeShape_.serviceAics, blockId_ / 2, blockId_ % 2);
+                auto event = reinterpret_cast<__gm__ rotating::Event*>(ctx->events) + lane;
+                uint64_t now = GetSystemCycle();
+                event->waitBegin = now;
+                auto stamp = reinterpret_cast<__gm__ uint64_t*>(event->pad);
+                stamp[2] = now;
+                stamp[3] = now;
+                stamp[4] = 0;
+                kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event), 128);
+            }
+        } else
 #endif
+        {
+            AdvanceWindow(epoch, sequenceHalfWindow);
+        }
+#endif
+        PostWindow(epoch, sequenceHalfWindow);
+    }
+    __aicore__ inline void PostWindow(uint32_t epoch, uint32_t sequenceHalfWindow) {
         // Join this producer's hit publication. Other producers remain free.
         PipeBarrier<PIPE_ALL>();
 #if defined(V9_UBMEM) && V9_UBMEM
@@ -351,6 +378,23 @@ private:
         SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
         DataCopy(windowScores,scoreOutLocal_,2048);DataCopy(windowIds,indicesOutLocal_,2048);
         SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
+#if KVIP_LARGE_BATCH_LI
+        // Epoch zero covers the resident and recent seeds only. The tagged
+        // IDs and their scores are still in this Q's private UB. Reuse them
+        // before the owner joins the four Qs and posts any prefetch.
+        rankHalf_ = 0;
+        rankEnd0_ = rankEnd1_ = runtimeShape_.resident;
+        rankReady_ = runtimeShape_.resident;
+        rankedEpoch_ = 0;
+        rankTrace_ = streamingWorkspace_ &&
+            (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U);
+        windowRankCut_ = UINT32_MAX;
+        windowMeta[4] = rankReady_;
+        auto row = reinterpret_cast<__gm__ rotating::Row*>(context->rows) + batch;
+        windowCoveredEmpty_ = row->requests == 0;
+        ExportWindowCold(query);
+        JoinColdOutput();
+#endif
 #endif
         if (publishProgress) {
             SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);

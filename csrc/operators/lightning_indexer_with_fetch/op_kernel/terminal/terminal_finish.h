@@ -1,4 +1,5 @@
 #pragma once
+#include "terminal_events.h"
 // Join is request-local. One warp gathers completion metadata once; other
 // warps clear dead per-round state concurrently instead of reloading the same
 // four GM flag lines from every warp.
@@ -54,6 +55,9 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void FinishTerminalRow(
         }
     }
     asc_syncthreads();
+    if constexpr (LargeBatch) {
+        SaveRequestEvents(a,ctx,b,q,t);
+    }
     if(!q && !t){asc_stcg(flags+5*32,0U);asc_stcg(flags+7*32,0U);}
 
     uint32_t extendedCount=control[4];

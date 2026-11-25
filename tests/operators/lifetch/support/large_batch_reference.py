@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Reuse the completed serial arm across the provider-budget-only retry."""
+"""Verify archived serial and fused results before comparing live measurements."""
 
 import hashlib
 import json
@@ -14,6 +14,39 @@ from large_batch_placement import placement
 
 SOURCE_REV = "e783914bc96f8aefde1043a2127cfdbadbc3d777"
 G10_BS20_SHA = "80b7b26e7bb7a663025c4c4f99a41c5ac4f58ce50b1a438c79154e240f0a6035"
+COMPUTE_BASELINE = "d2d9d482759ca852decf2ef2899b0604a4afcdb7"
+
+
+def compute_reference(directory, identity, output):
+    old, new = directory.parents[1], output.parents[2]
+    for name in ("host.txt", "machine_id.txt", "physical_npu.txt"):
+        value = (old / name).read_text().strip()
+        if not value or value != (new / name).read_text().strip():
+            raise ValueError(f"Archived comparison differs in {name}")
+    if (old / "native.txt").read_text().strip() != COMPUTE_BASELINE:
+        raise ValueError("Expected the measured large-batch compute baseline")
+    base = dict(identity, native=COMPUTE_BASELINE)
+    for arm, workers in (("serial", 2), ("fused", 32)):
+        path = directory / arm
+        record = json.loads((path / "ARM_RESULT.json").read_text())
+        proof = json.loads((path / "path/path_result.json").read_text())
+        if (
+            record["arm"] != arm or proof["path"] != arm or proof["transport"] != "urma"
+            or proof["correctness"] != "PASS" or proof["failures"]
+            or record["get_workers"] != workers or proof["runtime_workers"] != workers
+            or record["checked_queries"] != identity["calls"] * identity["batch"] * 4
+            or record["checked_rows"] != identity["calls"] * identity["batch"]
+            or len(record["samples"]) != identity["calls"]
+        ):
+            raise ValueError(f"Incomplete {arm} archive at {path}")
+        keys = ("graph", "LI", "tail", "LI1", "LI23") if arm == "fused" else ("graph", "LI", "tail")
+        for key in keys:
+            v = [s[key] for s in record["samples"]]
+            if any(not math.isfinite(t) or t <= 0 for t in v) or [mean(v), median(v)] != record["mean_p50_us"][key]:
+                raise ValueError(f"Archived {arm} {key} timing disagrees with samples")
+        if arm == "fused" and record["identity"] != base:
+            raise ValueError("Previous fused input, runtime or protocol differs")
+    return base, record["mean_p50_us"]
 
 
 def serial_identity(identity, repo):

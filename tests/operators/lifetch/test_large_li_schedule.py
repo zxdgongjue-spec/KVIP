@@ -137,10 +137,11 @@ struct ConstInfo {
 struct Service {
     void AllocEventID() {}
     void FreeEventID() {}
-    void LoadSequenceSplitThresholds(uint32_t) {}
+    unsigned thresholdsLoaded=0;
+    void LoadSequenceSplitThresholds(uint32_t) { ++thresholdsLoaded; }
 };
 template<class T> struct QuantLightningIndexerKernel {
-    void ProcessLargeScore(uint32_t,uint32_t,bool);
+    void ProcessLargeScore(uint32_t,uint32_t,bool,bool);
     Service vectorService, matmulService;
     uint32_t assignedRow_=0;
     void CalcGS1LoopParams(uint32_t) {}
@@ -164,9 +165,14 @@ int main() {
     for(int worker=-1;worker<2;++worker) workers.emplace_back([=]{
         lane=worker;
         QuantLightningIndexerKernel<int> op;
-        for (int r=0;r<100;++r) for (uint32_t n:{0,1,2,3,7,16}) {
-            op.ProcessLargeScore(32,32+n,true);
+        for (int r=0;r<100;++r) {
+            bool loaded = false;
+            for (uint32_t n:{0,1,2,3,7,16}) {
+                op.ProcessLargeScore(32,32+n,true,!loaded);
+                loaded |= n != 0;
+            }
         }
+        assert(op.vectorService.thresholdsLoaded == (worker < 0 ? 0U : 100U));
     });
     for(auto& worker:workers) worker.join();
     for(auto& flag:flags) assert(flag.load()==0);

@@ -17,7 +17,7 @@ import subprocess
 import numpy as np
 
 from large_batch_input import BATCHES, GROUPS, input_digest, load
-from large_batch_reference import reference_identity, stage_serial
+from large_batch_reference import compute_reference, reference_identity, stage_serial
 from reporting import atomic_json
 from workloads import ReplayPagePlan, configuration
 
@@ -334,6 +334,28 @@ def li_intervals(words, batch, mhz):
     return dict(clock_mhz=mhz, spans=details, per_query_cycle_stamps=stamps.tolist())
 
 
+def tail_team_intervals(stamps, mhz):
+    # One row holds one four-Q team until its last Q retires. Queue waits are
+    # inside this interval; the time between row assignments is outside it.
+    if stamps.ndim != 3 or stamps.shape[1:] != (4, 32) or len(stamps) not in BATCHES or not mhz > 0:
+        raise ValueError("Invalid terminal diagnostic shape or clock")
+    starts, finishes = stamps[:, :, 0], stamps[:, :, 10]
+    if np.any(starts <= 0) or np.any(finishes <= starts):
+        raise ValueError("Incomplete terminal row timestamps")
+    row_starts, row_finishes = starts.min(axis=1), finishes.max(axis=1)
+    duration = row_finishes - row_starts
+    span = int(row_finishes.max() - row_starts.min())
+    last = int(row_finishes.argmax())
+    return dict(
+        observed_span_us=span / mhz,
+        mean_assigned_teams=float(duration.sum()) / span,
+        row_mean_us=float(duration.mean()) / mhz,
+        row_max_us=int(duration.max()) / mhz,
+        last_row=last,
+        last_q=int(finishes[last].argmax()) + 1,
+    )
+
+
 def measured_replays(ex, proofs, serial, torch, states, sequence, config, directory, *, fused):
     import torch_npu
     from torch.profiler import record_function
@@ -459,6 +481,7 @@ def measured_replays(ex, proofs, serial, torch, states, sequence, config, direct
             state.forward.events_src.fill_(-1)
             state.forward.events_dst.fill_(-1)
             state.forward.times.zero_()
+            terminal.times.zero_()
             stream.synchronize()
             replay.replay()
             stream.synchronize()
@@ -469,6 +492,12 @@ def measured_replays(ex, proofs, serial, torch, states, sequence, config, direct
             state.validate(inputs)
             proofs["ordered_Index_diagnostic_rows"] = check_ordered_index(state, before, before_valid)
             proofs["separate_LI_diagnostic"] = li_intervals(state.forward.times.cpu().numpy(), state.batch, mhz)
+            # Keep the existing instrumented replay's raw per-request records.
+            # The two arrays use different device ABIs and are timed only once.
+            proofs["separate_window_event_u64"] = state.rotating.events.cpu().numpy().view("<u8").tolist()
+            stamps = terminal.times.cpu().numpy()
+            proofs["separate_terminal_query_stamps"] = stamps.tolist()
+            proofs["separate_terminal_teams"] = tail_team_intervals(stamps, mhz)
             state.forward.set_diagnostics(False)
     except BaseException as error:
         if pending:
@@ -549,8 +578,12 @@ def run(args):
         raise ValueError("A KVAF server is required for a live measurement")
     fused = args.arm == "fused"
     serial = None
+    previous = None
     if fused:
-        expected, reference = reference_identity(args.serial_result, identity, repo)
+        base = identity
+        if args.compare_archived_pair:
+            base, previous = compute_reference(args.serial_result.parent, identity, args.output)
+        expected, reference = reference_identity(args.serial_result, base, repo)
         old = json.loads((args.serial_result / "ARM_RESULT.json").read_text())
         path = args.serial_result / "selected.npy"
         if (
@@ -639,6 +672,15 @@ def run(args):
         summary["vs_strong_serial_graph_gain_pct"] = [
             100 * (a - b) / a for a, b in zip(old["mean_p50_us"]["graph"], times["graph"])
         ]
+        if previous is not None:
+            summary["comparison_archive"] = str(args.serial_result.parent)
+            summary["vs_previous_fused_saved_mean_p50_us"] = {
+                k: [a - b for a, b in zip(previous[k], times[k])]
+                for k in ("graph", "LI1", "LI23", "LI", "tail")
+            }
+            summary["vs_previous_fused_graph_gain_pct"] = [
+                100 * (a - b) / a for a, b in zip(previous["graph"], times["graph"])
+            ]
     else:
         del summary["exact"]
     atomic_json(args.output / "ARM_RESULT.json", summary)
@@ -672,6 +714,12 @@ def run(args):
     if fused:
         spans = proofs["separate_LI_diagnostic"]["spans"]
         print(f"DIAGNOSTIC {tag} separate_calls=1", *(f"{k}={v:.2f}" for k, v in spans.items()))
+        if previous is not None:
+            teams = proofs["separate_terminal_teams"]
+            print(f"DIAGNOSTIC {tag} tail separate_calls=1 "
+                  f"mean_assigned_teams={teams['mean_assigned_teams']:.2f}/16 "
+                  f"row_mean/max_us={teams['row_mean_us']:.2f}/{teams['row_max_us']:.2f} "
+                  f"last_row={teams['last_row']} last_Q={teams['last_q']}")
         print(
             f"SAVED {tag} vs_strong_serial",
             *(
@@ -680,6 +728,11 @@ def run(args):
             ),
             "graph_gain_mean/P50_pct=%+.2f/%+.2f" % tuple(summary["vs_strong_serial_graph_gain_pct"]),
         )
+        if previous is not None:
+            print(f"SAVED {tag} vs_previous_fused", *(
+                f"{k}_mean/P50_us={a:+.2f}/{b:+.2f}"
+                for k, (a, b) in summary["vs_previous_fused_saved_mean_p50_us"].items()
+            ), "graph_gain_mean/P50_pct=%+.2f/%+.2f" % tuple(summary["vs_previous_fused_graph_gain_pct"]))
 
 
 if __name__ == "__main__":
@@ -694,6 +747,7 @@ if __name__ == "__main__":
     parser.add_argument("--reuse-serial-archive", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--serial-result", type=Path)
+    parser.add_argument("--compare-archived-pair", action="store_true")
     parser.add_argument(
         "--keep-trace", action="store_true", help="Keep the raw profiler timeline after successful attribution"
     )

@@ -13,7 +13,7 @@ __simt_callee__ inline uint64_t CoveredAddressSimt(uint64_t incremental,uint32_t
 }
 // One bit per physical Index position: valid local or already admitted.
 // Packed scores and eligibility use disjoint banks; the full TopK stays intact.
-template<bool Gathered=false, bool Empty=false>
+template<bool Gathered=false, bool Empty=false, bool PositiveFinal=false>
 __simd_vf__ inline void PackUncovered(__ubuf__ uint32_t* ids,__ubuf__ uint16_t* scores,
     __ubuf__ uint32_t* covered,__ubuf__ uint32_t* eligible,
     __ubuf__ uint32_t* packed,__ubuf__ uint32_t* count,uint32_t valid) {
@@ -23,7 +23,8 @@ __simd_vf__ inline void PackUncovered(__ubuf__ uint32_t* ids,__ubuf__ uint16_t* 
     Duplicate(zero,uint32_t(0));Duplicate(one,uint32_t(1));Duplicate(mask31,uint32_t(31));
     Duplicate(invalid,UINT32_MAX);Duplicate(sum,uint32_t(0));ClearSpr<SpecialPurposeReg::AR>();
     for(uint16_t i=0;i<2048;i+=64){
-        LoadAlign(id,ids+i);LoadAlign<uint16_t,LoadDist::DIST_UNPACK_B16>(score,scores+i);
+        LoadAlign(id,ids+i);
+        if constexpr (!PositiveFinal) LoadAlign<uint16_t,LoadDist::DIST_UNPACK_B16>(score,scores+i);
         CompareScalar<uint32_t,CMPMODE::LT>(bounded,id,valid,all);Select(safe,id,zero,bounded);
         ShiftRights(index,safe,int16_t(5),all);And(shift,safe,mask31,all);
         if constexpr(Empty) { Duplicate(bits,uint32_t(0)); }
@@ -32,13 +33,37 @@ __simd_vf__ inline void PackUncovered(__ubuf__ uint32_t* ids,__ubuf__ uint16_t* 
             ShiftRight(bits,bits,reinterpret_cast<RegTensor<int32_t>&>(shift),all);And(bits,bits,one,all);
         }
         CompareScalar<uint32_t,CMPMODE::EQ>(miss,bits,uint32_t(0),all);MaskAnd(take,bounded,miss,all);
-        Select(kept,id,invalid,take);StoreAlign(eligible+i,kept,all);
+        if constexpr (!PositiveFinal) {
+            Select(kept,id,invalid,take);StoreAlign(eligible+i,kept,all);
+        }
         Duplicate<uint32_t,MaskMergeMode::ZEROING>(ones,uint32_t(1),take);Add(sum,sum,ones,all);
-        Squeeze<uint32_t,MicroAPI::GatherMaskMode::STORE_REG>(out,reinterpret_cast<RegTensor<uint32_t>&>(score),take);
+        if constexpr (PositiveFinal)
+            Squeeze<uint32_t,MicroAPI::GatherMaskMode::STORE_REG>(out,id,take);
+        else
+            Squeeze<uint32_t,MicroAPI::GatherMaskMode::STORE_REG>(out,reinterpret_cast<RegTensor<uint32_t>&>(score),take);
         StoreUnAlign<uint32_t,PostLiteral::POST_MODE_UPDATE>(packed,out,store);
     }
     StoreUnAlignPost(packed,store);ReduceSum(total,sum,all);
     auto first=CreateMask<uint32_t,MaskPattern::VL1>();StoreAlign(count,total,first);
+}
+// The full final quota admits every uncovered winner. A positive minimum
+// makes the generic selector's zero-score pass empty, so packing IDs directly
+// preserves both membership and the exact Post/Index order.
+__aicore__ inline uint32_t CollectPositiveFinalMisses(LocalTensor<uint32_t> ids,
+    LocalTensor<uint32_t> output, LocalTensor<uint32_t> scratch,
+    __gm__ uint32_t* covered, uint32_t valid) {
+    GlobalTensor<uint32_t> bits;
+    bits.SetGlobalBuffer(covered);
+    DataCopy(scratch, bits, (valid + 255) / 256 * 8);
+    SetFlag<HardEvent::MTE2_V>(EVENT_ID4);
+    WaitFlag<HardEvent::MTE2_V>(EVENT_ID4);
+    auto bitmap = reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr());
+    auto compact = reinterpret_cast<__ubuf__ uint32_t*>(output.GetPhyAddr());
+    auto winners = reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr());
+    PackUncovered<false, false, true>(winners, nullptr, bitmap, nullptr, compact, bitmap + 4096, valid);
+    SetFlag<HardEvent::V_S>(EVENT_ID4);
+    WaitFlag<HardEvent::V_S>(EVENT_ID4);
+    return scratch.GetValue(4096);
 }
 __simd_vf__ inline void Narrow(__ubuf__ uint32_t* input,__ubuf__ uint16_t* output,uint32_t n,uint32_t padded) {
     using namespace MicroAPI;auto all=CreateMask<uint32_t,MaskPattern::ALL>();

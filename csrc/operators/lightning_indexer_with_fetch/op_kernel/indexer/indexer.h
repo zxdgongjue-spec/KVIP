@@ -93,7 +93,7 @@ public:
     GM_ADDR rotationContext_ = nullptr;
 #if KVIP_LARGE_BATCH_LI
     uint32_t assignedRow_ = 0;
-    __aicore__ inline void ProcessLargeScore(uint32_t begin, uint32_t end, bool cold);
+    __aicore__ inline void ProcessLargeScore(uint32_t begin, uint32_t end, bool cold, bool loadThreshold = true);
     __aicore__ inline void ProcessLargeThreshold(uint32_t query);
 #endif
 #endif

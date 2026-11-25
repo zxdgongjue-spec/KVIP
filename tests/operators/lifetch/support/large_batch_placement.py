@@ -43,12 +43,15 @@ if __name__ == '__main__':
     cli = argparse.ArgumentParser(description=__doc__)
     cmds = cli.add_subparsers(dest='mode', required=True)
     cmds.add_parser('find').add_argument('out', type=Path)
+    cmds.add_parser('get').add_argument('thp', type=Path)
     cmp = cmds.add_parser('compare')
     cmp.add_argument('serial', type=Path)
     cmp.add_argument('fused', type=Path)
     args = cli.parse_args()
     if args.mode == 'find':
         print(*find(args.out))
+    elif args.mode == 'get':
+        print(*placement(args.thp))
     else:
         first, second = placement(args.serial), placement(args.fused)
         if first != second:

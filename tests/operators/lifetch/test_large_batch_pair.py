@@ -10,7 +10,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "support"))
 from large_batch_input import BATCHES, FrozenRound, expand, input_digest
-from large_batch_pair import check_scores, large_account, li_intervals, stage_sample, verify_abc, verify_assignments
+from large_batch_pair import check_scores, large_account, li_intervals, stage_sample, tail_team_intervals, verify_abc, verify_assignments
 from workloads import ReplayPagePlan, ReplayRound
 
 
@@ -43,6 +43,18 @@ def fixture():
 
 
 class LargeBatchReplay(unittest.TestCase):
+    def test_tail_teams_two_waves_with_one_slow_query(self):
+        stamps = np.zeros((20, 4, 32), dtype=np.int64)
+        stamps[:16, :, 0], stamps[:16, :, 10] = 100, 200
+        stamps[16:, :, 0], stamps[16:, :, 10] = 200, 300
+        stamps[19, 2, 10] = 320
+        summary = tail_team_intervals(stamps, 2)
+        self.assertAlmostEqual(summary["mean_assigned_teams"], 2020 / 220)
+        self.assertEqual((summary["row_max_us"], summary["last_row"], summary["last_q"]), (60, 19, 3))
+        stamps[4, 1, 10] = 0
+        with self.assertRaisesRegex(ValueError, "Incomplete"):
+            tail_team_intervals(stamps, 2)
+
     def test_rows_aliases_and_pair_identity(self):
         base = fixture()
         for batch in BATCHES:
