@@ -802,7 +802,7 @@ class ReplayRound:
                 self.logical_address_valid[rows, layout])
 
 
-def assemble_round(references):
+def assemble_round(references, *, captures=None):
     """Merge selected DPs; retain page aliasing within DP, separate DP arenas."""
     if not references:
         raise ValueError('Cannot assemble an empty replay round')
@@ -819,7 +819,7 @@ def assemble_round(references):
         if ref.dp_rank in seen_ranks:
             raise ValueError('Duplicate DP in a replay round')
         seen_ranks.add(ref.dp_rank)
-        capture = load_score_capture(ref.manifest_path)
+        capture = load_score_capture(ref.manifest_path) if captures is None else captures[ref.dp_rank]
         arrays, source_geometry = capture.arrays, capture.manifest['geometry']
         current = {name: source_geometry[name] for name in
                    ('history', 'resident', 'heads', 'token_bytes', 'output_stride')}

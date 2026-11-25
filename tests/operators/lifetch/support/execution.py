@@ -740,10 +740,10 @@ def native_payload(torch: Any, batch: int, tokens: int) -> Any:
     return torch.stack(rows)
 
 
-def create_kvaf_runtime(sdk, get_kernel, put_kernel, token_bytes, block_size, device_id, workers, transport):
+def create_kvaf_runtime(sdk, get_kernel, put_kernel, token_bytes, block_size, device_id, workers, transport, *, jettys=2):
     put = sdk.PutExecutionConfig(transport, "aiv")
     get = sdk.GetExecutionConfig(transport, "aiv", "direct")
-    jets = {"jettys": 2} if transport == "urma" else {}
+    jets = {"jettys": jettys} if transport == "urma" else {}
     return sdk.NpuRuntime(
         batch_get_token_bytes=token_bytes,
         batch_get_tokens_per_block=block_size,
@@ -1443,13 +1443,21 @@ class NativeMtp:
         self.profiling = torch.empty((self.batch, 8, 32), dtype=torch.int64, device=device)
         self.initial_payload = (
             torch.stack(
-                [owner.session.cpu_payload[row, ids] for row, ids in enumerate(self.reverse_initial.cpu().long())]
+                [self.cpu_tokens(row, ids) for row, ids in enumerate(self.reverse_initial.cpu().long())]
             )
             .reshape(-1, self.token_bytes)
             .to(device)
         )
         self.output = self.initial_payload.clone()
         self.total = self.counts[self.batch :]
+
+    def cpu_tokens(self, row, ids):
+        """Reference bytes for exactly these logical IDs, outside every timed launch."""
+        session = self.owner.session
+        pages = getattr(session, 'replay_pages', None)
+        if pages is None:
+            return session.cpu_payload[row, ids]
+        return self.torch.from_numpy(pages.token_payload(row, ids.numpy()))
 
     def reset(self):
         self.forward.copy_(self.initial)
@@ -1535,7 +1543,7 @@ class NativeMtp:
                 expected = reference[row, ids[row].to(output.device)]
             else:
                 actual = output[row, slots]
-                expected = self.owner.session.cpu_payload[row, ids[row]]
+                expected = self.cpu_tokens(row, ids[row])
             if not self.torch.equal(actual, expected):
                 raise ValueError(f"native_mtp_payload_mismatch:row={row}")
         return counts
@@ -3599,11 +3607,16 @@ class NativeReplayState:
         for row in range(self.batch):
             hot = initial.captured_hot_valid[row] != 0
             mapping[row, initial.captured_layout[row, :self.resident][hot]] = np.flatnonzero(hot)
-        if not hasattr(pages, 'cpu_payload'):
-            pages.cpu_payload = torch.from_numpy(np.stack([
-                pages.token_payload(row, np.arange(self.history)) for row in range(self.batch)]))
-        session = SimpleNamespace(runtime=runtime, device_table=table, batch_get_attempted=False,
-                                  cpu_payload=pages.cpu_payload)
+        session = SimpleNamespace(runtime=runtime, device_table=table, batch_get_attempted=False)
+        if self.batch > 16 and not hasattr(pages, 'cpu_payload'):
+            # A BS32 all-history reference would materialize 2.57 GiB twice in
+            # list + stack, although only the initial hot and selected KV are read.
+            session.replay_pages = pages
+        else:
+            if not hasattr(pages, 'cpu_payload'):
+                pages.cpu_payload = torch.from_numpy(np.stack([
+                    pages.token_payload(row, np.arange(self.history)) for row in range(self.batch)]))
+            session.cpu_payload = pages.cpu_payload
         owner = SimpleNamespace(batch=self.batch, resident_budget=self.stride,
                                 cache_map=torch.from_numpy(mapping).to(device), lease=None, session=session)
         self.native = NativeMtp(torch, device, owner, self.fixture, source_tokens=self.history,
@@ -3947,10 +3960,14 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     g = initial.geometry
     width = g['token_bytes']
     workers = 40 if fused and config.transport == 'urma' else 2
+    jettys = 2
+    if fused and config.transport == 'urma' and g['batch'] > 16:
+        workers = 32
+        jettys = (5 * g['batch'] + workers - 1) // workers
     borrowed = shared_pool.borrow(torch, device, g['batch'], g['history'], workers) if shared_pool else None
     runtime = borrowed.runtime if borrowed else create_kvaf_runtime(
         kvaf, build / 'bin/kvaf_execute_batch_get_kernels.o', build / 'bin/kvaf_execute_batch_put_kernels.o',
-        width, 128, config.device, workers, config.transport)
+        width, 128, config.device, workers, config.transport, jettys=jettys)
     state = graph = table = resources = None
     batch_states = []
     pending = False

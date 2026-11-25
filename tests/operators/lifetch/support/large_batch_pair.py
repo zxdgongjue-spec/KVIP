@@ -1,0 +1,688 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Measure the strong serial and fused Q4 paths on identical expanded requests."""
+
+import argparse
+from contextlib import ExitStack
+from copy import deepcopy
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+from pathlib import Path
+from statistics import mean, median
+import subprocess
+
+import numpy as np
+
+from large_batch_input import BATCHES, GROUPS, input_digest, load
+from reporting import atomic_json
+from workloads import ReplayPagePlan, configuration
+
+CALLS = 10
+WARMUP = 4
+
+
+def check_scores(inputs, selected, serial):
+    # The native oracle is evaluated on this very batch. Independently, both
+    # paths' normal validators check every strict winner against the full scores.
+    exact = 0
+    for b in range(inputs.geometry["batch"]):
+        for q in range(4):
+            got, ref = selected[b, q], serial[b, q]
+            if np.array_equal(got, ref):
+                exact += 1
+                continue
+            keys = inputs.logical_score_keys[b, q]
+            cutoff = np.min(keys[ref])
+            delta = np.setxor1d(got, ref, assume_unique=True)
+            if not np.all(keys[delta] == cutoff):
+                raise ValueError(f"Row {b} Q{q + 1} TopK disagrees above or below native cutoff")
+    return exact
+
+
+def large_account(events, scope, elapsed, *, fused=True):
+    """Recognize CANN device names and task types in one restored graph."""
+    from decimal import Decimal
+
+    spans = [e for e in events if e.get("ph") == "X" and e.get("name") == scope]
+    if len(spans) != 1:
+        raise ValueError(f"Expected one profiler scope {scope}, found {len(spans)}")
+    base = Decimal(str(spans[0]["ts"]))
+    duration = float(spans[0]["dur"])
+    names = (
+        {"LI1": ("v9_li_large_hot",), "LI23": ("v9_li_large_threshold_cold",), "tail": ("v9_parallel_terminal_large",)}
+        if fused
+        else {
+            "li": ("quantlightningindexer",),
+            "lidu_prepare": ("a5lidufusedbatchgetpreparemtp",),
+            "fetch": ("kvafexecutebatchgetaivkernelv2", "kvafexecutebatchgetaivkernelv3"),
+        }
+    )
+    suffix = r"(?:(?:_[0-9]+)|(?:_mix_ai[cv])|(?:_ai[cv]))*"
+    names_re = {key: re.compile("(?:" + "|".join(aliases) + ")" + suffix, re.I) for key, aliases in names.items()}
+    stages = {key: [] for key in names}
+    hardware_pids = {
+        e.get("pid")
+        for e in events
+        if e.get("ph") == "M" and e.get("name") == "process_name" and e.get("args", {}).get("name") == "Ascend Hardware"
+    }
+    for e in events:
+        if e.get("ph") != "X":
+            continue
+        cat = (e.get("cat") or "").lower()
+        if any(label in cat for label in ("cpu", "runtime", "python", "annotation")):
+            continue
+        args = e.get("args") or {}
+        task_type = str(args.get("Task Type", "")).upper()
+        symbol = e.get("name", "")
+        key = next((k for k, p in names_re.items() if p.fullmatch(symbol)), None)
+        compute = (
+            "kernel" in cat
+            or task_type.startswith(("KERNEL", "MIX_AI"))
+            or task_type in ("AI_CORE", "AI_VECTOR_CORE", "AIC", "AIV", "AICPU")
+        )
+        if not key and not compute:
+            # On the CANN hardware plane, named model/fence, event or memory
+            # tasks are not runnable compute kernels. An unlabeled hardware
+            # task cannot be silently counted as an inter-kernel gap.
+            if e.get("pid") not in hardware_pids or task_type.startswith(
+                ("MODEL_", "NOTIFY", "EVENT", "MEMCPY", "MEMSET", "STREAM", "LABEL", "PROFILING")
+            ):
+                continue
+        start = float(Decimal(str(e["ts"])) - base)
+        stop = start + float(e.get("dur", 0))
+        if not 0 <= start < stop <= duration:
+            continue
+        if key is None:
+            raise ValueError(f"Unattributed device task {symbol!r} ({task_type or cat}) in {scope}")
+        stream = args.get("Physic Stream Id", args.get("Stream Id", e.get("tid")))
+        task = args.get("Task Id")
+        variant = re.search(r"(?:_mix_|_)(ai[cv])(?=_|$)", symbol.lower())
+        role = (
+            variant.group(1)
+            if variant
+            else {"MIX_AIC": "aic", "MIX_AIV": "aiv", "KERNEL_MIX_AIC": "aic", "KERNEL_MIX_AIV": "aiv"}.get(task_type)
+        )
+        stages[key].append((start, stop, role, (e.get("pid"), stream, task)))
+    intervals = {}
+    for key, records in stages.items():
+        if len(records) == 1:
+            intervals[key] = [records[0][:2]]
+        elif len(records) == 2:
+            a, b = records
+            if {a[2], b[2]} != {"aic", "aiv"} or None in a[3] or a[3] != b[3] or max(a[0], b[0]) >= min(a[1], b[1]):
+                raise ValueError(f"Ambiguous repeated {key} launches in {scope}: {records}")
+            intervals[key] = [(min(a[0], b[0]), max(a[1], b[1]))]
+        else:
+            raise ValueError(f"{scope}: expected one attributable {key} launch, got {records}")
+    return dict(intervals_us=intervals, event_us=elapsed)
+
+
+def stage_sample(accounting, fused):
+    """Separate active kernels, inter-kernel gaps, and graph event overhead."""
+    if "error" in accounting:
+        raise ValueError(f"Device attribution failed: {accounting}")
+    stages = accounting["intervals_us"]
+    expected = ("LI1", "LI23", "tail") if fused else ("li", "lidu_prepare", "fetch")
+    if set(stages) != set(expected) or any(len(stages[k]) != 1 for k in expected):
+        raise ValueError(f"Unexpected production kernel sequence: {stages}")
+    intervals = [stages[k][0] for k in expected]
+    if any(not math.isfinite(a) or not math.isfinite(b) or a >= b for a, b in intervals) or any(
+        b > c + 0.001 for (_, b), (c, _) in zip(intervals, intervals[1:])
+    ):
+        raise ValueError(f"Unordered production kernel boundaries: {intervals}")
+    active = {k: b - a for k, (a, b) in zip(expected, intervals)}
+    span = intervals[-1][1] - intervals[0][0]
+    event = float(accounting["event_us"])
+    if not math.isfinite(event) or event <= 0 or event < span - 2:
+        raise ValueError(f"Inconsistent graph event {event} and kernel span {span}")
+    sample = dict(
+        graph=event,
+        LI=active["LI1"] + active["LI23"] if fused else active["li"],
+        tail=active["tail"] if fused else active["lidu_prepare"] + active["fetch"],
+        span=span,
+        inter_kernel_gap=span - sum(active.values()),
+        event_minus_span=event - span,
+    )
+    sample.update({k: active[k] for k in (("LI1", "LI23") if fused else ("lidu_prepare", "fetch"))})
+    return sample
+
+
+def verify_abc(slots, ids, bounds, resident, stride):
+    """An emitted ABC hit has a live logical token and its fixed circular slot."""
+    tail = slots >= resident
+    if not tail.any():
+        return
+    lo, hi = bounds[:, :1, None], bounds[:, 1:, None]
+    width = stride - resident
+    if width <= 0 or np.any(tail & ((ids < lo) | (ids >= hi) | (slots != resident + ids % width))):
+        raise ValueError("ABC output differs from its logical range or circular slot")
+
+
+def verify_assignments(start, layout, before_valid, valid, sources, destinations):
+    """Reconstruct the full admission permutation, including released source slots."""
+    src, dst = np.asarray(sources, dtype=np.int64), np.asarray(destinations, dtype=np.int64)
+    if (
+        src.shape != dst.shape
+        or src.ndim != 1
+        or np.any(src < 0)
+        or np.any(dst < 0)
+        or np.any(src >= len(start))
+        or np.any(dst >= len(valid))
+        or len(np.unique(src)) != len(src)
+        or len(np.unique(dst)) != len(dst)
+    ):
+        raise ValueError("Duplicate or out-of-range source/destination in terminal journal")
+    released = src[~np.isin(src, dst, assume_unique=True)]
+    displaced = dst[~np.isin(dst, src, assume_unique=True)]
+    expected = start.copy()
+    expected[dst] = start[src]
+    expected[released] = start[displaced]
+    expected_valid = before_valid.copy()
+    expected_valid[released[released < len(valid)]] = 0
+    expected_valid[dst] = 1
+    if not np.array_equal(expected, layout) or not np.array_equal(expected_valid, valid):
+        raise ValueError("Ordered terminal journal and committed full Index/validity disagree")
+
+
+def check_ordered_index(state, start, before_valid):
+    src = state.forward.events_src.cpu().numpy()
+    dst = state.forward.events_dst.cpu().numpy()
+    counts = state.rotating.change_count.cpu().numpy()
+    prefetch = state.rotating.rows[:, 9].cpu().numpy()
+    final = state.rotating.final_posts[:, :, 0].cpu().numpy().sum(axis=1)
+    layout = state.storage.logical_ids[1:].cpu().numpy()
+    valid = state.storage.hot_valid[1:].cpu().numpy()
+    if (
+        src.ndim != 2
+        or src.shape != dst.shape
+        or src.shape[0] != state.batch
+        or not np.array_equal(counts, prefetch + final)
+        or np.any(counts < 0)
+        or np.any(counts > src.shape[1])
+    ):
+        raise ValueError("Ordered terminal journal count differs from prefetch and final admissions")
+    for row, count in enumerate(counts):
+        verify_assignments(start[row], layout[row], before_valid[row], valid[row], src[row, :count], dst[row, :count])
+    return state.batch
+
+
+def mutable_snapshots(state, fused):
+    """Save the mutable tensors restored by reset() after preparing one frozen round.
+
+    Queue state and transport leases are live throughout. The query, key lengths,
+    tail bounds, address-table validity and other read-only inputs stay bound.
+    """
+    if fused:
+        targets = [
+            getattr(state.storage, name)[1:] for name in ("keys", "scales", "addresses", "logical_ids", "hot_valid")
+        ]
+        targets.extend((state.output, state.rotating.lru_slots, state.rotating.reserved_hot))
+    else:
+        targets = [
+            getattr(state.native, name) for name in ("forward", "reverse", "cursors", "output", "preferred", "bitmap")
+        ]
+    return [(target, target.clone()) for target in targets]
+
+
+def read_selected(state, inputs, fused):
+    """Verify public IDs and the Index slots used by each Q, outside its event."""
+    batch = state.batch
+    shape = (batch, 4, 2048)
+    if fused:
+        state.check_completion()
+        terminal = state.forward.terminal
+        counts = state.rotating.final_posts[:, :, 0].cpu().numpy()
+        from correctness import validate_terminal_receipts
+
+        status = terminal.owner.core_status.cpu().numpy().view(np.uint64)
+        validate_terminal_receipts(counts, status, terminal.queue_views)
+        prefetch = state.rotating.rows[:, 9].cpu().numpy()
+        if np.any(prefetch < 0) or np.any(prefetch > 2048):
+            raise ValueError("Prefetch exceeded the per-request reservation")
+        traffic = dict(prefetch=int(prefetch.sum()), final=int(counts.sum()))
+        raw = state.workspace.topk.cpu().numpy().reshape(shape)
+        unpack = state.workspace.inputs.unpack_indices.cpu().numpy().reshape(-1)
+        if np.any(raw < 0) or np.any(raw >= state.history) or not np.array_equal(np.sort(unpack), np.arange(batch * 4)):
+            raise ValueError("Invalid raw fused TopK physical positions or query map")
+        logical = state.input_layout[np.arange(batch)[:, None, None], raw]
+        expected = logical.reshape(-1, 2048)[unpack].reshape(shape)
+        emitted = state.update.logical_output.cpu().numpy().reshape(shape)
+        if not np.array_equal(np.sort(expected, axis=-1), np.sort(emitted, axis=-1)):
+            raise ValueError("Published and raw fused TopK sets disagree")
+        slots = state.update.slot_output.cpu().numpy().reshape(shape)
+        if np.any(slots < 0) or np.any(slots >= state.stride):
+            raise ValueError("Fused TopK output contains an invalid slot")
+        rows = np.arange(1, batch + 1)[:, None, None]
+        safe = np.minimum(slots, state.resident - 1)
+        valid = state.storage.hot_valid.cpu().numpy()[rows, safe] != 0
+        mapped = state.storage.logical_ids.cpu().numpy()[rows, safe]
+        if np.any((slots < state.resident) & valid & (mapped != emitted)):
+            raise ValueError("Committed hot-slot Index differs from its emitted token")
+        verify_abc(slots, emitted, inputs.tail_bounds, state.resident, state.stride)
+        # An Index-only exchange may retire a source hot slot while this call
+        # still reads its old bytes. Only accept that exact pre-call mapping,
+        # and read the complete KV bytes for every such (slot, token) pair.
+        retired = (slots < state.resident) & ~valid
+        traffic["retired_hot_outputs_verified"] = int(np.count_nonzero(retired))
+        for row in np.flatnonzero(retired.any(axis=(1, 2))):
+            old_slots = slots[row][retired[row]]
+            old_ids = emitted[row][retired[row]]
+            if not np.all(inputs.captured_hot_valid[row, old_slots]) or not np.array_equal(
+                state.input_layout[row, old_slots], old_ids
+            ):
+                raise ValueError(f"Row {row} output used an invalidated slot without the original hot token")
+            positions = np.unique(old_slots)
+            index = state.torch.from_numpy(positions.astype(np.int64)).to(state.device)
+            actual = state.output[row + 1, index].cpu().numpy()
+            expected_bytes = state.pages.token_payload(row, state.input_layout[row, positions])
+            if not np.array_equal(actual, expected_bytes):
+                raise ValueError(f"Row {row} selected an invalidated slot with incorrect KV bytes")
+    else:
+        counts = state.native.counts.cpu().numpy()
+        if (
+            counts.shape != (batch + 1,)
+            or np.any(counts[:-1] < 0)
+            or np.any(counts[:-1] > 8192)
+            or counts[-1] != np.sum(counts[:-1])
+        ):
+            raise ValueError("Native per-row fetch counts disagree with the total")
+        traffic = dict(fetch=int(counts[-1]))
+        emitted = state.selected.cpu().numpy().reshape(shape)
+        if np.any(emitted < 0) or np.any(emitted >= state.history):
+            raise ValueError("Strong serial produced an invalid token")
+        slots = state.native.forward.cpu().numpy()[np.arange(batch)[:, None, None], emitted]
+        exported = state.native.destinations.cpu().numpy().reshape(shape)
+        if (
+            np.any(slots < 0)
+            or np.any(slots >= state.stride)
+            or not np.array_equal(np.sort(slots, axis=-1), np.sort(exported, axis=-1))
+        ):
+            raise ValueError("Strong serial output slots differ from its committed token map")
+    sorted_ids = np.sort(emitted, axis=-1)
+    valid = np.take_along_axis(inputs.logical_score_valid, sorted_ids, axis=2)
+    if (
+        np.any(sorted_ids >= inputs.query_ends[..., None])
+        or not np.all(valid)
+        or np.any(np.diff(sorted_ids, axis=-1) == 0)
+    ):
+        raise ValueError("TopK contains duplicate or non-causal tokens")
+    return sorted_ids.astype(np.int32), traffic
+
+
+def li_intervals(words, batch, mhz):
+    if not mhz or not math.isfinite(mhz) or mhz <= 0:
+        raise ValueError("Missing NPU clock calibration for LI diagnostics")
+    stamps = words[64 * batch : 128 * batch].reshape(batch, 4, 16)[:, :, :4]
+    if np.any(stamps == 0) or np.any(stamps[:, :, 0] >= stamps[:, :, 1]) or np.any(stamps[:, :, 2] >= stamps[:, :, 3]):
+        raise ValueError("Invalid per-Q LI2/LI3 diagnostic timestamps")
+    from diagnostics import union
+
+    details = {}
+    active = []
+    for col, label in ((0, "LI2"), (2, "LI3")):
+        intervals = [(int(a), int(b)) for a, b in stamps[:, :, col : col + 2].reshape(-1, 2)]
+        merged = union(intervals)
+        active.append(merged)
+        details[label + "_active_us"] = sum(b - a for a, b in merged) / mhz
+        details[label + "_wall_span_us"] = (max(b for _, b in merged) - min(a for a, _ in merged)) / mhz
+    both = union(active[0] + active[1])
+    details["overlap_us"] = details["LI2_active_us"] + details["LI3_active_us"] - sum(b - a for a, b in both) / mhz
+    return dict(clock_mhz=mhz, spans=details, per_query_cycle_stamps=stamps.tolist())
+
+
+def measured_replays(ex, proofs, serial, torch, states, sequence, config, directory, *, fused):
+    import torch_npu
+    from torch.profiler import record_function
+    from reporting import timing_summary
+
+    if len(states) != 1 or len(sequence.rounds) != 1 or config.warmup != WARMUP:
+        raise ValueError("Expected one restorable graph and one frozen capture")
+    (state,) = states
+    inputs = sequence.inputs
+    stream = torch.npu.current_stream(state.device)
+    capture = torch.npu.Stream()
+    graph = torch.npu.NPUGraph()
+    resources = None
+    pending = False
+
+    state.reset()
+    snapshots = mutable_snapshots(state, fused)
+    initial_policies = deepcopy(state.policies)
+    stream.synchronize()
+
+    def restore():
+        state.policies = deepcopy(initial_policies)
+        for target, initial in snapshots:
+            target.copy_(initial)
+        torch.npu.current_stream(state.device).synchronize()
+
+    class ObservedGraph:
+        def replay(self):
+            nonlocal pending
+            pending = True
+            graph.replay()
+
+        def completed(self):
+            nonlocal pending
+            pending = False
+
+    replay = ObservedGraph()
+    if fused:
+        terminal = state.forward.terminal
+        if terminal is None or np.unique(terminal.queue_views).size != 4 * state.batch:
+            raise ValueError("The fused operator must bind four independent terminal queues per request")
+        if len(terminal.queue_views) != 4 * state.batch:
+            raise ValueError("Unexpected number of per-query terminal queues")
+        proofs["jettys_each"] = int(terminal.owner.context["jettys_per_core"])
+        proofs["bound_private_queues"] = len(terminal.queue_views)
+        if int(terminal.owner.context["worker_count"]) != 32 or proofs["jettys_each"] != (5 * state.batch + 31) // 32:
+            raise ValueError("Unexpected fused queue resource geometry")
+        state.forward.set_diagnostics(False)
+    selected_calls, measurements, traffic = [], [], []
+    exact = 0
+    try:
+        with ExitStack() as stack:
+            if fused:
+                stack.enter_context(state.lease.capture_scope())
+            stack.enter_context(torch.npu.stream(capture))
+            pending = True
+            if not fused:
+                resources = stack.enter_context(
+                    ex.capture_native_get(state.native.owner.session.runtime, capture, state.forward)
+                )
+                restore()
+            with torch.npu.graph(graph, stream=capture):
+                state.forward()
+            capture.synchronize()
+            pending = False
+        if fused and hasattr(state.lease, "retain_graph"):
+            state.lease.retain_graph(graph)
+        for _ in range(WARMUP):
+            restore()
+            replay.replay()
+            stream.synchronize()
+            replay.completed()
+            if fused:
+                state.check_completion()
+        profiler = torch_npu.profiler.profile(
+            activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        )
+        elapsed = []
+        scopes = [f"large_batch_graph_{i:02d}" for i in range(CALLS)]
+        with profiler:
+            for i, scope in enumerate(scopes):
+                restore()
+                begin, end = [torch.npu.Event(enable_timing=True) for _ in range(2)]
+                with record_function(scope):
+                    begin.record(stream)
+                    replay.replay()
+                    end.record(stream)
+                    end.synchronize()
+                    replay.completed()
+                elapsed.append(begin.elapsed_time(end) * 1000)
+                if i == 0:
+                    state.validate(inputs)
+                ids, requests = read_selected(state, inputs, fused)
+                traffic.append(requests)
+                if fused:
+                    exact += check_scores(inputs, ids, serial[i])
+                elif i:
+                    check_scores(inputs, ids, selected_calls[0])
+                selected_calls.append(ids)
+        trace = Path(directory) / "measured_trace.json"
+        profiler.export_chrome_trace(str(trace.resolve()))
+        data = json.loads(trace.read_text())
+        events = data["traceEvents"] if isinstance(data, dict) else data
+        for scope, event_us in zip(scopes, elapsed):
+            account = large_account(events, scope, event_us, fused=fused)
+            measurements.append(stage_sample(account, fused))
+        if fused:
+            mhz = state.forward.calibrate_counter_mhz()
+            state.forward.set_diagnostics(True)
+            restore()
+            # Confirm the restored device state, take a private copy of the old
+            # logical map, and mark all journal entries stale until the kernel
+            # writes the actual prefetch and terminal assignments.
+            before = state.storage.logical_ids[1:].cpu().numpy().copy()
+            before_valid = state.storage.hot_valid[1:].cpu().numpy().copy()
+            if not np.array_equal(before, inputs.captured_layout) or not np.array_equal(
+                before_valid, inputs.captured_hot_valid
+            ):
+                raise ValueError("Diagnostic graph did not start from the frozen capture")
+            state.forward.events_src.fill_(-1)
+            state.forward.events_dst.fill_(-1)
+            state.forward.times.zero_()
+            stream.synchronize()
+            replay.replay()
+            stream.synchronize()
+            replay.completed()
+            state.check_completion()
+            diagnostic_ids, _ = read_selected(state, inputs, True)
+            check_scores(inputs, diagnostic_ids, serial[0])
+            state.validate(inputs)
+            proofs["ordered_Index_diagnostic_rows"] = check_ordered_index(state, before, before_valid)
+            proofs["separate_LI_diagnostic"] = li_intervals(state.forward.times.cpu().numpy(), state.batch, mhz)
+            state.forward.set_diagnostics(False)
+    except BaseException as error:
+        if pending:
+            ex.NativeFetchSession.quarantine("large_batch_stream_completion_unknown", error)
+        raise
+    finally:
+        if not pending:
+            graph.reset()
+            if resources is not None:
+                resources.close()
+
+    proofs.update(ids=np.stack(selected_calls), samples=measurements, traffic=traffic, exact=exact)
+    timing = timing_summary([v["graph"] for v in measurements])
+    return dict(correctness="PASS", failures=[], rounds={inputs.source_round: timing}, all_rounds=timing)
+
+
+def run(args):
+    import execution as ex
+    from functools import partial
+    import kvaf
+    import kvip
+    import torch
+    import torch_npu
+
+    npu = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+    if npu not in ("0", "4") or os.environ.get("PEER_PHYSICAL_NPU", npu) != npu:
+        raise ValueError("Set PEER_PHYSICAL_NPU and ASCEND_RT_VISIBLE_DEVICES to the selected physical NPU")
+    repo = Path(__file__).resolve().parents[4]
+    revision = subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip()
+    if subprocess.check_output(["git", "-C", repo, "status", "--porcelain", "-uno"], text=True).strip():
+        raise ValueError("The checked-out measurement revision has tracked modifications")
+    sdk_python = args.kvaf_root.resolve() / "build-npu/python"
+    if not Path(kvaf.__file__).resolve().is_relative_to(sdk_python) or not Path(kvip.__file__).resolve().is_relative_to(
+        repo / "python"
+    ):
+        raise ValueError("Unexpected KVAF or KVIP Python module path")
+    kernel = args.kvaf_root / "build-npu/bin/kvaf_execute_batch_get_kernels.o"
+    with kernel.open("rb") as stream:
+        sdk_kernel_sha = hashlib.file_digest(stream, "sha256").hexdigest()
+    if args.arm == "fused" and args.serial_result is None:
+        raise ValueError("The fused arm requires the matching strong serial result")
+    sequence, donors = load(args.trace.resolve(), args.group, args.round, args.batch)
+    inputs = sequence.inputs
+    pages = ReplayPagePlan(sequence)
+    fingerprint = input_digest(inputs, pages, donors)
+    identity = dict(
+        group=args.group,
+        batch=args.batch,
+        native=revision,
+        sequence_sha256=fingerprint,
+        physical_npu=int(npu),
+        host=os.uname().nodename,
+        calls=CALLS,
+        warmup=WARMUP,
+        hardware=torch.npu.get_device_name(torch.device("npu:0")),
+        torch=str(torch.__version__),
+        torch_npu=str(torch_npu.__version__),
+        cann=str(getattr(torch.version, "cann", "")),
+        kvaf_get_kernel_sha256=sdk_kernel_sha,
+        physical_history=inputs.geometry["history"],
+        token_bytes=inputs.geometry["token_bytes"],
+        registered_pages=pages.page_count,
+        query_end_minmax=[int(inputs.query_ends.min()), int(inputs.query_ends.max())],
+        donor_rows=donors,
+        protocol="one_restored_graph_per_device_event_with_profiler",
+    )
+    print(
+        f"INPUT G{args.group} BS{args.batch} sha256={fingerprint} donor_rows={donors} pages={pages.page_count} "
+        f"Q_ends_min/max={inputs.query_ends.min()}/{inputs.query_ends.max()}",
+        flush=True,
+    )
+    fused = args.arm == "fused"
+    serial = None
+    if fused:
+        old = json.loads((args.serial_result / "ARM_RESULT.json").read_text())
+        path = args.serial_result / "selected.npy"
+        if (
+            old["identity"] != identity
+            or old["arm"] != "serial"
+            or old["get_workers"] != 2
+            or old["checked_queries"] != CALLS * args.batch * 4
+        ):
+            raise ValueError("Strong serial was measured on a different input, build, device or protocol")
+        with path.open("rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != old["selection_sha256"]:
+                raise ValueError("Strong serial output checksum mismatch")
+        serial = np.load(path, mmap_mode="r", allow_pickle=False)
+        if serial.shape != (CALLS, args.batch, 4, 2048):
+            raise ValueError("Strong serial output shape mismatch")
+    cfg = configuration(
+        [
+            "diagnose",
+            "--transport",
+            "urma",
+            "--input",
+            "real",
+            "--trace-root",
+            str(args.trace),
+            "--group",
+            str(args.group),
+            "--round-range",
+            "1:1",
+            "--device",
+            "0",
+            "--kvaf-root",
+            str(args.kvaf_root),
+            "--kvaf-server",
+            args.kvaf_server,
+            "--prefetch-rank-start",
+            "1024",
+            "--prefetch-tokens",
+            "1024",
+            "--intermediate-fetches",
+            "4",
+            "--warmup",
+            str(WARMUP),
+            "--iterations",
+            "1",
+            "--level",
+            "1",
+            "--output",
+            str(args.output),
+        ]
+    )
+    proofs = {}
+    scratch_existed = (args.output / "export_only_prof_dir").exists()
+    ex.measure_replay_batch = partial(measured_replays, ex, proofs, serial)
+    result = ex.run_path(cfg, args.output / "path", sequence, pages, fused=fused)
+    workers = 32 if fused else 2
+    if result["correctness"] != "PASS" or result["failures"] or result["runtime_workers"] != workers:
+        raise ValueError(f"{args.arm}: production replay failed or used incorrect worker count")
+    values = proofs["samples"]
+    if len(values) != CALLS:
+        raise ValueError("Incomplete timed replay")
+    times = {k: [mean(v[k] for v in values), median(v[k] for v in values)] for k in values[0]}
+    ids = args.output / "selected.npy"
+    np.save(ids, proofs.pop("ids"), allow_pickle=False)
+    with ids.open("rb") as stream:
+        sha = hashlib.file_digest(stream, "sha256").hexdigest()
+    checked = CALLS * args.batch * 4
+    summary = dict(
+        identity=identity,
+        arm=args.arm,
+        mean_p50_us=times,
+        get_workers=workers,
+        checked_queries=checked,
+        checked_rows=CALLS * args.batch,
+        selection_sha256=sha,
+        full_KV_Index_checked_calls=1,
+        full_KV_Index_checked_rows=args.batch,
+        checks="per-call TopK and output-slot Index; complete selected KV bytes on first measured call",
+        **proofs,
+    )
+    if fused:
+        summary["vs_strong_serial_saved_mean_p50_us"] = {
+            k: [a - b for a, b in zip(old["mean_p50_us"][k], times[k])] for k in ("graph", "LI", "tail")
+        }
+        summary["vs_strong_serial_graph_gain_pct"] = [
+            100 * (a - b) / a for a, b in zip(old["mean_p50_us"]["graph"], times["graph"])
+        ]
+    else:
+        del summary["exact"]
+    atomic_json(args.output / "ARM_RESULT.json", summary)
+    if not args.keep_trace:
+        (args.output / "path/measured_trace.json").unlink()
+        # torch_npu creates this scratch folder in the worker's cwd. The
+        # launcher gives each invocation its own newly created arm directory.
+        scratch = args.output / "export_only_prof_dir"
+        if (
+            args.output.resolve() == Path.cwd()
+            and scratch.is_dir()
+            and not scratch.is_symlink()
+            and not scratch_existed
+        ):
+            shutil.rmtree(scratch)
+    tag = f"G{args.group} BS{args.batch} {args.arm}"
+    print(
+        f"CHECK {tag} TopK_score=PASS queries={checked}/{checked} Index_slots=PASS "
+        f"rows={CALLS * args.batch}/{CALLS * args.batch} full_KV_Index=PASS full_KV_rows={args.batch}/{args.batch}"
+        + (
+            f" vs_strong_serial_score=PASS exact_ID_sets={proofs['exact']}/{checked} ordered_Index_diagnostic={proofs['ordered_Index_diagnostic_rows']}/{args.batch}"
+            if fused
+            else ""
+        )
+    )
+    print(f"TIMING {tag}", *(f"{k}_mean/P50_us={times[k][0]:.2f}/{times[k][1]:.2f}" for k in ("graph", "LI", "tail")))
+    print(
+        f"TRAFFIC {tag}",
+        *(f"{k}_tokens_per_call={mean(v[k] for v in proofs['traffic']):.2f}" for k in proofs["traffic"][0]),
+    )
+    if fused:
+        spans = proofs["separate_LI_diagnostic"]["spans"]
+        print(f"DIAGNOSTIC {tag} separate_calls=1", *(f"{k}={v:.2f}" for k, v in spans.items()))
+        print(
+            f"SAVED {tag} vs_strong_serial",
+            *(
+                f"{k}_mean/P50_us={a:+.2f}/{b:+.2f}"
+                for k, (a, b) in summary["vs_strong_serial_saved_mean_p50_us"].items()
+            ),
+            "graph_gain_mean/P50_pct=%+.2f/%+.2f" % tuple(summary["vs_strong_serial_graph_gain_pct"]),
+        )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--arm", choices=("serial", "fused"), required=True)
+    parser.add_argument("--trace", type=Path, required=True)
+    parser.add_argument("--group", type=int, choices=GROUPS, required=True)
+    parser.add_argument("--round", type=int, default=1)
+    parser.add_argument("--batch", type=int, choices=BATCHES, required=True)
+    parser.add_argument("--kvaf-root", type=Path, required=True)
+    parser.add_argument("--kvaf-server", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--serial-result", type=Path)
+    parser.add_argument(
+        "--keep-trace", action="store_true", help="Keep the raw profiler timeline after successful attribution"
+    )
+    run(parser.parse_args())
