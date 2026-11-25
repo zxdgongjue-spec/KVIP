@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Capture one checked msprof replay of the current main P2 LIFetch route."""
+"""Capture checked msprof replays of the fused LIFetch routes."""
 
 import argparse
 import json
@@ -28,6 +28,8 @@ def parse_args(argv=None):
     parser.add_argument('--instruction-pipes', default='mte1|mte2|mte3',
                         help='pipe names separated by |, used with --instructions')
     comparison = parser.add_mutually_exclusive_group()
+    comparison.add_argument('--route', choices=('p2', 'dedicated'), default='p2',
+                            help='capture a single stock P2 or BS16 Dedicated Service forward')
     comparison.add_argument('--cold-compare', action='store_true', help='compare native P2 and Cold P4 at BS8/miss10')
     comparison.add_argument('--unified-compare', action='store_true',
                             help='compare native P2, full Score P2 and full Score P4 at BS8/miss10')
@@ -43,6 +45,8 @@ def parse_args(argv=None):
         args.warmup = 2 if args.comparison_routes else 0
     if args.comparison_routes and (args.batch != 8 or args.miss_percent != 10 or args.instructions):
         parser.error('Score comparison uses BS8, miss 10% and the scoped kernel/source trace')
+    if args.route == 'dedicated' and (args.batch != 16 or args.instructions):
+        parser.error('Dedicated Service requires BS16 and the scoped kernel/source trace')
     if not args.comparison_routes and args.local_counts is not None:
         parser.error('--local-counts applies to a Score comparison')
     args.local_counts = args.local_counts == 'on' if args.local_counts is not None else args.cold_compare
@@ -181,7 +185,12 @@ def capture(args, output, kvaf, arguments, manifest):
     if args.comparison_routes:
         capture_comparison(args, output, arguments, manifest, profiler)
         return
-    captured = capture_route(args, output, configuration(arguments), manifest, profiler)
+    config = configuration(arguments)
+    if args.route == 'dedicated':
+        config.msprof_cold_route = args.route
+        config.msprof_local_counts = args.local_counts
+        config.msprof_build_dir = str(output / 'trace_build')
+    captured = capture_route(args, output, config, manifest, profiler, cold_route=args.route)
     if args.instruction_plan:
         instruction_output = output / 'instruction'
         manifest['instruction_status_file'] = str(instruction_output / 'instruction_status.json')
@@ -198,8 +207,9 @@ def main(argv=None):
     kvaf = Path(os.environ.get('KVIP_KVAF_ROOT', a5_root / 'KVAF-unified-813f1750')).resolve()
     arguments = bench_args(args, kvaf)
     route = ('unified_score_p2_p4_comparison' if args.unified_compare else
-             'cold_p2_p4_comparison' if args.cold_compare else 'main_p2_parallel_terminal')
-    planned_routes = args.comparison_routes or ('p2',)
+             'cold_p2_p4_comparison' if args.cold_compare else
+             'dedicated_service_parallel_terminal' if args.route == 'dedicated' else 'main_p2_parallel_terminal')
+    planned_routes = args.comparison_routes or (args.route,)
     manifest = dict(
         status='NOT_RUN', commit=git(ROOT, 'rev-parse', 'HEAD'), main_commit=MAIN,
         worktree_dirty=bool(git(ROOT, 'status', '--porcelain', '--untracked-files=normal')),

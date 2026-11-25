@@ -309,6 +309,8 @@ private:
     }
 
     __aicore__ inline uint64_t DedicatedColdReady(uint32_t query, uint32_t epoch, uint32_t half) const {
+        KVIP_TRACE_BEGIN(readyScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+            Cold, DedicatedReadySnapshot, epoch, query);
         uint32_t ends[(kvip_dedicated_cold::kRounds - 1) * kvip_dedicated_cold::kFragments] = {};
         for (uint32_t w = 1; w <= epoch; ++w) {
             for (uint32_t fragment = 0; fragment < kvip_dedicated_cold::kFragments; ++fragment) {
@@ -335,6 +337,7 @@ private:
         for (uint32_t fragment = shard; fragment < endFragment; ++fragment) {
             const auto range = kvip_dedicated_cold::Fragment(runtimeShape_.history, runtimeShape_.resident,
                 half, epoch, fragment);
+            if (range.begin == range.end) continue;
             const uint32_t limit = range.end * kvip_dedicated_cold::kTileTokens;
             for (uint32_t query = firstQuery; query < firstQuery + 2; ++query) {
                 while (ReadDedicatedCursor(query, epoch, fragment) < limit) {}
@@ -1026,6 +1029,10 @@ __aicore__ inline void QLIVector<QLIT>::PublishColdTile(const QLICommon::RunInfo
                 kvip_dedicated_cold::kFragments * kvip_dedicated_cold::kProgressWords * sizeof(uint32_t);
             publish.dstStride = queryStride - publish.blockLen;
             const uint32_t offset = kvip_dedicated_cold::ProgressOffset(queryRow, dedicatedEpoch_, progressShard);
+            // The two UB banks can post to the same GM cursor. Order those
+            // writes and make this tile's scores and predicates visible
+            // before a separate Service lane can observe its cursor.
+            PipeBarrier<PIPE_MTE3>();
             DataCopyPad(dedicatedProgressGm_[offset], rotationProgress_[(info.s2Idx % 64) * 16], publish);
         } else if (coldParts_) {
             // MTE3 has already queued this tile's predicates.

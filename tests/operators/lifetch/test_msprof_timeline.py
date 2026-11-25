@@ -10,7 +10,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'experiments/lifetch_mr23_service'))
 from lifetch_msprof_timeline import (  # noqa: E402
-    PHASES, PHASES_COLD_P4, PHASES_UNIFIED, device_business_view, publish_business_views, require_fused_replay,
+    PHASES, PHASES_COLD_P4, PHASES_DEDICATED, PHASES_UNIFIED, device_business_view, publish_business_views,
+    require_fused_replay,
 )
 
 
@@ -102,6 +103,14 @@ def test_unified_score_and_cold_t2_must_match_their_route():
     for route in ('full_p2', 'full_uniform'):
         stages = require_fused_replay(raw, cold_route=route)
         assert [stage['kernel'] for stage in stages] == [kernel for _, kernel, _ in PHASES_UNIFIED]
+    with pytest.raises(ValueError, match='different named kernel'):
+        require_fused_replay(raw)
+
+
+def test_dedicated_vendor_kernels_require_the_dedicated_route():
+    raw = fused_replay(PHASES_DEDICATED)
+    stages = require_fused_replay(raw, cold_route='dedicated')
+    assert stages[2]['kernel'] == 'v9_li_kernel_cold_dedicated_service'
     with pytest.raises(ValueError, match='different named kernel'):
         require_fused_replay(raw)
 

@@ -221,16 +221,37 @@ extern "C" uint32_t kvip_dedicated_cold_supported(const rotating::RuntimeShape* 
         shape->aicCount == kMixGroups && shape->liCores == kMixGroups && shape->serviceLanes == kServiceLanes;
 }
 
-extern "C" uint32_t kvip_parallel_tail_dedicated_service_forward(
+template<bool Profile = false>
+static uint32_t LaunchDedicatedService(
     void* bindings, void* terminal, void* stream, const rotating::RuntimeShape* shape) {
     if (!bindings || !terminal || !stream || !kvip_dedicated_cold_supported(shape)) return 100000;
     const uint32_t groups = shape->liCores;
-    uint32_t result = aclrtlaunch_v9_li_kernel(groups, stream, bindings);
-    if (!result) result = aclrtlaunch_v9_li_kernel_threshold_dedicated_service(groups, stream, bindings);
-    if (!result) result = aclrtlaunch_v9_li_kernel_cold_dedicated_service(groups, stream, bindings);
-    if (!result) result = aclrtlaunch_v9_parallel_terminal(shape->batch * 4, stream, terminal);
+    uint32_t result = LaunchTailStage<Profile>(stream, ParallelTailStage::Hot, [&] {
+        return aclrtlaunch_v9_li_kernel(groups, stream, bindings);
+    });
+    if (!result) result = LaunchTailStage<Profile>(stream, ParallelTailStage::Threshold, [&] {
+        return aclrtlaunch_v9_li_kernel_threshold_dedicated_service(groups, stream, bindings);
+    });
+    if (!result) result = LaunchTailStage<Profile>(stream, ParallelTailStage::ColdService, [&] {
+        return aclrtlaunch_v9_li_kernel_cold_dedicated_service(groups, stream, bindings);
+    });
+    if (!result) result = LaunchTailStage<Profile>(stream, ParallelTailStage::Terminal, [&] {
+        return aclrtlaunch_v9_parallel_terminal(shape->batch * 4, stream, terminal);
+    });
     return result;
 }
+
+extern "C" uint32_t kvip_parallel_tail_dedicated_service_forward(
+    void* bindings, void* terminal, void* stream, const rotating::RuntimeShape* shape) {
+    return LaunchDedicatedService(bindings, terminal, stream, shape);
+}
+
+#if KVIP_STAGE_TRACE
+extern "C" uint32_t kvip_parallel_tail_dedicated_service_profile_forward(
+    void* bindings, void* terminal, void* stream, const rotating::RuntimeShape* shape) {
+    return LaunchDedicatedService<true>(bindings, terminal, stream, shape);
+}
+#endif
 
 extern "C" uint32_t kvip_partitioned_hot_score_parts(const rotating::RuntimeShape* shape) {
     return kvip_parallel_tail_supported(shape) ? kvip_hot_score::Parts(shape->batch,shape->resident,shape->aicCount) : 0;

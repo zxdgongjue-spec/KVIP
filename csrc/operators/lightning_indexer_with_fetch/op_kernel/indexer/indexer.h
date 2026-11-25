@@ -946,6 +946,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanDedicatedFragment(
     uint32_t half, uint32_t epoch, uint32_t fragment, uint32_t& loop, uint32_t& scaleLoop, bool last, bool reloadQuery)
 {
     const auto tiles = kvip_dedicated_cold::Fragment(runtimeShape_.history, resident_, half, epoch, fragment);
+    if (tiles.begin == tiles.end) return;
 #if KVIP_STAGE_TRACE
     traceWindow_ = epoch;
 #endif

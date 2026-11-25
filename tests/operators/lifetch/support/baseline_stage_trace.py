@@ -48,10 +48,18 @@ UNIFIED_KERNELS = {
     20: ('Full history Score', 'v9_li_kernel_score_t2'),
     22: ('Cold T2 + rotating Service', 'v9_li_kernel_cold_t2'),
 }
+DEDICATED_KERNELS = {
+    **KERNELS,
+    21: (KERNELS[21][0], 'v9_li_kernel_threshold_dedicated_service'),
+    22: ('Cold Score + dedicated Service', 'v9_li_kernel_cold_dedicated_service'),
+}
 ROUTE_KERNELS = {'p2': KERNELS, 'cold_p4': COLD_P4_KERNELS,
+                 'dedicated': DEDICATED_KERNELS,
                  **{route: UNIFIED_KERNELS for route in UNIFIED_ROUTES}}
 WAIT_PARTITIONED_HALF = 218
 T2_PIPE_PHASES = (219, 220, 221, 222)
+DEDICATED_DRIVER_WAIT = 224
+DEDICATED_READY_SNAPSHOT = 225
 PHASES = {
     1: 'Kernel body',
     2: 'Kernel setup',
@@ -77,6 +85,8 @@ PHASES = {
     167: 'Wait final Get CQ',
     168: 'Join prefetch CQ',
     169: 'Request join and completion status',
+    DEDICATED_DRIVER_WAIT: 'Dedicated driver wait',
+    DEDICATED_READY_SNAPSHOT: 'Dedicated ready cursor snapshot',
 }
 PIPE_SCOPES = {
     180: ('AIC', 'WAIT', 'Wait for AIV credit'),
@@ -183,6 +193,7 @@ class StageBuffer:
         profile_symbol = {
             'p2': 'kvip_parallel_tail_profile_forward',
             'cold_p4': 'kvip_parallel_tail_cold_partitioned_profile_forward',
+            'dedicated': 'kvip_parallel_tail_dedicated_service_profile_forward',
             'full_p2': 'kvip_parallel_tail_unified_p2_profile_forward',
             'full_uniform': 'kvip_parallel_tail_unified_partitioned_profile_forward',
         }[cold_route]
@@ -292,6 +303,7 @@ def verify_route(events, batch, *, require_pipe_scopes=False, cold_route='p2', s
     four_aiv = set(range(4 * batch))
     two_aic = set(range(64, 64 + 2 * batch))
     cold_lanes = {'cold_p4': set(range(8 * batch)) | set(range(64, 64 + 4 * batch)),
+                  'dedicated': four_aiv | set(range(64, 88)),
                   'p2': four_aiv | two_aic}.get(cold_route, four_aiv)
     score_groups = batch * score_parts
     score_lanes = set(range(2 * score_groups)) | set(range(64, 64 + score_groups))
@@ -303,6 +315,23 @@ def verify_route(events, batch, *, require_pipe_scopes=False, cold_route='p2', s
                              f'got {len(bodies[kernel])}')
     if any(event['lane'] not in bodies[event['kernel']] for event in events):
         raise ValueError('A source scope has no corresponding kernel body on its lane')
+    dedicated_scopes = {DEDICATED_DRIVER_WAIT, DEDICATED_READY_SNAPSHOT}
+    dedicated_events = [event for event in events if event['phase'] in dedicated_scopes]
+    if cold_route == 'dedicated':
+        if batch != 16:
+            raise ValueError('Dedicated Service source trace requires BS16')
+        driver_coverage = {(event['lane'], event['iteration']) for event in dedicated_events
+                           if event['phase'] == DEDICATED_DRIVER_WAIT}
+        expected_waits = {(lane, window) for lane in range(48, 64) for window in (1, 2, 3)}
+        snapshot_coverage = {(event['lane'], event['iteration'], event['detail'])
+                             for event in dedicated_events if event['phase'] == DEDICATED_READY_SNAPSHOT}
+        expected_snapshots = {(48 + request, window, request * 4 + q) for request in range(16)
+                              for window in range(4) for q in range(4)}
+        if (driver_coverage != expected_waits or snapshot_coverage != expected_snapshots
+                or any(event['kernel'] != 22 for event in dedicated_events)):
+            raise ValueError('Dedicated Service driver waits or ready snapshots have incomplete lane/window coverage')
+    elif dedicated_events:
+        raise ValueError('Dedicated Service scopes appeared on a different Cold route')
     if unified and require_pipe_scopes:
         sampled = {(event['iteration'], event['phase'], event['lane']) for event in events
                    if event['phase'] in T2_PIPE_PHASES}
@@ -344,6 +373,8 @@ def render(events, counter_mhz, *, cold_route='p2'):
                     (20, 191): 'Full-history Score reduction SIMD VF',
                     (20, 192): 'Full-history Score writeback issue',
                     (22, 22): 'AIV precomputed Cold tile scan'} if cold_route in UNIFIED_ROUTES else {}
+    if cold_route == 'dedicated':
+        scope_labels[22, 150] = 'Dedicated Service'
 
     def metadata(name, pid, tid, label):
         trace.append(dict(name=name, ph='M', pid=pid, tid=tid, args={'name': label}))
@@ -374,7 +405,9 @@ def render(events, counter_mhz, *, cold_route='p2'):
                     iteration=event['iteration'], detail=event['detail'], begin_tick=begin, end_tick=end)
         window_epoch = None
         category = kernel_stage
-        if kernel in (20, 22) and (phase in (21, 22, 25, *range(150, 156)) or phase in PIPE_SCOPES):
+        if kernel in (20, 22) and (phase in (21, 22, 25, *range(150, 156),
+                                             DEDICATED_DRIVER_WAIT, DEDICATED_READY_SNAPSHOT)
+                                   or phase in PIPE_SCOPES):
             window_epoch = event['iteration']
             args['window_epoch'] = window_epoch
         if phase in PIPE_SCOPES:
@@ -395,11 +428,11 @@ def render(events, counter_mhz, *, cold_route='p2'):
                 args['tile_index'] = slot
                 args['sampled_scan_tile'] = True
             lane_scopes[(core_type, pipe)].append(event)
-        elif phase in (23, 155) or kernel == 23:
+        elif phase in (23, 155, DEDICATED_READY_SNAPSHOT) or kernel == 23:
             args.update(request_row=event['detail'] // 4, query=event['detail'] % 4)
         elif phase in (21, 22, 152, 153):
             args['request_row'] = event['detail']
-        elif phase in (25, 150, 151):
+        elif phase in (25, 150, 151, DEDICATED_DRIVER_WAIT):
             args['service_lane'] = event['detail']
         elif phase == 154:
             args['request_or_service_lane'] = event['detail']
@@ -503,6 +536,9 @@ def write_capture(directory, raw, counter_mhz, state, library, config, soc, mspr
     report = replay_evidence(state, library, config, soc)
     if cold_route == 'cold_p4':
         report['route'] = 'Hot P2 + Cold P4 + four-AIV Terminal'
+    elif cold_route == 'dedicated':
+        report.update(route='Hot P2 + Cold Score with Dedicated Service + four-AIV Terminal',
+                      cold_score_aic=24, cold_score_aiv=48, cold_service_aiv=16)
     elif cold_route in UNIFIED_ROUTES:
         report['route'] = f'Full Score P{score_parts} + Cold T2 + four-AIV Terminal'
     phases = {event['phase'] for event in events}
@@ -511,7 +547,7 @@ def write_capture(directory, raw, counter_mhz, state, library, config, soc, mspr
         raise ValueError('Observed Get counts have missing descriptor, submission or completion markers')
     report.update(
         traced_invocations=1,
-        cold_route=cold_route, hot_parts=score_parts, cold_parts=cold_parts,
+        cold_route=cold_route, hot_parts=score_parts, cold_parts=None if cold_route == 'dedicated' else cold_parts,
         service_lanes=int(state.rotating.runtime_shape.serviceLanes),
         local_counts=getattr(config, 'msprof_local_counts', False),
         clock=CLOCK, counter_mhz=counter_mhz, events=len(events), stages=stages,

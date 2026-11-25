@@ -185,6 +185,30 @@ def test_full_score_records_partitioned_compute_and_aiv_only_cold_t2():
     assert sample['args']['sampled_scan_tile'] is True
 
 
+def test_dedicated_wait_and_ready_lanes_are_rendered_separately():
+    events = [event for event in decode(sample_buffer(pipe_scopes=True, batch=16))
+              if not (event['kernel'] == 22 and event['lane'] >= 88)]
+    for request in range(16):
+        for window in range(4):
+            scope = dict(lane=48 + request, core=request, kernel=22, block=48 + request,
+                         subblock=request % 2, begin=5100, end=5110, iteration=window)
+            if window:
+                events.append(dict(scope, phase=source_trace.DEDICATED_DRIVER_WAIT, detail=request))
+            for q in range(4):
+                events.append(dict(scope, phase=source_trace.DEDICATED_READY_SNAPSHOT, detail=4 * request + q))
+    verify_route(events, 16, require_pipe_scopes=True, cold_route='dedicated')
+    verified, _ = render(events, 1000, cold_route='dedicated')
+    wait = next(event for event in verified['traceEvents']
+                if event['name'] == 'Dedicated driver wait' and event['tid'] == 63)
+    assert wait['args']['service_lane'] == 15
+    assert wait['args']['window_epoch'] == 1
+    ready = next(event for event in verified['traceEvents']
+                 if event['name'] == 'Dedicated ready cursor snapshot' and event['tid'] == 63)
+    assert ready['args']['request_row'] == 15 and ready['args']['query'] == 0
+    with pytest.raises(ValueError, match='incomplete lane/window coverage'):
+        verify_route(events[:-1], 16, cold_route='dedicated')
+
+
 def test_source_lane_count_deduplicates_nested_scopes():
     spans = [dict(begin=10, end=30, lane=0), dict(begin=20, end=40, lane=0), dict(begin=25, end=35, lane=1)]
     assert source_trace.source_lane_counts(spans) == [(10, 1), (25, 2), (35, 1), (40, 0)]

@@ -3988,14 +3988,15 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     if baseline_trace and (not msprof_output or instruction_replay):
         raise ValueError('Baseline stage trace requires an exclusive profile output')
     if cold_route is not None:
-        if not baseline_trace or cold_route not in ('p2', 'cold_p4', 'full_p2', 'full_uniform'):
-            raise ValueError('Score comparison requires a marked fusion replay')
-        if (tuple(config.batches) != (8,) or config.history != 131072 or config.queries != 4
+        if not baseline_trace or cold_route not in ('p2', 'cold_p4', 'full_p2', 'full_uniform', 'dedicated'):
+            raise ValueError('Experimental profiling requires a marked fusion replay')
+        expected_batch = 16 if cold_route == 'dedicated' else 8
+        if (tuple(config.batches) != (expected_batch,) or config.history != 131072 or config.queries != 4
                 or config.resident != 16384 or config.index_heads != 32
-                or config.miss_percent != 10 or config.prefetch_tokens != 512
+                or (cold_route != 'dedicated' and config.miss_percent != 10) or config.prefetch_tokens != 512
                 or config.prefetch_rank_start != 1024 or type(config.msprof_local_counts) is not bool
                 or not config.msprof_build_dir):
-            raise ValueError('Cold partition trace requires the BS8/Q4/128K/miss10 prefetch fixture and one shared build')
+            raise ValueError(f'The {cold_route} trace requires its BS{expected_batch}/Q4/128K prefetch fixture')
     if instruction_replay:
         instruction_library = Path(getattr(config, 'msprof_instruction_library', '')).resolve()
         if config.warmup or msprof_output or not instruction_library.is_file():
@@ -4007,8 +4008,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     soc = acl.get_soc_name()
     device_resources = query_device_resources(cann, config.device)
     aics = device_resources['effective_aic']
-    if dedicated_service is not None and (aics != 32 or device_resources['aiv'] < 64
-                                           or 'Ascend950' not in soc):
+    if (dedicated_service is not None or cold_route == 'dedicated') and (
+            aics != 32 or device_resources['aiv'] < 64 or 'Ascend950' not in soc):
         raise ValueError(f"Dedicated Service targets A5 with 32 MIX groups, got {soc} "
                          f"with {aics} effective AICs and {device_resources['aiv']} AIVs")
     if profile_replay:
@@ -4157,7 +4158,11 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             from baseline_stage_trace import StageBuffer, scoped_msprof, write_capture
 
             cold_parts = score_parts = 2
-            if cold_route in ('full_p2', 'full_uniform'):
+            if cold_route == 'dedicated':
+                from terminal_handoff import bind_dedicated_service
+
+                bind_dedicated_service(state, cold_route)
+            elif cold_route in ('full_p2', 'full_uniform'):
                 from terminal_handoff import bind_unified_score
 
                 score_parts = bind_unified_score(state, cold_route)

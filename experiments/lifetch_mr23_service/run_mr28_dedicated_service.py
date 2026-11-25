@@ -131,6 +131,7 @@ def main():
     modes = MODES if args.route == 'both' else (args.route,)
     completed = {}
     manifest = dict(status='NOT_RUN', commit=git(ROOT, 'rev-parse', 'HEAD'), main_base=MAIN,
+                    worktree_dirty=bool(git(ROOT, 'status', '--porcelain', '--untracked-files=no')),
                     expected_kvaf=KVAF, arguments=arguments, variants=modes, cold_roles=COLD_ROLES,
                     local_counts=False, prefetch_trace=args.prefetch_trace, staged_eager=args.staged_eager,
                     dedicated_drain_aiv1=not args.legacy_credit_tail,

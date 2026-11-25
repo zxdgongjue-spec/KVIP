@@ -25,8 +25,15 @@ PHASES_UNIFIED = (
     ('COLD_SERVICE', 'v9_li_kernel_cold_t2', 'Cold T2 + rotating Service'),
     PHASES[3],
 )
+PHASES_DEDICATED = (
+    PHASES[0],
+    ('THRESHOLD', 'v9_li_kernel_threshold_dedicated_service', PHASES[1][2]),
+    ('COLD_SERVICE', 'v9_li_kernel_cold_dedicated_service', 'Cold Score + dedicated Service'),
+    PHASES[3],
+)
 ROUTE_PHASES = {'p2': PHASES, 'cold_p4': PHASES_COLD_P4,
-                'full_p2': PHASES_UNIFIED, 'full_uniform': PHASES_UNIFIED}
+                'full_p2': PHASES_UNIFIED, 'full_uniform': PHASES_UNIFIED,
+                'dedicated': PHASES_DEDICATED}
 MARKERS = {f'KVIP_LIFETCH_{stage}_{side}' for stage, _, _ in PHASES for side in ('BEGIN', 'END')}
 KERNELS = {kernel for phases in ROUTE_PHASES.values() for _, kernel, _ in phases}
 COMPUTE_TYPES = {'AI_CORE', 'AI_VECTOR_CORE', 'MIX_AIC', 'MIX_AIV', 'AIV_SQE', 'FUSION'}

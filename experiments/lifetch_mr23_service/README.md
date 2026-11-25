@@ -344,3 +344,26 @@ and final Get counts before assigning a latency change to the schedule.
 The run writes `summary.csv` and `requests.csv`. The optional
 `--prefetch-trace` adds a separate replay with prefetch submission
 timestamps and their lead over Terminal.
+
+### BS16 standalone msprof replay
+
+In the A5 container, collect each route separately with the same fixture
+and local counts disabled. Each invocation warms up twice and captures
+one marked fused forward. The profiling scope starts after fixture
+initialization and BatchPut.
+
+```bash
+runner=experiments/lifetch_mr23_service
+for route in p2 dedicated; do
+    bash "$runner/run_mr28_baseline_msprof.sh" \
+        --route "$route" --batch 16 --miss-percent 10 \
+        --warmup 2 --timeout-seconds 1800 || break
+done
+```
+
+Each output directory contains `lifetch_msprof_trace.json` for the native
+task spans and `lifetch_business_trace.json` for the per-core business
+and MTE/VF source scopes. The Dedicated trace separates the driver wait
+and ready cursor snapshot from the predecessor wait, per-Q TopK,
+deduplication, and prefetch submission. Compare the same clock domain
+across routes and use the separate graph run for KV-ready latency.

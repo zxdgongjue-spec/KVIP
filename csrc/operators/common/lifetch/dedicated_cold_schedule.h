@@ -28,11 +28,16 @@ using TileRange = kvip_cold_score::TileRange;
 // prefix. The third producer in each 2-request group scores both upper tails.
 KVIP_DEDICATED_COLD_DEVICE inline TileRange Fragment(
     uint32_t history, uint32_t resident, uint32_t half, uint32_t epoch, uint32_t fragment) {
-    const uint32_t start = resident + 2 * (epoch - 1) * half;
-    const uint32_t halfEnd = start + half;
-    const uint32_t end = halfEnd + half < history ? halfEnd + half : history;
+    const uint32_t windowStart = resident + 2 * (epoch - 1) * half;
+    const uint32_t start = windowStart < history ? windowStart : history;
+    const uint32_t end = start + 2 * half < history ? start + 2 * half : history;
+    const uint32_t halfEnd = start + half < end ? start + half : end;
     const uint32_t pages = (end - start) / 256;
-    const uint32_t ownerEnd = start + ((2 * pages + 1) / 3) * 256;
+    const uint32_t balancedEnd = start + ((2 * pages + 1) / 3) * 256;
+    // Keep one upper page with the request-local producer when possible.
+    // Its final fragment releases the query buffer kept over all windows.
+    const uint32_t minOwnerEnd = halfEnd + 256 < end ? halfEnd + 256 : end;
+    const uint32_t ownerEnd = balancedEnd > minOwnerEnd ? balancedEnd : minOwnerEnd;
     const uint32_t begins[kFragments] = {start, halfEnd, ownerEnd};
     const uint32_t ends[kFragments] = {halfEnd, ownerEnd, end};
     return {begins[fragment] / kTileTokens, ends[fragment] / kTileTokens};
@@ -60,6 +65,7 @@ KVIP_DEDICATED_COLD_DEVICE inline uint32_t Prefix(
     for (uint32_t e = 1; e <= epoch; ++e) {
         for (uint32_t fragment = first; fragment < limit; ++fragment) {
             const auto tiles = Fragment(history, resident, half, e, fragment);
+            if (tiles.begin == tiles.end) continue;
             const uint32_t visible = ends[(e - 1) * kFragments + fragment];
             if (visible <= tiles.begin * kTileTokens) return ready;
             if (visible < tiles.end * kTileTokens) return visible;
