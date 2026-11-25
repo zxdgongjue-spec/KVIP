@@ -52,6 +52,23 @@ def test_interchange_only_cutoff_ties():
         check_scores(data, candidate, [serial])
 
 
+def test_ten_scored_calls_verifiably_bound_to_ten_measured_outputs(tmp_path):
+    from correctness import topk_fingerprint
+    from score_equivalence_report import measured_sets
+
+    data, serial = example(16)
+    outputs = np.broadcast_to(serial, (10, *serial.shape))
+    save_checked(tmp_path, 4, data, serial, {}, outputs, expected_calls=10)
+    receipt = json.loads((tmp_path/'score_topk_check.json').read_text())
+    current = (None, [topk_fingerprint(serial)] * 10)
+    assert (receipt['calls'], receipt['queries']) == (10, 640)
+    assert measured_sets(tmp_path, 4, current, serial, receipt, expected_calls=10).all()
+    with pytest.raises(ValueError, match='Incomplete'):
+        measured_sets(tmp_path, 4, current, serial, receipt)
+    with pytest.raises(ValueError, match='Expected 10'):
+        save_checked(tmp_path, 4, data, serial, {}, outputs[:9], expected_calls=10)
+
+
 def test_report_binds_score_checked_ids_to_measured_and_archive(tmp_path, monkeypatch, capsys):
     import score_equivalence_report as report
     from correctness import topk_fingerprint

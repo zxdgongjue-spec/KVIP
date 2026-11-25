@@ -51,9 +51,9 @@ def test_oracle_reads_the_native_ids_not_the_candidate_ids(tmp_path, group):
         main.archived_oracle(root, group)
 
 
-def profile(folder):
+def profile(folder, calls=20):
     parts, durations = [], []
-    for i in range(20):
+    for i in range(calls):
         start = i*60
         li = [[start+j*5, start+j*5+3] for j in range(3)]
         end = start+33+(i%4)
@@ -63,9 +63,9 @@ def profile(folder):
             intervals_us=dict(li=li, topk_resolve_update=tail),
             stages_us=dict(li=9, topk_resolve_update=end-start-18))))
     path = folder/'diagnose/round-1/full_attribution.json'
-    put(path, dict(samples=parts, graph_calls=20, graph_accounting=dict(event_us=1202.)))
-    return path, dict(graph_calls=20, measured_graphs=1, timing_protocol='one_profiled_graph', event_mean_us=60.1,
-                      mean_us=60.1, p50_us=34.5, samples_us=durations)
+    put(path, dict(samples=parts, graph_calls=calls, graph_accounting=dict(event_us=60.1*calls)))
+    return path, dict(graph_calls=calls, measured_graphs=1, timing_protocol='one_profiled_graph', event_mean_us=60.1,
+                      mean_us=60.1, p50_us=float(np.median(durations)), samples_us=durations)
 
 
 def test_measured_boundary_uses_graph_event_mean_and_joined_kernel_span(tmp_path):
@@ -84,3 +84,13 @@ def test_mismatched_event_and_profiler_time_is_rejected(tmp_path):
     timing['event_mean_us'] = timing['mean_us'] = 34.5
     with pytest.raises(ValueError, match='Graph event mean'):
         main.main_times(tmp_path, timing)
+
+
+def test_ten_call_graph_preserves_event_and_rejects_other_denominators(tmp_path):
+    _, timing = profile(tmp_path, 10)
+    assert main.main_times(tmp_path, timing, expected_calls=10)['graph'] == (60.1, 34.0)
+    with pytest.raises(ValueError, match='20 independent'):
+        main.main_times(tmp_path, timing)
+    timing['mean_us'] = timing['event_mean_us'] = 30.05
+    with pytest.raises(ValueError, match='Graph event mean'):
+        main.main_times(tmp_path, timing, expected_calls=10)

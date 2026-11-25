@@ -22,14 +22,14 @@ def checked_outputs(root, group, current, serial, identity, oracle_path):
     return folder, source, measured_sets(folder, group, current, serial, receipt)
 
 
-def measured_sets(folder, group, current, serial, receipt):
-    if receipt['group'] != group or (receipt['calls'], receipt['queries']) != (20, 1280):
+def measured_sets(folder, group, current, serial, receipt, *, expected_calls=20):
+    if receipt['group'] != group or (receipt['calls'], receipt['queries']) != (expected_calls, expected_calls * 16 * 4):
         raise ValueError('Incomplete score-equivalent check')
     if receipt['serial_set_digest'] != topk_fingerprint(serial):
         raise ValueError('Strong serial oracle differs between runs')
     with np.load(folder / 'score_topk_ids.npz', allow_pickle=False) as raw:
         outputs = raw['fused']
-    if (outputs.shape != (20, 16, 4, 2048) or outputs.dtype.kind not in 'iu'
+    if (outputs.shape != (expected_calls, 16, 4, 2048) or outputs.dtype.kind not in 'iu'
             or [topk_fingerprint(call) for call in outputs] != current[1]):
         raise ValueError('Score-checked outputs differ from the measured and KV-checked outputs')
     exact = np.all(np.sort(outputs, axis=-1) == np.sort(serial, axis=-1), axis=-1)

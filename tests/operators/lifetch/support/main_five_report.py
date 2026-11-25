@@ -63,12 +63,13 @@ def archived_oracle(owner_root, group):
     return ids, receipt
 
 
-def main_times(folder, timing):
+def main_times(folder, timing, *, expected_calls=20):
     profile = read(folder / 'diagnose/round-1/full_attribution.json')
     samples = profile['samples']
-    if (profile['graph_calls'] != 20 or len(samples) != 20 or timing['graph_calls'] != 20
+    if (profile['graph_calls'] != expected_calls or len(samples) != expected_calls
+            or timing['graph_calls'] != expected_calls or len(timing['samples_us']) != expected_calls
             or timing['timing_protocol'] != 'one_profiled_graph' or timing['measured_graphs'] != 1):
-        raise ValueError('Expected one graph with 20 independent measured calls')
+        raise ValueError(f'Expected one graph with {expected_calls} independent measured calls')
     before, after, spans = [], [], []
     for i, sample in enumerate(samples):
         item = sample['accounting']
@@ -93,7 +94,7 @@ def main_times(folder, timing):
     graph = (timing['event_mean_us'], median(spans))
     if (not isfinite(graph[0]) or graph[0] <= 0 or not isclose(graph[0], timing['mean_us'])
             or not isclose(graph[1], timing['p50_us'], abs_tol=0.025)
-            or not isclose(graph[0]*20, profile['graph_accounting']['event_us'], abs_tol=0.025)
+            or not isclose(graph[0]*expected_calls, profile['graph_accounting']['event_us'], abs_tol=0.025)
             or not np.allclose(spans, timing['samples_us'], rtol=1e-6, atol=0.025)):
         raise ValueError('Graph event mean or per-call spans disagree with the measured profile')
     return dict(graph=graph, LI1_to_LI3=(mean(before), median(before)),
@@ -101,7 +102,7 @@ def main_times(folder, timing):
 
 
 def measured_parallel(root, group, arm, revision, owner, native, old_receipt, archived_inputs, *,
-                      verify_library, timing_reader=main_times, capture_meta_name=None):
+                      verify_library, timing_reader=None, capture_meta_name=None, expected_calls=20):
     from li_restore_archive import check_snapshot
     from ranked_integration_sets import INPUT_AND_RESULTS
     from score_equivalence_report import measured_sets
@@ -116,7 +117,7 @@ def measured_parallel(root, group, arm, revision, owner, native, old_receipt, ar
     if out['input_paths'] != inputs['source_paths'] or inputs['geometry'] != out['geometry']:
         raise ValueError(f'G{group}: output capture metadata mismatch')
     expected = dict(group=group, transport='urma', input='real', device=0, physical_npu=4, warmup=4,
-                    iterations=20, intermediate_fetches=4, prefetch_tokens=1024, prefetch_rank_start=1024,
+                    iterations=expected_calls, intermediate_fetches=4, prefetch_tokens=1024, prefetch_rank_start=1024,
                     fused_only=True, production_revision=revision)
     differences = [name for name, value in expected.items() if config.get(name) != value]
     if differences:
@@ -125,10 +126,11 @@ def measured_parallel(root, group, arm, revision, owner, native, old_receipt, ar
             or out['correctness'] != 'PASS' or out['failures']):
         raise ValueError(f'G{group}: mainline device validation or transport setup failed')
     proof = read(folder / 'mainline_checks.json')
+    expected_counts = (expected_calls, expected_calls * 16)
     if (proof['production_revision'] != revision or proof['production_terminal'] is not True
             or proof['profiled_terminal_kernel'] != 'v9_parallel_terminal'
-            or (proof['measured_calls'], proof['measured_kv_index_rows']) != (20, 320)
-            or (proof['ordered_diagnostic_calls'], proof['ordered_diagnostic_rows']) != (20, 320)):
+            or (proof['measured_calls'], proof['measured_kv_index_rows']) != expected_counts
+            or (proof['ordered_diagnostic_calls'], proof['ordered_diagnostic_rows']) != expected_counts):
         raise ValueError(f'G{group}: incomplete mainline kernel, measured outputs or ordered Index evidence')
     sha = proof['library_sha256']
     if len(sha) != 64 or any(c not in '0123456789abcdef' for c in sha):
@@ -147,8 +149,12 @@ def measured_parallel(root, group, arm, revision, owner, native, old_receipt, ar
         raise ValueError(f'G{group}: mainline and owner archive used different native oracles')
     if proof['capture_operand_hashes'] != source['identity']['inputs']:
         raise ValueError(f'G{group}: measured input differs from the archived native operands')
-    exact = measured_sets(folder, group, (inputs, out['topk_set_digests']), native, receipt)
-    new_times = timing_reader(folder, out['all_rounds'])
+    exact = measured_sets(folder, group, (inputs, out['topk_set_digests']), native, receipt,
+                          expected_calls=expected_calls)
+    if timing_reader is None:
+        new_times = main_times(folder, out['all_rounds'], expected_calls=expected_calls)
+    else:
+        new_times = timing_reader(folder, out['all_rounds'])
     thp = read(root / f'g{group}/{arm}/thp.json')
     if (thp.get('status') != 'measured' or thp.get('page_mode') != 'thp'
             or thp['bytes'] <= 0):

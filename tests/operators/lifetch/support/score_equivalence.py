@@ -35,9 +35,9 @@ def check_scores(inputs, serial, outputs):
                 exact_queries=int(match.sum()), serial_set_digest=topk_fingerprint(serial))
 
 
-def save_checked(directory, group, inputs, reference, metadata, outputs):
-    if len(outputs) != 20 or inputs.geometry['batch'] != 16:
-        raise ValueError('Expected 20 measured Q4 calls with batch 16')
+def save_checked(directory, group, inputs, reference, metadata, outputs, *, expected_calls=20):
+    if len(outputs) != expected_calls or inputs.geometry['batch'] != 16:
+        raise ValueError(f'Expected {expected_calls} measured Q4 calls with batch 16')
     result = check_scores(inputs, reference, outputs)
     # The standalone native LI reference is part of this result archive, even
     # if a later run prunes its build or native LI cache.

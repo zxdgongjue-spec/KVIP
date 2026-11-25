@@ -13,7 +13,6 @@ import numpy as np
 
 
 REVISION = '609fa26fd715f9409bbe74e1b2d3685c58dfb0cf'
-CALLS = 20
 BATCH = 16
 
 
@@ -46,6 +45,7 @@ def worker(args):
     # archived reader decodes both into the same immutable ReplayRound.
     # Only the capture decoder is inherited. The runtime, profiler, public
     # binding and test code below all come from the pinned mainline checkout.
+    call_ids = range(args.iterations)
     from workloads import ReplaySequence as ArchiveSequence
     from main_five_report import archived_oracle
     from native_li_reference import digest
@@ -85,7 +85,7 @@ def worker(args):
         '--group', str(args.group), '--round-range', '1:1', '--device', '0',
         '--kvaf-root', str(args.kvaf_root), '--kvaf-server', args.kvaf_server,
         '--prefetch-rank-start', '1024', '--prefetch-tokens', '1024', '--intermediate-fetches', '4',
-        '--warmup', '4', '--iterations', str(CALLS), '--level', '2', '--output', str(args.output / 'results'),
+        '--warmup', '4', '--iterations', str(args.iterations), '--level', '2', '--output', str(args.output / 'results'),
     ])
     pages = ReplayPagePlan(sequence)
     paths = [str(ref.manifest_path) for refs in sequence.rounds for ref in refs]
@@ -270,7 +270,7 @@ def worker(args):
     result = ex.run_path(cfg, fused, sequence, pages, fused=True)
     if result['correctness'] != 'PASS' or result['failures']:
         raise ValueError(f'Official mainline replay failed: {result["failures"]}')
-    if set(outputs) != set(range(CALLS)) or set(ordered) != set(outputs) or len(library_paths) != 1:
+    if set(outputs) != set(call_ids) or set(ordered) != set(outputs) or len(library_paths) != 1:
         raise ValueError('Incomplete measured or diagnostic verification')
     if args.availability_only:
         from check_isolated_device import extract
@@ -291,7 +291,7 @@ def worker(args):
             capture_operand_hashes=operand_hashes, loaded_library=str(library),
             library_sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
             kv_calls=len(outputs), ordered_index_calls=len(ordered), ordered_index_rows=sum(ordered.values())))
-        np.save(fused / 'diagnostic_ids.npy', np.stack([outputs[i] for i in range(CALLS)]), allow_pickle=False)
+        np.save(fused / 'diagnostic_ids.npy', np.stack([outputs[i] for i in call_ids]), allow_pickle=False)
         return
     samples = json.loads((fused / 'diagnose/round-1/full_attribution.json').read_text())['samples']
     for i, sample in enumerate(samples):
@@ -300,7 +300,7 @@ def worker(args):
         if (entry['invocation'] != i or set(intervals) != {'li', 'topk_resolve_update'} or
                 len(intervals['li']) != 3 or len(intervals['topk_resolve_update']) != 1):
             raise ValueError(f'Unexpected mainline profiler kernels in invocation {i}')
-    if len(samples) != CALLS:
+    if len(samples) != args.iterations:
         raise ValueError('Incomplete mainline profiler capture')
     library, = library_paths
     device_proof = {}
@@ -308,18 +308,18 @@ def worker(args):
         from unified_main_device import check
         device_proof['device_text_sha256'] = check(library)
     if history_cap:
-        if set(measured_requests) != set(range(CALLS)):
+        if set(measured_requests) != set(call_ids):
             raise ValueError('Missing measured prefetch or terminal request counts')
         history_cap['measured_requests'] = {
-            key: [measured_requests[i][column] for i in range(CALLS)]
+            key: [measured_requests[i][column] for i in call_ids]
             for column, key in enumerate(('prefetch', 'final'))}
         device_proof['history_cap'] = history_cap
     if args.production_graph or args.ablation_policy:
         from main_five_report import main_times
-        main_times(fused, result['all_rounds'])
+        main_times(fused, result['all_rounds'], expected_calls=args.iterations)
         counts = {name: len(addresses) for name, addresses in private_buffers.items()}
-        if set(counts.values()) != {CALLS}:
-            raise ValueError(f'Expected 20 independent states within one graph: {counts}')
+        if set(counts.values()) != {args.iterations}:
+            raise ValueError(f'Expected {args.iterations} independent states within one graph: {counts}')
         device_proof['independent_buffers'] = counts
     runtime = dict(host=platform.node(), visible=os.environ['ASCEND_RT_VISIBLE_DEVICES'],
                    npu=torch.npu.get_device_name(torch.device('npu:0')), torch=str(torch.__version__),
@@ -332,41 +332,41 @@ def worker(args):
         measured_calls=len(outputs), measured_kv_index_rows=len(outputs) * BATCH,
         ordered_diagnostic_calls=len(ordered), ordered_diagnostic_rows=sum(ordered.values())))
     if args.ablation_policy:
-        if len(cq_status_ranges) != CALLS or any(set(calls) != set(range(CALLS)) for calls in cq_calls.values()):
+        if len(cq_status_ranges) != args.iterations or any(set(calls) != set(call_ids) for calls in cq_calls.values()):
             raise ValueError('Incomplete independent measured or diagnostic queue receipts')
         atomic_json(fused / 'ablation_receipts.json', dict(
             policy=args.ablation_policy, independent_status_allocations=len(cq_status_ranges),
-            **{phase: [calls[i] for i in range(CALLS)] for phase, calls in cq_calls.items()}))
+            **{phase: [calls[i] for i in call_ids] for phase, calls in cq_calls.items()}))
     if args.borrow_audit:
-        if len(mailboxes) < CALLS:
+        if len(mailboxes) < args.iterations:
             raise ValueError('Missing independent window mailbox storage')
         atomic_json(fused/'borrow_checks.json', dict(
             device_text_sha256=borrow.check_device(library, args.revision),
             measured=borrow.summarize(borrow_calls['measured']),
             terminal_only=borrow.summarize(borrow_calls['detail']),
-            calls={phase: [values[i] for i in range(CALLS)] for phase, values in borrow_calls.items()}))
+            calls={phase: [values[i] for i in call_ids] for phase, values in borrow_calls.items()}))
         if args.revision == borrow.COMBINED:
-            if len(cq_status_ranges) != CALLS or any(set(calls) != set(range(CALLS)) for calls in cq_calls.values()):
+            if len(cq_status_ranges) != args.iterations or any(set(calls) != set(call_ids) for calls in cq_calls.values()):
                 raise ValueError('Incomplete per-query final CQ receipts')
             atomic_json(fused/'final_cq_checks.json', dict(
                 independent_status_allocations=len(cq_status_ranges),
-                **{phase: [calls[i] for i in range(CALLS)] for phase, calls in cq_calls.items()}))
-        if set(detail_ids) != set(range(CALLS)):
+                **{phase: [calls[i] for i in call_ids] for phase, calls in cq_calls.items()}))
+        if set(detail_ids) != set(call_ids):
             raise ValueError('Incomplete terminal-only TopK results')
-        np.save(fused/'terminal_only_ids.npy', np.stack([detail_ids[i] for i in range(CALLS)]), allow_pickle=False)
+        np.save(fused/'terminal_only_ids.npy', np.stack([detail_ids[i] for i in call_ids]), allow_pickle=False)
     if team_trace:
         if set(window_workers) != set(outputs):
             raise ValueError('Missing final-window worker diagnostic calls')
         atomic_json(fused/'window_workers.json', dict(
             fields=['arrival','snapshot','begin','end','ready_packed','topk_calls','scanned_tokens','merge_candidates'],
-            calls=[window_workers[i] for i in range(CALLS)]))
+            calls=[window_workers[i] for i in call_ids]))
     if spare_trace:
         atomic_json(fused/'penultimate_workers.json', dict(
             queries=[0, 3],
             fields=['available','done','arrival','begin','end','topk_calls','scanned','candidates',
                     'assigned','ready_packed','covered_empty','snapshot'],
-            calls=[spare_workers[i] for i in range(CALLS)]))
-    np.save(fused / 'measured_ids.npy', np.stack([outputs[i] for i in range(CALLS)]), allow_pickle=False)
+            calls=[spare_workers[i] for i in call_ids]))
+    np.save(fused / 'measured_ids.npy', np.stack([outputs[i] for i in call_ids]), allow_pickle=False)
 
 
 def main(args):
@@ -390,14 +390,15 @@ def main(args):
     outputs = np.load(ids_file, allow_pickle=False)
     inputs = next(iter(ReplaySequence(args.trace, args.group, (1, 1))))
     save_checked(fused, args.group, inputs, serial,
-                 {**source, 'origin': 'completed-owner-archive', 'archive_path': str(args.owner_archive)}, outputs)
+                 {**source, 'origin': 'completed-owner-archive', 'archive_path': str(args.owner_archive)},
+                 outputs, expected_calls=args.iterations)
     if args.borrow_audit:
         extra_dir = fused/'terminal_only'
         extra_dir.mkdir(exist_ok=False)
         file = fused/'terminal_only_ids.npy'
         save_checked(extra_dir, args.group, inputs, serial,
                      {**source, 'origin': 'completed-owner-archive', 'archive_path': str(args.owner_archive)},
-                     np.load(file, allow_pickle=False))
+                     np.load(file, allow_pickle=False), expected_calls=args.iterations)
         file.unlink()
     result_file = fused / 'path_result.json'
     result = json.loads(result_file.read_text())
@@ -408,20 +409,20 @@ def main(args):
         import shutil
         ref = json.loads((fused / 'score_topk_check.json').read_text())
         checks = json.loads((fused / 'ready_checks.json').read_text())
-        if (ref['calls'], ref['queries'], checks['kv_calls'], checks['ordered_index_rows']) != (CALLS, CALLS*4*BATCH, CALLS, CALLS*BATCH):
+        if (ref['calls'], ref['queries'], checks['kv_calls'], checks['ordered_index_rows']) != (args.iterations, args.iterations*4*BATCH, args.iterations, args.iterations*BATCH):
             raise ValueError('Incomplete availability replay checks')
         output = args.output.parent
         for name in ('detail_samples.json', 'cold_publication.json', 'raw_rank_progress.npz'):
             shutil.copyfile(fused / 'diagnose/round-1' / name, output / name)
         atomic_json(output/'ready_checks.json', dict(**checks, score_check=ref))
         print(f'G{args.group} DIAGNOSTIC_CHECK TopK_score_vs_strong_serial=PASS '
-              f'calls={ref["calls"]}/{CALLS} queries={ref["queries"]}/{4*BATCH*CALLS} '
+              f'calls={ref["calls"]}/{args.iterations} queries={ref["queries"]}/{4*BATCH*args.iterations} '
               f'exact_sets={ref["exact_queries"]}/{ref["queries"]} '
-              f'KV=PASS ordered_Index=PASS rows={checks["ordered_index_rows"]}/{CALLS*BATCH} '
+              f'KV=PASS ordered_Index=PASS rows={checks["ordered_index_rows"]}/{args.iterations*BATCH} '
               f'workers_per_call={BATCH*4} score_publications_per_call={BATCH*4*12} terminal_text_vs_upstream=PASS', flush=True)
 
 
-if __name__ == '__main__':
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('main', 'trace', 'owner-archive', 'kvaf-root', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
@@ -432,13 +433,19 @@ if __name__ == '__main__':
     modes.add_argument('--availability-only', action='store_true')
     modes.add_argument('--borrow-audit', action='store_true')
     modes.add_argument('--ablation-policy', choices=('single', 'paced'),
-                       help='Audit each Q’s actual GET/CQ receipts after a normal timed graph and its diagnostic replay')
+                       help='Audit each Q’s GET/CQ receipts for 10 timed calls and their separate diagnostic replay')
     modes.add_argument('--history-cap', type=int, choices=(131328, 524544),
                        help='Physical Q4 history capacity for the same 128K captured input')
     parser.add_argument('--production-graph', action='store_true',
                         help='Use the production graph containing 20 independent calls at the specified capacity')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
-    parsed = parser.parse_args()
+    parsed = parser.parse_args(argv)
+    parsed.iterations = 10 if parsed.ablation_policy else 20
     if parsed.production_graph and not parsed.history_cap:
         parser.error('--production-graph requires --history-cap')
+    return parsed
+
+
+if __name__ == '__main__':
+    parsed = parse_args()
     (worker if parsed.worker else main)(parsed)

@@ -29,7 +29,8 @@ def timeline():
     return dict(clock_mhz=10., cores=cores, last_block=42, observed_span_us=2.4)
 
 
-def test_reconcile_last_worker_only_and_print_delta(tmp_path, capsys):
+@pytest.mark.parametrize('calls', [10, 20])
+def test_reconcile_last_worker_only_and_print_delta(tmp_path, capsys, calls):
     t = timeline()
     s = inspect(t)
     assert s['span'] == pytest.approx(2.4)
@@ -37,10 +38,10 @@ def test_reconcile_last_worker_only_and_print_delta(tmp_path, capsys):
     assert sum(s['stages'].values()) == pytest.approx(s['span'])
     folder = tmp_path/'diagnose/round-1'
     folder.mkdir(parents=True)
-    samples = [dict(round=i, source_round=1, streaming_cycles=[dict(terminal_timeline=t)]) for i in range(20)]
+    samples = [dict(round=i, source_round=1, streaming_cycles=[dict(terminal_timeline=t)]) for i in range(calls)]
     (folder/'detail_samples.json').write_text(json.dumps(samples))
-    report = terminal_detail(tmp_path)
-    assert report['last_blocks'] == {42: 20} and report['tie_calls'] == 0
+    report = terminal_detail(tmp_path, expected_calls=calls)
+    assert report['last_blocks'] == {42: calls} and report['tie_calls'] == 0
     print_terminal_detail(7, dict(pr30=report, active=report))
     assert 'active_minus_pr30_last_worker_phase_mean_us' in capsys.readouterr().out
 

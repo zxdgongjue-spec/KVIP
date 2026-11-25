@@ -32,7 +32,7 @@ if [[ $mode == pr30-feature-steps ]]; then
         echo "Expected the NPU4 main archive and the matching main -> dualcut -> paced experiment commits" >&2
         exit 2
     fi
-    prefix=pr30-feature-steps
+    prefix=pr30-feature-steps-ten
 elif [[ $mode == cap-pair ]]; then
     if [[ $main != cfe2b52f6403d5edd612c314bc7110525a5f5789 ]]; then
         echo "The capacity comparison requires the candidate with 512K support" >&2
@@ -219,7 +219,7 @@ elif [[ $mode == pr30-feature-steps ]]; then
             if [[ -f "$out/$field.txt" ]]; then cp "$out/$field.txt" "$out/block$block/"; fi
         done
     done
-    echo "CONFIG baseline=$archive measured=dualcut,paced blocks=2 reverse_order=1 groups=10,4,17,7,2 physical_NPU=4 BS16_Q4 warmup=4 calls_per_arm_per_block=20"
+    echo "CONFIG baseline=$archive measured=dualcut,paced blocks=2 reverse_order=1 groups=10,4,17,7,2 physical_NPU=4 BS16_Q4 warmup=4 calls_per_arm_per_block=10 archived_main_calls=20"
 elif [[ $mode == active-history ]]; then
     echo "CONFIG measured=active_512k archive=$archive native=$main sdk=$sdk NPU=4 BS=16 Q=4 warmup=4 calls=20"
 elif [[ $mode == cap-pair ]]; then

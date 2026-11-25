@@ -15,26 +15,28 @@ def receipts(policy):
     final = [[1, 2, 253, 0], [255, 0, 0, 0]] + [[0]*4 for _ in range(14)]
     cqe = [[1, 2, 4, 0] if policy == 'paced' else [1, 1, 1, 0], [1, 0, 0, 0]]
     return [dict(prefetch=[0]*16, final=deepcopy(final), cqe=deepcopy(cqe)+[[0]*4 for _ in range(14)],
-                 first_post_peak_4us_tokens=32, peak_pending_queries=3) for _ in range(20)]
+                 first_post_peak_4us_tokens=32, peak_pending_queries=3) for _ in range(10)]
 
 
 def test_measured_per_query_completions():
     values = receipts('paced')
     r = report.receipt_summary(values, True)
-    assert r == dict(prefetch=0, final=511, eligible_q=40, split_q=40, split_rows=20,
-                     cqe_hist=[1200, 40, 20, 0, 20])
+    assert r == dict(prefetch=0, final=511, eligible_q=20, split_q=20, split_rows=10,
+                     cqe_hist=[600, 20, 10, 0, 10])
     with pytest.raises(ValueError, match='CQ receipts'):
         report.receipt_summary(values, False)
     values[0]['cqe'][0][1] = 4
     with pytest.raises(ValueError, match='CQ receipts'):
         report.receipt_summary(values, True)
     with pytest.raises(ValueError, match='Incomplete'):
-        report.receipt_summary(values[:19], True)
+        report.receipt_summary(values[:9], True)
+    with pytest.raises(ValueError, match='Incomplete'):
+        report.receipt_summary(values * 2, True)
 
 
 def test_separate_diagnostic_uses_actual_first_batch_cq_for_paced(tmp_path, monkeypatch):
     phases = {k: [1, 2] for k in ('WQE_and_publish','index_update_and_join','final_CQ_join','prefetch_CQ_join')}
-    monkeypatch.setattr(report, 'terminal_detail', lambda folder: dict(status='OK', phases_us=phases))
+    monkeypatch.setattr(report, 'terminal_detail', lambda folder, expected_calls: dict(status='OK', phases_us=phases))
     def single_post(sample, policy):
         assert policy == 'single'
         return dict(first_post_peak_4us_tokens=250, peak_pending_queries=4)
@@ -43,15 +45,18 @@ def test_separate_diagnostic_uses_actual_first_batch_cq_for_paced(tmp_path, monk
                for i in range(20)]
     atomic_json(tmp_path/'diagnose/round-1/detail_samples.json', samples)
     calls = receipts('paced')
-    assert report.diagnostic(tmp_path, 'single')['first_post_peak_4us_tokens'] == 250
-    assert report.diagnostic(tmp_path, 'paced', calls)['first_post_peak_4us_tokens'] == 32
+    assert report.diagnostic(tmp_path, 'single', 20)['first_post_peak_4us_tokens'] == 250
+    with pytest.raises(ValueError, match='incomplete diagnostic calls'):
+        report.diagnostic(tmp_path, 'paced', 10, calls)
+    atomic_json(tmp_path/'diagnose/round-1/detail_samples.json', samples[:10])
+    assert report.diagnostic(tmp_path, 'paced', 10, calls)['first_post_peak_4us_tokens'] == 32
     with pytest.raises(ValueError, match='Missing paced'):
-        report.diagnostic(tmp_path, 'paced')
+        report.diagnostic(tmp_path, 'paced', 10)
     with pytest.raises(ValueError, match='Live doorbells'):
-        report.diagnostic(tmp_path, 'single', calls)
+        report.diagnostic(tmp_path, 'single', 10, calls)
     calls[0]['final'][0][1] += 1
     with pytest.raises(ValueError, match='traffic disagrees'):
-        report.diagnostic(tmp_path, 'paced', calls)
+        report.diagnostic(tmp_path, 'paced', 10, calls)
 
 
 def test_archive_compiler_drift_and_fresh_comparisons(tmp_path, monkeypatch, capsys):
@@ -78,7 +83,7 @@ def test_archive_compiler_drift_and_fresh_comparisons(tmp_path, monkeypatch, cap
                  last_worker_mean_us={'WQE_and_publish':1, 'index_update_and_join':2,
                                       'final_CQ_join':3, 'prefetch_CQ_join':4})
         m = report.receipt_summary(receipts('paced' if arm == 'paced' else 'single'), arm == 'paced')
-        return metrics, m, d, sha, controls.copy(), thp, 1280
+        return metrics, m, d, sha, controls.copy(), thp, 1280 if arm == 'mainline' else 640
     monkeypatch.setattr(report, 'collect_arm', collect)
     for group in report.GROUPS:
         (out/f'g{group}').mkdir()
@@ -88,10 +93,15 @@ def test_archive_compiler_drift_and_fresh_comparisons(tmp_path, monkeypatch, cap
     row = report.read(out/'g7/feature_steps.json')
     assert row['device_text'] == dict(main_tail_equals_dualcut=False, dualcut_li_equals_paced=True)
     assert row['order'] == ['paced','dualcut']
+    assert row['calls_per_graph'] == {'mainline': 20, 'dualcut': 10, 'paced': 10}
     assert set(row['measured']) == {'dualcut','paced'}
     text = capsys.readouterr().out
     assert 'G7 dualcut_vs_mainline saved graph_mean/P50_us=+10.00/+10.00' in text
-    assert 'historical_main unmodified_stage_binary=DIFF' in text
+    assert 'historical_main calls_per_graph=20/10 unmodified_stage_binary=DIFF' in text
+    assert 'fresh_same_block calls_per_graph=10/10 unmodified_stage_binary=MATCH' in text
+    assert 'G7 CHECK arm=mainline TopK_score_vs_strong_serial=PASS calls=20/20 queries=1280/1280' in text
+    assert 'G7 CHECK arm=paced TopK_score_vs_strong_serial=PASS calls=10/10 queries=640/640' in text
+    assert 'eligible_Q=20/640 split_Q=20/640 split_rows=10/160' in text
     assert 'FIVE_GROUP_EQUAL_WEIGHT paced_vs_dualcut graph_saved_mean_us=+6.000' in text
     (archive/'host.txt').write_text('different-node')
     with pytest.raises(ValueError, match='different host'):

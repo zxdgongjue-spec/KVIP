@@ -22,12 +22,13 @@ def test_reverse_order_and_stage_isolation(tmp_path):
             }
             (path / 'feature_steps.json').write_text(json.dumps(dict(
                 group=group, timing=timings, measured={'paced': {'split_q': group}},
+                calls_per_graph={'mainline': 20, 'dualcut': 10, 'paced': 10},
                 device_text={'main_tail_equals_dualcut': True, 'dualcut_li_equals_paced': True})))
     summarize(tmp_path)
     result = json.loads((tmp_path / 'feature_comparison.json').read_text())
     assert result['equal_weight']['A_vs_main'] == {'graph': [10, 10], 'LI': [14, 14], 'tail': [-3, -3]}
     assert result['groups']['7']['B_vs_A']['tail'] == [1, 2]
-    assert result['groups']['7']['paced_split_Q_per_1280'] == [7, 7]
+    assert result['groups']['7']['paced_split_Q_per_640'] == [7, 7]
 
     path = tmp_path / 'block2/g7'
     (path / 'order.txt').write_text('dualcut paced')
@@ -42,3 +43,7 @@ def test_reverse_order_and_stage_isolation(tmp_path):
     result = json.loads((tmp_path / 'feature_comparison.json').read_text())
     assert result['groups']['7']['unmodified_stage_match'] == {
         'A_vs_main': [True, True], 'B_vs_A': [True, False]}
+    data['calls_per_graph']['paced'] = 20
+    report.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match='expected 10 measured candidate calls'):
+        summarize(tmp_path)
