@@ -365,9 +365,15 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
             GlobalTensor<uint32_t> saved; saved.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(WindowTopkPrefix()+uint64_t(query/4)*prefixBytes+4*2048*2)+(query%4)*2048);
             GlobalTensor<uint16_t> savedScores;
             savedScores.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(WindowTopkPrefix()+uint64_t(query/4)*prefixBytes)+(query%4)*2048);
-            PipeBarrier<PIPE_ALL>();DataCopy(indicesOutLocal_,saved,2048);DataCopy(scoreOutLocal_,savedScores,2048);
+            PipeBarrier<PIPE_ALL>();
+            DataCopy(indicesOutLocal_,saved,2048);
+            const uint16_t finalCutoff = LargeFinal ? uint16_t(meta[2]) : 0U;
+            // end0 covers every valid slot of this row. The positive final path consumes only IDs.
+            if (!finalCutoff || end0 > 131072U) {
+                DataCopy(scoreOutLocal_,savedScores,2048);
+            }
             SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
-            ExportWindowCold<LargeFinal>(query, LargeFinal ? uint16_t(meta[2]) : 0U);
+            ExportWindowCold<LargeFinal>(query, finalCutoff);
         }
         return;
     }
