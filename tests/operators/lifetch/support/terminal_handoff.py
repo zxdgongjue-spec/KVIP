@@ -9,6 +9,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
 STAGES = ('hot_us', 'threshold_us', 'cold_service_us', 'terminal_us')
+DYNAMIC_STAGES = ('hot_us', 'resident_cold_service_us', 'terminal_us')
+READY_SERVICE_MODES = ('static_ready', 'dynamic')
+DYNAMIC_MAILBOX_BYTES = 192 * 128
 COUNT_COLUMNS = ('prefetch_requests', 'final_get_requests', 'total_get_requests')
 
 
@@ -125,7 +128,7 @@ def bind_dedicated_service(state, mode):
     forward = dense_terminal(state)
     if mode == 'p2':
         return
-    if mode != 'dedicated':
+    if mode not in ('dedicated', *READY_SERVICE_MODES):
         raise ValueError(f'Unknown dedicated Service mode {mode!r}')
     workspace = state.workspace
     if not (workspace.tail_bounds.eq(0).all().item()
@@ -138,34 +141,44 @@ def bind_dedicated_service(state, mode):
             or workspace.compute.data_ptr() % 64):
         raise ValueError('Dedicated Service requires aligned progress space after the Score rows')
     library = forward.rotating.library
-    supported = library.kvip_dedicated_cold_supported
+    if mode in READY_SERVICE_MODES:
+        required = queries * state.history * 2 + ledger_bytes + DYNAMIC_MAILBOX_BYTES
+        if workspace.compute.nbytes < required or workspace.compute.data_ptr() % 128:
+            raise ValueError('Ready Service requires an aligned mailbox after the Cold progress ledger')
+        supported = library.kvip_dynamic_service_supported
+    else:
+        supported = library.kvip_dedicated_cold_supported
     supported.argtypes, supported.restype = [ctypes.c_void_p], ctypes.c_uint32
     if supported(forward.shape_pointer) != 1:
         raise ValueError('Dedicated Service is unsupported for this Terminal shape')
-    function = library.kvip_parallel_tail_dedicated_service_forward
+    function = getattr(library, f'kvip_parallel_tail_{mode}_service_forward')
     function.argtypes, function.restype = [ctypes.c_void_p] * 4, ctypes.c_uint32
     forward.terminal_function = function
 
 
 def run_staged_eager(state, mode, progress):
-    """Synchronize the four existing launches to localize an eager failure."""
+    """Synchronize the selected launches to localize an eager failure."""
     forward = state.forward
     rotating = forward.rotating
     stream = rotating.owner.lease.check_stream()
     shape = rotating.runtime_shape
     bindings = forward.bindings.data_ptr()
     terminal = forward.terminal.workspace.data_ptr()
-    suffixes = {
-        'p2': ('_1', '_2'),
-        'dedicated': ('_threshold_dedicated_service', '_cold_dedicated_service'),
-    }
-    threshold, cold = suffixes[mode]
-    stages = (
-        ('Hot', 'v9_li_kernel', shape.liCores, bindings),
-        ('Threshold', 'v9_li_kernel' + threshold, shape.liCores, bindings),
-        ('Cold+Service', 'v9_li_kernel' + cold, shape.liCores, bindings),
-        ('Terminal', 'v9_parallel_terminal', shape.batch * 4, terminal),
-    )
+    hot = 'v9_li_kernel_hot_ready_service' if mode in READY_SERVICE_MODES else 'v9_li_kernel'
+    stages = [('Hot', hot, shape.liCores, bindings)]
+    if mode == 'dynamic':
+        stages.append(('Resident+Cold+Service', 'v9_li_kernel_dynamic_service', shape.liCores, bindings))
+    else:
+        threshold, cold = {
+            'p2': ('_1', '_2'),
+            'dedicated': ('_threshold_dedicated_service', '_cold_dedicated_service'),
+            'static_ready': ('_threshold_dedicated_service', '_cold_static_ready_service'),
+        }[mode]
+        stages.extend((
+            ('Threshold', 'v9_li_kernel' + threshold, shape.liCores, bindings),
+            ('Cold+Service', 'v9_li_kernel' + cold, shape.liCores, bindings),
+        ))
+    stages.append(('Terminal', 'v9_parallel_terminal', shape.batch * 4, terminal))
     progress('staged eager binding synchronization')
     stream.synchronize()
     progress('staged eager binding synchronized')
@@ -190,20 +203,21 @@ def fixture_hash(path):
     return digest.hexdigest()
 
 
-def terminal_stages(measured):
-    """Split MR25's fixed launch order within each checked graph invocation."""
+def terminal_stages(measured, *, dynamic=False):
+    """Measure the actual launch boundaries within each checked graph invocation."""
+    names = DYNAMIC_STAGES if dynamic else STAGES
     rows = []
     for sample in measured['samples']:
         intervals = sample['intervals_us']
         li = intervals.get('li', ())
         terminal = intervals.get('topk_resolve_update', ())
-        if len(li) != 3 or len(terminal) != 1:
-            raise ValueError(f'Expected Hot, threshold, Cold and Terminal: {intervals}')
+        if len(li) != len(names) - 1 or len(terminal) != 1:
+            raise ValueError(f'Unexpected launch count for {names}: {intervals}')
         phases = [*li, *terminal]
         if (any(start >= end for start, end in phases)
                 or any(left[1] > right[0] for left, right in zip(phases, phases[1:]))):
             raise ValueError(f'MR25 phases do not follow the expected order: {phases}')
-        rows.append(dict(zip(STAGES, (end - start for start, end in phases))))
+        rows.append(dict(zip(names, (end - start for start, end in phases))))
     return rows
 
 

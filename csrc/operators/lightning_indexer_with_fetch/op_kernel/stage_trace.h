@@ -55,6 +55,9 @@ enum Phase : uint32_t {
     ColdProgressReset = 229, ColdThresholdRead = 230, ColdQueryRebind = 231,
     ColdProgressPrepare = 232, TerminalResolvePrepare = 233
 };
+
+// Separate IDs for opt-in scheduling; leave the LI handoff range distinct.
+enum DynamicPhase : uint32_t { DynamicScoreJob = 248, DynamicServiceJob = 249 };
 }
 
 #if KVIP_STAGE_TRACE && defined(__CCE_AICORE__)

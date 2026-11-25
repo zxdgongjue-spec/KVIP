@@ -140,6 +140,9 @@ extern "C" uint32_t aclrtlaunch_v9_li_kernel_score_t2(uint32_t,void*,void*,uint3
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_t2(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_threshold_dedicated_service(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_dedicated_service(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_hot_ready_service(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_static_ready_service(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_dynamic_service(uint32_t,void*,void*);
 #endif
 enum class ParallelTailStage { Hot, Threshold, ColdService, Terminal };
 
@@ -250,6 +253,59 @@ extern "C" uint32_t kvip_parallel_tail_dedicated_service_forward(
 extern "C" uint32_t kvip_parallel_tail_dedicated_service_profile_forward(
     void* bindings, void* terminal, void* stream, const rotating::RuntimeShape* shape) {
     return LaunchDedicatedService<true>(bindings, terminal, stream, shape);
+}
+#endif
+
+extern "C" uint32_t kvip_dynamic_service_supported(const rotating::RuntimeShape* shape) {
+#if KVIP_SERVICE_LOCAL_COUNTS || KVIP_SERVICE_UB_CANDIDATES
+    return 0;
+#else
+    return kvip_dedicated_cold_supported(shape);
+#endif
+}
+
+template<bool Dynamic, bool Profile = false>
+static uint32_t LaunchReadyService(void* bindings, void* terminal, void* stream,
+                                   const rotating::RuntimeShape* shape) {
+    if (!bindings || !terminal || !stream || !kvip_dynamic_service_supported(shape)) return 100000;
+    const uint32_t groups = shape->liCores;
+    uint32_t result = LaunchTailStage<Profile>(stream, ParallelTailStage::Hot, [&] {
+        return aclrtlaunch_v9_li_kernel_hot_ready_service(groups, stream, bindings);
+    });
+    if constexpr (!Dynamic) {
+        if (!result) result = LaunchTailStage<Profile>(stream, ParallelTailStage::Threshold, [&] {
+            return aclrtlaunch_v9_li_kernel_threshold_dedicated_service(groups, stream, bindings);
+        });
+    }
+    if (!result) result = LaunchTailStage<Profile>(stream, ParallelTailStage::ColdService, [&] {
+        if constexpr (Dynamic) return aclrtlaunch_v9_li_kernel_dynamic_service(groups, stream, bindings);
+        return aclrtlaunch_v9_li_kernel_cold_static_ready_service(groups, stream, bindings);
+    });
+    if (!result) result = LaunchTailStage<Profile>(stream, ParallelTailStage::Terminal, [&] {
+        return aclrtlaunch_v9_parallel_terminal(shape->batch * 4, stream, terminal);
+    });
+    return result;
+}
+
+extern "C" uint32_t kvip_parallel_tail_static_ready_service_forward(
+    void* bindings, void* terminal, void* stream, const rotating::RuntimeShape* shape) {
+    return LaunchReadyService<false>(bindings, terminal, stream, shape);
+}
+
+extern "C" uint32_t kvip_parallel_tail_dynamic_service_forward(
+    void* bindings, void* terminal, void* stream, const rotating::RuntimeShape* shape) {
+    return LaunchReadyService<true>(bindings, terminal, stream, shape);
+}
+
+#if KVIP_STAGE_TRACE
+extern "C" uint32_t kvip_parallel_tail_static_ready_service_profile_forward(
+    void* bindings, void* terminal, void* stream, const rotating::RuntimeShape* shape) {
+    return LaunchReadyService<false, true>(bindings, terminal, stream, shape);
+}
+
+extern "C" uint32_t kvip_parallel_tail_dynamic_service_profile_forward(
+    void* bindings, void* terminal, void* stream, const rotating::RuntimeShape* shape) {
+    return LaunchReadyService<true, true>(bindings, terminal, stream, shape);
 }
 #endif
 

@@ -11,6 +11,9 @@ struct QLITilingData {
     uint32_t resident,splitQ,aicCount;
 };
 #include "../../lightning_indexer_with_fetch/op_kernel/indexer/indexer.h"
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+#include "indexer/dynamic_mailbox.h"
+#endif
 namespace {
 using QLIKernel::SequenceLiPhase;
 
@@ -23,15 +26,16 @@ __aicore__ inline bool HasUniformLengths(const rotating::RuntimeShape& shape, GM
     return true;
 }
 
-template <SequenceLiPhase Phase>
-__aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2) {
+template <SequenceLiPhase Phase, bool ExternalBody = false, bool OwnWindow = false>
+__aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, uint32_t job = 0) {
     using namespace AscendC; using namespace QLICommon;
     auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
 #if KVIP_STAGE_TRACE
     constexpr bool traceHotSlot = Phase == SequenceLiPhase::Hot || Phase == SequenceLiPhase::UnifiedScore;
     constexpr bool traceColdSlot = Phase == SequenceLiPhase::Cold || Phase == SequenceLiPhase::PrecomputedCold ||
-        Phase == SequenceLiPhase::DedicatedCold;
+        Phase == SequenceLiPhase::DedicatedCold ||
+        Phase == SequenceLiPhase::DynamicScore || Phase == SequenceLiPhase::DynamicService;
     const uint64_t stageTrace = (parts == 2 || Phase == SequenceLiPhase::Cold ||
         Phase == SequenceLiPhase::UnifiedScore)
         ? KVIP_TRACE_WORKSPACE(P(15)) : 0;
@@ -46,7 +50,7 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2) {
         }
     }
 #endif
-    KVIP_TRACE_RECORD(kernelScope, stageTrace, traceKernel, kvip_trace::KernelBody, 0, 0);
+    KVIP_TRACE_RECORD(kernelScope, ExternalBody ? 0 : stageTrace, traceKernel, kvip_trace::KernelBody, 0, 0);
     KVIP_TRACE_RECORD(setupScope, stageTrace, traceKernel, kvip_trace::Setup, 0, 0);
     auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(a[14]));
     bool splitSequence = rotating::UseSequenceSplit(shape) && HasUniformLengths(shape, P(5), P(6));
@@ -78,7 +82,8 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2) {
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
         if constexpr (Phase == SequenceLiPhase::Cold) {
             if (parts > 2) op.vectorService.BindPartitionedCold(P(12), parts);
-        } else if constexpr (Phase == SequenceLiPhase::DedicatedCold) {
+        } else if constexpr (Phase == SequenceLiPhase::DedicatedCold || Phase == SequenceLiPhase::DynamicScore ||
+            Phase == SequenceLiPhase::DynamicService) {
             op.vectorService.BindDedicatedCold(P(12));
         }
 #endif
@@ -86,7 +91,14 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2) {
     KVIP_TRACE_END(setupScope);
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
     if constexpr (Phase == SequenceLiPhase::DedicatedCold) {
-        op.ProcessDedicatedCold(P(12));
+        op.template ProcessDedicatedCold<OwnWindow>(P(12));
+    } else if constexpr (Phase == SequenceLiPhase::DynamicScore) {
+        op.ProcessDynamicScore(P(12), dynamic_li::Row(job), dynamic_li::Window(job), dynamic_li::Fragment(job));
+    } else if constexpr (Phase == SequenceLiPhase::DynamicService) {
+        if ASCEND_IS_AIV {
+            op.vectorService.RunDynamicService(dynamic_li::Row(job), dynamic_li::Window(job),
+                                               rotating::SequenceHalfWindow(shape));
+        }
     } else
 #endif
     if constexpr (Phase == SequenceLiPhase::Hot) {
@@ -157,6 +169,13 @@ __aicore__ inline void ResetDedicatedColdProgress(GM_ADDR bindings) {
     WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     pipe.Destroy();
 }
+__aicore__ inline dynamic_li::Mailbox DynamicMailbox(GM_ADDR bindings) {
+    const auto a = reinterpret_cast<__gm__ uint64_t*>(bindings);
+    return {reinterpret_cast<GM_ADDR>(a[12]) +
+        kvip_cold_score::ScoreBytes(dynamic_li::kRows, kvip_dedicated_cold::kHistory) +
+        kvip_dedicated_cold::ProgressBytes()};
+}
+
 #endif
 }
 #endif
@@ -208,6 +227,95 @@ extern "C" __global__ __aicore__ void v9_li_kernel_cold_dedicated_service(GM_ADD
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     RunLi<SequenceLiPhase::DedicatedCold>(bindings);
+#endif
+}
+// Reset the mailbox on the same stream for each graph invocation. Each
+// physical lane clears two disjoint cache lines before normal Hot Score.
+extern "C" __global__ __aicore__ void v9_li_kernel_hot_ready_service(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    auto bus = DynamicMailbox(bindings);
+    const uint32_t block = AscendC::GetBlockIdx();
+    if ASCEND_IS_AIV {
+        bus.SendService(block, 0);
+        bus.CompleteAiv(block, 0);
+    } else {
+        bus.SendScore(block, 0);
+        bus.CompleteAic(block, 0);
+    }
+    RunLi<SequenceLiPhase::Hot>(bindings);
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_li_kernel_cold_static_ready_service(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    RunLi<SequenceLiPhase::DedicatedCold, false, true>(bindings);
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_li_kernel_dynamic_service(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    using namespace AscendC;
+    auto bus = DynamicMailbox(bindings);
+    const uint32_t block = GetBlockIdx();
+#if KVIP_STAGE_TRACE
+    const auto a = reinterpret_cast<__gm__ uint64_t*>(bindings);
+    const uint64_t trace = KVIP_TRACE_WORKSPACE(reinterpret_cast<GM_ADDR>(a[15]));
+#endif
+    KVIP_TRACE_BEGIN(body, trace, Cold, KernelBody, 0, 0);
+    if ASCEND_IS_AIC {
+        if (block == 0) {
+            dynamic_li::Dispatcher dispatcher;
+            while (!dispatcher.Step(bus)) {}
+            for (uint32_t group = 0; group < dynamic_li::kMix; ++group) {
+                bus.SendScore(group, dynamic_li::kStop);
+            }
+            return;
+        }
+        uint32_t seen = 0;
+        while (true) {
+            const uint32_t job = bus.Score(block);
+            if (job == dynamic_li::kStop) return;
+            if (job == seen) continue;
+            {
+                KVIP_TRACE_BEGIN(scope, trace, Cold, DynamicScoreJob, dynamic_li::Window(job), job);
+                RunLi<SequenceLiPhase::DynamicScore, true>(bindings, 2, job);
+            }
+            bus.CompleteAic(block, job);
+            seen = job;
+        }
+    } else {
+        ResetDedicatedColdProgress(bindings);
+        RunLi<SequenceLiPhase::Threshold>(bindings);
+        PipeBarrier<PIPE_ALL>();
+        bus.CompleteAiv(block, dynamic_li::kResidentReady);
+        uint32_t seenScore = 0, seenService = 0;
+        while (true) {
+            const uint32_t job = bus.Score(block / 2);
+            if (job == dynamic_li::kStop) return;
+            if (job != seenScore) {
+                {
+                    KVIP_TRACE_BEGIN(scope, trace, Cold, DynamicScoreJob, dynamic_li::Window(job), job);
+                    RunLi<SequenceLiPhase::DynamicScore, true>(bindings, 2, job);
+                }
+                bus.CompleteAiv(block, job);
+                seenScore = job;
+                continue;
+            }
+            const uint32_t service = bus.Service(block);
+            if (service != seenService) {
+                {
+                    KVIP_TRACE_BEGIN(scope, trace, Cold, DynamicServiceJob, dynamic_li::Window(service), service);
+                    RunLi<SequenceLiPhase::DynamicService, true>(bindings, 2, service);
+                    PipeBarrier<PIPE_ALL>();
+                }
+                bus.CompleteAiv(block, service);
+                seenService = service;
+            }
+        }
+    }
 #endif
 }
 #endif

@@ -12,7 +12,8 @@ import sys
 
 from lifetch_cold_trace_comparison import REFERENCE, ROUTES as COLD_ROUTES, write_comparison
 from lifetch_instruction_capture import STAGES, collect_instructions, instruction_plan
-from lifetch_msprof_timeline import publish_business_views, verified_vendor_timeline
+from lifetch_msprof_timeline import READY_SERVICE_ROUTES, publish_business_views, verified_vendor_timeline
+from lifetch_ready_trace_comparison import write_ready_comparison
 from lifetch_unified_trace_comparison import ROUTES as UNIFIED_ROUTES, write_unified_comparison
 from run_mr25_handoff import KVAF, MAIN, ROOT, git, read, save
 
@@ -28,8 +29,10 @@ def parse_args(argv=None):
     parser.add_argument('--instruction-pipes', default='mte1|mte2|mte3',
                         help='pipe names separated by |, used with --instructions')
     comparison = parser.add_mutually_exclusive_group()
-    comparison.add_argument('--route', choices=('p2', 'dedicated'), default='p2',
-                            help='capture a single stock P2 or BS16 Dedicated Service forward')
+    comparison.add_argument('--route', choices=('p2', 'dedicated', *READY_SERVICE_ROUTES), default='p2',
+                            help='capture one stock or experimental fused forward')
+    comparison.add_argument('--dynamic-compare', action='store_true',
+                            help='compare fixed and dynamic Service on one BS16/miss10 case')
     comparison.add_argument('--cold-compare', action='store_true', help='compare native P2 and Cold P4 at BS8/miss10')
     comparison.add_argument('--unified-compare', action='store_true',
                             help='compare native P2, full Score P2 and full Score P4 at BS8/miss10')
@@ -38,13 +41,19 @@ def parse_args(argv=None):
     parser.add_argument('--dry-run', action='store_true', help='print the capture plan without CANN or KVAF')
     args = parser.parse_args(argv)
     args.comparison_routes = (COLD_ROUTES if args.cold_compare else
-                              UNIFIED_ROUTES if args.unified_compare else ())
+                              UNIFIED_ROUTES if args.unified_compare else
+                              READY_SERVICE_ROUTES if args.dynamic_compare else ())
     if args.batch is None:
-        args.batch = 8 if args.comparison_routes else 16
+        args.batch = 8 if args.cold_compare or args.unified_compare else 16
     if args.warmup is None:
         args.warmup = 2 if args.comparison_routes else 0
-    if args.comparison_routes and (args.batch != 8 or args.miss_percent != 10 or args.instructions):
+    if (args.cold_compare or args.unified_compare) and (args.batch != 8 or args.miss_percent != 10 or args.instructions):
         parser.error('Score comparison uses BS8, miss 10% and the scoped kernel/source trace')
+    ready_service = args.dynamic_compare or args.route in READY_SERVICE_ROUTES
+    if ready_service and (args.batch != 16 or args.miss_percent != 10 or args.instructions):
+        parser.error('Dynamic Service uses BS16, miss 10% and the scoped kernel/source trace')
+    if ready_service and args.local_counts == 'on':
+        parser.error('Dynamic Service uses local counts OFF on both routes')
     if args.route == 'dedicated' and (args.batch != 16 or args.instructions):
         parser.error('Dedicated Service requires BS16 and the scoped kernel/source trace')
     if not args.comparison_routes and args.local_counts is not None:
@@ -138,7 +147,7 @@ def capture_comparison(args, output, arguments, manifest, profiler):
     manifests, captures = {}, {}
     manifest['routes'] = manifests
     for route in args.comparison_routes:
-        print(f'Running BS8 fusion trace {route}, local_counts={args.local_counts}', flush=True)
+        print(f'Running BS{args.batch} fusion trace {route}, local_counts={args.local_counts}', flush=True)
         arm = output / route
         arm.mkdir()
         arm_manifest = manifests[route] = dict(route=route, local_counts=args.local_counts, status='RUNNING')
@@ -158,6 +167,16 @@ def capture_comparison(args, output, arguments, manifest, profiler):
             save(arm / 'manifest.json', arm_manifest)
     if len(captures) != len(args.comparison_routes):
         raise RuntimeError('Every comparison arm requires checked source and native captures')
+    if args.dynamic_compare:
+        result = write_ready_comparison(output, captures)
+        manifest.update(comparison=str(output / 'dynamic_trace_comparison.json'),
+                        comparison_timeline=str(output / 'dynamic_trace_native.json'))
+        for route, row in result['routes'].items():
+            print(f"{route}: Resident+Cold+Service {row['resident_cold_service_device_us']:.2f} us, "
+                  f"Hot to Terminal {row['hot_to_terminal_device_us']:.2f} us", flush=True)
+        print(f"Get comparison: {result['get_comparison']['status']}; "
+              f"native timeline: {manifest['comparison_timeline']}", flush=True)
+        return
     if args.unified_compare:
         result = write_unified_comparison(output, captures, args.local_counts)
         manifest.update(comparison=str(output / 'unified_trace_comparison.json'),
@@ -188,8 +207,10 @@ def capture(args, output, kvaf, arguments, manifest):
         capture_comparison(args, output, arguments, manifest, profiler)
         return
     config = configuration(arguments)
-    if args.route == 'dedicated':
+    if args.route in ('dedicated', *READY_SERVICE_ROUTES):
         config.msprof_cold_route = args.route
+        if args.route in READY_SERVICE_ROUTES:
+            config.mr28_cold_trace = args.route
         config.msprof_local_counts = args.local_counts
         config.msprof_build_dir = str(output / 'trace_build')
     captured = capture_route(args, output, config, manifest, profiler, cold_route=args.route)
@@ -208,7 +229,9 @@ def main(argv=None):
     a5_root = Path(os.environ.get('KVIP_A5_ROOT', '/home/w00568585/li-aligned-a5'))
     kvaf = Path(os.environ.get('KVIP_KVAF_ROOT', a5_root / 'KVAF-unified-813f1750')).resolve()
     arguments = bench_args(args, kvaf)
-    route = ('unified_score_p2_p4_comparison' if args.unified_compare else
+    route = ('static_dynamic_service_comparison' if args.dynamic_compare else
+             args.route if args.route in READY_SERVICE_ROUTES else
+             'unified_score_p2_p4_comparison' if args.unified_compare else
              'cold_p2_p4_comparison' if args.cold_compare else
              'dedicated_service_parallel_terminal' if args.route == 'dedicated' else 'main_p2_parallel_terminal')
     planned_routes = args.comparison_routes or (args.route,)

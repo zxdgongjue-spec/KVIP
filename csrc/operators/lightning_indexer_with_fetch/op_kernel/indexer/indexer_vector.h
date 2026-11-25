@@ -84,6 +84,14 @@ public:
         dedicatedEpoch_ = epoch;
     }
 
+    __aicore__ inline void RunDynamicService(uint32_t row, uint32_t epoch, uint32_t half) {
+        dedicatedLane_ = row;
+        AllocEventID();
+        RotateFetch(epoch, half);
+        FreeEventID();
+    }
+
+    template <bool OwnWindow = false>
     __aicore__ inline void RunDedicatedService(uint32_t lane, uint32_t half) {
         dedicatedLane_ = lane;
         KVIP_TRACE_BEGIN(eventInit, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
@@ -91,7 +99,10 @@ public:
         AllocEventID();
         KVIP_TRACE_END(eventInit);
         for (uint32_t epoch = 0; epoch < runtimeShape_.rounds; ++epoch) {
-            if (epoch) WaitDedicatedDriver(lane, epoch, half);
+            if (epoch) {
+                if constexpr (OwnWindow) WaitOwnWindow(lane, epoch, half);
+                else WaitDedicatedDriver(lane, epoch, half);
+            }
             RotateFetch(epoch, half);
         }
         KVIP_TRACE_BEGIN(eventDrain, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
@@ -327,6 +338,20 @@ private:
         const uint32_t end0 = kvip_dedicated_cold::Prefix(runtimeShape_.history, runtimeShape_.resident, half, epoch, 0, ends);
         const uint32_t end1 = kvip_dedicated_cold::Prefix(runtimeShape_.history, runtimeShape_.resident, half, epoch, 1, ends);
         return uint64_t(end0) | (uint64_t(end1) << 32);
+    }
+
+    __aicore__ inline void WaitOwnWindow(uint32_t row, uint32_t epoch, uint32_t half) const {
+        KVIP_TRACE_BEGIN(scope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+            Cold, DedicatedDriverWait, epoch, row);
+        for (uint32_t fragment = 0; fragment < kvip_dedicated_cold::kFragments; ++fragment) {
+            const auto tiles = kvip_dedicated_cold::Fragment(runtimeShape_.history, runtimeShape_.resident,
+                half, epoch, fragment);
+            if (tiles.begin == tiles.end) continue;
+            const uint32_t end = tiles.end * kvip_dedicated_cold::kTileTokens;
+            for (uint32_t q = 0; q < SIM_Q; ++q) {
+                while (ReadDedicatedCursor(row * SIM_Q + q, epoch, fragment) < end) {}
+            }
+        }
     }
 
     __aicore__ inline void WaitDedicatedDriver(uint32_t lane, uint32_t epoch, uint32_t half) const {

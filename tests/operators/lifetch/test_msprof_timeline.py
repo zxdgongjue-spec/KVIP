@@ -10,7 +10,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'experiments/lifetch_mr23_service'))
 from lifetch_msprof_timeline import (  # noqa: E402
-    PHASES, PHASES_COLD_P4, PHASES_DEDICATED, PHASES_UNIFIED, device_business_view, publish_business_views,
+    PHASES, PHASES_COLD_P4, PHASES_DEDICATED, PHASES_DYNAMIC, PHASES_STATIC_READY, PHASES_UNIFIED,
+    device_business_view, publish_business_views,
     main, require_fused_replay,
 )
 
@@ -141,6 +142,18 @@ def test_dedicated_vendor_kernels_require_the_dedicated_route():
     assert stages[2]['kernel'] == 'v9_li_kernel_cold_dedicated_service'
     with pytest.raises(ValueError, match='different named kernel'):
         require_fused_replay(raw)
+
+
+def test_dynamic_three_launch_profile_uses_its_own_marks_and_handoffs():
+    raw = fused_replay(PHASES_DYNAMIC)
+    stages = require_fused_replay(raw, cold_route='dynamic')
+    assert [stage['kernel'] for stage in stages] == [kernel for _, kernel, _ in PHASES_DYNAMIC]
+    handoffs = device_business_view(raw, stages)['kvip_inter_kernel_handoffs']
+    assert len(handoffs) == 2
+    with pytest.raises(ValueError, match='missing device markers'):
+        require_fused_replay(raw, cold_route='static_ready')
+    with pytest.raises(ValueError, match='unexpected device markers'):
+        require_fused_replay(fused_replay(PHASES_STATIC_READY), cold_route='dynamic')
 
 
 def test_published_source_and_vendor_views_keep_their_clocks(tmp_path):

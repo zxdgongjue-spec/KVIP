@@ -35,7 +35,7 @@ using AscendC::CacheMode;
 using AscendC::CrossCoreSetFlag;
 using AscendC::CrossCoreWaitFlag;
 
-enum class SequenceLiPhase { Hot, Threshold, Cold, Final, UnifiedScore, PrecomputedCold, DedicatedCold };
+enum class SequenceLiPhase { Hot, Threshold, Cold, Final, UnifiedScore, PrecomputedCold, DedicatedCold, DynamicScore, DynamicService };
 
 // 由于S2循环前，RunInfo还没有赋值，使用TempLoopInfo临时存放B、N、S1轴相关的信息；同时减少重复计算
 struct TempLoopInfo {
@@ -70,7 +70,9 @@ public:
     template <SequenceLiPhase Phase>
     __aicore__ inline void ProcessSequenceSplit(uint32_t parts = 2);
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    template <bool OwnWindow = false>
     __aicore__ inline void ProcessDedicatedCold(GM_ADDR compute);
+    __aicore__ inline void ProcessDynamicScore(GM_ADDR compute, uint32_t row, uint32_t epoch, uint32_t fragment);
 #endif
 
     // =================================类型定义区=================================
@@ -974,12 +976,14 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanDedicatedFragment(
 }
 
 template <typename QLIT>
+template <bool OwnWindow>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessDedicatedCold(GM_ADDR compute)
 {
     const uint32_t half = rotating::SequenceHalfWindow(runtimeShape_);
     if (aiCoreIdx >= kvip_dedicated_cold::kProducerGroups) {
         if ASCEND_IS_AIV {
-            vectorService.RunDedicatedService(tmpBlockIdx - 2 * kvip_dedicated_cold::kProducerGroups, half);
+            vectorService.template RunDedicatedService<OwnWindow>(
+                tmpBlockIdx - 2 * kvip_dedicated_cold::kProducerGroups, half);
         }
         return;
     }
@@ -1040,6 +1044,39 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessDedicatedCold(G
 #endif
     }
 }
+template <typename QLIT>
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessDynamicScore(
+    GM_ADDR compute, uint32_t row, uint32_t epoch, uint32_t fragment)
+{
+    if ASCEND_IS_AIV {
+        vectorService.AllocEventID();
+        CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT);
+        CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + 1);
+        vectorService.PrepareRotationProgress();
+        vectorService.SetDedicatedColdEpoch(epoch);
+    } else {
+        matmulService.AllocEventID();
+    }
+    BindDedicatedQuery(compute, row, epoch);
+    uint32_t loop = 0, scaleLoop = 0;
+    const uint32_t half = rotating::SequenceHalfWindow(runtimeShape_);
+    ScanDedicatedFragment(row, half, epoch, fragment, loop, scaleLoop, true, true);
+    if ASCEND_IS_AIV {
+        vectorService.FreeEventID();
+    } else {
+        matmulService.FreeEventID();
+        KVIP_TRACE_BEGIN(cubeTail, stageTrace_, Cold, LiCubeWait, epoch, row);
+        constexpr uint32_t bank = QLICommon::ConstInfo::CROSS_VC_EVENT;
+        constexpr uint32_t peer = QLICommon::ConstInfo::AIV0_AIV1_OFFSET;
+        CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(bank);
+        CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(bank + 1);
+        CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(bank + peer);
+        CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(bank + peer + 1);
+    }
+    // ACK follows Score and bitmap publication and both peers' Cube credits.
+    PipeBarrier<PIPE_ALL>();
+}
+
 #endif
 
 template <typename QLIT>

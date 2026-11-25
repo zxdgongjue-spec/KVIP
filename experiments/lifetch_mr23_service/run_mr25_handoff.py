@@ -36,7 +36,7 @@ def read(path):
     return json.loads(path.read_text())
 
 
-def collect(directory, mode, batch):
+def collect(directory, mode, batch, *, stage_fields=STAGES):
     row = dict(variant=mode, batch=batch, miss_percent=10, accepted=False,
                reason='Missing completed report')
     folder = directory / mode / 'miss10' / f'case-b{batch}'
@@ -59,7 +59,7 @@ def collect(directory, mode, batch):
                profiler_p50_us=timing['p50_us'], li_us=timing['stage_mean_us']['li'],
                inter_kernel_gap_us=timing['inter_kernel_gap_mean_us'],
                graph_edges_us=timing['outside_invocations_mean_us'],
-               **{key: statistics.mean(r[key] for r in stages) for key in STAGES},
+               **{key: statistics.mean(r[key] for r in stages) for key in stage_fields},
                **{key + '_per_call': sum(r[key] for r in counts) / calls for key in COUNT_COLUMNS})
     row.update({key: value for key, value in route.items() if key not in ('mode', 'library')})
     row.update(prefetch_observed=row['prefetch_requests_per_call'] > 0,

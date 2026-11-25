@@ -53,14 +53,27 @@ DEDICATED_KERNELS = {
     21: (KERNELS[21][0], 'v9_li_kernel_threshold_dedicated_service'),
     22: ('Cold Score + dedicated Service', 'v9_li_kernel_cold_dedicated_service'),
 }
+STATIC_READY_KERNELS = {
+    **DEDICATED_KERNELS,
+    20: (KERNELS[20][0], 'v9_li_kernel_hot_ready_service'),
+    22: ('Cold Score + fixed Service', 'v9_li_kernel_cold_static_ready_service'),
+}
+DYNAMIC_KERNELS = {
+    **STATIC_READY_KERNELS,
+    21: (KERNELS[21][0], 'v9_li_kernel_dynamic_service'),
+    22: ('Dynamic Cold Score and Service', 'v9_li_kernel_dynamic_service'),
+}
 ROUTE_KERNELS = {'p2': KERNELS, 'cold_p4': COLD_P4_KERNELS,
-                 'dedicated': DEDICATED_KERNELS,
+                 'dedicated': DEDICATED_KERNELS, 'static_ready': STATIC_READY_KERNELS,
+                 'dynamic': DYNAMIC_KERNELS,
                  **{route: UNIFIED_KERNELS for route in UNIFIED_ROUTES}}
 WAIT_PARTITIONED_HALF = 218
 T2_PIPE_PHASES = (219, 220, 221, 222)
 DEDICATED_DRIVER_WAIT = 224
 DEDICATED_READY_SNAPSHOT = 225
 COLD_PROGRESS_RESET = 229
+DYNAMIC_SCORE_JOB = 248
+DYNAMIC_SERVICE_JOB = 249
 PHASES = {
     1: 'Kernel body',
     2: 'Kernel setup',
@@ -96,6 +109,8 @@ PHASES = {
     231: 'Drain and rebind Dedicated Cold query',
     232: 'Prepare Cold progress staging in UB',
     233: 'Publish final TopK generation and prepare Resolve',
+    DYNAMIC_SCORE_JOB: 'Dynamically assigned Score fragment',
+    DYNAMIC_SERVICE_JOB: 'Dynamically assigned Service window',
 }
 PIPE_SCOPES = {
     180: ('AIC', 'WAIT', 'Wait for AIV credit'),
@@ -209,6 +224,8 @@ class StageBuffer:
             'p2': 'kvip_parallel_tail_profile_forward',
             'cold_p4': 'kvip_parallel_tail_cold_partitioned_profile_forward',
             'dedicated': 'kvip_parallel_tail_dedicated_service_profile_forward',
+            'static_ready': 'kvip_parallel_tail_static_ready_service_profile_forward',
+            'dynamic': 'kvip_parallel_tail_dynamic_service_profile_forward',
             'full_p2': 'kvip_parallel_tail_unified_p2_profile_forward',
             'full_uniform': 'kvip_parallel_tail_unified_partitioned_profile_forward',
         }[cold_route]
@@ -218,9 +235,10 @@ class StageBuffer:
         self.workspace = self.forward.workspace
         if self.workspace.numel() != 256:
             raise RuntimeError('LIFetch streaming binding must be exactly 256 bytes')
-        self.buffer = state.torch.zeros(HEADER_BYTES + LANES * (LANE_BYTES + CAPACITY * EVENT.size),
+        capacity = 2048 if cold_route == 'dynamic' else CAPACITY
+        self.buffer = state.torch.zeros(HEADER_BYTES + LANES * (LANE_BYTES + capacity * EVENT.size),
                                         dtype=state.torch.uint8, device=state.device)
-        header = struct.pack('<Q4I', MAGIC, VERSION, LANES, CAPACITY, EVENT.size)
+        header = struct.pack('<Q4I', MAGIC, VERSION, LANES, capacity, EVENT.size)
         self.buffer[:len(header)] = state.torch.tensor(list(header), dtype=state.torch.uint8, device=state.device)
         address = struct.pack('<Q', self.buffer.data_ptr())
         self.pointer = state.torch.tensor(list(address), dtype=state.torch.uint8, device=state.device)
@@ -295,6 +313,10 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
     required = {**REQUIRED, 22: REQUIRED[22] - {21}} if unified else REQUIRED
     missing = {kernel: sorted(expected - phases[kernel]) for kernel, expected in required.items()
                if not expected.issubset(phases[kernel])}
+    if cold_route == 'dynamic':
+        missing_jobs = {DYNAMIC_SCORE_JOB, DYNAMIC_SERVICE_JOB} - phases[22]
+        if missing_jobs:
+            raise ValueError(f'Missing dynamic source stages: {sorted(missing_jobs)}')
     if missing:
         raise ValueError(f'Missing required source stages: {missing}')
     if require_pipe_scopes:
@@ -305,10 +327,13 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
             raise ValueError(f'Missing required pipe scopes: {missing_pipe}')
     if require_handoff_scopes:
         expected = dict(REQUIRED_HANDOFF)
-        if cold_route in ('cold_p4', 'dedicated'):
+        if cold_route in ('cold_p4', 'dedicated', 'static_ready', 'dynamic'):
             expected[21] = expected[21] | {COLD_PROGRESS_RESET}
-        if cold_route == 'dedicated':
+        if cold_route in ('dedicated', 'static_ready'):
             expected[22] = expected[22] | {231}
+        if cold_route == 'dynamic':
+            # The dynamic job scope wraps role-local initialization and drain.
+            expected[22] = {228, DYNAMIC_SCORE_JOB, DYNAMIC_SERVICE_JOB}
         missing_handoff = {kernel: sorted(required - phases[kernel]) for kernel, required in expected.items()
                            if not required.issubset(phases[kernel])}
         if missing_handoff:
@@ -330,6 +355,8 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
     two_aic = set(range(64, 64 + 2 * batch))
     cold_lanes = {'cold_p4': set(range(8 * batch)) | set(range(64, 64 + 4 * batch)),
                   'dedicated': four_aiv | set(range(64, 88)),
+                  'static_ready': four_aiv | set(range(64, 88)),
+                  'dynamic': four_aiv | two_aic,
                   'p2': four_aiv | two_aic}.get(cold_route, four_aiv)
     score_groups = batch * score_parts
     score_lanes = set(range(2 * score_groups)) | set(range(64, 64 + score_groups))
@@ -343,7 +370,7 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
         raise ValueError('A source scope has no corresponding kernel body on its lane')
     dedicated_scopes = {DEDICATED_DRIVER_WAIT, DEDICATED_READY_SNAPSHOT}
     dedicated_events = [event for event in events if event['phase'] in dedicated_scopes]
-    if cold_route == 'dedicated':
+    if cold_route in ('dedicated', 'static_ready', 'dynamic'):
         if batch != 16:
             raise ValueError('Dedicated Service source trace requires BS16')
         driver_coverage = {(event['lane'], event['iteration']) for event in dedicated_events
@@ -351,8 +378,12 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
         expected_waits = {(lane, window) for lane in range(48, 64) for window in (1, 2, 3)}
         snapshot_coverage = {(event['lane'], event['iteration'], event['detail'])
                              for event in dedicated_events if event['phase'] == DEDICATED_READY_SNAPSHOT}
-        expected_snapshots = {(48 + request, window, request * 4 + q) for request in range(16)
-                              for window in range(4) for q in range(4)}
+        workers = (verify_dynamic_jobs(events) if cold_route == 'dynamic' else
+                   {(request, window): 48 + request for request in range(16) for window in range(4)})
+        expected_snapshots = {(lane, window, request * 4 + q)
+                              for (request, window), lane in workers.items() for q in range(4)}
+        if cold_route == 'dynamic':
+            expected_waits.clear()
         if (driver_coverage != expected_waits or snapshot_coverage != expected_snapshots
                 or any(event['kernel'] != 22 for event in dedicated_events)):
             raise ValueError('Dedicated Service driver waits or ready snapshots have incomplete lane/window coverage')
@@ -367,6 +398,60 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
             raise ValueError(f'Cold T2 samples differ from expected window/lane coverage: '
                              f'{len(needed - sampled)} missing, {len(sampled - needed)} unexpected')
 
+
+
+def dynamic_job(detail):
+    return (detail >> 4) & 15, (detail >> 2) & 3, detail & 3
+
+
+def verify_dynamic_jobs(events):
+    """Verify the 64 independent Resident producers, three score peers and window handoffs."""
+    resident = {}
+    tickets = defaultdict(list)
+    services = {}
+    for event in events:
+        phase, lane, detail = event['phase'], event['lane'], event['detail']
+        if phase == 23 and event['kernel'] == 21:
+            if detail in resident or detail != lane:
+                raise ValueError('Dynamic Resident requires a unique AIV per Q')
+            resident[detail] = event['end']
+        elif phase == DYNAMIC_SCORE_JOB:
+            if event['kernel'] != 22 or dynamic_job(detail)[1] != event['iteration']:
+                raise ValueError('Score job tag does not match its window or kernel')
+            tickets[detail].append(event)
+        elif phase == DYNAMIC_SERVICE_JOB:
+            row, window, _ = dynamic_job(detail)
+            key = row, window
+            if (key in services or lane >= 64 or event['kernel'] != 22
+                    or window != event['iteration']):
+                raise ValueError(f'Duplicate or invalid Service assignment at {key}')
+            services[key] = event
+    if set(resident) != set(range(64)):
+        raise ValueError('Incomplete single-round Resident coverage')
+    score = {}
+    for ticket, markers in tickets.items():
+        key = dynamic_job(ticket)
+        aics = [e['lane'] for e in markers if e['lane'] >= 64]
+        if key in score or len(markers) != 3 or len(aics) != 1:
+            raise ValueError(f'Score job {key} did not execute once as a MIX group')
+        group = aics[0] - 64
+        if not group or {e['lane'] for e in markers} != {aics[0], 2 * group, 2 * group + 1}:
+            raise ValueError(f'Score job {key} has mismatched FIXP peers')
+        if min(e['begin'] for e in markers) < max(resident[key[0] * 4 + q] for q in range(4)):
+            raise ValueError(f'Score job {key} began before its Resident inputs')
+        score[key] = max(e['end'] for e in markers)
+    if set(score) != {(b, w, f) for b in range(16) for w in (1, 2, 3) for f in range(3)}:
+        raise ValueError('Dynamic Score did not cover every fragment once')
+    if set(services) != {(b, w) for b in range(16) for w in range(4)}:
+        raise ValueError('Dynamic Service did not cover every window once')
+    for (row, window), event in services.items():
+        ready = max(resident[row * 4 + q] for q in range(4))
+        if window:
+            ready = max(ready, services[row, window - 1]['end'],
+                        *(score[row, window, f] for f in range(3)))
+        if event['begin'] < ready:
+            raise ValueError(f'Service {(row, window)} started before its data dependencies')
+    return {key: event['lane'] for key, event in services.items()}
 
 def source_lane_counts(spans):
     """Count distinct logical lanes, even when their source scopes overlap."""
@@ -451,8 +536,10 @@ def render(events, counter_mhz, *, cold_route='p2'):
                     (20, 191): 'Full-history Score reduction SIMD VF',
                     (20, 192): 'Full-history Score writeback issue',
                     (22, 22): 'AIV precomputed Cold tile scan'} if cold_route in UNIFIED_ROUTES else {}
-    if cold_route == 'dedicated':
+    if cold_route in ('dedicated', 'static_ready'):
         scope_labels[22, 150] = 'Dedicated Service'
+    elif cold_route == 'dynamic':
+        scope_labels[22, 150] = 'Service on assigned AIV'
 
     def metadata(name, pid, tid, label):
         trace.append(dict(name=name, ph='M', pid=pid, tid=tid, args={'name': label}))
@@ -484,7 +571,8 @@ def render(events, counter_mhz, *, cold_route='p2'):
         window_epoch = None
         category = kernel_stage
         if kernel in (20, 22) and (phase in (21, 22, 25, *range(150, 156),
-                                             DEDICATED_DRIVER_WAIT, DEDICATED_READY_SNAPSHOT, 230, 231)
+                                             DEDICATED_DRIVER_WAIT, DEDICATED_READY_SNAPSHOT, 230, 231,
+                                             DYNAMIC_SCORE_JOB, DYNAMIC_SERVICE_JOB)
                                    or phase in PIPE_SCOPES):
             window_epoch = event['iteration']
             args['window_epoch'] = window_epoch
@@ -506,6 +594,11 @@ def render(events, counter_mhz, *, cold_route='p2'):
                 args['tile_index'] = slot
                 args['sampled_scan_tile'] = True
             lane_scopes[(core_type, pipe)].append(event)
+        elif phase in (DYNAMIC_SCORE_JOB, DYNAMIC_SERVICE_JOB):
+            row, window, fragment = dynamic_job(event['detail'])
+            args.update(request_row=row, window_epoch=window, job_ticket=event['detail'] >> 8)
+            if phase == DYNAMIC_SCORE_JOB:
+                args['fragment'] = fragment
         elif phase in (23, 155, DEDICATED_READY_SNAPSHOT, COLD_PROGRESS_RESET) or kernel == 23:
             args.update(request_row=event['detail'] // 4, query=event['detail'] % 4)
         elif phase in (21, 22, 152, 153, 230, 231):
@@ -626,9 +719,12 @@ def write_capture(directory, raw, counter_mhz, state, library, config, soc, mspr
     report = replay_evidence(state, library, config, soc)
     if cold_route == 'cold_p4':
         report['route'] = 'Hot P2 + Cold P4 + four-AIV Terminal'
-    elif cold_route == 'dedicated':
+    elif cold_route in ('dedicated', 'static_ready'):
         report.update(route='Hot P2 + Cold Score with Dedicated Service + four-AIV Terminal',
                       cold_score_aic=24, cold_score_aiv=48, cold_service_aiv=16)
+    elif cold_route == 'dynamic':
+        report.update(route='Hot P2 + Resident and dynamically assigned Cold/Service + four-AIV Terminal',
+                      cold_score_worker_pool=31, service_worker_pool=64)
     elif cold_route in UNIFIED_ROUTES:
         report['route'] = f'Full Score P{score_parts} + Cold T2 + four-AIV Terminal'
     phases = {event['phase'] for event in events}
@@ -637,7 +733,7 @@ def write_capture(directory, raw, counter_mhz, state, library, config, soc, mspr
         raise ValueError('Observed Get counts have missing descriptor, submission or completion markers')
     report.update(
         traced_invocations=1,
-        cold_route=cold_route, hot_parts=score_parts, cold_parts=None if cold_route == 'dedicated' else cold_parts,
+        cold_route=cold_route, hot_parts=score_parts, cold_parts=None if cold_route in ('dedicated', 'static_ready', 'dynamic') else cold_parts,
         service_lanes=int(state.rotating.runtime_shape.serviceLanes),
         local_counts=getattr(config, 'msprof_local_counts', False),
         clock=CLOCK, counter_mhz=counter_mhz, events=len(events), stages=stages,

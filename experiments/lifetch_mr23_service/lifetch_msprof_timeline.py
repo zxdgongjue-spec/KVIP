@@ -32,9 +32,22 @@ PHASES_DEDICATED = (
     ('COLD_SERVICE', 'v9_li_kernel_cold_dedicated_service', 'Cold Score + dedicated Service'),
     PHASES[3],
 )
+PHASES_STATIC_READY = (
+    ('HOT', 'v9_li_kernel_hot_ready_service', PHASES[0][2]),
+    PHASES_DEDICATED[1],
+    ('COLD_SERVICE', 'v9_li_kernel_cold_static_ready_service', 'Cold Score + fixed Service'),
+    PHASES[3],
+)
+PHASES_DYNAMIC = (
+    PHASES_STATIC_READY[0],
+    ('COLD_SERVICE', 'v9_li_kernel_dynamic_service', 'Resident Top2048 + dynamic Cold Score and Service'),
+    PHASES[3],
+)
+READY_SERVICE_ROUTES = ('static_ready', 'dynamic')
 ROUTE_PHASES = {'p2': PHASES, 'cold_p4': PHASES_COLD_P4,
                 'full_p2': PHASES_UNIFIED, 'full_uniform': PHASES_UNIFIED,
-                'dedicated': PHASES_DEDICATED}
+                'dedicated': PHASES_DEDICATED, 'static_ready': PHASES_STATIC_READY,
+                'dynamic': PHASES_DYNAMIC}
 MARKERS = {f'KVIP_LIFETCH_{stage}_{side}' for stage, _, _ in PHASES for side in ('BEGIN', 'END')}
 KERNELS = {kernel for phases in ROUTE_PHASES.values() for _, kernel, _ in phases}
 COMPUTE_TYPES = {'AI_CORE', 'AI_VECTOR_CORE', 'MIX_AIC', 'MIX_AIV', 'AIV_SQE', 'FUSION'}
@@ -88,9 +101,13 @@ def require_fused_replay(document, *, cold_route='p2'):
                 tasks.append(dict(name=name, stream=stream, begin=interval[0], end=interval[1],
                                   task_id=str(args['Task Id']), batch_id=str(args.get('Batch Id', ''))))
 
-    missing_marks = sorted(MARKERS - markers.keys())
-    if missing_marks:
-        raise ValueError(f'Fusion replay missing device markers={missing_marks}')
+    expected = {f'KVIP_LIFETCH_{stage}_{side}' for stage, _, _ in ROUTE_PHASES[cold_route]
+                for side in ('BEGIN', 'END')}
+    missing_marks = sorted(expected - markers.keys())
+    unexpected_marks = sorted(markers.keys() - expected)
+    if missing_marks or unexpected_marks:
+        raise ValueError(f'Fusion replay missing device markers={missing_marks}; '
+                         f'unexpected device markers={unexpected_marks}')
     streams = {stream for copies in markers.values() for stream, _, _ in copies}
     if len(streams) != 1 or any(len(copies) != 1 for copies in markers.values()):
         raise ValueError('Fusion phase markers do not describe exactly one stream replay')
@@ -144,7 +161,8 @@ def device_handoffs(vendor, intervals):
             device_tasks.append((name, args, interval))
 
     result = []
-    for left, right, dependency in zip(intervals, intervals[1:], DEPENDENCIES):
+    dependencies = (DEPENDENCIES[0], DEPENDENCIES[2]) if len(intervals) == 3 else DEPENDENCIES
+    for left, right, dependency in zip(intervals, intervals[1:], dependencies):
         stream = left['stream']
         if stream != right['stream']:
             raise ValueError('Cannot attribute an inter-kernel gap across streams')

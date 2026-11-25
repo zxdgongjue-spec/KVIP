@@ -367,3 +367,43 @@ and MTE/VF source scopes. The Dedicated trace separates the driver wait
 and ready cursor snapshot from the predecessor wait, per-Q TopK,
 deduplication, and prefetch submission. Compare the same clock domain
 across routes and use the separate graph run for KV-ready latency.
+
+### BS16 dynamic Score/Service experiment
+
+Refresh the MR28 checkout on the host. The existing shared checkout and KVAF
+build are then available inside the A5 container. Run the two commands in the
+container with its CANN/KVAF environment. Set `KVIP_A5_DEVICE` to the device
+ordinal visible inside that container. The runner defaults to ordinal 0.
+
+```bash
+cd /home/w00568585/li-aligned-a5/KVIP-mr28
+runner=experiments/lifetch_mr23_service
+bash "$runner/run_mr28_dynamic_service.sh" --warmup 2 --iterations 10
+bash "$runner/run_mr28_baseline_msprof.sh" --dynamic-compare --warmup 2 --timeout-seconds 1800
+```
+
+Both use one fixture (BS16, Q4, H128K, resident 16K, miss 10%, W4,
+32 AIC/64 AIV and prefetch budget 512 per request). Local candidate-count
+optimization stays off in both arms. `static_ready` uses fixed Dedicated Score
+and Service workers. `dynamic` executes each Resident Q once, then assigns
+Cold Score fragments to free MIX groups and Service windows to free AIVs.
+Both arms wait for the same request's Resident result, current scores and
+prior window publication. The existing prefetch and Terminal paths run in
+both arms.
+
+The performance runner writes `summary.json`, `summary.csv` and
+`requests.csv`. The graph Event covers Hot through Terminal, including
+completion. The dynamic kernel overlaps Resident, Cold and Service, so its
+profiler measurement covers that whole kernel. The fixed control reports
+Resident and Cold/Service separately and also their sum. A matched latency
+ratio requires identical per-request prefetch and final Get vectors. Raw
+observations and vector differences remain in the report.
+
+The profiling runner captures one checked forward per arm after fixture
+setup and BatchPut. Open `dynamic_trace_native.json` to compare native
+device intervals. Open each arm's `lifetch_business_trace.json` to inspect
+logical AIC/AIV lanes, dynamically assigned fragments and Service windows,
+and sampled MTE/VF scopes. `dynamic_trace_comparison.json` reports the first
+W1 prefetch doorbell, native elapsed spans and per-window Get counts.
+`dynamic_trace_scopes.csv` summarizes the instrumented scopes. Native task
+timestamps and source-scope timestamps use separate clock domains.

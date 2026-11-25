@@ -43,6 +43,8 @@ add_library(v9_bridge SHARED op_host/launch.cpp)
 target_include_directories(v9_bridge PRIVATE ${KVAF_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/include ${_base}/include)
 target_compile_definitions(v9_bridge PRIVATE KVIP_OUTPUT_WORKER=$<BOOL:${KVIP_OUTPUT_WORKER}>
   KVIP_HOT_SCORE_PARTITION=$<BOOL:${KVIP_HOT_SCORE_PARTITION}>
+  KVIP_SERVICE_LOCAL_COUNTS=$<BOOL:${KVIP_SERVICE_LOCAL_COUNTS}>
+  KVIP_SERVICE_UB_CANDIDATES=$<BOOL:${KVIP_SERVICE_UB_CANDIDATES}>
   KVIP_STAGE_TRACE=$<BOOL:${KVIP_STAGE_TRACE}>)
 target_link_libraries(v9_bridge PRIVATE v9_kernel host_intf_pub ascendcl)
 if(KVIP_STAGE_TRACE)

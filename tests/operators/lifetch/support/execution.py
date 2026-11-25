@@ -3815,7 +3815,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             if handoff:
                 from terminal_handoff import request_counts, terminal_stages
 
-                handoff_samples.extend(terminal_stages(measured))
+                handoff_samples.extend(terminal_stages(
+                    measured, dynamic=getattr(config, 'mr28_dedicated_service', None) == 'dynamic'))
                 for index, state in enumerate(states):
                     rotating = state.rotating
                     records = request_counts(rotating.rows.cpu().numpy(), rotating.final_posts.cpu().numpy(),
@@ -3973,6 +3974,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     profile_replay = baseline_trace or instruction_replay
     msprof_output = getattr(config, 'msprof_output', None)
     cold_route = getattr(config, 'msprof_cold_route', None)
+    dedicated_routes = ('dedicated', 'static_ready', 'dynamic')
+    ready_routes = ('static_ready', 'dynamic')
     partition_trial = hot_partition is not None or cold_partition is not None
     score_trial = partition_trial or unified_score is not None or dedicated_service is not None
     if score_trial and not (fused and handoff and config.transport == 'urma'
@@ -3988,13 +3991,14 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     if baseline_trace and (not msprof_output or instruction_replay):
         raise ValueError('Baseline stage trace requires an exclusive profile output')
     if cold_route is not None:
-        if not baseline_trace or cold_route not in ('p2', 'cold_p4', 'full_p2', 'full_uniform', 'dedicated'):
+        if not baseline_trace or cold_route not in ('p2', 'cold_p4', 'full_p2', 'full_uniform', *dedicated_routes):
             raise ValueError('Experimental profiling requires a marked fusion replay')
-        expected_batch = 16 if cold_route == 'dedicated' else 8
+        expected_batch = 16 if cold_route in dedicated_routes else 8
         if (tuple(config.batches) != (expected_batch,) or config.history != 131072 or config.queries != 4
                 or config.resident != 16384 or config.index_heads != 32
                 or (cold_route != 'dedicated' and config.miss_percent != 10) or config.prefetch_tokens != 512
                 or config.prefetch_rank_start != 1024 or type(config.msprof_local_counts) is not bool
+                or (cold_route in ready_routes and config.msprof_local_counts)
                 or not config.msprof_build_dir):
             raise ValueError(f'The {cold_route} trace requires its BS{expected_batch}/Q4/128K prefetch fixture')
     if instruction_replay:
@@ -4008,7 +4012,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     soc = acl.get_soc_name()
     device_resources = query_device_resources(cann, config.device)
     aics = device_resources['effective_aic']
-    if (dedicated_service is not None or cold_route == 'dedicated') and (
+    if (dedicated_service is not None or cold_route in dedicated_routes) and (
             aics != 32 or device_resources['aiv'] < 64 or 'Ascend950' not in soc):
         raise ValueError(f"Dedicated Service targets A5 with 32 MIX groups, got {soc} "
                          f"with {aics} effective AICs and {device_resources['aiv']} AIVs")
@@ -4158,7 +4162,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             from baseline_stage_trace import StageBuffer, scoped_msprof, write_capture
 
             cold_parts = score_parts = 2
-            if cold_route == 'dedicated':
+            if cold_route in dedicated_routes:
                 from terminal_handoff import bind_dedicated_service
 
                 bind_dedicated_service(state, cold_route)
@@ -4281,13 +4285,15 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                                                    producer_parts=unified_parts,
                                                    producer_blocks=unified_parts * g['batch'])
                 if dedicated_service is not None:
-                    dedicated = dedicated_service == 'dedicated'
+                    dedicated = dedicated_service in ('dedicated', 'static_ready')
+                    dynamic = dedicated_service == 'dynamic'
+                    score_groups = 24 if dedicated else shape.liCores - int(dynamic)
                     result['handoff_route'].update(
                         dedicated_service=dedicated, available_aiv=device_resources['aiv'],
-                        cold_mixed_groups=shape.liCores,
-                        cold_score_aic=24 if dedicated else shape.liCores,
-                        cold_score_aiv=48 if dedicated else 2 * shape.liCores,
-                        cold_service_aiv=shape.serviceLanes,
+                        cold_mixed_groups=shape.liCores, cold_score_aic=score_groups,
+                        cold_score_aiv=2 * score_groups,
+                        cold_service_aiv=2 * shape.liCores if dynamic else shape.serviceLanes,
+                        scheduler_aic=int(dynamic), resident_aiv=g['batch'] * 4,
                     )
             atomic_json(directory / 'path_result.json', result)
             return result
