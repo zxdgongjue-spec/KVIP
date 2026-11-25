@@ -1,10 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Capacity/lifecycle adapter for the original slot LRU kernels."""
 
+import os
+
 import numpy as np
 from numba import set_num_threads
 
-from kvip.cache._lru_kernel import _commit_lru_rows, _reset_lru_rows, _write_oldest_victims
+from kvip.cache._lru_kernel import (
+    _commit_lru_rows,
+    _rebuild_extent_order,
+    _reset_lru_rows,
+    _write_extent_victims,
+    _write_oldest_victims,
+)
 
 TOPK = 2048
 BITMAP_WORD_BITS = 32
@@ -18,7 +26,19 @@ class SlotLRU:
     outside ``active`` and are never linked into the eviction chain.
     """
 
-    def __init__(self):
+    def __init__(self, *, policy=None, extent=None):
+        policy = policy if policy is not None else os.getenv("KVIP_HOT_EVICTION_POLICY", "slot_lru")
+        if extent is None:
+            extent = int(os.getenv("KVIP_HOT_EVICTION_EXTENT", "1" if policy == "slot_lru" else "8"))
+        if policy not in ("slot_lru", "extent_r1") or extent not in (1, 4, 8, 16):
+            raise ValueError("Expected slot_lru or extent_r1 with extent 1, 4, 8 or 16")
+        if policy == "slot_lru" and extent != 1:
+            raise ValueError("slot_lru requires extent 1")
+        self.extent = extent
+        self.extent_shift = extent.bit_length() - 1
+        self.extent_seen = np.empty(0, dtype=np.uint8)
+        self.extent_links = np.empty((2, 0), dtype=np.int32)
+        self.extent_ends = np.full(2, -1, dtype=np.int32)
         self.version = 0
         self.active = 0
         self.next = np.empty((1, 0), dtype=np.int32)
@@ -46,6 +66,10 @@ class SlotLRU:
             words = (capacity + BITMAP_WORD_BITS - 1) // BITMAP_WORD_BITS
             words = (words + BITMAP_ALIGNMENT_WORDS - 1) // BITMAP_ALIGNMENT_WORDS * BITMAP_ALIGNMENT_WORDS
             self.bitmap = np.zeros((1, words), dtype=np.int32)
+            if self.extent > 1:
+                blocks = (capacity + self.extent - 1) // self.extent
+                self.extent_seen = np.empty(blocks, dtype=np.uint8)
+                self.extent_links = np.empty((2, blocks), dtype=np.int32)
             changed = True
         count = min(TOPK, committed)
         if committed < self.active or self.active == 0 < committed:
@@ -64,6 +88,8 @@ class SlotLRU:
             )
             self.slots[0, count:] = -1
             self.active = committed
+            if self._effective_extent() > 1:
+                self._rebuild_extents()
             self.version += 1
             return
         if committed > self.active:
@@ -80,9 +106,24 @@ class SlotLRU:
         if changed:
             self._select()
 
+    def _effective_extent(self):
+        # The fixed ABI expects every candidate for a short row. A partial
+        # committed tail falls back to the original slot order.
+        return self.extent if self.active and self.active % self.extent == 0 else 1
+
+    def _rebuild_extents(self):
+        _rebuild_extent_order(self.next, self.head, self.extent, self.extent_seen, self.extent_links, self.extent_ends)
+
     def _select(self):
         self.version += 1
         self.slots.fill(-1)
+        extent = self._effective_extent()
+        if extent > 1:
+            self._rebuild_extents()
+            _write_extent_victims(
+                0, self.slots, self.bitmap, min(TOPK, self.active), extent, self.extent_links, self.extent_ends
+            )
+            return
         _write_oldest_victims(
             0,
             self.next,
@@ -114,6 +155,10 @@ class SlotLRU:
             self.unique,
             min(TOPK, self.active),
             self.bitmap.shape[1],
+            self._effective_extent(),
+            self.extent_shift,
+            self.extent_links,
+            self.extent_ends,
         )
         self.version += 1
 

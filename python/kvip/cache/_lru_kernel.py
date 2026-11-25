@@ -53,6 +53,59 @@ def _write_oldest_victims(
         slot = int(next_slot[row, slot])
 
 
+@njit(nogil=True)
+def _rebuild_extent_order(next_slot, head, extent, seen, links, ends):
+    """Project slot recency onto the newest member of each complete extent."""
+    seen.fill(0)
+    slot = head[0]
+    previous = -1
+    ends[0] = -1
+    while slot >= 0:
+        block = slot // extent
+        seen[block] += 1
+        if seen[block] == extent:
+            links[1, block] = previous
+            if previous >= 0:
+                links[0, previous] = block
+            else:
+                ends[0] = block
+            previous = block
+        slot = next_slot[0, slot]
+    ends[1] = previous
+    if previous >= 0:
+        links[0, previous] = -1
+
+
+@njit(nogil=True)
+def _write_extent_victims(row, slots, bitmap, count, extent, links, ends):
+    bitmap[row].fill(0)
+    block = ends[0]
+    for written in range(0, count, extent):
+        start = block * extent
+        for offset in range(extent):
+            slots[row, written + offset] = start + offset
+        bitmap[row, start >> 5] |= np.int32(((np.uint32(1) << extent) - 1) << (start & 31))
+        block = links[0, block]
+
+
+@njit(inline="always")
+def _touch_extent(block, links, ends):
+    tail = ends[1]
+    if block == tail:
+        return
+    previous = links[1, block]
+    following = links[0, block]
+    if previous < 0:
+        ends[0] = following
+    else:
+        links[0, previous] = following
+    links[1, following] = previous
+    links[0, tail] = block
+    links[1, block] = tail
+    links[0, block] = -1
+    ends[1] = block
+
+
 @njit(parallel=True, nogil=True)
 def _reset_lru_rows(
     flat_rows,
@@ -126,6 +179,10 @@ def _commit_lru_rows(
     unique_counts,
     victim_count,
     bitmap_words,
+    extent,
+    extent_shift,
+    extent_links,
+    extent_ends,
 ):
     """提交指定稳定行的 Final slot，并缓存这些行的下一代 victim。"""
     # 负责把 LIDU 返回的 destination slot 移动到 LRU 尾部
@@ -158,6 +215,7 @@ def _commit_lru_rows(
         tail = int(queue_tail[row])
 
         # slot-ID 升序扫描，确保同一步的 LRU 更新顺序确定。slot ID 从小到大扫描。
+        last_block = -1
         for word in range(active_words):
             remaining_bits = np.int64(np.uint32(victim_bitmap[row, word]))
             while remaining_bits != 0:
@@ -166,6 +224,12 @@ def _commit_lru_rows(
                 # 得到 bit 下标
                 bit = _single_bit_index(lowest_bit)
                 slot = (word << 5) + bit
+
+                if extent > 1:
+                    block = slot >> extent_shift
+                    if block != last_block:
+                        _touch_extent(block, extent_links, extent_ends)
+                        last_block = block
 
                 # 更新链表，把节点接到 tail 后面
                 if slot != tail:
@@ -188,12 +252,15 @@ def _commit_lru_rows(
         queue_head[row] = head
         queue_tail[row] = tail
         # 完成slot移动后，重新生成victim
-        _write_oldest_victims(
-            row,
-            next_slot,
-            queue_head,
-            victim_slots,
-            victim_bitmap,
-            victim_count,
-            bitmap_words,
-        )
+        if extent > 1:
+            _write_extent_victims(row, victim_slots, victim_bitmap, victim_count, extent, extent_links, extent_ends)
+        else:
+            _write_oldest_victims(
+                row,
+                next_slot,
+                queue_head,
+                victim_slots,
+                victim_bitmap,
+                victim_count,
+                bitmap_words,
+            )

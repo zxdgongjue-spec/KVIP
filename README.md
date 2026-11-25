@@ -140,6 +140,19 @@ python -m pip install pytest ruff
 bash scripts/check.sh
 ```
 
+KVIP hot-slot eviction can be selected before starting the vLLM worker:
+
+```bash
+export KVIP_HOT_EVICTION_POLICY=extent_r1
+export KVIP_HOT_EVICTION_EXTENT=8
+```
+
+The default is `slot_lru`. The R1 extent size can be 1, 4, 8 or 16 (default 8
+when R1 is selected). R1 orders blocks by the most recent access to any
+member and outputs the existing slot list and bitmap. Unaligned committed
+rows use the slot order until they reach an extent boundary. This implements
+recency-based block selection without an overwrite grace period.
+
 Graph-mode native/fused comparison using real DDR and the current service LRU:
 
 ```bash
