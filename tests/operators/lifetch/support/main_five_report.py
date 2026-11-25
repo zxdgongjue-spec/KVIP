@@ -27,6 +27,9 @@ def case_folder(root, group, arm):
 def archived_oracle(owner_root, group):
     """Load the saved native IDs, including G2's self-contained serial reference."""
     owner_root = Path(owner_root)
+    if (owner_root / 'native_score_oracle.json').is_file():
+        from feature_score_oracle import load_oracle
+        return load_oracle(owner_root, group)
     if ((owner_root / 'logical-ties.txt').read_text().strip() != OWNER
             or (owner_root / 'physical_npu.txt').read_text().strip() != '4'):
         raise ValueError('Expected the archived per-Q final TopK version measured on physical NPU4')
@@ -144,7 +147,8 @@ def measured_parallel(root, group, arm, revision, owner, native, old_receipt, ar
             raise ValueError(f'G{group}: loaded binary differs from the recorded build')
     receipt = read(folder / 'score_topk_check.json')
     source = receipt['native_reference']
-    if (source['origin'] != 'completed-owner-archive' or Path(source['archive_path']).resolve() != owner.resolve()
+    expected_origin = 'native-only-oracle' if old_receipt.get('reference_kind') == 'native-only' else 'completed-owner-archive'
+    if (source['origin'] != expected_origin or Path(source['archive_path']).resolve() != owner.resolve()
             or source['identity'] != old_receipt['native_reference']['identity']):
         raise ValueError(f'G{group}: mainline and owner archive used different native oracles')
     if proof['capture_operand_hashes'] != source['identity']['inputs']:

@@ -119,6 +119,8 @@ def read_arm(root, group, arm, revision, owner, oracle, *, verify_library):
 
 def oracle_for(owner, group):
     serial, receipt = archived_oracle(owner, group)
+    if receipt.get('reference_kind') == 'native-only':
+        return serial, receipt, receipt['capture']
     archived = read(case_folder(owner, group, 'logical-ties').parent / 'replay_input.json')
     return serial, receipt, archived
 

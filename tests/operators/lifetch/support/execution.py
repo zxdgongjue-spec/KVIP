@@ -36,6 +36,7 @@ from kvip.operators.lifetch_ubmem.binding import UbmemBinding
 from kvip.operators.lifetch_ubmem.build import UbmemGeometry, build_ubmem_library, kvaf_cann
 from kvip.runtime.device import query_device_resources
 from kvip.runtime.loader import load_lifetch_library
+from native_li_reference import native_li
 from performance import measure_sequence
 from reporting import CorrectnessRecorder, atomic_json, record_case_failure, timing_summary
 from workloads import SOURCE, ReplayPagePlan, ReplaySequence
@@ -121,28 +122,6 @@ def native_fixture(torch, arguments, batch, history):
             "key_scale": arguments[4].view(torch.float32).reshape(history // 128, 128, 1),
         },
     }
-
-
-def native_li(torch_npu, fixture):
-    """Same BSND/sparse=0 contract as the accepted native Stage2 benchmark."""
-    result = torch_npu.npu_quant_lightning_indexer(
-        query=fixture["query"],
-        key=fixture["key"],
-        weights=fixture["native_inputs"]["weights"],
-        query_dequant_scale=fixture["native_inputs"]["query_scale"],
-        key_dequant_scale=fixture["native_inputs"]["key_scale"],
-        actual_seq_lengths_query=fixture["li_query_lengths"],
-        actual_seq_lengths_key=fixture["actual_key"],
-        block_table=fixture["block_table"],
-        query_quant_mode=0,
-        key_quant_mode=0,
-        layout_query="BSND",
-        layout_key="PA_BSND",
-        sparse_count=2048,
-        sparse_mode=fixture.get("sparse_mode", 0),
-    )
-    selected = result[0] if isinstance(result, (list, tuple)) else result
-    return selected.reshape(-1, 1, 2048)
 
 
 def runner_options(config):

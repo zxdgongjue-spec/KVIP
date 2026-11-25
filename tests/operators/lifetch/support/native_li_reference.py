@@ -14,6 +14,28 @@ MODES = ('strong_serial', 'strong_serial_repeat', 'same_layout_native')
 CACHE_SCHEMA = 2
 
 
+def native_li(torch_npu, fixture):
+    """Call the stock LI with the replay sparse mode and logical Q4 lengths."""
+    result = torch_npu.npu_quant_lightning_indexer(
+        query=fixture["query"],
+        key=fixture["key"],
+        weights=fixture["native_inputs"]["weights"],
+        query_dequant_scale=fixture["native_inputs"]["query_scale"],
+        key_dequant_scale=fixture["native_inputs"]["key_scale"],
+        actual_seq_lengths_query=fixture["li_query_lengths"],
+        actual_seq_lengths_key=fixture["actual_key"],
+        block_table=fixture["block_table"],
+        query_quant_mode=0,
+        key_quant_mode=0,
+        layout_query="BSND",
+        layout_key="PA_BSND",
+        sparse_count=2048,
+        sparse_mode=fixture.get("sparse_mode", 0),
+    )
+    selected = result[0] if isinstance(result, (list, tuple)) else result
+    return selected.reshape(-1, 1, 2048)
+
+
 class NativeReplayLI:
     """The serial replay's BSND query and PA_BSND Index operands, without the fetch."""
     def __init__(self, torch, device, geometry):

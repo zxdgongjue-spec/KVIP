@@ -381,7 +381,8 @@ def main(args):
             subprocess.check_output(['git', '-C', args.main, 'status', '--porcelain', '-uno'], text=True).strip()):
         raise ValueError('Expected clean pinned production mainline on physical NPU4')
     serial, receipt = archived_oracle(args.owner_archive, args.group)
-    source = receipt['native_reference']
+    origin = 'native-only-oracle' if receipt.get('reference_kind') == 'native-only' else 'completed-owner-archive'
+    source = {**receipt['native_reference'], 'origin': origin, 'archive_path': str(args.owner_archive)}
     # The reader and mainline have different modules named execution,
     # performance, correctness, etc. Keep the production process independent.
     subprocess.run([sys.executable, '-B', __file__, *sys.argv[1:], '--worker'], check=True)
@@ -389,16 +390,13 @@ def main(args):
     ids_file = fused / ('diagnostic_ids.npy' if args.availability_only else 'measured_ids.npy')
     outputs = np.load(ids_file, allow_pickle=False)
     inputs = next(iter(ReplaySequence(args.trace, args.group, (1, 1))))
-    save_checked(fused, args.group, inputs, serial,
-                 {**source, 'origin': 'completed-owner-archive', 'archive_path': str(args.owner_archive)},
-                 outputs, expected_calls=args.iterations)
+    save_checked(fused, args.group, inputs, serial, source, outputs, expected_calls=args.iterations)
     if args.borrow_audit:
         extra_dir = fused/'terminal_only'
         extra_dir.mkdir(exist_ok=False)
         file = fused/'terminal_only_ids.npy'
-        save_checked(extra_dir, args.group, inputs, serial,
-                     {**source, 'origin': 'completed-owner-archive', 'archive_path': str(args.owner_archive)},
-                     np.load(file, allow_pickle=False), expected_calls=args.iterations)
+        save_checked(extra_dir, args.group, inputs, serial, source, np.load(file, allow_pickle=False),
+                     expected_calls=args.iterations)
         file.unlink()
     result_file = fused / 'path_result.json'
     result = json.loads(result_file.read_text())

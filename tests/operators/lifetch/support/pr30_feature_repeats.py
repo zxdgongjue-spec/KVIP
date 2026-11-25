@@ -25,15 +25,22 @@ def summarize(root):
         if (any(row['group'] != group for row in records) or sorted(orders[0]) != ['dualcut', 'paced']
                 or orders[1] != orders[0][::-1]):
             raise ValueError(f'G{group}: expected two complete comparisons run in reverse order')
-        if records[0]['timing']['mainline'] != records[1]['timing']['mainline']:
+        if (records[0]['reference'] != records[1]['reference'] or
+                records[0]['timing'].get('mainline') != records[1]['timing'].get('mainline')):
             raise ValueError(f'G{group}: the two blocks used different upstream baselines')
-        if any(row['calls_per_graph'] != calls_per_graph for row in records):
+        expected = {arm: n for arm, n in calls_per_graph.items()
+                    if arm != 'mainline' or records[0]['reference'] is not None}
+        if any(row['calls_per_graph'] != expected or set(row['timing']) != set(expected) for row in records):
             raise ValueError(f'G{group}: expected 10 measured candidate calls and 20 archived main calls')
         split = [row['measured']['paced']['split_q'] for row in records]
-        groups[group] = {}
+        groups[group] = {'reference': records[0]['reference']}
         for label, before, after, check in (
                 ('A_vs_main', 'mainline', 'dualcut', 'main_tail_equals_dualcut'),
                 ('B_vs_A', 'dualcut', 'paced', 'dualcut_li_equals_paced')):
+            if before not in expected:
+                groups[group][label] = None
+                print(f'G{group} {label} UNAVAILABLE reason=no_matching_local_main_archive')
+                continue
             saved = {stage: [row['timing'][before][stage][0] - row['timing'][after][stage][0] for row in records]
                      for stage in STAGES}
             groups[group][label] = saved
@@ -46,6 +53,11 @@ def summarize(root):
         groups[group][f'paced_split_Q_per_{queries_per_block}'] = split
     equal_weight = {}
     for label in ('A_vs_main', 'B_vs_A'):
+        missing = [str(g) for g in GROUPS if groups[g][label] is None]
+        if missing:
+            equal_weight[label] = None
+            print(f'FIVE_GROUP_EQUAL_WEIGHT {label} UNAVAILABLE missing_groups={",".join(missing)}')
+            continue
         avg = {stage: [mean(groups[g][label][stage][i] for g in GROUPS) for i in range(2)] for stage in STAGES}
         equal_weight[label] = avg
         matched = all(all(groups[g]['unmodified_stage_match'][label]) for g in GROUPS)

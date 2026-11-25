@@ -103,6 +103,25 @@ def test_archive_compiler_drift_and_fresh_comparisons(tmp_path, monkeypatch, cap
     assert 'G7 CHECK arm=paced TopK_score_vs_strong_serial=PASS calls=10/10 queries=640/640' in text
     assert 'eligible_Q=20/640 split_Q=20/640 split_rows=10/160' in text
     assert 'FIVE_GROUP_EQUAL_WEIGHT paced_vs_dualcut graph_saved_mean_us=+6.000' in text
+    (out/'g7/reference.txt').write_text('unavailable')
+    report.report(out, 7, tmp_path/'owner')
+    report.summary(out)
+    missing = report.read(out/'g7/feature_steps.json')
+    assert missing['reference'] is None and missing['calls_per_graph'] == {'dualcut': 10, 'paced': 10}
+    assert set(missing['timing']) == set(missing['measured']) == {'dualcut', 'paced'}
+    text = capsys.readouterr().out
+    assert 'G7 dualcut_vs_mainline UNAVAILABLE' in text and 'G7 CHECK arm=mainline' not in text
+    assert 'FIVE_GROUP_EQUAL_WEIGHT dualcut_vs_mainline UNAVAILABLE missing_groups=7' in text
+    assert 'FIVE_GROUP_EQUAL_WEIGHT paced_vs_dualcut graph_saved_mean_us=+6.000' in text
+    def moved(root, group, arm, owner, oracle, host):
+        values = list(collect(root, group, arm, owner, oracle, host))
+        if arm == 'paced':
+            values[5] = dict(thp, ub_device='another_HCA')
+        return values
+    monkeypatch.setattr(report, 'collect_arm', moved)
+    with pytest.raises(ValueError, match='placement differs'):
+        report.report(out, 7, tmp_path/'owner')
+    (out/'g7/reference.txt').write_text(str(archive))
     (archive/'host.txt').write_text('different-node')
     with pytest.raises(ValueError, match='different host'):
         report.report(out, 7, tmp_path/'owner')

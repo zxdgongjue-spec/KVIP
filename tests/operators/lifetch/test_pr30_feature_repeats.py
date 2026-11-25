@@ -21,7 +21,7 @@ def test_reverse_order_and_stage_isolation(tmp_path):
                 'paced': {'graph': [290 - block, 288], 'LI': [226, 226], 'tail': [58 - block, 56]},
             }
             (path / 'feature_steps.json').write_text(json.dumps(dict(
-                group=group, timing=timings, measured={'paced': {'split_q': group}},
+                group=group, reference='/same-machine/archive', timing=timings, measured={'paced': {'split_q': group}},
                 calls_per_graph={'mainline': 20, 'dualcut': 10, 'paced': 10},
                 device_text={'main_tail_equals_dualcut': True, 'dualcut_li_equals_paced': True})))
     summarize(tmp_path)
@@ -47,3 +47,20 @@ def test_reverse_order_and_stage_isolation(tmp_path):
     report.write_text(json.dumps(data))
     with pytest.raises(ValueError, match='expected 10 measured candidate calls'):
         summarize(tmp_path)
+    data['calls_per_graph']['paced'] = 10
+    for block in (2, 1):
+        report = tmp_path/f'block{block}/g7/feature_steps.json'
+        if block == 1:
+            data = json.loads(report.read_text())
+        data['reference'] = None
+        del data['timing']['mainline'], data['calls_per_graph']['mainline']
+        data['device_text']['main_tail_equals_dualcut'] = None
+        report.write_text(json.dumps(data))
+        if block == 2:
+            with pytest.raises(ValueError, match='different upstream baselines'):
+                summarize(tmp_path)
+    summarize(tmp_path)
+    result = json.loads((tmp_path / 'feature_comparison.json').read_text())
+    assert result['equal_weight']['A_vs_main'] is None
+    assert result['groups']['7']['A_vs_main'] is None
+    assert result['equal_weight']['B_vs_A']['tail'] == [1, 2]

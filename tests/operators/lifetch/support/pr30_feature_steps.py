@@ -44,17 +44,31 @@ def text_hashes(path):
     return result
 
 
+def group_reference(root, group):
+    group_marker = root/f'g{group}/reference.txt'
+    value = group_marker.read_text().strip() if group_marker.exists() else marker(root, 'reference')
+    if value == 'unavailable':
+        return None
+    if not value or not Path(value).is_absolute():
+        raise ValueError(f'G{group}: expected an absolute archive path or unavailable')
+    return Path(value).resolve()
+
+
 def check_roots(root, archive):
     for arm, revision in REVISIONS.items():
         if marker(root, arm) != revision:
             raise ValueError(f'Wrong pinned build for {arm}')
-    if marker(archive, 'main') != REVISIONS['mainline']:
+    if archive is not None and marker(archive, 'main') != REVISIONS['mainline']:
         raise ValueError(f'Unexpected archived main revision in {archive}')
-    for directory in (root, archive):
+    for directory in ((root, archive) if archive is not None else (root,)):
         if (marker(directory, 'kvaf'), marker(directory, 'kvaf_tree'), marker(directory, 'physical_npu')) != (
                 SDK, SDK_TREE, '4'):
             raise ValueError(f'Unexpected SDK, source tree or NPU in {directory}')
-    if not marker(root, 'host') or marker(root, 'host') != marker(archive, 'host'):
+    if not marker(root, 'host'):
+        raise ValueError('Missing replay hostname')
+    if archive is None:
+        return
+    if marker(root, 'host') != marker(archive, 'host'):
         raise ValueError('Baseline belongs to a different host')
     if (marker(root, 'machine_id') and marker(archive, 'machine_id') and
             marker(root, 'machine_id') != marker(archive, 'machine_id')):
@@ -171,30 +185,35 @@ def format_times(times, signed=False):
 
 
 def report(root, group, owner):
-    archive = Path(marker(root, 'reference')).resolve()
+    archive = group_reference(root, group)
     check_roots(root, archive)
     oracle = oracle_for(owner, group)
     timing, measured, diagnostics, images, exact = {}, {}, {}, {}, {}
-    for arm in REVISIONS:
+    arms = tuple(REVISIONS) if archive is not None else ('dualcut', 'paced')
+    for arm in arms:
         source = archive if arm == 'mainline' else root
         timing[arm], receipts, diagnostics[arm], images[arm], controls, thp, exact[arm] = collect_arm(
             source, group, arm, owner, oracle, marker(root, 'host'))
-        if arm == 'mainline':
+        if arm == arms[0]:
             base_controls, base_thp = controls, thp
         else:
             if (controls != base_controls or pair_placement(base_thp, thp, local_baseline=True) != 'matched'):
                 raise ValueError(f'G{group} {arm}: input, runtime or CPU transport placement differs')
+        if arm != 'mainline':
             measured[arm] = receipts
-    code_check = dict(main_tail_equals_dualcut=images['mainline'][TERMINAL] == images['dualcut'][TERMINAL],
+    code_check = dict(main_tail_equals_dualcut=(
+                          images['mainline'][TERMINAL] == images['dualcut'][TERMINAL] if archive else None),
                       dualcut_li_equals_paced=all(images['dualcut'][k] == images['paced'][k] for k in LI_TEXT))
     order = (root/f'g{group}/order.txt').read_text().split()
     if sorted(order) != ['dualcut', 'paced']:
         raise ValueError(f'G{group}: invalid arm order {order}')
     atomic_json(root/f'g{group}/feature_steps.json', dict(
-        group=group, calls_per_graph=CALLS_PER_GRAPH, timing=timing, measured=measured, diagnostic=diagnostics,
-        device_text=code_check, executable_sha256=images, native=REVISIONS, reference=str(archive), order=order,
+        group=group, calls_per_graph={a: CALLS_PER_GRAPH[a] for a in arms},
+        timing=timing, measured=measured, diagnostic=diagnostics,
+        device_text=code_check, executable_sha256=images, native=REVISIONS,
+        reference=str(archive) if archive is not None else None, order=order,
         runtime=base_controls['runtime'], exact_id_sets=exact))
-    for arm in REVISIONS:
+    for arm in arms:
         calls = CALLS_PER_GRAPH[arm]
         rows, queries = calls * 16, calls * 16 * 4
         print(f'G{group} CHECK arm={arm} TopK_score_vs_strong_serial=PASS calls={calls}/{calls} '
@@ -215,6 +234,9 @@ def report(root, group, owner):
               f'last_worker_WQE/Index/final_CQ/prefetch_CQ_mean_us=' +
               '/'.join(f'{v:.2f}' for v in p.values()))
     for (prior, arm), code_matched in zip(PAIRS, code_check.values()):
+        if prior not in timing:
+            print(f'G{group} {arm}_vs_{prior} UNAVAILABLE reason=no_matching_local_main_archive')
+            continue
         print(f'G{group} {arm}_vs_{prior} saved', format_times(saved(timing[prior], timing[arm]), signed=True),
               'historical_main' if prior == 'mainline' else 'fresh_same_block',
               f'calls_per_graph={CALLS_PER_GRAPH[prior]}/{CALLS_PER_GRAPH[arm]}',
@@ -223,17 +245,24 @@ def report(root, group, owner):
 
 def summary(root):
     rows = [read(root/f'g{g}/feature_steps.json') for g in GROUPS]
-    if any(r['group'] != g or r['calls_per_graph'] != CALLS_PER_GRAPH or
-           r['native'] != REVISIONS or r['reference'] != marker(root, 'reference') or
-           r['runtime'] != rows[0]['runtime'] for g, r in zip(GROUPS, rows)):
-        raise ValueError('Mixed groups, baseline archives, revisions or runtimes')
-    print('TIMING graph_mean=graph_event_divided_by_calls mainline_graph_calls=20 candidate_graph_calls=10 '
+    for group, row in zip(GROUPS, rows):
+        archive = group_reference(root, group)
+        expected = CALLS_PER_GRAPH if archive is not None else {'dualcut': FRESH_CALLS, 'paced': FRESH_CALLS}
+        if (row['group'] != group or row['calls_per_graph'] != expected or set(row['timing']) != set(expected)
+                or row['native'] != REVISIONS or row['reference'] != (str(archive) if archive else None)
+                or row['runtime'] != rows[0]['runtime']):
+            raise ValueError('Mixed groups, baseline archives, revisions or runtimes')
+    print('TIMING graph_mean=graph_event_divided_by_calls mainline_archive_graph_calls=20 candidate_graph_calls=10 '
           'graph_P50=median_first_LI_to_tail_end_span '
           'LI=three_LI_kernels tail=final_TopK_through_last_CQ_and_retire')
     print('DIAGNOSTIC_SEPARATE_REPLAY first_post_peak=first_doorbell_tokens_in_busiest_4us '
           'peak_pending=overlapping_submit_to_software_CQ_observation_intervals '
           'hardware_conflict_counter=unavailable')
     for prior, arm in PAIRS:
+        missing = [str(row['group']) for row in rows if prior not in row['timing']]
+        if missing:
+            print(f'FIVE_GROUP_EQUAL_WEIGHT {arm}_vs_{prior} UNAVAILABLE missing_groups={",".join(missing)}')
+            continue
         diffs = [saved(r['timing'][prior], r['timing'][arm]) for r in rows]
         stages = ' '.join(f'{k}_saved_mean_us={mean(d[k][0] for d in diffs):+.3f}' for k in METRICS)
         print(f'FIVE_GROUP_EQUAL_WEIGHT {arm}_vs_{prior} {stages}')

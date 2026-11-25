@@ -3,7 +3,7 @@
 set -eo pipefail
 if (( $# < 3 || $# > 5 )) || [[ ! $2 =~ ^[a-f0-9]{40}$ || ! $3 =~ ^[a-f0-9]{40}$ ||
     ( $# == 4 && $4 != cap-pair ) || ( $# == 5 && $4 != active-history && $4 != pr30-parity && $4 != near512 && $4 != near512-five && $4 != near512-locality && $4 != pr30-feature-steps ) ]]; then
-    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA [cap-pair | active-history ARCHIVED_CAP_PAIR | pr30-parity ARCHIVED_ACTIVE_HISTORY | {near512,near512-five} ARCHIVED_PR30_PARITY | near512-locality ARCHIVED_ACTIVE_HISTORY | pr30-feature-steps ARCHIVED_UNIFIED_MAIN]" >&2
+    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA [cap-pair | active-history ARCHIVED_CAP_PAIR | pr30-parity ARCHIVED_ACTIVE_HISTORY | {near512,near512-five} ARCHIVED_PR30_PARITY | near512-locality ARCHIVED_ACTIVE_HISTORY | pr30-feature-steps {ARCHIVED_UNIFIED_MAIN,auto-local}]" >&2
     exit 2
 fi
 repo=$1
@@ -13,6 +13,7 @@ mode=${4:-single}
 upstream=d6cfd392f722dd3f96ef6e05175f503aac511dbb
 name=unified_main
 prefix=unified-main-five
+auto_feature_reference=0
 if [[ $main != "$upstream" ]]; then
     git -C "$repo" merge-base --is-ancestor 54acdb9c54853441d08898a2623407f4492a83a4 "$main" || {
         echo "Expected a native build containing the window-rank and paced-GET PR" >&2
@@ -24,9 +25,17 @@ fi
 if [[ $mode == pr30-feature-steps ]]; then
     dualcut=bba4372065e549d0f2291bc08458d6250d4fa161
     paced=b261b4885edd79dabac822a2e6e3790c7f226ad6
-    archive=$(cd "$5" && pwd)
-    if [[ $main != "$upstream" || $(<"$archive/main.txt") != "$upstream" ||
-          $(<"$archive/physical_npu.txt") != 4 ||
+    if [[ $5 == auto-local ]]; then
+        auto_feature_reference=1
+        archive=auto-local
+    else
+        archive=$(cd "$5" && pwd)
+        if [[ $(<"$archive/main.txt") != "$upstream" || $(<"$archive/physical_npu.txt") != 4 ]]; then
+            echo "Expected a matching mainline archive on physical NPU4: $archive" >&2
+            exit 2
+        fi
+    fi
+    if [[ $main != "$upstream" ||
           $(git -C "$repo" rev-parse "$dualcut^") != "$main" ||
           $(git -C "$repo" rev-parse "$paced^") != "$dualcut" ]]; then
         echo "Expected the NPU4 main archive and the matching main -> dualcut -> paced experiment commits" >&2
@@ -120,7 +129,7 @@ if [[ -r /etc/machine-id ]]; then cat /etc/machine-id >"$out/machine_id.txt"; fi
 if [[ $mode == active-history || $mode == pr30-parity || $mode == near512* || $mode == pr30-feature-steps ]]; then
     printf '%s\n' "$archive" >"$out/reference.txt"
     for field in host machine_id; do
-        if [[ -f "$archive/$field.txt" ]] && ! cmp -s "$archive/$field.txt" "$out/$field.txt"; then
+        if [[ $auto_feature_reference == 0 && -f "$archive/$field.txt" ]] && ! cmp -s "$archive/$field.txt" "$out/$field.txt"; then
             echo "Capacity archive belongs to a different host ($field): $archive" >&2
             exit 1
         fi
@@ -271,7 +280,9 @@ run_arm() (
             [[ $(<"$p/host.txt") == "$here" && $(<"$p/physical_npu.txt") == 4 ]] &&
             [[ ! -s "$out/machine_id.txt" || ! -s "$p/machine_id.txt" || $(<"$out/machine_id.txt") == $(<"$p/machine_id.txt") ]]
     }
-    if [[ -n $paired_placement ]]; then
+    if [[ $auto_feature_reference == 1 && -z $paired_placement ]]; then
+        placement=
+    elif [[ -n $paired_placement ]]; then
         placement=$paired_placement
         [[ -f $placement ]]
     elif [[ $mode == cap-pair ]] && ! on_this_card "${PEER_MAIN_PLACEMENT_ROOT:-$area/main-five.hF6qQ8}"; then
@@ -303,9 +314,20 @@ print(name)
 PY_DEVICE
     )
         fi
-    elif [[ $name == unified_main ]]; then
+    elif [[ $name == unified_main && $auto_feature_reference == 0 ]]; then
         echo "Missing verified mainline CPU placement: $placement" >&2
         exit 1
+    elif (( auto_feature_reference )); then
+        # No local placement receipt yet. Keep the CPU allocation on one
+        # allowed NUMA node; reuse the observed adapter and node for its peer.
+        for node_path in /sys/devices/system/node/node[0-9]*; do
+            [[ -r "$node_path/cpulist" ]] || continue
+            cpus=$(<"$node_path/cpulist")
+            if [[ -n $cpus ]] && command -v taskset >/dev/null && taskset -c "$cpus" true >/dev/null 2>&1; then
+                node=${node_path##*node}
+                break
+            fi
+        done
     fi
     command=("$cpu")
     if [[ -n "$node" ]]; then
@@ -317,9 +339,8 @@ PY_DEVICE
         fi
     fi
     port=$("$PYTHON" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
-    hca=()
-    if [[ -n "$ub_device" ]]; then hca+=(--ub-device "$ub_device"); fi
-    "${command[@]}" --listen 127.0.0.1 --port "$port" "${hca[@]}" --memory-page-mode thp >"$arm/cpu.log" 2>&1 &
+    if [[ -n "$ub_device" ]]; then command+=(--ub-device "$ub_device"); fi
+    "${command[@]}" --listen 127.0.0.1 --port "$port" --memory-page-mode thp >"$arm/cpu.log" 2>&1 &
     server=$!
     monitor=
     cleanup() {
@@ -409,7 +430,12 @@ run_group() (
     fi
     trace=$(bash "$entry/peer_g2_input.sh" "$work" "$g")
     if [[ $mode == pr30-feature-steps ]]; then
-        owner=$("$PYTHON" -B - "$support" "$archive" "$g" <<'PY_OWNER'
+        group_reference=$archive
+        if (( auto_feature_reference )); then
+            group_reference=$("$PYTHON" -B "$support/feature_host_reference.py" "$area" "$g" baseline)
+        fi
+        if [[ -n $group_reference ]]; then
+            owner=$("$PYTHON" -B - "$support" "$group_reference" "$g" <<'PY_OWNER'
 import sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
@@ -417,26 +443,42 @@ from main_five_report import case_folder, read
 folder = case_folder(Path(sys.argv[2]), int(sys.argv[3]), 'mainline')
 print(read(folder / 'score_topk_check.json')['native_reference']['archive_path'])
 PY_OWNER
-        )
-        placement="$archive/g$g/mainline/thp.json"
-        for block in 1 2; do (
-            out="$out/block$block"
+            )
+            placement="$group_reference/g$g/mainline/thp.json"
+            echo "G$g MAIN_REFERENCE=$group_reference"
+        else
+            owner=$("$PYTHON" -B "$support/feature_host_reference.py" "$area" "$g" owner)
+            if [[ -z $owner ]]; then
+                owner="$out/oracle/g$g"
+                KVIP_Q4_NATIVE_LI_CACHE="${KVIP_Q4_NATIVE_LI_CACHE:-$area/native-li-reference-g2}" \
+                    "$PYTHON" -B "$support/feature_score_oracle.py" "$trace" "$g" "$owner"
+            fi
+            placement=$("$PYTHON" -B "$support/feature_host_reference.py" "$area" "$g" placement)
+            echo "G$g MAIN_REFERENCE=unavailable measured=dualcut,paced oracle=$owner"
+        fi
+        result_root=$out
+        for block in 1 2; do
+            out="$result_root/block$block"
             order=(dualcut paced)
             if [[ $g == 4 || $g == 7 ]]; then order=(paced dualcut); fi
             if [[ $block == 2 ]]; then order=("${order[1]}" "${order[0]}"); fi
             mkdir -p "$out/g$g"
+            printf '%s\n' "${group_reference:-unavailable}" >"$out/g$g/reference.txt"
             printf '%s\n' "${order[*]}" >"$out/g$g/order.txt"
             echo "BLOCK_BEGIN G$g block=$block order=${order[*]}"
-            for label in "${order[@]}"; do (
-                case $label in
-                    dualcut) main=$dualcut; main_src=$dualcut_src;;
-                    paced) main=$paced; main_src=$paced_src;;
-                esac
-                export PYTHONPATH="$main_src/python:$PYTHONPATH"
-                run_arm "$g" "$label" "$trace" "$owner" "$placement"
-            ); done
+            for label in "${order[@]}"; do
+                (
+                    case $label in
+                        dualcut) main=$dualcut; main_src=$dualcut_src;;
+                        paced) main=$paced; main_src=$paced_src;;
+                    esac
+                    export PYTHONPATH="$main_src/python:$PYTHONPATH"
+                    run_arm "$g" "$label" "$trace" "$owner" "$placement"
+                )
+                if [[ -z $placement ]]; then placement="$out/g$g/$label/thp.json"; fi
+            done
             "$PYTHON" -B "$support/pr30_feature_steps.py" "$out" "$g" "$owner"
-        ); done
+        done
         exit
     fi
     owner=$(select_owner "$g")
