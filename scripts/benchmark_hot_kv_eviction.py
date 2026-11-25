@@ -7,6 +7,8 @@ import csv
 import json
 import sys
 import time
+from collections import deque
+from itertools import groupby
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +52,7 @@ class Associations:
         self.budget = budget
         self.rng = np.random.default_rng(seed)
         self.edges = {}
+        self.previous = None
 
     def sample(self, tokens, limit):
         if len(tokens) <= limit:
@@ -58,24 +61,32 @@ class Associations:
 
     def update(self, demand, at_risk):
         active = set(demand)
+        anchors = self.sample(demand, self.anchors)
         votes = {}
-        candidates = self.sample(demand, self.candidates)
-        for anchor in self.sample(demand, self.anchors):
-            neighbors = self.edges.setdefault(anchor, {})
-            # Only previously learned links vote. This round trains the next one.
-            for token, score in list(neighbors.items()):
-                if token not in active and token in at_risk and score >= 2:
+        for anchor in anchors:
+            for token, score in self.edges.get(anchor, {}).items():
+                if score >= 2 and token in at_risk and token not in active:
                     votes[token] = votes.get(token, 0) + score
-                score += 1 if token in active else -1
-                if score:
-                    neighbors[token] = min(score, 255)
-                else:
-                    del neighbors[token]
-            for token in candidates:
-                if len(neighbors) >= self.neighbors:
-                    break
-                if token != anchor and token not in neighbors:
-                    neighbors[token] = 1
+
+        # Train A(t-1) -> B(t), restricted to B that was absent and at risk
+        # when the decision was made. Learn only after forming current votes.
+        if self.previous is not None:
+            previous_anchors, previous_risk = self.previous
+            positives = self.sample(sorted(active & previous_risk), self.candidates)
+            for anchor in previous_anchors:
+                neighbors = self.edges.setdefault(anchor, {})
+                for token, score in list(neighbors.items()):
+                    if token in previous_risk:
+                        score += 1 if token in active else -1
+                        if score:
+                            neighbors[token] = min(score, 255)
+                        else:
+                            del neighbors[token]
+                for token in positives:
+                    if len(neighbors) >= self.neighbors:
+                        break
+                    neighbors.setdefault(token, 1)
+        self.previous = anchors, at_risk - active
         return set(sorted(votes, key=lambda token: (-votes[token], token))[: self.budget])
 
 
@@ -126,7 +137,7 @@ class Cache:
             order = np.lexsort((recency, np.where(protected, np.inf, score)))
         return (order[: self.budget // self.g, None] * self.g + np.arange(self.g)).ravel()
 
-    def step(self, demand):
+    def step(self, demand, future=None):
         # Model reads from the beginning-of-round mapping, then apply writes.
         # Only the used prefix of the reserved slots is physically overwritten.
         misses = [token for token in demand if token not in self.mapping]
@@ -134,7 +145,21 @@ class Cache:
         slot_order = None
         if misses and self.associations is not None:
             slot_order = np.argsort(self.last, kind="stable")
-        victims = self.select(slot_order)[: len(misses)] if misses else np.empty(0, dtype=np.int64)
+        if misses and future is not None:
+            order = np.argsort(self.last, kind="stable")[: self.budget]
+            horizon = int(self.policy.removeprefix("oracle"))
+            # Within the same victim budget, prefer empty slots then evict
+            # the tokens whose next use is farthest away within this horizon.
+            ranks = [
+                horizon + 2
+                if self.slots[slot] == EMPTY
+                else min(future.get(self.slots[slot], horizon + 1), horizon + 1)
+                for slot in order
+            ]
+            chosen = np.argsort(-np.asarray(ranks), kind="stable")[: len(misses)]
+            victims = order[np.sort(chosen)]
+        else:
+            victims = self.select(slot_order)[: len(misses)] if misses else np.empty(0, dtype=np.int64)
         selection_ns = time.perf_counter_ns() - began if misses else 0
         evicted = 0
         protected_hits = 0
@@ -217,6 +242,48 @@ def resize_initial(initial, oldest, capacity):
     return resized, remap[oldest_live]
 
 
+ORACLE_HORIZONS = (1, 2, 4)
+
+
+def demands_for_round(tails, topk):
+    return [
+        list(dict.fromkeys(int(token) for token in topk[row].flat if not begin <= token < end))
+        for row, (begin, end) in enumerate(tails)
+    ]
+
+
+def replay_frames(references, lookahead):
+    def load_round(group):
+        frames = {}
+        for ref in group:
+            logical, valid, oldest, tails, topk = read_round(ref.manifest_path)
+            frames[ref.dp_rank] = (ref, logical, valid, oldest, demands_for_round(tails, topk))
+        return frames
+
+    rounds = (load_round(group) for _, group in groupby(references, key=lambda ref: ref.source_round))
+    queue = deque()
+    for _ in range(lookahead + 1):
+        frame = next(rounds, None)
+        if frame is not None:
+            queue.append(frame)
+    while queue:
+        current = queue.popleft()
+        for rank, frame in current.items():
+            ref, logical, valid, oldest, demands = frame
+            future = [{} for _ in demands]
+            for distance, following in enumerate(queue, 1):
+                next_ref, _, _, _, next_demands = following[rank]
+                if ref.request_signature != next_ref.request_signature:
+                    raise ValueError("Request identity changed within lookahead")
+                for row, demand in enumerate(next_demands):
+                    for token in demand:
+                        future[row].setdefault(token, distance)
+            yield ref, logical, valid, oldest, demands, future
+        frame = next(rounds, None)
+        if frame is not None:
+            queue.append(frame)
+
+
 def simulate(args, references):
     caches = {}
     sample_counts = {}
@@ -252,8 +319,8 @@ def simulate(args, references):
     with args.output.open("x", newline="") as output:
         writer = csv.writer(output)
         writer.writerow(header)
-        for ref in references:
-            logical, valid, oldest, tails, topk = read_round(ref.manifest_path)
+        lookahead = max(ORACLE_HORIZONS) if args.association else 0
+        for ref, logical, valid, oldest, demands, future in replay_frames(references, lookahead):
             captured_capacity = valid.shape[1]
             capacity = args.hot_capacity or captured_capacity
             if capacity > captured_capacity:
@@ -268,6 +335,8 @@ def simulate(args, references):
                     live = np.count_nonzero(initial != EMPTY)
                     print(f"DP {ref.dp_rank} request row {row}: {live}/{capacity} hot slots occupied initially")
                     choices = [("lru", 1)] + [(policy, g) for g in args.extents for policy in POLICIES[1:]]
+                    if args.association:
+                        choices.extend((f"oracle{horizon}", 1) for horizon in ORACLE_HORIZONS)
                     caches[key] = {
                         (p, g): Cache(p, g, initial, initial_oldest, args.victims, args.half_life, args.grace)
                         for p, g in choices
@@ -284,8 +353,7 @@ def simulate(args, references):
                             "assoc_lru", 1, initial, initial_oldest, args.victims, args.half_life, args.grace, model
                         )
                     sample_counts[key] = 0
-                begin, end = tails[row]
-                demand = list(dict.fromkeys(int(token) for token in topk[row].flat if not begin <= token < end))
+                demand = demands[row]
                 scored = sample_counts[key] >= args.warmup_rounds
                 sample_counts[key] += 1
                 if args.association and scored:
@@ -296,7 +364,7 @@ def simulate(args, references):
                 for (policy, g), cache in caches[key].items():
                     if len(cache.slots) != capacity:
                         raise ValueError("Hot capacity changed during a request")
-                    result = cache.step(demand)
+                    result = cache.step(demand, future[row] if policy.startswith("oracle") else None)
                     writer.writerow(
                         (ref.dp_rank, ref.source_round, signature[0], policy, g, int(scored), capacity, *result)
                     )
@@ -336,6 +404,8 @@ def simulate(args, references):
                 f"Association vs LRU: avoided misses={avoided_misses}, added misses={added_misses}, "
                 f"next-round weak hit rate={hit_rate:.2f}%, model update p50={update_us:.2f} us"
             )
+    if args.association:
+        print("Oracle1/2/4 use future accesses within the same LRU candidate window (offline hindsight references).")
     print(f"Per-round CSV: {args.output}")
 
 
