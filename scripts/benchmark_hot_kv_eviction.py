@@ -56,7 +56,7 @@ class Associations:
             return tokens
         return [tokens[i] for i in self.rng.choice(len(tokens), limit, replace=False)]
 
-    def update(self, demand, mapping):
+    def update(self, demand, at_risk):
         active = set(demand)
         votes = {}
         candidates = self.sample(demand, self.candidates)
@@ -64,7 +64,7 @@ class Associations:
             neighbors = self.edges.setdefault(anchor, {})
             # Only previously learned links vote. This round trains the next one.
             for token, score in list(neighbors.items()):
-                if token not in active and token in mapping and score >= 2:
+                if token not in active and token in at_risk and score >= 2:
                     votes[token] = votes.get(token, 0) + score
                 score += 1 if token in active else -1
                 if score:
@@ -84,6 +84,8 @@ class Cache:
         self.policy = policy
         self.associations = associations
         self.weak = set()
+        self.saved = set()
+        self.displaced = set()
         self.g = granularity
         self.slots = initial.copy()
         self.mapping = {int(token): slot for slot, token in enumerate(initial) if token != EMPTY}
@@ -100,9 +102,9 @@ class Cache:
         self.count = np.zeros(len(initial), dtype=np.float64)
         self.born = np.full(len(initial) // self.g, -grace - 1, dtype=np.int64)
 
-    def select(self):
+    def select(self, slot_order=None):
         if self.policy in ("lru", "assoc_lru"):
-            order = np.argsort(self.last, kind="stable")
+            order = np.argsort(self.last, kind="stable") if slot_order is None else slot_order
             if self.weak:
                 mask = np.zeros(len(self.slots), dtype=bool)
                 mask[[self.mapping[token] for token in self.weak]] = True
@@ -129,16 +131,30 @@ class Cache:
         # Only the used prefix of the reserved slots is physically overwritten.
         misses = [token for token in demand if token not in self.mapping]
         began = time.perf_counter_ns()
-        victims = self.select()[: len(misses)] if misses else np.empty(0, dtype=np.int64)
+        slot_order = None
+        if misses and self.associations is not None:
+            slot_order = np.argsort(self.last, kind="stable")
+        victims = self.select(slot_order)[: len(misses)] if misses else np.empty(0, dtype=np.int64)
         selection_ns = time.perf_counter_ns() - began if misses else 0
         evicted = 0
         protected_hits = 0
         current_hits = set(demand) - set(misses)
+        saved_reuse = len(self.saved & current_hits)
+        displaced_misses = len(self.displaced.intersection(misses))
+        self.saved.difference_update(current_hits)
+        self.displaced.difference_update(misses)
+        saved_now = displaced_now = set()
+        if slot_order is not None and self.weak:
+            old_slots = set(slot_order[: len(victims)])
+            new_slots = set(victims)
+            saved_now = {int(self.slots[slot]) for slot in old_slots - new_slots} - {EMPTY}
+            displaced_now = {int(self.slots[slot]) for slot in new_slots - old_slots} - {EMPTY}
         self.count *= 2 ** (-1 / self.half_life)
         for slot, token in zip(victims, misses):
             old = self.slots[slot]
             if old != EMPTY:
                 del self.mapping[int(old)]
+                self.saved.discard(old)
                 evicted += 1
                 protected_hits += old in current_hits
             self.slots[slot] = token
@@ -151,12 +167,17 @@ class Cache:
                 self.clock += 1
                 self.last[slot] = self.clock
                 self.count[slot] += 1
+        self.saved.update(saved_now)
+        self.displaced.update(displaced_now)
         predictions = len(self.weak)
         predicted_hits = sum(token in current_hits for token in self.weak)
         update_ns = 0
         if self.associations is not None:
             began = time.perf_counter_ns()
-            self.weak = self.associations.update(demand, self.mapping)
+            # The next round can overwrite only the LRU victim prefix.
+            risky_slots = np.argsort(self.last, kind="stable")[: self.budget]
+            at_risk = set(self.slots[risky_slots]) - {EMPTY}
+            self.weak = self.associations.update(demand, at_risk)
             update_ns = time.perf_counter_ns() - began
         self.round += 1
         runs = int(1 + np.count_nonzero(np.diff(victims) != 1)) if len(victims) else 0
@@ -172,6 +193,10 @@ class Cache:
             predictions,
             predicted_hits,
             update_ns,
+            len(saved_now),
+            saved_reuse,
+            len(displaced_now),
+            displaced_misses,
         )
 
 
@@ -218,6 +243,10 @@ def simulate(args, references):
         "weak_from_previous_round",
         "weak_next_round_hits",
         "association_update_ns",
+        "victims_skipped",
+        "skipped_then_hit",
+        "replacement_victims",
+        "replacement_then_miss",
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("x", newline="") as output:
@@ -298,6 +327,11 @@ def simulate(args, references):
         if policy == "assoc_lru":
             hit_rate = 100 * weak_hits / weak if weak else 0
             update_us = np.median(values[:, 10]) / 1000
+            skipped, reused, replacements, rereads = values[:, 11:15].sum(axis=0)
+            print(
+                f"At-risk outcomes: skipped victims={skipped}, later hits={reused}, "
+                f"replacement victims={replacements}, later misses={rereads}"
+            )
             print(
                 f"Association vs LRU: avoided misses={avoided_misses}, added misses={added_misses}, "
                 f"next-round weak hit rate={hit_rate:.2f}%, model update p50={update_us:.2f} us"
