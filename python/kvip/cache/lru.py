@@ -29,7 +29,7 @@ class SlotLRU:
     def __init__(self, *, policy=None, extent=None):
         policy = policy if policy is not None else os.getenv("KVIP_HOT_EVICTION_POLICY", "slot_lru")
         if extent is None:
-            extent = int(os.getenv("KVIP_HOT_EVICTION_EXTENT", "1" if policy == "slot_lru" else "8"))
+            extent = int(os.getenv("KVIP_HOT_EVICTION_EXTENT", "8")) if policy == "extent_r1" else 1
         if policy not in ("slot_lru", "extent_r1") or extent not in (1, 4, 8, 16):
             raise ValueError("Expected slot_lru or extent_r1 with extent 1, 4, 8 or 16")
         if policy == "slot_lru" and extent != 1:

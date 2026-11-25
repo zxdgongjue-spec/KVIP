@@ -55,3 +55,6 @@ def test_extent_configuration_from_environment(monkeypatch):
     monkeypatch.setenv("KVIP_HOT_EVICTION_POLICY", "extent_r1")
     monkeypatch.setenv("KVIP_HOT_EVICTION_EXTENT", "4")
     assert SlotLRU().extent == 4
+
+    monkeypatch.setenv("KVIP_HOT_EVICTION_POLICY", "slot_lru")
+    assert SlotLRU().extent == 1
