@@ -60,6 +60,7 @@ WAIT_PARTITIONED_HALF = 218
 T2_PIPE_PHASES = (219, 220, 221, 222)
 DEDICATED_DRIVER_WAIT = 224
 DEDICATED_READY_SNAPSHOT = 225
+COLD_PROGRESS_RESET = 229
 PHASES = {
     1: 'Kernel body',
     2: 'Kernel setup',
@@ -87,6 +88,14 @@ PHASES = {
     169: 'Request join and completion status',
     DEDICATED_DRIVER_WAIT: 'Dedicated driver wait',
     DEDICATED_READY_SNAPSHOT: 'Dedicated ready cursor snapshot',
+    226: 'Initialize pipeline events and credits',
+    227: 'Drain pipeline events and output banks',
+    228: 'Destroy LI pipeline',
+    COLD_PROGRESS_RESET: 'Clear Cold progress before Resident Top2048',
+    230: 'Read resident thresholds into Cold UB',
+    231: 'Drain and rebind Dedicated Cold query',
+    232: 'Prepare Cold progress staging in UB',
+    233: 'Publish final TopK generation and prepare Resolve',
 }
 PIPE_SCOPES = {
     180: ('AIC', 'WAIT', 'Wait for AIV credit'),
@@ -147,6 +156,12 @@ REQUIRED_PIPE = {
     21: {196, 197, 198},
     22: {183, 184, 191, 192},
     23: {211, 213, 214, 216},
+}
+REQUIRED_HANDOFF = {
+    20: {226, 227, 228},
+    21: {226, 227, 228},
+    22: {226, 227, 228, 230, 232},
+    23: {233},
 }
 CLOCK = ('Device GetSystemCycle relative to the first recorded scope, scaled by an independent '
          'NPU Event calibration. msprof host and device task timestamps are separate.')
@@ -262,7 +277,8 @@ def decode(raw):
     return sorted(events, key=lambda e: (e['begin'], -e['end'], e['lane']))
 
 
-def verify_route(events, batch, *, require_pipe_scopes=False, cold_route='p2', score_parts=2):
+def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_scopes=False,
+                 cold_route='p2', score_parts=2):
     phases = defaultdict(set)
     bodies = defaultdict(set)
     for event in events:
@@ -287,6 +303,16 @@ def verify_route(events, batch, *, require_pipe_scopes=False, cold_route='p2', s
                         for kernel, expected in required_pipe.items() if not expected.issubset(phases[kernel])}
         if missing_pipe:
             raise ValueError(f'Missing required pipe scopes: {missing_pipe}')
+    if require_handoff_scopes:
+        expected = dict(REQUIRED_HANDOFF)
+        if cold_route in ('cold_p4', 'dedicated'):
+            expected[21] = expected[21] | {COLD_PROGRESS_RESET}
+        if cold_route == 'dedicated':
+            expected[22] = expected[22] | {231}
+        missing_handoff = {kernel: sorted(required - phases[kernel]) for kernel, required in expected.items()
+                           if not required.issubset(phases[kernel])}
+        if missing_handoff:
+            raise ValueError(f'Missing required handoff scopes: {missing_handoff}')
     partition_waits = [event for event in events if event['phase'] == WAIT_PARTITIONED_HALF]
     if cold_route == 'cold_p4':
         if (not partition_waits or {event['iteration'] for event in partition_waits} != {1, 2, 3}
@@ -363,6 +389,58 @@ def source_lane_counts(spans):
     return result
 
 
+SOURCE_HANDOFFS = (
+    ('Hot score to Resident Top2048', 20, (21, 22), 21, (23,),
+     (27, 227, 228, COLD_PROGRESS_RESET, 2, 226)),
+    ('Resident Top2048 to Cold or W0 Service', 21, (23,), 22, (21, 22, 150),
+     (227, 228, 2, 226, 230, 231, 232)),
+    ('Cold and Service to first Resolve', 22, (21, 22, 150), 23, (161,),
+     (27, 227, 228, 2, 160, 233)),
+)
+
+
+def source_handoffs(events, counter_mhz):
+    """Measure business boundaries on the source clock, with work on any lane."""
+    by_phase = defaultdict(list)
+    for event in events:
+        by_phase[event['kernel'], event['phase']].append(event)
+    result = []
+    for label, left, previous, right, following, phases in SOURCE_HANDOFFS:
+        ends = {PHASES[phase]: max(e['end'] for e in by_phase[left, phase])
+                for phase in previous if by_phase[left, phase]}
+        starts = {PHASES[phase]: min(e['begin'] for e in by_phase[right, phase])
+                  for phase in following if by_phase[right, phase]}
+        if not ends or not starts:
+            continue
+        begin, end = max(ends.values()), min(starts.values())
+        coverage = []
+        all_spans = []
+        for phase in phases:
+            spans = [(max(begin, e['begin']), min(end, e['end']))
+                     for kernel in (left, right) for e in by_phase[kernel, phase]
+                     if max(begin, e['begin']) < min(end, e['end'])]
+            if not spans:
+                continue
+            all_spans.extend(spans)
+            coverage.append(dict(phase=PHASES[phase],
+                                 duration_on_any_lane_us=covered_ticks(spans) / counter_mhz))
+        duration = max(0, end - begin)
+        result.append(dict(name=label, begin_tick=begin, end_tick=end,
+                           last_previous_scope_end_ticks=ends, first_following_scope_begin_ticks=starts,
+                           duration_us=duration / counter_mhz,
+                           uncovered_source_us=(duration - covered_ticks(all_spans)) / counter_mhz,
+                           overlapping_source_scopes=end < begin, observed_scopes=coverage))
+    return result
+
+
+def covered_ticks(spans):
+    covered, last = 0, 0
+    for start, end in sorted(spans):
+        covered += max(0, end - max(start, last))
+        last = max(last, end)
+    return covered
+
+
 def render(events, counter_mhz, *, cold_route='p2'):
     if not math.isfinite(counter_mhz) or counter_mhz <= 0:
         raise ValueError('A positive measured device counter frequency is required')
@@ -384,7 +462,7 @@ def render(events, counter_mhz, *, cold_route='p2'):
                           ts=(begin - origin) / counter_mhz, dur=(end - begin) / counter_mhz, args=args))
 
     for pid, name in [(0, 'Kernel envelopes | source scopes'), (1, 'AIC lanes'), (2, 'AIV lanes'),
-                      (3, 'Observed source lane counts')]:
+                      (3, 'Observed source lane counts'), (4, 'Business handoffs | source clock')]:
         metadata('process_name', pid, 0, name)
     kernel_bodies = defaultdict(list)
     stage_sets = defaultdict(list)
@@ -406,7 +484,7 @@ def render(events, counter_mhz, *, cold_route='p2'):
         window_epoch = None
         category = kernel_stage
         if kernel in (20, 22) and (phase in (21, 22, 25, *range(150, 156),
-                                             DEDICATED_DRIVER_WAIT, DEDICATED_READY_SNAPSHOT)
+                                             DEDICATED_DRIVER_WAIT, DEDICATED_READY_SNAPSHOT, 230, 231)
                                    or phase in PIPE_SCOPES):
             window_epoch = event['iteration']
             args['window_epoch'] = window_epoch
@@ -428,9 +506,9 @@ def render(events, counter_mhz, *, cold_route='p2'):
                 args['tile_index'] = slot
                 args['sampled_scan_tile'] = True
             lane_scopes[(core_type, pipe)].append(event)
-        elif phase in (23, 155, DEDICATED_READY_SNAPSHOT) or kernel == 23:
+        elif phase in (23, 155, DEDICATED_READY_SNAPSHOT, COLD_PROGRESS_RESET) or kernel == 23:
             args.update(request_row=event['detail'] // 4, query=event['detail'] % 4)
-        elif phase in (21, 22, 152, 153):
+        elif phase in (21, 22, 152, 153, 230, 231):
             args['request_row'] = event['detail']
         elif phase in (25, 150, 151, DEDICATED_DRIVER_WAIT):
             args['service_lane'] = event['detail']
@@ -448,7 +526,10 @@ def render(events, counter_mhz, *, cold_route='p2'):
     for kernel, spans in sorted(kernel_bodies.items()):
         name, entry = kernels[kernel]
         metadata('thread_name', 0, kernel, entry)
-        begin, end = bounds(spans)
+        # The partitioned routes reset the GM Cold cursors before RunLi.
+        # The reset belongs to the same Threshold dispatch.
+        prologue = stage_sets.get((kernel, COLD_PROGRESS_RESET, None), [])
+        begin, end = bounds([*spans, *prologue])
         add_span(name, 'Kernel source envelope', 0, kernel, begin, end,
                  dict(kernel_entry=entry, marked_lanes=len(spans), begin_tick=begin, end_tick=end))
 
@@ -479,9 +560,17 @@ def render(events, counter_mhz, *, cold_route='p2'):
         for tick, count in source_lane_counts(spans):
             trace.append(dict(name=title, cat='KVIP source lane count', ph='C', pid=3, tid=tid,
                               ts=(tick - origin) / counter_mhz, args={'lanes': count}))
+    handoffs = source_handoffs(events, counter_mhz)
+    for tid, handoff in enumerate(handoffs, 1):
+        metadata('thread_name', 4, tid, handoff['name'])
+        if handoff['duration_us']:
+            add_span(handoff['name'], 'KVIP business handoff', 4, tid, handoff['begin_tick'],
+                     handoff['end_tick'], handoff)
     document = dict(traceEvents=trace, displayTimeUnit='ms',
                     metadata=dict(clock=CLOCK, counter_mhz=counter_mhz, cold_route=cold_route,
-                                  pipe_scope_semantics=PIPE_SEMANTICS))
+                                  pipe_scope_semantics=PIPE_SEMANTICS, source_handoffs=handoffs,
+                                  handoff_semantics='Source scopes can overlap across phases and lanes; '
+                                  'observed scope durations do not partition the handoff.'))
     return document, summaries
 
 
@@ -525,7 +614,8 @@ def write_capture(directory, raw, counter_mhz, state, library, config, soc, mspr
     comparison_route = getattr(config, 'msprof_cold_route', None)
     cold_route = comparison_route or 'p2'
     events = decode(raw)
-    verify_route(events, state.batch, require_pipe_scopes=True, cold_route=cold_route, score_parts=score_parts)
+    verify_route(events, state.batch, require_pipe_scopes=True, require_handoff_scopes=True,
+                 cold_route=cold_route, score_parts=score_parts)
     if comparison_route:
         cold_phases = (22, 151) if cold_route in UNIFIED_ROUTES else (21, 22, 151, 192)
         for phase in cold_phases:
@@ -555,6 +645,7 @@ def write_capture(directory, raw, counter_mhz, state, library, config, soc, mspr
         raw_trace='baseline_stage_trace.bin', visual_trace='baseline_stage_trace.json',
         observer_cost='Measured source scopes include marker overhead and existing synchronization',
         pipe_scope_semantics=PIPE_SEMANTICS,
+        source_handoffs=document['metadata']['source_handoffs'],
     )
     atomic_json(directory / 'baseline_stage_trace.json', document)
     atomic_json(directory / 'baseline_stage_report.json', report)

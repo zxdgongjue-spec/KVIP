@@ -86,11 +86,16 @@ public:
 
     __aicore__ inline void RunDedicatedService(uint32_t lane, uint32_t half) {
         dedicatedLane_ = lane;
+        KVIP_TRACE_BEGIN(eventInit, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+            Cold, LiEventsAcquire, 0, lane);
         AllocEventID();
+        KVIP_TRACE_END(eventInit);
         for (uint32_t epoch = 0; epoch < runtimeShape_.rounds; ++epoch) {
             if (epoch) WaitDedicatedDriver(lane, epoch, half);
             RotateFetch(epoch, half);
         }
+        KVIP_TRACE_BEGIN(eventDrain, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+            Cold, LiEventsDrain, 0, lane);
         FreeEventID();
     }
 
@@ -200,7 +205,9 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
         );
 #endif
     }
-    __aicore__ inline void LoadSequenceSplitThresholds(uint32_t batch) {
+    __aicore__ inline void LoadSequenceSplitThresholds(uint32_t batch, [[maybe_unused]] uint32_t epoch = 0) {
+        KVIP_TRACE_BEGIN(loadScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+            Cold, ColdThresholdRead, epoch, batch);
         constexpr uint32_t count = SIM_Q * 2048;
         constexpr uint32_t rowBytes = count * 6 + SIM_Q * 256;
         GlobalTensor<uint16_t> thresholds;

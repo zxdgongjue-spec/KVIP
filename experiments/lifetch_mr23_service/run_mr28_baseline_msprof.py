@@ -120,9 +120,11 @@ def capture_route(args, output, config, manifest, profiler, *, cold_route='p2'):
     source = read(stage_trace)
     business, device = publish_business_views(output, vendor, source, intervals, save, cold_route=cold_route)
     manifest.update(msprof_timeline=str(native_path), business_trace=str(business),
-                    msprof_business_trace=str(device), kernel_intervals=intervals)
+                    msprof_business_trace=str(device), kernel_intervals=intervals,
+                    handoff_report=str(output / 'lifetch_handoff_report.json'))
     print(f'Open fused stages: {business}', flush=True)
     print(f'Open msprof with fusion phase labels: {device}', flush=True)
+    print(f'Kernel and business-scope handoffs: {manifest["handoff_report"]}', flush=True)
     for row in intervals:
         print(f'  {row["name"]}: {row["duration_us"]:.2f} us', flush=True)
     print(f'Early prefetch / final Get: {report["total_prefetch"]} / {report["total_final_get"]}', flush=True)

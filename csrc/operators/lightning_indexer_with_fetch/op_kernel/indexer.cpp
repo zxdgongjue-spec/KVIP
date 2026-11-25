@@ -95,7 +95,9 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2) {
     } else {
         op.template ProcessSequenceSplit<Phase>(parts);
     }
+    KVIP_TRACE_RECORD(teardownScope, stageTrace, traceKernel, kvip_trace::LiPipeDestroy, 0, 0);
     pipe.Destroy();
+    KVIP_TRACE_END(teardownScope);
 #undef P
 }
 
@@ -109,6 +111,8 @@ __aicore__ inline void ResetPartitionedColdProgress(GM_ADDR bindings, uint32_t p
     const uint32_t words = parts * kvip_cold_score::kProgressWords;
     const uint32_t query = GetBlockIdx();
     if (query >= shape.batch * kvip_cold_score::kQueries) return;
+    KVIP_TRACE_BEGIN(resetScope, KVIP_TRACE_WORKSPACE(reinterpret_cast<GM_ADDR>(a[15])),
+        Threshold, ColdProgressReset, 0, query);
     GlobalTensor<uint32_t> output;
     output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(raw) +
         kvip_cold_score::ProgressOffset(query, 0, parts));
@@ -133,6 +137,8 @@ __aicore__ inline void ResetDedicatedColdProgress(GM_ADDR bindings) {
     const auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(a[14]));
     const uint32_t query = GetBlockIdx();
     if (query >= shape.batch * kvip_dedicated_cold::kQueries) return;
+    KVIP_TRACE_BEGIN(resetScope, KVIP_TRACE_WORKSPACE(reinterpret_cast<GM_ADDR>(a[15])),
+        Threshold, ColdProgressReset, 0, query);
     constexpr uint32_t words = (kvip_dedicated_cold::kRounds - 1) *
         kvip_dedicated_cold::kFragments * kvip_dedicated_cold::kProgressWords;
     const auto progress = reinterpret_cast<GM_ADDR>(a[12]) + kvip_cold_score::ScoreBytes(shape.batch, shape.history);

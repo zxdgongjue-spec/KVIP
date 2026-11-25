@@ -50,7 +50,10 @@ enum Phase : uint32_t {
     ColdPartitionWait = 218,
     ColdT2BankWait = 219, ColdT2ScoreMte2 = 220,
     ColdT2PredicateVf = 221, ColdT2PublishMte3 = 222,
-    PrefetchDoorbell = 223, DedicatedDriverWait = 224, DedicatedReadySnapshot = 225
+    PrefetchDoorbell = 223, DedicatedDriverWait = 224, DedicatedReadySnapshot = 225,
+    LiEventsAcquire = 226, LiEventsDrain = 227, LiPipeDestroy = 228,
+    ColdProgressReset = 229, ColdThresholdRead = 230, ColdQueryRebind = 231,
+    ColdProgressPrepare = 232, TerminalResolvePrepare = 233
 };
 }
 

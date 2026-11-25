@@ -130,6 +130,7 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  KVIP_TRACE_BEGIN(topkScope, stageTrace, Terminal, TerminalTopK, 0, query);
  uint32_t topkError=op.TerminalQueryRuntime(query);
  KVIP_TRACE_END(topkScope);
+ KVIP_TRACE_BEGIN(resolvePrepareScope, stageTrace, Terminal, TerminalResolvePrepare, 0, query);
  uint32_t ownError=topkError;if(profile)ts[2]=GetSystemCycle();Signal(flags,q,generation);
  auto postWork=op.TerminalWork(),postIds=op.TerminalCompact(),postScratch=op.TerminalScratch();
  auto compact=reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048;
@@ -146,6 +147,7 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  auto activeLru=reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+uint64_t(b)*rotating::kLruSlots;
  uint32_t slotCapacity=rotating::kLruSlots;bool capacityCounted=false;
  auto headers=reinterpret_cast<__gm__ uint32_t*>(rotating::TopKHeader(ctx))+b*128;
+ KVIP_TRACE_END(resolvePrepareScope);
  for(uint32_t capacityPass=0;capacityPass<2;++capacityPass){
  if(capacityPass){
  KVIP_TRACE_BEGIN(capacityScope, stageTrace, Terminal, TerminalCapacity, capacityPass, query);

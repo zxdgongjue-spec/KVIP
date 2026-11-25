@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Verify and label one CANN-exported fused replay."""
 
+import argparse
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 import json
@@ -37,6 +38,11 @@ ROUTE_PHASES = {'p2': PHASES, 'cold_p4': PHASES_COLD_P4,
 MARKERS = {f'KVIP_LIFETCH_{stage}_{side}' for stage, _, _ in PHASES for side in ('BEGIN', 'END')}
 KERNELS = {kernel for phases in ROUTE_PHASES.values() for _, kernel, _ in phases}
 COMPUTE_TYPES = {'AI_CORE', 'AI_VECTOR_CORE', 'MIX_AIC', 'MIX_AIV', 'AIV_SQE', 'FUSION'}
+DEPENDENCIES = (
+    'Resident reads the committed Hot Score from GM',
+    'Cold consumes resident thresholds. W0 Service consumes the resident TopK state.',
+    'Terminal consumes Cold scores and the incremental TopK/Service state. Resolve follows final per-Q TopK.',
+)
 
 
 def events(document):
@@ -121,6 +127,55 @@ def require_fused_replay(document, *, cold_route='p2'):
     return result
 
 
+def device_handoffs(vendor, intervals):
+    """Partition same-stream kernel gaps at the existing device markers."""
+    device_tasks = []
+    for event in events(vendor):
+        if not isinstance(event, dict):
+            continue
+        args, name = event.get('args'), event.get('name')
+        if not isinstance(args, dict) or not isinstance(name, str):
+            continue
+        if (not {'Physic Stream Id', 'Task Id'}.issubset(args)
+                or (name not in MARKERS and 'Task Type' not in args)):
+            continue
+        interval = get_interval(event)
+        if interval is not None:
+            device_tasks.append((name, args, interval))
+
+    result = []
+    for left, right, dependency in zip(intervals, intervals[1:], DEPENDENCIES):
+        stream = left['stream']
+        if stream != right['stream']:
+            raise ValueError('Cannot attribute an inter-kernel gap across streams')
+        begin, end = left['end_us'], max(left['end_us'], right['begin_us'])
+        # Tolerate CANN timestamp rounding at adjoining task boundaries.
+        end_mark = min(end, max(begin, left['marker_end_us']))
+        begin_mark = min(end, max(end_mark, right['marker_begin_us']))
+        segments = [
+            dict(name=name, begin_us=a, end_us=b, duration_us=b-a)
+            for name, a, b in (
+                ('Previous kernel end to END mark', begin, end_mark),
+                ('Between device marks', end_mark, begin_mark),
+                ('BEGIN mark to next kernel start', begin_mark, end),
+            )
+        ]
+        enclosed = {}
+        for name, args, (start, stop) in device_tasks:
+            start, stop = float(start), float(stop)
+            if str(args['Physic Stream Id']) == stream and begin <= start <= stop <= end:
+                task_id = str(args['Task Id'])
+                enclosed[name, task_id, start, stop] = dict(
+                    name=name, task_id=task_id, task_type=args.get('Task Type'),
+                    begin_us=start, end_us=stop)
+        result.append(dict(name=f"{left['name']} to {right['name']}", stream=stream,
+                           previous_kernel=left['kernel'], following_kernel=right['kernel'],
+                           begin_us=begin, end_us=end, duration_us=end-begin,
+                           dependency=dependency, segments=segments,
+                           observed_stream_tasks=sorted(enclosed.values(), key=lambda row: row['begin_us'])))
+    return result
+
+
 def device_business_view(vendor, intervals):
     """Copy the exact msprof device clock and add a readable kernel-stage track."""
     result = dict(vendor) if isinstance(vendor, dict) else {}
@@ -132,12 +187,25 @@ def device_business_view(vendor, intervals):
     raw.extend((
         dict(name='process_name', ph='M', pid=pid, tid=0, args={'name': 'KVIP fused LIFetch'}),
         dict(name='thread_name', ph='M', pid=pid, tid=1, args={'name': 'Business kernel phases'}),
+        dict(name='thread_name', ph='M', pid=pid, tid=2, args={'name': 'Same-stream kernel handoffs'}),
+        dict(name='thread_name', ph='M', pid=pid, tid=3, args={'name': 'Handoffs split by device marks'}),
     ))
     for interval in intervals:
         raw.append(dict(name=interval['name'], cat='KVIP fused kernel', ph='X', pid=pid, tid=1,
                         ts=interval['begin_us'], dur=interval['duration_us'],
                         args=interval))
+    handoffs = device_handoffs(vendor, intervals)
+    for handoff in handoffs:
+        if handoff['duration_us'] > 0:
+            raw.append(dict(name=handoff['name'], cat='KVIP kernel handoff', ph='X', pid=pid, tid=2,
+                            ts=handoff['begin_us'], dur=handoff['duration_us'], args=handoff))
+        for segment in handoff['segments']:
+            if segment['duration_us'] > 0:
+                raw.append(dict(name=segment['name'], cat='KVIP device marks', ph='X', pid=pid, tid=3,
+                                ts=segment['begin_us'], dur=segment['duration_us'],
+                                args=dict(segment, handoff=handoff['name'])))
     result['traceEvents'] = raw
+    result['kvip_inter_kernel_handoffs'] = handoffs
     return result
 
 
@@ -157,8 +225,16 @@ def publish_business_views(output, vendor, source, intervals, save, *, cold_rout
                                'msprof_verified_device_intervals': intervals}
     business_path = output / 'lifetch_business_trace.json'
     device_path = output / 'lifetch_msprof_trace.json'
+    device_view = device_business_view(vendor, intervals)
     save(business_path, source_view)
-    save(device_path, device_business_view(vendor, intervals))
+    save(device_path, device_view)
+    save(output / 'lifetch_handoff_report.json', dict(
+        native_device_handoffs=device_view['kvip_inter_kernel_handoffs'],
+        source_business_handoffs=source_view['metadata'].get('source_handoffs', []),
+        timing_note=('Native intervals use original msprof device timestamps and can contain profiling '
+                     'marks and dispatch. Source intervals use GetSystemCycle, with uncovered intervals '
+                     'meaning unclassified time in the recorded scopes. Interpret each clock separately.'),
+    ))
     return business_path, device_path
 
 
@@ -177,3 +253,24 @@ def verified_vendor_timeline(paths, *, cold_route='p2'):
     if len(accepted) != 1:
         raise ValueError('Multiple complete fusion replays in one msprof capture')
     return accepted[0]
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Label a previously exported, marked LIFetch msprof timeline.')
+    parser.add_argument('native_trace', type=Path, help='CANN msprof_*.json export')
+    parser.add_argument('--route', choices=ROUTE_PHASES, default='p2')
+    parser.add_argument('--out', type=Path, required=True, help='new JSON file with handoff tracks')
+    args = parser.parse_args(argv)
+    try:
+        _, vendor, intervals = verified_vendor_timeline([args.native_trace], cold_route=args.route)
+        labeled = device_business_view(vendor, intervals)
+        with args.out.open('x') as output:
+            json.dump(labeled, output, ensure_ascii=False)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    for handoff in labeled['kvip_inter_kernel_handoffs']:
+        print(f"{handoff['name']}  {handoff['duration_us']:.2f} us")
+
+
+if __name__ == '__main__':
+    main()

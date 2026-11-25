@@ -11,7 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'experiments/lifetch_mr23_service'))
 from lifetch_msprof_timeline import (  # noqa: E402
     PHASES, PHASES_COLD_P4, PHASES_DEDICATED, PHASES_UNIFIED, device_business_view, publish_business_views,
-    require_fused_replay,
+    main, require_fused_replay,
 )
 
 
@@ -46,6 +46,34 @@ def test_scoped_cann_export_adds_four_business_phases_without_changing_raw_event
     assert [event['name'] for event in view['traceEvents'] if event.get('cat') == 'KVIP fused kernel'] == [
         name for _, _, name in PHASES
     ]
+
+
+def test_handoffs_split_at_device_marks_and_include_only_owner_stream_tasks():
+    raw = fused_replay()
+    raw.extend([
+        hardware('same-stream event', 1_032, 90, 2, task_type='EVENT'),
+        hardware('other stream event', 1_032, 91, 2, task_type='EVENT', stream=19),
+    ])
+    view = device_business_view(raw, require_fused_replay(raw))
+    handoffs = view['kvip_inter_kernel_handoffs']
+    assert len(handoffs) == 3
+    first = handoffs[0]
+    assert (first['begin_us'], first['end_us'], first['duration_us']) == (1_024, 1_044, 20)
+    assert [segment['duration_us'] for segment in first['segments']] == [6, 10, 4]
+    assert [task['name'] for task in first['observed_stream_tasks']] == [
+        'KVIP_LIFETCH_HOT_END', 'same-stream event', 'KVIP_LIFETCH_THRESHOLD_BEGIN',
+    ]
+    assert sum(event.get('cat') == 'KVIP kernel handoff' for event in view['traceEvents']) == 3
+
+
+def test_labels_existing_scoped_trace_without_overwriting_it(tmp_path):
+    raw_path = tmp_path / 'msprof_old.json'
+    output = tmp_path / 'annotated.json'
+    raw = fused_replay(PHASES_DEDICATED)
+    raw_path.write_text(json.dumps(raw))
+    main([str(raw_path), '--route', 'dedicated', '--out', str(output)])
+    assert json.loads(raw_path.read_text()) == raw
+    assert len(json.loads(output.read_text())['kvip_inter_kernel_handoffs']) == 3
 
 
 def test_batch_put_only_and_leaked_initialization_are_rejected():
@@ -128,4 +156,8 @@ def test_published_source_and_vendor_views_keep_their_clocks(tmp_path):
     assert json.loads(source_path.read_text())['traceEvents'] == source['traceEvents']
     device = json.loads(device_path.read_text())['traceEvents']
     assert device[:len(raw)] == raw
-    assert device[-1]['ts'] == stages[-1]['begin_us']
+    kernel_track = [event for event in device if event.get('cat') == 'KVIP fused kernel']
+    assert kernel_track[-1]['ts'] == stages[-1]['begin_us']
+    handoffs = json.loads((tmp_path / 'lifetch_handoff_report.json').read_text())
+    assert [row['duration_us'] for row in handoffs['native_device_handoffs']] == [20, 20, 20]
+    assert handoffs['source_business_handoffs'] == []

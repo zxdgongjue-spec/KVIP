@@ -82,6 +82,31 @@ def test_trace_has_measured_lane_and_stage_envelopes():
     assert any(entry['pid'] == 1 and entry['tid'] == 64 for entry in spans)
 
 
+def test_handoff_counts_cold_cursor_reset_on_the_threshold_source_clock():
+    events = decode(sample_buffer())
+    template = next(e for e in events if e['kernel'] == 21 and e['lane'] == 0)
+    events.extend([
+        dict(template, phase=source_trace.COLD_PROGRESS_RESET, begin=3_700, end=3_810),
+        dict(template, phase=source_trace.COLD_PROGRESS_RESET, lane=1, block=1, begin=3_730, end=3_840),
+    ])
+    document, _ = render(events, counter_mhz=1000, cold_route='dedicated')
+    threshold = next(e for e in document['traceEvents']
+                     if e.get('cat') == 'Kernel source envelope' and e['name'] == 'Resident threshold')
+    assert threshold['args']['begin_tick'] == 3_700
+    handoffs = document['metadata']['source_handoffs']
+    assert len(handoffs) == 3
+    reset = next(e for e in handoffs[0]['observed_scopes'] if e['phase'].startswith('Clear Cold progress'))
+    assert reset['duration_on_any_lane_us'] == 0.14
+    assert handoffs[0]['uncovered_source_us'] == pytest.approx(0.518 - 0.140 - 0.003)
+    assert any(e.get('cat') == 'KVIP business handoff' for e in document['traceEvents'])
+
+
+def test_fresh_capture_requires_handoff_scopes_but_old_capture_still_decodes():
+    events = decode(sample_buffer())
+    verify_route(events, batch=1)
+    with pytest.raises(ValueError, match='Missing required handoff scopes'):
+        verify_route(events, batch=1, require_handoff_scopes=True)
+
 def test_overflow_and_incomplete_events_are_rejected():
     raw = sample_buffer()
     struct.pack_into('<I', raw, HEADER_BYTES + 4, 1)
