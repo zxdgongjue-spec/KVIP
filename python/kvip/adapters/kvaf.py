@@ -224,7 +224,7 @@ class KvafGetLease(StreamLease):
 class KvafQueueView:
     """Original LIFetch owner interface backed by a service Runtime lease.
 
-    The original launcher takes one single-jetty argument view per physical AIV.
+    The original launcher takes one single-jetty argument view per logical queue.
     This adapter only slices the existing channel/queue arrays; it does not
     construct another Runtime, allocate DDR, reset queues, or import a fixture.
     """
@@ -235,8 +235,9 @@ class KvafQueueView:
         self.addresses, self.valid = addresses, valid
         self.device, self.abi_sizes = lease.device, lease.sizes
         self.context = lease.register_output(output)
-        if self.context["jettys_per_core"] != 2:
-            raise ValueError("LIFetch requires two jettys per KVAF worker")
+        self.queue_count = self.context["worker_count"] * self.context["jettys_per_core"]
+        if self.queue_count <= 0:
+            raise ValueError("LIFetch requires live KVAF queues")
         if addresses.device != self.device or valid.device != self.device:
             raise ValueError("Fused queue address tables must be on the Runtime device")
         if not addresses.is_contiguous() or not valid.is_contiguous() or addresses.numel() != valid.numel():
@@ -244,8 +245,7 @@ class KvafQueueView:
         torch = lease.torch
         if addresses.dtype not in (torch.int64, torch.uint64) or valid.dtype != torch.uint8:
             raise ValueError("Fused queue address/valid tables must be int64 or uint64 / uint8")
-        queues = self.context["worker_count"] * 2
-        self.core_status = torch.zeros((queues, self.abi_sizes["status"]), dtype=torch.uint8, device=self.device)
+        self.core_status = torch.zeros((self.queue_count, self.abi_sizes["status"]), dtype=torch.uint8, device=self.device)
         self.descriptors = torch.zeros((4, 8192), dtype=torch.int32, device=self.device)
         self.device_args = None
         lease.plans.append(self)
@@ -258,7 +258,7 @@ class KvafQueueView:
         context, sizes = self.context, self.abi_sizes
         stride = self.descriptors.stride(0) * self.descriptors.element_size()
         blobs = []
-        for queue in range(context["worker_count"] * 2):
+        for queue in range(self.queue_count):
             fields = [
                 self.addresses.data_ptr(),
                 self.valid.data_ptr(),

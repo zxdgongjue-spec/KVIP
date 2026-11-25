@@ -9,27 +9,27 @@ from kvip.operators.lifetch.streaming import StreamingLIFetchForward
 
 class LIFetchForward(StreamingLIFetchForward):
     def __init__(self, rotating, update, *, q_workers=2):
+        parallel_terminal = False
+        if not hasattr(rotating, "lease"):
+            supported = rotating.library.kvip_parallel_tail_supported
+            supported.argtypes, supported.restype = [ctypes.c_void_p], ctypes.c_uint32
+            parallel_terminal = bool(supported(rotating.shape_pointer))
         super().__init__(
-            rotating, update, rotating.torch, rotating.prefetch_limit, fused_final=True, q_workers=q_workers
+            rotating, update, rotating.torch, rotating.prefetch_limit, fused_final=True, q_workers=q_workers,
+            parallel_terminal=parallel_terminal,
         )
-        # Keep the legacy completion configuration for unsupported geometries
-        # and UBmem. URMA sequence-split calls use the four-core terminal below.
         self.prepare_metadata = True
         self.ubmem_overlap_fetch = hasattr(rotating, "lease")
         self.parallel_finalize = True
         self.terminal = None
         self.set_options()
-        # UBmem and unsplit geometries retain their supported completion path.
-        if not hasattr(rotating, "lease"):
-            supported = rotating.library.kvip_parallel_tail_supported
-            supported.argtypes, supported.restype = [ctypes.c_void_p], ctypes.c_uint32
-            if supported(self.shape_pointer):
-                self.terminal = TerminalLeaseBinding(rotating)
-                self.terminal.attach_workspace(self)
-                rotating.parallel_terminal = self.terminal
-                self.terminal_function = rotating.library.kvip_parallel_tail_forward
-                self.terminal_function.argtypes = [ctypes.c_void_p] * 4
-                self.terminal_function.restype = ctypes.c_uint32
+        if parallel_terminal:
+            self.terminal = TerminalLeaseBinding(rotating)
+            self.terminal.attach_workspace(self)
+            rotating.parallel_terminal = self.terminal
+            self.terminal_function = rotating.library.kvip_parallel_tail_forward
+            self.terminal_function.argtypes = [ctypes.c_void_p] * 4
+            self.terminal_function.restype = ctypes.c_uint32
 
     def __call__(self):
         if self.terminal is None:

@@ -68,13 +68,14 @@ public:
     __aicore__ inline LocalTensor<uint32_t> TerminalScratch() { return topkSharedTmpLocal_; }
     __aicore__ inline LocalTensor<uint32_t> TerminalIds() { return indicesOutLocal_; }
     __aicore__ inline LocalTensor<uint32_t> TerminalWork() { return mrgValueLocal_.template ReinterpretCast<uint32_t>(); }
+    template<bool LargeBatch = false>
     __aicore__ inline void TerminalQuery(uint32_t query, uint32_t scanHistory) {
         exportWindowCold_=true;rankTrace_=false;rankedEpoch_=runtimeShape_.rounds;
         incrementalMetadataActive_=false;incrementalHasNext_=false;
         windowCoveredEmpty_=false;
         // Replay the same shard boundaries as the LI producers. Score, mask
         // and covered-row addresses still use the bound physical history.
-        uint32_t half=rotating::SequenceHalfWindow(runtimeShape_,scanHistory);
+        uint32_t half=LargeBatch ? 0U : rotating::SequenceHalfWindow(runtimeShape_,scanHistory);
         rankHalf_=half;rankReady_=uint64_t(scanHistory)|(uint64_t(scanHistory)<<32);
         AdvanceIncremental(query,scanHistory,half?scanHistory:0,half);
         JoinColdOutput();
@@ -84,6 +85,7 @@ public:
     }
 // Included inside the private terminal QLIVector class only.
 // The production hot/cold/window QLIVector is not changed.
+template<bool LargeBatch = false>
 __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query, uint32_t scanHistory) {
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     const uint32_t valid=ctx->queryEnds?
@@ -101,7 +103,7 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query, uint32_t scanHis
         PipeBarrier<PIPE_ALL>();
         return missing?1U:0U;
     }
-    TerminalQuery(query,scanHistory);
+    TerminalQuery<LargeBatch>(query,scanHistory);
     return 0;
 }
 
@@ -795,6 +797,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     }
 #endif
 
+#if !KVIP_LARGE_BATCH_LI
 #if !V9_UBMEM
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident && (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
 #else
@@ -818,6 +821,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         DataCopyPad(rotationProgressGm_[(info.bIdx * SIM_Q + curAivS1Idx) * 32 + progressShard * 16],
             rotationProgress_[(info.s2Idx % 64) * 16], publish);
     }
+#endif
     SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
     CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB
 }

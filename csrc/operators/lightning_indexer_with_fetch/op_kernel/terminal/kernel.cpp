@@ -1,4 +1,5 @@
 #include "terminal_runtime_abi.h"
+#include "large_batch_li.h"
 #include "window_types.h"
 #if defined(__CCE_AICORE__)
 #include "shadow_exchange_parallel.h"
@@ -89,16 +90,13 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void UpdateIndex(
  asc_threadfence();
 }
 
-#endif
-extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
-#if defined(__CCE_AICORE__)
- KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
- if ASCEND_IS_AIV {
+template<bool LargeBatch>
+__aicore__ inline void RunTerminalRow(GM_ADDR binding, uint32_t b, uint32_t q){
  auto runtime=reinterpret_cast<__gm__ terminal_runtime::Binding*>(binding);
  GM_ADDR arg=reinterpret_cast<GM_ADDR>(runtime->pipeline);
  auto a=reinterpret_cast<__gm__ pipeline_ab::Args*>(arg);auto ctx=reinterpret_cast<__gm__ rotating::Context*>(a->context);auto s=rotating::LoadRuntimeShape(ctx);
  bool profile=(runtime->options&1U)!=0;
- uint32_t b=GetBlockIdx()/4,q=GetBlockIdx()%4,query=b*4+q;
+ uint32_t query=b*4+q;
  auto flags=reinterpret_cast<__gm__ uint32_t*>(runtime->flags)+terminal_runtime::RowFlagOffset(b);
  auto ts=reinterpret_cast<__gm__ uint64_t*>(runtime->times)+terminal_runtime::QueryTraceOffset(b,q);
  const uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
@@ -116,8 +114,9 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  QLIKernel::QLIVector<Type> op;QLICommon::ConstInfo ci{};ci.gSize=32;ci.qHeadNum=32;ci.kHeadNum=1;ci.headDim=128;ci.mBaseSize=64;ci.s1BaseSize=2;ci.s2BaseSize=128;ci.sparseCount=2048;ci.kSeqSize=s.history;ci.kCacheBlockSize=128;ci.maxBlockNumPerBatch=s.history/128;
  QLITilingData tiling{};op.SetStreamingWorkspace(arg);op.InitParams(ci,&tiling,false);op.InitBuffers(&pipe,false);op.SetRotationContext(reinterpret_cast<GM_ADDR>(ctx));
  GlobalTensor<uint16_t> scores;op.InitVecWorkspaceTensor(scores);GlobalTensor<bfloat16_t> weights;GlobalTensor<float> qs,ks;GlobalTensor<int32_t> out,blocks;out.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(ctx->selected));op.InitVecInputTensor(weights,qs,ks,out,blocks);
- uint32_t scanHistory=rotating::ActiveScanHistory(s,reinterpret_cast<__gm__ const uint32_t*>(ctx->queryEnds),b);
- op.AllocEventID();if(profile)ts[1]=GetSystemCycle();uint32_t topkError=op.TerminalQueryRuntime(query,scanHistory);
+ auto ends=reinterpret_cast<__gm__ const uint32_t*>(ctx->queryEnds);
+ uint32_t scanHistory=LargeBatch ? large_li::ScanHistory(s,ends,b) : rotating::ActiveScanHistory(s,ends,b);
+ op.AllocEventID();if(profile)ts[1]=GetSystemCycle();uint32_t topkError=op.template TerminalQueryRuntime<LargeBatch>(query,scanHistory);
  uint32_t ownError=topkError;if(profile)ts[2]=GetSystemCycle();Signal(flags,q,generation);
  auto postWork=op.TerminalWork(),postIds=op.TerminalCompact(),postScratch=op.TerminalScratch();
  auto compact=reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048;
@@ -162,7 +161,7 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  // Consume the original compact UB result directly; compact destinations use postWork.
  // MERGED_OUTPUT_BEFORE_WQE
  if(profile)ts[6]=GetSystemCycle();
- Simt::VF_CALL<PackUniqueLocal>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(postIds.GetPhyAddr()),width,counts[0],counts[1],counts[2],counts[3],q,mapping,reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postControl.GetPhyAddr()),(reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+uint64_t(b)*1),reinterpret_cast<__gm__ uint64_t*>(rotating::RequestAddressTable(ctx,b,owner,s.history)),reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postWork[2048].GetPhyAddr()),s.resident,reinterpret_cast<__ubuf__ uint32_t*>(postWork[4096].GetPhyAddr()),activeLru,slotCapacity,capacityCounted,capacityPass==0,headers,priorSlots,(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity),(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+uint64_t(b)*rotating::kChangeCapacity),(uint64_t(tailEnd)<<32)|tailBegin,tailCapacity,reinterpret_cast<__gm__ uint32_t*>(runtime->templates)+query*32,args,reinterpret_cast<__ubuf__ uint32_t*>(op.TerminalIds().GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postControl[8].GetPhyAddr()),(reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history),flags,generation,s.history,reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+query*2048,owner*uint32_t(ctx->outputStride),update,s.batch,query);
+ Simt::VF_CALL<PackUniqueLocal<LargeBatch>>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(postIds.GetPhyAddr()),width,counts[0],counts[1],counts[2],counts[3],q,mapping,reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postControl.GetPhyAddr()),(reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+uint64_t(b)*1),reinterpret_cast<__gm__ uint64_t*>(rotating::RequestAddressTable(ctx,b,owner,s.history)),reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postWork[2048].GetPhyAddr()),s.resident,reinterpret_cast<__ubuf__ uint32_t*>(postWork[4096].GetPhyAddr()),activeLru,slotCapacity,capacityCounted,capacityPass==0,headers,priorSlots,(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity),(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+uint64_t(b)*rotating::kChangeCapacity),(uint64_t(tailEnd)<<32)|tailBegin,tailCapacity,reinterpret_cast<__gm__ uint32_t*>(runtime->templates)+query*32,args,reinterpret_cast<__ubuf__ uint32_t*>(op.TerminalIds().GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postControl[8].GetPhyAddr()),(reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history),flags,generation,s.history,reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+query*2048,owner*uint32_t(ctx->outputStride),update,s.batch,query);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  if(!postControl.GetValue(14))break;
  }
@@ -177,8 +176,11 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  GlobalTensor<uint32_t> output,slots;
  output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(runtime->logical)+query*2048);slots.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048);
  SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
- DataCopy(slots,postScratch,2048);
- PublishTerminalOutputs(update,s.batch,query,ids,postScratch,postControl[9],ctx->locations+uint64_t(query)*2048*4);
+ // A remapped public row can share the exact slot allocation. Its sole
+ // writer must be the routed query, including when that query retires first.
+ const bool sharedSlotOutput = LargeBatch && update[23] == ctx->locations;
+ if (!sharedSlotOutput) DataCopy(slots,postScratch,2048);
+ PublishTerminalOutputs<LargeBatch>(update,s.batch,query,ids,postScratch,postControl[terminal_runtime::Routes<LargeBatch>::base],sharedSlotOutput ? 0 : ctx->locations+uint64_t(query)*2048*4);
  uint32_t packError=postControl.GetValue(8);ownError|=packError;
  if(profile)ts[7]=GetSystemCycle();
  auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args->queue_state);
@@ -284,10 +286,28 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  }
  flags[(28+q)*32]=uint32_t(cqError)|ownError;
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+(28+q)*32),4);
- Simt::VF_CALL<FinishTerminalRow>(Simt::Dim3{512,1,1},a,ctx,runtime,b,q,owner,total,first,n,flags,generation,scanHistory,work);
+ Simt::VF_CALL<FinishTerminalRow<LargeBatch>>(Simt::Dim3{512,1,1},a,ctx,runtime,b,q,owner,total,first,n,flags,generation,scanHistory,work);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  if(profile)ts[10]=GetSystemCycle();
  pipe.Destroy();if(profile)kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ts),256);
- } // ASCEND_IS_AIV
+ }
+#include "terminal_schedule.h"
+#endif
+
+extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
+#if defined(__CCE_AICORE__)
+ KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+ if ASCEND_IS_AIV {
+  RunTerminalRow<false>(binding, GetBlockIdx()/4, GetBlockIdx()%4);
+ }
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_parallel_terminal_large(GM_ADDR binding){
+#if defined(__CCE_AICORE__)
+ KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+ if ASCEND_IS_AIV {
+  RunTerminalTeams(binding, GetBlockIdx()/4, GetBlockIdx()%4);
+ }
 #endif
 }

@@ -30,6 +30,8 @@ static uint32_t LaunchLi(void* bindings, void* stream, const rotating::RuntimeSh
 #undef LI_LAUNCH_3
 }
 extern "C" uint32_t v9_li(void* bindings,void* stream,const rotating::RuntimeShape* shape) {
+    // Large Q4 LI shares per-row readiness with its bound terminal workspace.
+    if (shape && shape->batch > 16 && shape->finalWorkers == 4) return 100000;
     return LaunchLi(bindings,stream,shape);
 }
 extern "C" uint32_t v9_li_cores(const rotating::RuntimeShape* shape) { return shape->liCores; }
@@ -120,13 +122,25 @@ extern "C" uint32_t kvip_streaming_resolver_cores(){return pipeline_ab::kResolve
 extern "C" uint32_t kvip_streaming_flag_count(){return pipeline_ab::kFlagCount;}
 
 extern "C" uint32_t aclrtlaunch_v9_parallel_terminal(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_large_hot(uint32_t,void*,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_large_threshold_cold(uint32_t,void*,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_parallel_terminal_large(uint32_t,void*,void*);
 extern "C" uint32_t kvip_parallel_tail_supported(const rotating::RuntimeShape* shape) {
+    if (shape && rotating::NativeLargeBatch(shape->batch, shape->aicCount))
+        return shape->indexHeads == 32 && shape->finalWorkers == 4 &&
+            shape->liCores == 32 && shape->serviceLanes == shape->batch && shape->rounds >= 2;
     return shape && shape->batch && shape->batch<=16 && shape->finalWorkers==4 &&
         shape->batch*4<=shape->aicCount*2 && rotating::UseSequenceSplit(*shape);
 }
 extern "C" uint32_t kvip_parallel_tail_forward(void* bindings,void* terminal,
     void* stream,const rotating::RuntimeShape* shape) {
     if(!bindings || !terminal || !stream || !kvip_parallel_tail_supported(shape))return 100000;
+    if (shape->batch > 16) {
+        uint32_t result = aclrtlaunch_v9_li_large_hot(shape->liCores, stream, bindings, terminal);
+        if (!result) result = aclrtlaunch_v9_li_large_threshold_cold(shape->liCores, stream, bindings, terminal);
+        if (!result) result = aclrtlaunch_v9_parallel_terminal_large(64, stream, terminal);
+        return result;
+    }
     uint32_t result=aclrtlaunch_v9_li_kernel(shape->liCores,stream,bindings);
     if(!result)result=aclrtlaunch_v9_li_kernel_1(shape->liCores,stream,bindings);
     if(!result)result=aclrtlaunch_v9_li_kernel_2(shape->liCores,stream,bindings);

@@ -4,6 +4,7 @@ MAX_SEQUENCE_TOKENS = 512 * 1024
 # vLLM reserves three speculative positions after max_model_len for a Q4 step.
 MAX_HISTORY_TOKENS = ((MAX_SEQUENCE_TOKENS + 3 + 255) // 256) * 256
 MAX_RESIDENT_TOKENS = 128 * 1024
+LARGE_BATCHES = (20, 24, 28, 32)
 
 
 def validate_history(history, resident=None):
@@ -34,6 +35,21 @@ def li_geometry(batch, tiling="auto", intermediate_fetches=32, aic_count=32, ser
         raise ValueError("intermediate_fetches must be a nonnegative integer")
     if not isinstance(aic_count, int) or not 1 <= aic_count <= 32:
         raise ValueError("aic_count must be in 1..32")
+    if batch in LARGE_BATCHES and tiling == "auto" and aic_count == 32:
+        rounds = min(intermediate_fetches, aic_count)
+        # Each row's primary group publishes one prefetch stream in every window.
+        if service_aics not in (0, batch // 2):
+            raise ValueError("Large Q4 batches require one prefetch lane per request")
+        primaries = list(range(batch))
+        return dict(
+            service_aics_per_window=batch // 2, service_aivs_per_window=batch,
+            service_groups=[primaries.copy() for _ in range(rounds)],
+            li_tiling=tiling, available_aic=aic_count, logical_aic_tasks=aic_count,
+            cores_per_batch=1, queries_per_aic=4, queries_per_aiv=2,
+            rotating_aic=aic_count, rotating_aiv=2 * aic_count,
+            intermediate_fetches_requested=intermediate_fetches, intermediate_fetches=rounds,
+            service_aic=primaries,
+        )
     cores_per_batch = 2 if tiling == "auto" and 2 * batch <= aic_count else 1
     cores = min(aic_count, batch * cores_per_batch)
     rounds = min(intermediate_fetches, cores)
@@ -72,6 +88,10 @@ def trigger_tokens(batch, history, resident, tiling="auto", intermediate_fetches
 
 
 def final_aivs(batch, tiling="auto", aic_count=32, requested=0):
+    if batch in LARGE_BATCHES and tiling == "auto" and aic_count == 32:
+        if requested not in (0, 4):
+            raise ValueError("Large Q4 batches use four final workers per request")
+        return 4
     cores = li_geometry(batch, tiling, 0, aic_count)["rotating_aiv"]
     workers = requested or (4 if cores >= batch * 4 else (2 if cores >= batch * 2 else 1))
     if workers not in (1, 2, 4) or workers * batch > cores:

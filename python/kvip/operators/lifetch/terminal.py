@@ -86,7 +86,7 @@ class TerminalLeaseBinding:
         if hasattr(self, "workspace"):
             raise ValueError("Terminal workspace is already attached")
         shape = self.rotating.runtime_shape
-        if shape.batch * 4 > shape.aicCount * 2:
+        if min(shape.batch, 16) * 4 > shape.aicCount * 2:
             raise ValueError("Four concurrent AIVs per request are required")
         torch, device = self.rotating.torch, self.rotating.device
         self.flags = torch.zeros((shape.batch, 32, 32), dtype=torch.int32, device=device)
@@ -97,6 +97,9 @@ class TerminalLeaseBinding:
         self.capacity = torch.zeros(
             (shape.batch, 10240 + 4 * ((shape.resident + 31) // 32)), dtype=torch.int32, device=device
         )
+        # Large-batch scheduler layout is four 128-byte lines (TerminalRowSchedule).
+        self.row_schedule = torch.zeros((4, 32), dtype=torch.int32, device=device) if shape.batch > 16 else None
+        self.li_ready = torch.empty((shape.batch, 8, 32), dtype=torch.int32, device=device) if shape.batch > 16 else None
         blob = struct.pack(
             "<6Q2I9Q",
             forward.workspace.data_ptr(),
@@ -108,7 +111,9 @@ class TerminalLeaseBinding:
             1,
             0,
             self.capacity.data_ptr(),
-            *([0] * 8),
+            0 if self.row_schedule is None else self.row_schedule.data_ptr(),
+            0 if self.li_ready is None else self.li_ready.data_ptr(),
+            *([0] * 6),
         )
         if len(blob) != 128:
             raise AssertionError("Terminal runtime ABI packing changed")

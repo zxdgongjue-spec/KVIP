@@ -2,6 +2,7 @@
 // Join is request-local. One warp gathers completion metadata once; other
 // warps clear dead per-round state concurrently instead of reloading the same
 // four GM flag lines from every warp.
+template<bool LargeBatch>
 __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void FinishTerminalRow(
     __gm__ pipeline_ab::Args* a, __gm__ rotating::Context* ctx,
     __gm__ terminal_runtime::Binding* runtime, uint32_t b,uint32_t q,
@@ -43,7 +44,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void FinishTerminalRow(
         auto covered=reinterpret_cast<__gm__ uint32_t*>(
             kvip_prefetch_rank::CoveredAddress(ctx->incremental,ctx->shape.batch,history,b));
         for(uint32_t i=q*clearThreads+t-32;i<words;i+=4*clearThreads)asc_stcg(covered+i,0U);
-        if(a->completedEvents){
+        if(!LargeBatch && a->completedEvents){
             uint32_t eventWords=ctx->shape.rounds*ctx->shape.serviceLanes*(sizeof(rotating::Event)/4);
             auto live=reinterpret_cast<__gm__ uint32_t*>(ctx->events);
             auto saved=reinterpret_cast<__gm__ uint32_t*>(a->completedEvents);

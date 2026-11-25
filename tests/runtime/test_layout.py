@@ -186,7 +186,7 @@ def test_terminal_queues_are_disjoint_and_rebind_output():
             entity_bytes=struct.pack("<48I", *words),
         )
 
-    for batch in (1, 2, 4, 8, 16):
+    for batch in (1, 2, 4, 8, 16, 20, 24, 28, 32):
         bindings = bind_queues(batch, [view(i) for i in range(batch * 5)], 656)
         used = {b.view for b in bindings}
         prefetch = set(range(0, 2 * batch, 2))

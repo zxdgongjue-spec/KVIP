@@ -91,6 +91,11 @@ public:
     bool sequenceTopKOnly_ = false;
 #if !V9_UBMEM
     GM_ADDR rotationContext_ = nullptr;
+#if KVIP_LARGE_BATCH_LI
+    uint32_t assignedRow_ = 0;
+    __aicore__ inline void ProcessLargeScore(uint32_t begin, uint32_t end, bool cold);
+    __aicore__ inline void ProcessLargeThreshold(uint32_t query);
+#endif
 #endif
 private:
     static constexpr uint32_t HEAD_DIM = 128;
@@ -460,7 +465,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
 
     // 获取分核信息
     if (sequenceSplit_) {
+#if KVIP_LARGE_BATCH_LI
+        splitCoreInfo.bN2Start = assignedRow_;
+#else
         splitCoreInfo.bN2Start = aiCoreIdx / 2;
+#endif
         splitCoreInfo.bN2End = splitCoreInfo.bN2Start;
         splitCoreInfo.s2End = constInfo.kSeqSize / constInfo.s2BaseSize - 1;
     } else {
@@ -474,7 +483,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
     GlobalTensor<SCORE_T> scoreGm; // 存放vec核写出的score
     uint64_t singleCoreScoreSize = constInfo.s1BaseSize * QLICommon::Align((uint64_t)constInfo.kSeqSize,
                                     (uint64_t)constInfo.s2BaseSize)  * sizeof(SCORE_T);
+#if KVIP_LARGE_BATCH_LI
+    const uint32_t scoreRow = assignedRow_;
+#else
     uint32_t scoreRow = sequenceSplit_ ? aiCoreIdx / 2 : aiCoreIdx;
+#endif
     scoreGm.SetGlobalBuffer((__gm__ SCORE_T *)(workspace + scoreRow * singleCoreScoreSize));
     offset += GetBlockNum() * singleCoreScoreSize;
 
@@ -695,7 +708,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
         if ASCEND_IS_AIC {
             matmulService.ComputeMm1(info);
         } else {
+#if KVIP_LARGE_BATCH_LI
+            vectorService.ProcessVec1(info, 0, false, shard == 2);
+#else
             vectorService.ProcessVec1(info, shard, tile + 1 == end);
+#endif
         }
     }
 #if !V9_UBMEM

@@ -5,11 +5,11 @@ import ctypes
 
 import numpy as np
 
-from kvip.operators.lifetch.geometry import validate_history
+from kvip.operators.lifetch.geometry import LARGE_BATCHES, validate_history
 
 
 class StreamingLIFetchForward:
-    def __init__(self, rotating, update, torch, prefetch_limit, *, fused_final=False, q_workers=None):
+    def __init__(self, rotating, update, torch, prefetch_limit, *, fused_final=False, q_workers=None, parallel_terminal=False):
         if rotating.device != update.device:
             raise ValueError("Fetch and Index update must use the same device")
         if update.bindings.numel() != 28:
@@ -18,8 +18,8 @@ class StreamingLIFetchForward:
         shape = rotating.runtime_shape
         self.batch, self.history, self.resident = shape.batch, shape.history, shape.resident
         self.shape_pointer = ctypes.byref(shape)
-        if not 1 <= self.batch <= 16:
-            raise ValueError(f"LIFetch supports BS1..16; received BS={self.batch}; no legacy fallback")
+        if not 1 <= self.batch <= 16 and not (parallel_terminal and self.batch in LARGE_BATCHES):
+            raise ValueError(f"Unsupported LIFetch completion path for BS={self.batch}")
         validate_history(self.history, self.resident)
         if shape.indexHeads not in (32, 64):
             raise ValueError("LIFetch requires 32 or 64 Index heads")
@@ -43,7 +43,7 @@ class StreamingLIFetchForward:
         if self.resolver_cores != 3 or flag_count != 16:
             raise ValueError("Rebuild KVIP: the public LIFetch pipeline requires the shared three-role ABI")
         self.function = rotating.library.kvip_lifetch_streaming_forward
-        if b * self.resolver_cores + 4 * q_workers > shape.aicCount * 2:
+        if not parallel_terminal and b * self.resolver_cores + 4 * q_workers > shape.aicCount * 2:
             raise ValueError("LIFetch resolver and Fetch workers exceed the concurrently resident AIV budget")
         if shape.finalWorkers != 4:
             raise ValueError("Streaming LIFetch requires four query publication records per request")

@@ -107,7 +107,11 @@ V9_DEVICE inline uint32_t ServiceCore(uint32_t rt_batch,uint32_t rt_splitQ,uint3
     return rt_splitQ ? (rank%rt_batch)*2+rank/rt_batch : rank;
 }
 V9_DEVICE inline uint32_t ServiceLane(uint32_t rt_batch,uint32_t rt_splitQ,uint32_t rt_serviceAics,uint32_t core,uint32_t sub) {
+#if KVIP_LARGE_BATCH_LI
+    return core;  // This entry point gives each request its own service lane.
+#else
     return (ServiceRank(rt_batch,rt_splitQ,core)%rt_serviceAics)*2+sub;
+#endif
 }
 V9_DEVICE inline int32_t EpochAt(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_splitQ,uint32_t rt_rounds,uint32_t rt_serviceAics,uint32_t tileEnd, uint32_t core) {
     uint32_t rank=ServiceRank(rt_batch,rt_splitQ,core),epoch=rank/rt_serviceAics;

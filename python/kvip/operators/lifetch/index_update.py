@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bind producer change records to stable service-owned Index rows."""
 
+from kvip.operators.lifetch.geometry import LARGE_BATCHES
 from kvip.operators.lifetch.workspace import device_words
 
 
@@ -41,8 +42,8 @@ class DirectIndexUpdate:
     ):
         self.torch, self.device = torch, keys.device
         self.batch = row_owners.numel()
-        if not 1 <= self.batch <= 16:
-            raise ValueError("LIFetch update requires 1..16 active rows")
+        if not 1 <= self.batch <= 16 and self.batch not in LARGE_BATCHES:
+            raise ValueError(f"Unsupported URMA Index update batch: {self.batch}")
         self.storage = keys, scales, addresses, logical_ids, row_owners, rotating
         if any(t.device != self.device for t in self.storage[:-1]) or any(
             not t.is_contiguous() for t in (keys, scales, logical_ids, row_owners)

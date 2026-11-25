@@ -18,7 +18,7 @@ UINT64_MAX = (1 << 64) - 1
 
 def final_queue(batch: int, row: int, query: int) -> int:
     """Match rotating::FinalQueue(batch, 4, row, query)."""
-    if not 1 <= batch <= 16 or not 0 <= row < batch or not 0 <= query < QUERIES:
+    if not 1 <= batch <= 32 or not 0 <= row < batch or not 0 <= query < QUERIES:
         raise ValueError("Invalid terminal queue geometry")
     return row * 2 + 1 if query == 0 else batch * 2 + row * 3 + query - 1
 
@@ -65,7 +65,7 @@ def bind_queues(batch: int, views: list[dict], token_bytes: int) -> list[QueueBi
     corresponding entity_bytes. All prefetch and terminal queues must be unique.
     No index, owner, active-row or progress value is snapshotted here.
     """
-    if not 1 <= batch <= 16 or len(views) < batch * 5:
+    if not 1 <= batch <= 32 or len(views) < batch * 5:
         raise ValueError("Four final queues plus one prefetch queue per row required")
     queues = set()
     sqs = set()

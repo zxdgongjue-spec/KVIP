@@ -6,6 +6,7 @@ from kvip.runtime.loader import load_lifetch_library
 import numpy as np
 
 from kvip.operators.lifetch.geometry import (
+    LARGE_BATCHES,
     MAX_SEQUENCE_TOKENS,
     final_aivs,
     li_geometry,
@@ -50,8 +51,8 @@ class LIFetchBinding:
         validate_history(history, resident)
         if history > MAX_SEQUENCE_TOKENS and query_ends is None:
             raise ValueError("The padded 512K Q4 workspace requires explicit exclusive query_ends")
-        if not 1 <= batch <= 16:
-            raise ValueError(f"LIFetch supports BS1..16; received BS={batch}; no legacy fallback")
+        if not 1 <= batch <= 16 and not (batch in LARGE_BATCHES and aic_count == 32 and li_tiling == "auto"):
+            raise ValueError(f"Unsupported LIFetch geometry: batch={batch}, AICs={aic_count}, tiling={li_tiling}")
         self.torch, self.owner = torch, owner
         self.library = load_lifetch_library(library)
         self.device = arguments[0].device
@@ -61,12 +62,15 @@ class LIFetchBinding:
             or any(x.device != self.device or not x.is_contiguous() for x in arguments)
         ):
             raise ValueError("V9 requires 14 contiguous input buffers on the same NPU")
+        index_heads = arguments[0].numel() // (batch * 4 * 128)
+        if batch > 16 and index_heads != 32:
+            raise ValueError("Large-batch Q4 URMA currently requires 32 Index heads")
         self.runtime_shape = RuntimeShape.prepare(
             self.library,
             batch=batch,
             history=history,
             resident=resident,
-            index_heads=arguments[0].numel() // (batch * 4 * 128),
+            index_heads=index_heads,
             aic_count=aic_count,
             windows=intermediate_fetches,
             split=li_tiling == "auto",
