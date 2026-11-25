@@ -59,13 +59,6 @@ bool mappedExport_=false;uint32_t mappedValid_=0;
 // QLIVector member: called after ID recovery while the complete Q is in UB.
 bool exportWindowCold_=false;bool rankTrace_=false;
 uint32_t rankedEpoch_=0;bool windowCoveredEmpty_=false;
-__aicore__ inline __gm__ uint64_t* RankProgress(uint32_t query) const {
-    const auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
-    const auto& s = runtimeShape_;
-    // All rows' covered bitmaps end where the per-query progress lines start.
-    auto end = kvip_prefetch_rank::CoveredAddress(ctx->incremental, s.batch, s.history, s.batch);
-    return reinterpret_cast<__gm__ uint64_t*>(end) + query * 32;
-}
 __aicore__ inline uint32_t WindowRank(__gm__ rotating::Context* ctx, uint32_t valid,
     uint32_t end0, uint32_t end1, uint32_t half, kvip_recent_index::Range recent, uint32_t& covered) const {
     const auto resident = runtimeShape_.resident;
@@ -90,9 +83,10 @@ __aicore__ inline void ExportWindowCold(uint32_t query) {
         uint64_t record=uint64_t(ready)|(uint64_t(coveredCount)<<18)|(uint64_t(rank)<<36);
         if(runtimeShape_.history>=(1U<<18))
             record=(1ULL<<63)|uint64_t(ready)|(uint64_t(coveredCount)<<26)|(uint64_t(rank-1)<<52);
-        auto trace=RankProgress(query)+rankedEpoch_;
-        *trace=record;
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace),8);
+        auto trace=reinterpret_cast<__gm__ uint64_t*>(ctx->incremental+
+            runtimeShape_.batch*(512+4*2048*6+1024+(runtimeShape_.history+255)/256*32));
+        trace[query*32+rankedEpoch_]=record;
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(trace+query*32+rankedEpoch_),8);
     }
     uint32_t b=query/4;
     auto covered=reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddress(
@@ -577,16 +571,6 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
     }
 }
-__aicore__ inline void FinishWindowTransfers() {
-    JoinColdOutput();
-    if(incrementalInputPending_) {
-        WaitFlag<HardEvent::MTE2_V>(EVENT_ID6);incrementalInputPending_=false;
-    }
-    incrementalHasNext_=false;
-    if(incrementalOutputPending_) {
-        WaitFlag<HardEvent::MTE3_V>(EVENT_ID6);incrementalOutputPending_=false;
-    }
-}
 __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     uint32_t lane=rotating::ServiceLane(runtimeShape_.batch,runtimeShape_.splitQ,
@@ -635,15 +619,7 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     }
     uint32_t cap=half?rotating::SequenceWindowEnd(runtimeShape_.history,runtimeShape_.resident,half,epoch):
         rotating::Trigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,epoch)*128;
-    bool delegated = false;
-#if KVIP_URMA_WINDOW_LI
-    const bool lastPair = lastRowTeam_ && epoch + 1 == runtimeShape_.rounds;
-#endif
     for(uint32_t b=lane;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes) for(uint32_t q=0;q<4;++q) {
-#if KVIP_URMA_WINDOW_LI
-        if (lastPair && !delegated && q < 2) delegated = OfferLastPair(b, q, requests0 == 0);
-        if (delegated && q >= 2) break;
-#endif
         // Init clears covered; the posting path records every admission in
         // requests. The predecessor fence makes the row and bitmap visible.
         windowCoveredEmpty_=incrementalMetadataActive_ && (((b-lane)/runtimeShape_.serviceLanes)==0 ? requests0==0 : requests1==0);
@@ -661,7 +637,6 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
         incrementalMetadataIndex_=((b-lane)/runtimeShape_.serviceLanes)*4+q;
         uint32_t nextB=q==3?b+runtimeShape_.serviceLanes:b,nextQ=(q+1)%4;
         incrementalHasNext_=incrementalPipeline_ && incrementalMetadataActive_ && nextB<runtimeShape_.batch;
-        if (delegated && q == 1) incrementalHasNext_ = false;
         if(incrementalHasNext_) {
             incrementalNextQuery_=nextB*4+nextQ;incrementalNextIndex_=incrementalMetadataIndex_+1;
             uint64_t nextReady=incrementalMetadata_.GetValue(progressIndex+16);
@@ -670,17 +645,21 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
         }
         AdvanceIncremental(b*4+q,end0,end1,half);
     }
-    FinishWindowTransfers();
+    JoinColdOutput();
+    if(incrementalInputPending_) {
+        WaitFlag<HardEvent::MTE2_V>(EVENT_ID6);incrementalInputPending_=false;
+    }
+    incrementalHasNext_=false;
+    if(incrementalOutputPending_) {
+        WaitFlag<HardEvent::MTE3_V>(EVENT_ID6);incrementalOutputPending_=false;
+    }
     if(incrementalMetadataActive_) {
         SetFlag<HardEvent::S_MTE3>(EVENT_ID5);WaitFlag<HardEvent::S_MTE3>(EVENT_ID5);
         for(uint32_t b=lane,i=0;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes,i+=64)
-            DataCopy(metadata[b*64],incrementalMetadata_[i],delegated ? 32U : 64U);
+            DataCopy(metadata[b*64],incrementalMetadata_[i],64);
         SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
         incrementalMetadataActive_=false;
     }
-#if KVIP_URMA_WINDOW_LI
-    if (delegated) JoinLastPair(lane);
-#endif
     exportWindowCold_=false;
     // The producer's progress lookup table shares the TopK score buffer.
     // Rebuild it before LI resumes; otherwise score bytes become fake progress.
