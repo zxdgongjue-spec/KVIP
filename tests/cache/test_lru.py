@@ -58,3 +58,36 @@ def test_extent_configuration_from_environment(monkeypatch):
 
     monkeypatch.setenv("KVIP_HOT_EVICTION_POLICY", "slot_lru")
     assert SlotLRU().extent == 1
+
+
+def test_r4_matches_physical_slot_reference():
+    extent = 8
+    active = 4096
+    row = SlotLRU(policy="extent_r4", extent=extent)
+    row.resize(active, active)
+    rng = np.random.default_rng(42)
+    counts = np.zeros(active, dtype=np.float32)
+    last = np.full(active, -1)
+    born = np.full(active // extent, -2)
+    victims = np.arange(2048)
+    for round_index in range(1, 12):
+        feedback = rng.integers(0, active + 16, 2048, dtype=np.int32) if round_index % 3 else np.empty(0, np.int32)
+        touched = np.unique(feedback[feedback < active])
+        hit_victims = touched[np.isin(touched, victims)]
+        born[hit_victims // extent] = round_index
+        counts[touched] = counts[touched] * np.exp2(-(round_index - last[touched]) / 64) + 1
+        last[touched] = round_index
+        decayed = counts * np.exp2(-(round_index - last) / 64)
+        score = decayed.reshape(-1, extent).max(axis=1)
+        score[round_index - born < 2] = np.inf
+        recency = last.reshape(-1, extent).max(axis=1)
+        order = np.lexsort((recency, score))[: 2048 // extent]
+        victims = (order[:, None] * extent + np.arange(extent)).ravel()
+        row.commit(feedback)
+        np.testing.assert_array_equal(row.slots[0], victims)
+        bits = np.unpackbits(row.bitmap.view(np.uint8), bitorder="little")
+        np.testing.assert_array_equal(np.flatnonzero(bits), np.sort(victims))
+    row.resize(active, 21)
+    row.commit(np.array([0, 20, 21], dtype=np.int32))
+    assert np.all(row.slots[0, 21:] == -1)
+    assert sorted(row.slots[0, :21]) == list(range(21))

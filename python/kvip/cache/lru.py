@@ -6,6 +6,7 @@ import os
 import numpy as np
 from numba import set_num_threads
 
+from kvip.cache._extent_r4 import ExtentR4
 from kvip.cache._lru_kernel import (
     _commit_lru_rows,
     _rebuild_extent_order,
@@ -29,11 +30,12 @@ class SlotLRU:
     def __init__(self, *, policy=None, extent=None):
         policy = policy if policy is not None else os.getenv("KVIP_HOT_EVICTION_POLICY", "slot_lru")
         if extent is None:
-            extent = int(os.getenv("KVIP_HOT_EVICTION_EXTENT", "8")) if policy == "extent_r1" else 1
-        if policy not in ("slot_lru", "extent_r1") or extent not in (1, 4, 8, 16):
-            raise ValueError("Expected slot_lru or extent_r1 with extent 1, 4, 8 or 16")
+            extent = int(os.getenv("KVIP_HOT_EVICTION_EXTENT", "8")) if policy != "slot_lru" else 1
+        if policy not in ("slot_lru", "extent_r1", "extent_r4") or extent not in (1, 4, 8, 16):
+            raise ValueError("Expected slot_lru, extent_r1 or extent_r4 with extent 1, 4, 8 or 16")
         if policy == "slot_lru" and extent != 1:
             raise ValueError("slot_lru requires extent 1")
+        self.r4 = ExtentR4(extent) if policy == "extent_r4" else None
         self.extent = extent
         self.extent_shift = extent.bit_length() - 1
         self.extent_seen = np.empty(0, dtype=np.uint8)
@@ -66,7 +68,9 @@ class SlotLRU:
             words = (capacity + BITMAP_WORD_BITS - 1) // BITMAP_WORD_BITS
             words = (words + BITMAP_ALIGNMENT_WORDS - 1) // BITMAP_ALIGNMENT_WORDS * BITMAP_ALIGNMENT_WORDS
             self.bitmap = np.zeros((1, words), dtype=np.int32)
-            if self.extent > 1:
+            if self.r4 is not None:
+                self.r4.resize(capacity)
+            elif self.extent > 1:
                 blocks = (capacity + self.extent - 1) // self.extent
                 self.extent_seen = np.empty(blocks, dtype=np.uint8)
                 self.extent_links = np.empty((2, blocks), dtype=np.int32)
@@ -88,7 +92,9 @@ class SlotLRU:
             )
             self.slots[0, count:] = -1
             self.active = committed
-            if self._effective_extent() > 1:
+            if self.r4 is not None:
+                self.r4.reset()
+            elif self._effective_extent() > 1:
                 self._rebuild_extents()
             self.version += 1
             return
@@ -114,11 +120,17 @@ class SlotLRU:
     def _rebuild_extents(self):
         _rebuild_extent_order(self.next, self.head, self.extent, self.extent_seen, self.extent_links, self.extent_ends)
 
+    def _r4_aligned(self):
+        return self.r4 is not None and self.active % self.extent == 0
+
     def _select(self):
         self.version += 1
         self.slots.fill(-1)
         extent = self._effective_extent()
-        if extent > 1:
+        if self._r4_aligned():
+            self.r4.select(self.active, min(TOPK, self.active), self.slots[0], self.bitmap[0])
+            return
+        if extent > 1 and self.r4 is None:
             self._rebuild_extents()
             _write_extent_victims(
                 0, self.slots, self.bitmap, min(TOPK, self.active), extent, self.extent_links, self.extent_ends
@@ -139,7 +151,12 @@ class SlotLRU:
         set_num_threads(1)
         # The caller validates against all mapped HBM slots before submission.
         feedback = np.ascontiguousarray(destinations[destinations < self.active], dtype=np.int32)
+        if self.r4 is not None and self.active:
+            self.r4.commit(feedback, self.bitmap[0], self._r4_aligned())
         if not feedback.size:
+            if self.active and self._r4_aligned():
+                self.r4.select(self.active, min(TOPK, self.active), self.slots[0], self.bitmap[0])
+                self.version += 1
             return
         _commit_lru_rows(
             self.rows,
@@ -155,11 +172,13 @@ class SlotLRU:
             self.unique,
             min(TOPK, self.active),
             self.bitmap.shape[1],
-            self._effective_extent(),
+            self._effective_extent() if self.r4 is None else 1,
             self.extent_shift,
             self.extent_links,
             self.extent_ends,
         )
+        if self._r4_aligned():
+            self.r4.select(self.active, min(TOPK, self.active), self.slots[0], self.bitmap[0])
         self.version += 1
 
 

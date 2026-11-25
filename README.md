@@ -153,6 +153,12 @@ member and outputs the existing slot list and bitmap. Unaligned committed
 rows use the slot order until they reach an extent boundary. This implements
 recency-based block selection without an overwrite grace period.
 
+Set `KVIP_HOT_EVICTION_POLICY=extent_r4` for R4. It ranks extents by
+the largest physical-slot access count with a 64-round half-life, then
+breaks ties by recency. Feedback into the previous victim bitmap refreshes
+the extent's two-round protection, and its slots retain their accumulated
+frequency.
+
 Graph-mode native/fused comparison using real DDR and the current service LRU:
 
 ```bash
