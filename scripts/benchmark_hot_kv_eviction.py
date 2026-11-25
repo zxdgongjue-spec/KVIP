@@ -138,6 +138,7 @@ def simulate(args, references):
         "destination_runs",
         "select_ns",
     )
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("x", newline="") as output:
         writer = csv.writer(output)
         writer.writerow(header)
@@ -194,7 +195,7 @@ def main():
     parser.add_argument("--round-range", required=True, help="Inclusive source rounds, e.g. 1:101")
     parser.add_argument("--dp", type=int, nargs="+", help="Only score these DP ranks")
     parser.add_argument("--victims", type=int, default=2048)
-    parser.add_argument("--extents", type=int, nargs="+", choices=(8, 16), default=(8, 16))
+    parser.add_argument("--extents", type=int, nargs="+", choices=(1, 4, 8, 16), default=(8, 16))
     parser.add_argument("--half-life", type=float, default=64)
     parser.add_argument("--grace", type=int, default=2)
     parser.add_argument("--warmup-rounds", type=int, default=1)
@@ -215,6 +216,11 @@ def main():
         sys.path.insert(0, str(root / "tests/operators/lifetch/support"))
         from workloads import select_series
 
+        if not any(args.trace_root.glob("dp[0-9]*/series.json")):
+            raise ValueError(
+                f"No DP series under {args.trace_root}. Pass the original score trace root "
+                "containing dp*/series.json. An individual suite case covers only one source round."
+            )
         references = select_series(args.trace_root, args.group, (first, last))
         if args.dp is not None:
             if set(args.dp) - {ref.dp_rank for ref in references}:
