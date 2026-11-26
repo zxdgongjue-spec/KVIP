@@ -60,3 +60,38 @@ def test_concurrent_rows_use_union_of_service_intervals():
     new[0][3] |= 1 << 32
     with pytest.raises(ValueError, match="Skipped service"):
         summarize([old, new], li, 656)
+
+
+def test_split_role_scores_can_cross_two_earlier_windows():
+    from copy import deepcopy
+    from window_density import split_role_intervals
+
+    clocks = [0] * 128
+    events = [[], [], [], []]
+    li = dict(clock_mhz=2., per_query_cycle_stamps=[[[1, 3, 5, 150]] * 4, [[2, 4, 6, 152]] * 4])
+    for r in (0, 1):
+        clocks[r * 64:r * 64 + 6] = [11, 55, 56, 86, 87, 110]
+        for i, (w, b, e) in enumerate([(10, 10, 40), (45, 60, 73), (74, 87, 99), (100, 111, 141 - r)]):
+            clocks[r * 64 + 16 + i * 3:r * 64 + 19 + i * 3] = [w,b,e]
+            events[i].append(event(i, b + 1, b + 2, e - 1, 0))
+    result = split_role_intervals(clocks, events, li)
+    a = result["rows"][0]
+    assert (result["last_li3_row"], result["last_window_row"]) == (1, 0)
+    assert a["score_us"] == [22., 15., 11.5] and a["wait_ready_us"] == [7.5, 6.5, 5.5]
+    assert a["score_overlapped_by_service_us"] == [14.5, 6.5, 6.]
+    late = deepcopy(clocks)
+    late[1] = 65
+    with pytest.raises(ValueError, match="score clocks|ready or service"):
+        split_role_intervals(late, events, li)
+    wrong = deepcopy(events)
+    wrong[1][0][1] = 95
+    with pytest.raises(ValueError, match="ready or service"):
+        split_role_intervals(clocks, wrong, li)
+    early = deepcopy(clocks)
+    early[2:4] = [46, 86]
+    early[:2] = [11, 44]
+    early[4:6] = [72, 110]
+    early[3] = 71
+    # Score segment 3 runs through window 1 and 2, separated by a ready wait.
+    a = split_role_intervals(early, events, li)["rows"][0]
+    assert a["score_service_overlap_matrix_us"][2] == [0., .5, 6., 0.]

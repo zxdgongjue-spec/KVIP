@@ -115,18 +115,17 @@ def measure_packed(ex, proofs, serial, torch, states, sequence, config, director
         stream.synchronize()
         sibling_checks = score_spans = None
         trace_args = getattr(state, "large_window_build_args", None)
-        if launch and launch.window_policy == "split-role":
-            # Its sole window worker publishes the normal epoch events. The old
-            # two-lane sibling-wait fields have no equivalent in this schedule.
-            trace_args = None
-            proofs.update(diagnostic_cold_symbol=expected_li23,
-                          diagnostic_cold_build_fingerprint=launch.source_fingerprint)
+        split_trace = launch is not None and launch.window_policy == "split-role"
+        if split_trace and not trace_args:
+            raise ValueError("Split-role diagnostics require their dedicated trace kernel")
         original_launch = state.forward.terminal_function
         if trace_args:
             from large_two_cold import build, attach
             trace_launch = build(*trace_args, trace_sibling=True)
             if trace_launch.source_fingerprint == launch.source_fingerprint:
                 raise ValueError("The timing and diagnostic cold builds must be separate")
+            if getattr(launch, "hot_function", None) is not None:
+                trace_launch.hot_function = launch.hot_function
             attach(state, trace_launch)
             proofs.update(diagnostic_cold_symbol=expected_li23 + "_trace",
                           diagnostic_cold_build_fingerprint=trace_launch.source_fingerprint)
@@ -148,7 +147,7 @@ def measure_packed(ex, proofs, serial, torch, states, sequence, config, director
         events = state.rotating.events.cpu().numpy().view("<u8").tolist()
         clocks = state.forward.times.cpu().numpy()
         li = li_intervals(clocks, state.batch, mhz)
-        if trace_args:
+        if trace_args and not split_trace:
             count = len(events) - 1
             words = clocks[state.batch * 64:state.batch * 128].reshape(state.batch, 4, 16)
             lane_times = words[:, :, 4:4 + 4 * count].reshape(state.batch, 4, count, 4)
@@ -158,6 +157,9 @@ def measure_packed(ex, proofs, serial, torch, states, sequence, config, director
         sources = state.forward.events_src.cpu().numpy()
         density = summarize(events, li, state.token_bytes, winners=winners, sources=sources,
                             sibling_checks=sibling_checks, score_spans=score_spans)
+        if split_trace:
+            from window_density import split_role_intervals
+            density["split_role"] = split_role_intervals(clocks, events, li)
         if sum(e["posted_tokens"] for e in density["epochs"]) != traffic["prefetch"]:
             raise ValueError("Doorbells disagree with the independent row GET counters")
         proofs["window_density"] = density
@@ -198,6 +200,15 @@ def save_packed(args, identity, inputs, proofs, workers, scratch_existed):
             waits = "/".join(f"{w['mean_sibling_exposed_previous_us']:.2f}" for w in windows[1:])
             scored_time = "/".join(f"{w['sibling_mean_score_overlap_previous_service_us']:.2f}" for w in windows[1:])
             detailed = f" sibling_mean_exposed_wait_us={waits} sibling_mean_score_span_overlap_us={scored_time}"
+        if "split_role" in density:
+            roles = density["split_role"]
+            row = roles["rows"][roles["last_li3_row"]]
+            fmt = lambda values: "/".join(f"{v:.2f}" for v in values)
+            print(f"G{args.group} BS{args.batch} SPLIT_ROLE_DIAG last_LI3_row={roles['last_li3_row']} "
+                  f"last_window_row={roles['last_window_row']} score3_us={fmt(row['score_us'])} "
+                  f"wait_ready3_us={fmt(row['wait_ready_us'])} service4_us={fmt(row['service_us'])} "
+                  f"score3_overlap_service_us={fmt(row['score_overlapped_by_service_us'])} "
+                  f"post_window_to_LI3_end_us={row['post_window_to_li3_end_us']:.2f}")
         print(f"G{args.group} BS{args.batch} WINDOW_DIAG posted_tokens={tokens} "
               f"useful_tokens={useful} first_useful_post_us={first_text} "
               f"post_owner_rows_arrived_before_previous_end={blocked} "

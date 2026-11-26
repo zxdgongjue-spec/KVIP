@@ -4,7 +4,11 @@
 #if defined(KVIP_EXPERIMENT_SPLIT_ROLE)
 constexpr uint32_t kWindows = 4;
 #define test_forward kvip_test_bs32_split_role_forward
+#if KVIP_TEST_SPLIT_ROLE_TRACE
+#define launch_cold aclrtlaunch_v9_li_large_bs32_split_role_trace
+#else
 #define launch_cold aclrtlaunch_v9_li_large_bs32_split_role
+#endif
 #else
 constexpr uint32_t kWindows = 3;
 #define test_forward kvip_test_two_cold_forward

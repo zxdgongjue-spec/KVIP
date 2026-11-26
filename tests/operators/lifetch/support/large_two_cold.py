@@ -21,8 +21,6 @@ def build(experiment_source, normal_library, sdk_build, soc, policy="two-cold", 
     # The normal build ID covers CANN, compiler, KVAF and all included operator sources.
     digest = hashlib.sha256()
     digest.update(f"{policy}:{soc}:trace_sibling={int(trace_sibling)}".encode())
-    if policy == "split-role" and trace_sibling:
-        raise ValueError("Split-role uses the measured kernel for its extra window diagnostic")
     if policy == "split-role":
         source = (experiment_source.resolve().parents[4] / "csrc/operators/lightning_indexer_with_fetch"
                   / "op_kernel/indexer_large_dualrole.cpp")

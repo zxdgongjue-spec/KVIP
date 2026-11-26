@@ -131,3 +131,54 @@ def summarize(events, li, token_bytes, *, winners=None, sources=None, sibling_ch
         result["mean_useful_lead_to_li_end_us"] = (
             sum((finish - t) * n for t, n in useful_posts) / total if total else None)
     return result
+
+
+def split_role_intervals(clocks, events, li):
+    """Trace only. Pair each row's three V0 score spans with all four V1 service spans."""
+    from math import isfinite
+
+    queries = li["per_query_cycle_stamps"]
+    mhz = li["clock_mhz"]
+    batch = len(queries)
+    if (not batch or not isfinite(mhz) or mhz <= 0 or len(events) != 4
+            or any(len(window) != batch for window in events) or len(clocks) < batch * 64):
+        raise ValueError("Incomplete split-role clock geometry")
+    per_row = []
+    li_ends, window_ends = [], []
+    for row, row_queries in enumerate(queries):
+        offset = row * 64
+        score = [tuple(map(int, clocks[offset + 2 * e:offset + 2 * e + 2])) for e in range(3)]
+        offset += 16
+        service = [tuple(map(int, clocks[offset + 3 * e:offset + 3 * e + 3])) for e in range(4)]
+        li_begin, li_end = map(int, row_queries[0][2:4])
+        if (len(row_queries) != 4 or not 0 < li_begin < li_end
+                or any(tuple(q[2:4]) != (li_begin, li_end) for q in row_queries)):
+            raise ValueError(f"Invalid split-role LI3 bounds at row {row}")
+        if any(not 0 < begin < end or (e and begin < score[e - 1][1])
+               for e, (begin, end) in enumerate(score)):
+            raise ValueError(f"Unordered V0 score clocks at row {row}")
+        for e, (wait, ready, done) in enumerate(service):
+            event = events[e][row]
+            if not (li_begin <= wait <= ready <= event[4] <= event[0] <= event[1] <= done <= li_end
+                    and (e or wait == ready)
+                    and (not e or service[e - 1][2] <= wait and score[e - 1][1] <= ready)):
+                raise ValueError(f"Unordered V1 ready or service clock at row {row} window {e}")
+        # A fast V0 can be more than one epoch ahead. Intersect with every V1
+        # service span in this row. These spans cannot overlap with each other.
+        overlaps = [[max(0, min(end, done) - max(begin, ready)) / mhz
+                     for _, ready, done in service] for begin, end in score]
+        li_ends.append(li_end)
+        window_ends.append(service[-1][2])
+        per_row.append(dict(row=row, score_cycles=score, wait_ready_done_cycles=service,
+                            score_us=[(end - begin) / mhz for begin, end in score],
+                            wait_ready_us=[(ready - wait) / mhz for wait, ready, _ in service[1:]],
+                            service_us=[(done - ready) / mhz for _, ready, done in service],
+                            score_service_overlap_matrix_us=overlaps,
+                            score_overlapped_by_service_us=[sum(matches) for matches in overlaps],
+                            post_window_to_li3_end_us=(li_end - service[-1][2]) / mhz))
+    # Resolve coincident last finishes to the lowest row ID and record how many tied.
+    last_li3, last_window = max(li_ends), max(window_ends)
+    return dict(clock_mhz=mhz, rows=per_row, last_li3_row=li_ends.index(last_li3),
+                tied_last_li3_rows=li_ends.count(last_li3),
+                last_window_row=window_ends.index(last_window),
+                tied_last_window_rows=window_ends.count(last_window))

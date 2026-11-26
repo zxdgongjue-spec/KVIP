@@ -374,6 +374,9 @@ run_packed_cohort() {
             [[ -s $result/packed_result.json ]]
             if (( packed_candidate && batch == 32 && block == 1 )); then
                 grep ' WINDOW_DIAG ' "$result/worker.log" | tee -a "$out/summary.txt" >&3
+                if [[ $bs32_li == split-role ]]; then
+                    grep ' SPLIT_ROLE_DIAG ' "$result/worker.log" | tee -a "$out/summary.txt" >&3
+                fi
             fi
             if (( packed_candidate && batch > 16 && large_cold_windows == 2 )) ||
                 { (( packed_candidate && batch == 32 )) && [[ $bs32_li == split-role ]]; }; then
