@@ -77,7 +77,8 @@ def collect_arm(root, group, arm, owner, oracle, host):
     controls = dict(config={k: v for k, v in cfg.items() if k not in varying}, runtime=runtime,
                     capture=capture, operands=proof['capture_operand_hashes'],
                     cap={k: v for k, v in cap.items() if k != 'measured_requests'}, cpu_bytes=thp['bytes'],
-                    oracle=oracle[1]['serial_set_digest'], placement=[single_numa_node(thp), thp['ub_device']])
+                    oracle=oracle[1]['ids_sha256'] if oracle[1].get('reference_kind') == 'native-only'
+                    else oracle[1]['serial_set_digest'], placement=[single_numa_node(thp), thp['ub_device']])
     result = dict(means=values, event_total_us=t['event_total_us'], spans_us=spans,
                   exact_id_queries=int(exact.sum()), library=proof['library_sha256'], traffic=traffic)
     return result, controls, thp

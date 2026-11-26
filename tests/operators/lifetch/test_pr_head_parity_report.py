@@ -15,7 +15,9 @@ def put(path, value):
     path.write_text(json.dumps(value))
 
 
-def test_block_checks_capacity_and_uses_device_event_separately_from_span(tmp_path, monkeypatch):
+@pytest.mark.parametrize('source_id', [dict(reference_kind='native-only', ids_sha256='serial'),
+                                       dict(serial_set_digest='serial')])
+def test_block_checks_capacity_and_uses_device_event_separately_from_span(tmp_path, monkeypatch, source_id):
     cap = 131328
     group = 7
     order = list(report.REVISIONS)
@@ -23,7 +25,7 @@ def test_block_checks_capacity_and_uses_device_event_separately_from_span(tmp_pa
     monkeypatch.setattr(report, 'identity', lambda root: {'host': 'b20'})
     ends = [[130000 + q for q in range(4)]] * 16
     source = dict(effective_native_ends=ends, identity={'inputs': {'query_ends': 'ends'}})
-    receipt = dict(native_reference=source, serial_set_digest='serial')
+    receipt = dict(native_reference=source, **source_id)
     monkeypatch.setattr(report, 'oracle_for', lambda owner, g: (None, receipt, {}))
     monkeypatch.setattr(report, 'case_folder', lambda root, g, arm: root/f'g{g}'/arm/'fused')
     monkeypatch.setattr(report, 'measured_parallel', lambda root, g, arm, *a, **k: measured[arm])
