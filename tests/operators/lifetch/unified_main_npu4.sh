@@ -2,8 +2,8 @@
 # Five captured BS16/Q4 groups on one physical NPU4 with the unified KVAF SDK.
 set -eo pipefail
 if (( $# < 3 || $# > 5 )) || [[ ! $2 =~ ^[a-f0-9]{40}$ || ! $3 =~ ^[a-f0-9]{40}$ ||
-    ( $# == 4 && $4 != cap-pair ) || ( $# == 5 && $4 != active-history && $4 != pr30-parity && $4 != near512 && $4 != near512-five && $4 != near512-locality && $4 != pr30-feature-steps && $4 != pr30-feature-live-main && $4 != pr-head-parity ) ]]; then
-    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA [cap-pair | active-history ARCHIVED_CAP_PAIR | pr30-parity ARCHIVED_ACTIVE_HISTORY | {near512,near512-five} ARCHIVED_PR30_PARITY | near512-locality ARCHIVED_ACTIVE_HISTORY | {pr30-feature-steps,pr30-feature-live-main} {ARCHIVED_UNIFIED_MAIN,auto-local} | pr-head-parity auto-local]" >&2
+    ( $# == 4 && $4 != cap-pair ) || ( $# == 5 && $4 != active-history && $4 != pr30-parity && $4 != near512 && $4 != near512-five && $4 != near512-locality && $4 != pr30-feature-steps && $4 != pr30-feature-live-main && $4 != pr-head-parity && $4 != pr31-table ) ]]; then
+    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA [cap-pair | active-history ARCHIVED_CAP_PAIR | pr30-parity ARCHIVED_ACTIVE_HISTORY | {near512,near512-five} ARCHIVED_PR30_PARITY | near512-locality ARCHIVED_ACTIVE_HISTORY | {pr30-feature-steps,pr30-feature-live-main} {ARCHIVED_UNIFIED_MAIN,auto-local} | pr-head-parity auto-local | pr31-table ARCHIVED_PR_HEAD_PARITY]" >&2
     exit 2
 fi
 repo=$1
@@ -66,6 +66,13 @@ elif [[ $mode == pr30-feature-steps ]]; then
     prefix=pr30-feature-fast
     if (( live_feature_main )); then prefix=pr30-feature-live-main-ten; fi
     if [[ -n ${PEER_FEATURE_PRIOR:-} ]]; then feature_prior=$(cd "$PEER_FEATURE_PRIOR" && pwd -P); fi
+elif [[ $mode == pr31-table ]]; then
+    archive=$(cd "$5" && pwd -P)
+    if [[ $main != 58155892a4f3b7a3bf9789d6055fa4a0f1e95c07 || ! -s $archive/pr_head_parity.json ]]; then
+        echo "Expected the measured PR31 head and the completed packed 128K comparison on this NPU4 host" >&2
+        exit 2
+    fi
+    prefix=pr31-capacity-packed
 elif [[ $mode == cap-pair ]]; then
     if [[ $main != cfe2b52f6403d5edd612c314bc7110525a5f5789 ]]; then
         echo "The capacity comparison requires the candidate with 512K support" >&2
@@ -119,7 +126,7 @@ fi
 if [[ -r /usr/local/Ascend/nnal/atb/set_env.sh ]]; then source /usr/local/Ascend/nnal/atb/set_env.sh; fi
 set -euo pipefail
 # Serialize checkout/preparation of the shared build cache, but not NPU replay.
-if (( head_parity )); then
+if (( head_parity )) || [[ $mode == pr31-table ]]; then
     # The BS20..32 launcher uses this same card. Wait before taking the SDK lock.
     exec 7>"$sources/largebs-$(</proc/sys/kernel/random/boot_id)-npu4.lock"
     if ! flock -n 7; then
@@ -166,7 +173,7 @@ if [[ -n $feature_prior ]]; then
     fi
     printf '%s\n' "$feature_prior" > "$out/prior_result_root.txt"
 fi
-if [[ $mode == pr30-feature-steps ]]; then
+if [[ $mode == pr30-feature-steps || $mode == pr31-table ]]; then
     # Also serialize two invocations of this launcher on the same machine and card.
     exec 9>"$sources/pr30-test-$(</proc/sys/kernel/random/boot_id)-npu4.lock"
     flock -n 9 || { echo "A feature replay is already using physical NPU4" >&2; exit 1; }
@@ -178,7 +185,7 @@ printf '4\n' >"$out/physical_npu.txt"
 cat /proc/sys/kernel/hostname >"$out/host.txt"
 cat /proc/sys/kernel/random/boot_id >"$out/boot_id.txt"
 if [[ -r /etc/machine-id ]]; then cat /etc/machine-id >"$out/machine_id.txt"; fi
-if [[ $mode == active-history || $mode == pr30-parity || $mode == near512* || $mode == pr30-feature-steps ]]; then
+if [[ $mode == active-history || $mode == pr30-parity || $mode == near512* || $mode == pr30-feature-steps || $mode == pr31-table ]]; then
     printf '%s\n' "$archive" >"$out/reference.txt"
     for field in host machine_id; do
         if [[ $auto_feature_reference == 0 && -f "$archive/$field.txt" ]] && ! cmp -s "$archive/$field.txt" "$out/$field.txt"; then
@@ -196,7 +203,7 @@ peer_physical_npu=4
 source "$support/peer_node_prepare.sh"
 dependency_mode=full
 # The published PR30 code requests LIDU registration even on its fused path.
-if [[ $head_parity == 0 && ( $name == long_history_candidate || $mode == pr30-feature-steps ) ]]; then dependency_mode=fused-only; fi
+if [[ $head_parity == 0 && $mode != pr31-table && ( $name == long_history_candidate || $mode == pr30-feature-steps ) ]]; then dependency_mode=fused-only; fi
 peer_prepare_node "$repo" "$baseline" "$clean" "$work" "$out" "$dependency_mode"
 sdk_src="$sources/unified-sdk-${sdk:0:8}-${upstream:0:8}"
 if ! git -C "$clean" cat-file -e "$sdk^{commit}" 2>/dev/null; then
@@ -271,6 +278,9 @@ if [[ $mode == pr30-parity ]]; then
         printf 'PR30_MISSING_GROUPS=%s REFERENCE_ROOT=%s\n' "${missing[*]}" "$ref_out"
         for g in "${missing[@]}"; do reference[$g]=$ref_out; done
     fi
+elif [[ $mode == pr31-table ]]; then
+    "$PYTHON" -B "$support/pr31_capacity_anchors.py" "$archive" "$out"
+    echo "CONFIG native=$main archive=$archive measured=wide128,near512 model_limit=524288 physical_slots=524544 blocks=2 reverse_order=1 physical_NPU=4 BS16_Q4 warmup=4 calls_per_arm_per_block=10"
 elif [[ $mode == pr30-feature-steps ]]; then
     if (( head_parity )); then
         arm_names=(pr30 pr31 pr31_table)
@@ -429,7 +439,7 @@ PY_DEVICE
     worker_timeout=1800
     # The production-graph audit restores and validates 20 independent wide
     # Index states outside the timed event. Allow for these host transfers.
-    if [[ $mode == pr30-parity || $mode == near512* || $mode == pr30-feature-steps ]]; then worker_timeout=7200; fi
+    if [[ $mode == pr30-parity || $mode == near512* || $mode == pr30-feature-steps || $mode == pr31-table ]]; then worker_timeout=7200; fi
     "$PYTHON" -B "$support/peer_thp.py" --unified-sdk --pid "$server" --log "$arm/cpu.log" --output "$arm/thp.json" --timeout "$worker_timeout" >"$arm/thp.log" 2>&1 &
     monitor=$!
     args=()
@@ -438,6 +448,14 @@ PY_DEVICE
         cap512k) args+=(--history-cap 524544);;
     esac
     if [[ $mode == pr30-parity ]]; then args+=(--production-graph); fi
+    if [[ $mode == pr31-table ]]; then
+        case $label in
+            wide128) shape=wide-short;;
+            near512) shape=wide-long;;
+            *) exit 2;;
+        esac
+        args+=(--ablation-policy paced --pr31-shape "$shape" --narrow-proof "$(<"$out/g$g/narrow_proof.txt")")
+    fi
     if [[ $mode == pr30-feature-steps ]]; then
         case $label in
             pr30|pr31|pr31_table) args+=(--ablation-policy paced --original-128k);;
@@ -499,6 +517,24 @@ run_group() (
         exit
     fi
     trace=$(bash "$entry/peer_g2_input.sh" "$work" "$g")
+    if [[ $mode == pr31-table ]]; then
+        result_root=$out
+        order=(wide128 near512)
+        if [[ $g == 4 || $g == 7 ]]; then order=(near512 wide128); fi
+        for block in 1 2; do
+            out="$result_root/block$block"
+            if [[ $block == 2 ]]; then order=("${order[1]}" "${order[0]}"); fi
+            printf '%s\n' "${order[*]}" >"$out/g$g/order.txt"
+            echo "BLOCK_BEGIN G$g block=$block order=${order[*]}"
+            owner=$(<"$out/g$g/owner.txt")
+            placement="$archive/block$block/g$g/pr31/thp.json"
+            for label in "${order[@]}"; do
+                run_arm "$g" "$label" "$trace" "$owner" "$placement"
+                echo "ARM_COMPLETE G$g $label block=$block"
+            done
+        done
+        exit
+    fi
     if [[ $mode == pr30-feature-steps ]]; then
         group_reference=$archive
         if (( auto_feature_reference )); then
@@ -675,6 +711,8 @@ done
 if ((${#failed[@]})); then echo "REPLAY_FAILED groups=${failed[*]} RESULT_ROOT=$out" >&2; exit 1; fi
 if (( head_parity )); then
     "$PYTHON" -B "$support/pr_head_parity_report.py" "$out" --summary
+elif [[ $mode == pr31-table ]]; then
+    "$PYTHON" -B "$support/pr31_capacity_table.py" "$out" "$archive"
 elif [[ $mode == pr30-feature-steps ]]; then
     for block in 1 2; do
         echo "BLOCK_SUMMARY block=$block"
