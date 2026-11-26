@@ -17,12 +17,16 @@ from terminal_handoff import CHECKED_KERNELS, COLD_GM_STAGE_FIELDS, STAGES
 from workloads import configuration
 
 
+FOLLOW_UP_ARMS = {1: ('p2', 'cold'), 8: ('p2', 'windows')}
+
+
 def plan(args, kvaf):
     batches = tuple(dict.fromkeys(args.batch or (1, 8)))
-    selected = set(args.variant or MODES)
+    selected = set(args.variant or MODES) | {'p2'}
     for batch in batches:
-        for mode in MODES:
-            if (mode != 'p2' and mode not in selected) or (batch == 1 and mode == 'windows'):
+        modes = FOLLOW_UP_ARMS[batch] if args.follow_up else MODES
+        for mode in modes:
+            if mode not in selected or (batch == 1 and mode == 'windows'):
                 continue
             requested = 3 if mode == 'windows' else 4
             effective = min(requested, batch * 2)
@@ -139,7 +143,10 @@ def summarize(output, rows):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--batch', type=int, choices=(1, 8), action='append')
-    parser.add_argument('--variant', choices=MODES, action='append', help='include one single-change arm; P2 is automatic')
+    route = parser.add_mutually_exclusive_group()
+    route.add_argument('--variant', choices=MODES, action='append', help='include one single-change arm; P2 is automatic')
+    route.add_argument('--follow-up', action='store_true', help='BS1 P2/P4 and BS8 W4/W3 only')
+    parser.add_argument('--repeats', type=int, default=1, help='repeat the matrix with the same bridge and independent workers')
     parser.add_argument('--trace', action='store_true', help='capture one checked msprof replay per arm')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--warmup', type=int)
@@ -148,15 +155,17 @@ def main():
     args = parser.parse_args()
     if args.warmup is None:
         args.warmup = 0 if args.trace else 1
-    if args.warmup < 0 or args.iterations < 1 or args.timeout_seconds < 1:
-        parser.error('warmup must be nonnegative, iterations and timeout must be positive')
+    if args.warmup < 0 or min(args.iterations, args.repeats, args.timeout_seconds) < 1:
+        parser.error('warmup must be nonnegative; iterations, repeats and timeout must be positive')
 
     a5 = Path(os.environ.get('KVIP_A5_ROOT', '/home/w00568585/li-aligned-a5'))
     kvaf = Path(os.environ.get('KVIP_KVAF_ROOT', a5 / 'KVAF-unified-813f1750'))
-    cases = list(plan(args, kvaf))
+    matrix = list(plan(args, kvaf))
+    cases = [dict(case, repeat=repeat) for repeat in range(1, args.repeats + 1) for case in matrix]
     manifest = dict(status='NOT_RUN', commit=git(ROOT, 'rev-parse', 'HEAD'), main_commit=MAIN,
                     worktree_dirty=bool(git(ROOT, 'status', '--porcelain', '--untracked-files=normal')),
                     kvaf_commit=KVAF, measurement='marked_msprof' if args.trace else 'graph_event',
+                    follow_up=args.follow_up, repeats=args.repeats,
                     scopes=dict(queries=4, history=131072, resident=16384, miss_percent=10,
                                 aic=32, aiv=64, prefetch_limit=512, per_window_limit=128, rank_start=1024),
                     cases=cases, bs1_windows='P2 already uses effective W2; fewer windows leave the sequence-split route')
@@ -179,19 +188,25 @@ def main():
             config.small_batch_service_aics = case['service_aics']
             config.handoff_build_dir = output / 'bench_bridge'
             config.msprof_build_dir = output / 'trace_bridge'
-            print(f"BS{case['batch']} {case['mode']} W{case['effective_windows']}", flush=True)
-            row = trace_arm(output, case, config, profiler) if args.trace else perf_arm(output, case, config)
+            repeat = case['repeat']
+            run_dir = output / f'repeat-{repeat:02d}' if args.repeats > 1 else output
+            print(f"Round {repeat}/{args.repeats}, BS{case['batch']} {case['mode']} W{case['effective_windows']}",
+                  flush=True)
+            row = trace_arm(run_dir, case, config, profiler) if args.trace else perf_arm(run_dir, case, config)
+            row['repeat'] = repeat
             rows.append(row)
+            pair = (repeat, row['batch'])
             if row['variant'] == 'p2':
-                bases[row['batch']] = row
+                bases[pair] = row
             else:
-                before = bases[row['batch']]
+                before = bases[pair]
                 if any(row[key] != before[key] for key in ('fixture_sha256', 'library_sha256')):
                     raise ValueError('Pair used different fixture or bridge')
                 if args.trace:
                     trace_compare(before, row)
                 else:
                     compare_request_counts(before, row)
+                    row['raw_kv_ready_delta_us'] = row['kv_ready_us'] - before['kv_ready_us']
             summarize(output, rows)
         manifest['status'] = 'PASS'
         return 0

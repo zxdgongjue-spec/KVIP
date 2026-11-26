@@ -657,3 +657,35 @@ Use `--dry-run` to validate the matrix without A5 dependencies.
   coverage and validates Top2048, KV and Index after device completion.
   Compare WQE generation and Final CQ on the critical path together with
   the number of requests whose peak per-queue load actually fell.
+
+### Follow-up pairs and offline attribution
+
+Use the same A5 fixture and prefetch configuration as above. Select the two
+short comparisons with one bridge build per run.
+
+```bash
+bash experiments/lifetch_mr23_service/run_small_batch_a5.sh \
+  --follow-up --warmup 1 --iterations 5 --repeats 2
+```
+
+Each round schedules BS1 P2/W2 and Cold P4/W2, followed by BS8 P2/W4 and
+P2/W3. Each arm uses an independent worker. The bridge is shared across
+rounds. The summary compares each candidate with the P2 row of its own BS and
+round and records `raw_kv_ready_delta_us` and the request-count comparison.
+Use `--batch 1` or `--batch 8` to select one pair. Add `--trace --warmup 0`
+to capture one checked replay per arm, with one round by default.
+
+The existing full trace run also contains the evidence for the second and
+third optimization points. Analyze it without a new replay.
+
+```bash
+python3 -B experiments/lifetch_mr23_service/analyze_small_batch_trace.py \
+  /home/w00568585/li-aligned-a5/results/mr28.2qKjVo --format csv
+```
+
+Use a single trace directory or a `repeat-NN` subdirectory as input. The
+default JSON includes per-window Top2048 and per-request Final Get
+details. The CSV gives the Resident, window and Final Top2048 source
+scopes, and the Final Get queue and CQ summary. Compare the maximal
+per-lane scope union and event coverage. Interpret these as measured
+source scopes with possible overlap.
