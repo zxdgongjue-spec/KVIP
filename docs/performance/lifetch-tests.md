@@ -496,11 +496,25 @@ ABC 种子范围读取正式绑定的 `tail_bounds`，按 query 有效长度及�
 例如热区为 16,384、四个窗口、最大有效位置为 130,292（右端不含）时，
 冷区每行计算 890 个 128-token 块。下一行的起始地址仍按 524,544 个位置计算。
 
+URMA 的窗口预取按整个 batch 的最大有效长度选去重表。取每个有效 Q 最后一个
+token 的位置加一，再取整批最大值。最大值不超过 157,696 时用位图，从 157,697
+起用固定 16 KiB 哈希表。表的类型全批统一，每个请求的四个 Q 在本窗口内一起去重。
+例如，同样配置 512K 上限，整批最长 128K 时用位图，只要有一个 Q 达到 157,697
+就全批用哈希表。填充 Q 的有效长度为零。图捕获固定执行流程，每次回放根据当批
+的有效长度在窗口预取开始前选表，长短批可以共用同一张图。
+
 从 KVIP 根目录执行以下命令，可在物理 NPU4 上分别验证 524,288 和 524,544 两种物理行长。
 测试使用 BS16、Q4 和本机临时 URMA 测试进程，核对 TopK、KV 内容、Index 顺序和每个 Q 的完成回执。
 
 ```bash
 bash tests/operators/lifetch/check_long_history_npu4.sh /home/c00982601/CacheOS/ubmem-validation/recent-index-threshold
+```
+
+如需单独验证图回放选表，可执行下面的命令。它在 512K 容量下只捕获一次图，
+依次回放最长为 131,072、157,697 和 157,696 的三批输入，检查实际选表、最终 TopK、KV、Index 和完成回执。
+
+```bash
+bash tests/operators/lifetch/check_long_history_npu4.sh /home/c00982601/CacheOS/ubmem-validation/recent-index-threshold dedup-replay
 ```
 
 ```bash

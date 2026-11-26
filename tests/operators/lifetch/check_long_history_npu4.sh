@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Run both long-history boundary cases against a temporary loopback URMA peer.
+# Run long-history or same-graph dedup checks against a temporary loopback URMA peer.
 set -eo pipefail
-work=${1:?usage: bash check_long_history_npu4.sh VALIDATION_WORK}
+work=${1:?usage: bash check_long_history_npu4.sh VALIDATION_WORK [long-history|dedup-replay]}
+suite=${2:-long-history}
+case "$suite" in long-history|dedup-replay) ;; *) echo "Unknown check suite: $suite" >&2; exit 2 ;; esac
 root=$(cd "$(dirname "$0")/../../.." && pwd)
 mkdir -p "$work"
 out=$(mktemp -d "$work/long-history-npu4.XXXXXX")
@@ -84,7 +86,20 @@ done
 grep -Fq "LISTEN address=127.0.0.1 port=$port" "$out/peer.log" || { tail -30 "$out/peer.log"; exit 1; }
 echo "KVIP=$(git -C "$root" rev-parse HEAD) KVAF=$(git -C "$sdk" rev-parse HEAD) physical_NPU=4 logical_NPU=0 HCA=${ub_device:-SDK_auto}"
 "$py" -B "$root/tests/operators/lifetch/test_lifetch.py" check --transport urma --device 0 \
-    --suite long-history --kvaf-root "$sdk" --kvaf-server "127.0.0.1:$port" --output "$out/checks" --timeout-seconds 1800
+    --suite "$suite" --kvaf-root "$sdk" --kvaf-server "127.0.0.1:$port" --output "$out/checks" --timeout-seconds 1800
+if [[ $suite == dedup-replay ]]; then
+    "$py" - "$out/checks" <<'PY_PLAN'
+import json, sys
+from pathlib import Path
+result, = Path(sys.argv[1]).glob('*/cases/dedup_replay/dedup_result.json')
+data = json.loads(result.read_text())
+if not data['passed']:
+    raise SystemExit(f'Failed dedup graph replay: {result}')
+for r in data['replays']:
+    print(f"PASS max_end={r['max_end']} words={r['words']} mode={r['mode']} TopK/KV/Index/private_CQ=PASS")
+PY_PLAN
+    exit 0
+fi
 "$py" - "$out/checks" <<'PY_CHECK'
 import json, sys
 from pathlib import Path

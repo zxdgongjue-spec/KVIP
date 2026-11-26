@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 #include "batch_get_abi.h"
 #include "runtime_shape.h"
 namespace rotating {
@@ -51,12 +52,16 @@ struct Context {
     RuntimeShape shape;
     uint64_t changeSlots, changeCount; // Extended direct-hot producer records, ABI 3.
     uint64_t incremental; // Per-Q TopK prefixes, admission bitmap and diagnostics.
-    uint64_t prefetchRankStart; // Zero preserves the default rank 1024.
+    uint32_t prefetchRankStart; // Zero preserves the default rank 1024.
+    uint32_t batchWindowWords;  // LI1 publishes the current replay's window plan in the old rank slot's high word.
     uint64_t mappingJournal, rowAddressBase; // Preserve 32-byte DMA alignment.
     // Optional serving layout: active row -> stable owner; addresses stay with
     // that owner's Index permutation. tailBounds[B,2] are [committed,write_end).
 
 };
+// The device plan occupies the high half of the original 64-bit rank binding.
+static_assert(offsetof(Context, batchWindowWords) == offsetof(Context, prefetchRankStart) + sizeof(uint32_t) &&
+              offsetof(Context, mappingJournal) == offsetof(Context, prefetchRankStart) + sizeof(uint64_t));
 #if defined(__CCE_AICORE__)
 // Fused requests keep live TopK headers immediately after their private rows.
 __aicore__ inline uint64_t TopKHeader(__gm__ Context* ctx){

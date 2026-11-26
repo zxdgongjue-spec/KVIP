@@ -46,6 +46,7 @@ class QLIVector {
 public:
     rotating::RuntimeShape runtimeShape_;
 #if !V9_UBMEM
+    uint32_t windowWords_ = 0;
 #include "incremental_methods.h"
 #endif
     __aicore__ inline void SetRotationContext(GM_ADDR p) {
@@ -115,16 +116,18 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query, uint32_t scanHis
 #endif
         // Join this producer's hit publication. Other producers remain free.
         PipeBarrier<PIPE_ALL>();
-#if defined(V9_UBMEM) && V9_UBMEM
+#if KVIP_STREAMING_LI
+        const bool captureIo = streamingWorkspace_ &&
+            (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U);
+#else
+        constexpr bool captureIo = false;
+#endif
+#if V9_UBMEM
         rotating::Service(rotationContext_, epoch, blockId_ / 2, blockId_ % 2,
+            topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow, captureIo);
 #else
         rotating::Service(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,runtimeShape_.serviceLanes,runtimeShape_.tokenBytes,runtimeShape_.postThreads,runtimeShape_.postBank,runtimeShape_.batchedRows,runtimeShape_.scanTokens,rotationContext_, epoch, blockId_ / 2, blockId_ % 2,
-#endif
-#if !KVIP_STREAMING_LI
-            topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow);
-#else
-            topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow,
-            streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U));
+            topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, windowWords_, captureIo);
 #endif
     }
     __aicore__ inline void LoadSequenceSplitThresholds(uint32_t batch) {

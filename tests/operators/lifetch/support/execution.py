@@ -302,9 +302,10 @@ def run_config(path, shared_pool=None):
         code = run_real(config, path.parent)
         atomic_json(path.parent / 'worker-result.json', dict(exit_code=code))
         return code
-    if getattr(config, 'check_suite', None) == 'long-history':
-        from long_history import check_max_history
-        code = check_max_history(config, path.parent, run_path)
+    if getattr(config, 'check_suite', None) in ('long-history', 'dedup-replay'):
+        from long_history import check_dedup_replay, check_max_history
+        check = check_dedup_replay if config.check_suite == 'dedup-replay' else check_max_history
+        code = check(config, path.parent, run_path)
         atomic_json(path.parent / 'worker-result.json', dict(exit_code=code))
         return code
     if getattr(config, 'check_suite', None) == 'stateful':

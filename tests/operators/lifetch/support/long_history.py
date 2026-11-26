@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused eager and graph boundary check with a closed-form score oracle."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -160,4 +161,70 @@ def check_max_history(config, directory, run_path):
         directory / "checks.json",
         [dict(case=config.check_case, correctness="PASS" if passed else "FAIL", detail=str(detail))],
     )
+    return int(not passed)
+
+
+def check_dedup_replay(config, directory, run_path):
+    """Capture once at 512K capacity and change the live ends on three replays."""
+    if config.transport != "urma":
+        raise ValueError("dedup-replay checks the URMA window service")
+    base = next(iter(max_history_sequence(directory, config.history)))
+    # Give short rows enough strict winners, then place a stronger candidate
+    # at the first ID that no longer fits the bitmap. Only Q4 of row 15 can see it.
+    keys = base.logical_keys[0].copy()
+    scores = base.logical_score_keys[0].copy()
+    keys[32768:33280, :4], scores[:, 32768:33280] = 0x38, 0xC200
+    boundary = 157696
+    keys[boundary, :4], scores[:, boundary] = 0x40, 0xC280
+    base = replace(base, logical_keys=np.broadcast_to(keys, base.logical_keys.shape),
+                   logical_score_keys=np.broadcast_to(scores, base.logical_score_keys.shape))
+    manifest = directory / "max_history_input.json"
+    maxima = (131072, boundary + 1, boundary)
+    history_ids = np.arange(config.history, dtype=np.int32)
+    batch_ends = []
+    for maximum in maxima:
+        ends = np.full(base.query_ends.shape, 131072, np.int32)
+        ends[-1, :] = maximum
+        batch_ends.append(ends - np.arange(3, -1, -1, dtype=np.int32))
+    atomic_json(manifest, dict(case=config.check_case, geometry=base.geometry,
+                               causal_ends_per_replay=[ends.tolist() for ends in batch_ends],
+                               shared_cold_candidate_range=[32768, 33280], boundary_winner_id=boundary))
+
+    class Sequence:
+        rounds = tuple((SimpleNamespace(source_round=i, manifest_path=manifest),) for i in (1, 2, 3))
+
+        def __iter__(self):
+            for number, ends in enumerate(batch_ends, 1):
+                yield replace(base, source_round=number, scheduler_round=number, query_ends=ends,
+                              logical_score_valid=(history_ids < ends[:, :, None]))
+
+    sequence = Sequence()
+    observations = []
+
+    def observe(state, inputs):
+        if state.forward.terminal is None:
+            raise AssertionError("dedup-replay requires the four-query URMA terminal")
+        # This is the clone actually captured by StreamingForward. The low
+        # 32 bits of the old rank slot hold the rank, the high 32 hold the plan.
+        words = int(state.forward._context.view(state.torch.int32)[-5].item())
+        end = int(inputs.query_ends.max())
+        expected = ((end + 255) // 256) * 8
+        if words != expected:
+            raise AssertionError(f"batch_max_end={end}: published words={words}, expected {expected}")
+        ids = state.update.logical_output.cpu().numpy().reshape(*inputs.query_ends.shape, 2048)
+        if not np.array_equal((ids == boundary).any(axis=2), inputs.query_ends > boundary):
+            raise AssertionError("boundary winner differs from this replay's causal ends")
+        if inputs.source_round == 2:
+            # The next input is a different shorter batch using the same graph.
+            # Restore its initial KV/Index layout before processing that batch.
+            state.reset()
+        observations.append(dict(max_end=end, words=words, mode="bitmap" if words <= boundary // 32 else "hash"))
+
+    result = run_path(config, directory / "fused", sequence, ReplayPagePlan(sequence), fused=True, round_check=observe)
+    # run_path checks eager once, then replays the single captured graph for each round.
+    passed = result["correctness"] == "PASS" and [r["max_end"] for r in observations] == [maxima[0], *maxima]
+    detail = dict(passed=passed, replays=observations[1:], failures=result["failures"])
+    atomic_json(directory / "dedup_result.json", detail)
+    atomic_json(directory / "checks.json", [dict(case=config.check_case, correctness="PASS" if passed else "FAIL",
+                                                detail=str(detail))])
     return int(not passed)

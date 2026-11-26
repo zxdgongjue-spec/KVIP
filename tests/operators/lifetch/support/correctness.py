@@ -14,6 +14,7 @@ FIXED_CASES = {
                  ('prefetch_zero', 2, 10., 0), ('boundary_regular', 2, 10., 512)],
     'stateful': [('stateful', 2, 100., 0)],
     'long-history': [('history_512k', 16, 25., 1024), ('model_512k_q4', 16, 25., 1024)],
+    'dedup-replay': [('dedup_replay', 16, 25., 1024)],
 }
 
 
@@ -82,6 +83,8 @@ def check_jobs(config):
                       'miss_percent': miss, 'prefetch_tokens': budget, 'warmup': 0, 'iterations': 1}
             if suite == 'stateful':
                 values.update(history=12288, resident=4096)
+            if suite == 'dedup-replay':
+                values.update(history=524288, resident=16384, intermediate_fetches=4)
             if suite == 'long-history':
                 values.update(history=524288 if name == 'history_512k' else 524544, resident=16384,
                               intermediate_fetches=4, iterations=2)

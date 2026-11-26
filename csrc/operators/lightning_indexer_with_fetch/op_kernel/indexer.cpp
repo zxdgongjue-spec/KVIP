@@ -54,6 +54,37 @@ __aicore__ inline void RunLi(GM_ADDR bindings) {
     if ASCEND_IS_AIV {
         op.vectorService.SetPrefixStorage(P(13));
         op.vectorService.SetRotationContext(P(14));
+#if !V9_UBMEM
+        // The split kernels run in order on the same stream. For a wide binding,
+        // LI1 publishes one plan before LI3, including on every captured replay.
+        if constexpr (Phase == SequenceLiPhase::Hot || Phase == SequenceLiPhase::Cold) {
+            auto ctx = reinterpret_cast<__gm__ rotating::Context*>(P(14));
+            if (shape.history <= rotating::kDirectWindowTokens) {
+                op.vectorService.windowWords_ = shape.history / 32;
+            } else if constexpr (Phase == SequenceLiPhase::Hot) {
+                if (!splitSequence || GetBlockIdx() == 0) {
+                    auto ends = reinterpret_cast<__gm__ const uint32_t*>(ctx->queryEnds);
+                    if (ends) {
+                        // Replay updates these fixed-address inputs before the LI launch.
+                        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->queryEnds), shape.batch * 4 * sizeof(*ends));
+                    }
+                    const uint32_t words = rotating::BatchWindowWords(shape.history, shape.batch, ends);
+                    if (splitSequence) {
+                        ctx->batchWindowWords = words;
+                        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&ctx->batchWindowWords), sizeof(words));
+                    } else {
+                        // Scoring and posting share a kernel here. Each AIV prepares
+                        // its own copy before scoring, without a cross-core wait.
+                        op.vectorService.windowWords_ = words;
+                    }
+                }
+            } else {
+                // An AIV may still cache this context line from an earlier replay.
+                kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(&ctx->batchWindowWords), sizeof(ctx->batchWindowWords));
+                op.vectorService.windowWords_ = ctx->batchWindowWords;
+            }
+        }
+#endif
     }
     if constexpr (Phase == SequenceLiPhase::Hot) {
         if (splitSequence) op.template ProcessSequenceSplit<Phase>();

@@ -13,6 +13,7 @@ namespace kvaf_device { using ubmem_device::CleanCacheLines; constexpr uint32_t 
 #include "simt_api/device_sync_functions.h"
 #include "simt_api/device_warp_functions.h"
 #include "context.h"
+#include "window_dedup.h"
 #include "indexer/ranked_candidates.h"
 #include "../../common/lifetch/prefetch_budget.h"
 
@@ -406,12 +407,6 @@ __aicore__ inline void SubmitFinal(uint32_t rt_tokenBytes,__gm__ Row* row,LocalT
 // Imported from batch_post.h
 
 namespace rotating {
-// Four 256-ID input rows must fit before the compact output in scratch.
-constexpr uint32_t kWindowOutputOffset = 23808 / sizeof(uint32_t);
-constexpr uint32_t kDirectWindowWords = kWindowOutputOffset - 4 * 256;
-constexpr uint32_t kWindowSetWords = 4096;
-static_assert(kWindowSetWords <= kDirectWindowWords);
-
 // One SIMT task covers every batch assigned to this AIV. Per-batch queues
 // remain independent. locations is dead until final resolve and stages IDs.
 
@@ -553,6 +548,7 @@ inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
     __ubuf__ uint32_t* ids,__ubuf__ uint32_t* cfg,uint32_t stride,
     uint32_t n0,uint32_t n1,uint32_t n2,uint32_t n3,uint32_t limit,uint32_t words,bool last,
     __gm__ uint32_t* mapping,__gm__ Context* ctx,uint32_t batch,uint32_t resident) {
+    const bool sparseWindow = words > kDirectWindowWords;
     uint32_t tid=threadIdx.x,lane=tid%32;
     for(uint32_t i=tid;i<4*stride;i+=256) {
         uint32_t q=i/stride,j=i%stride,n=q==0?n0:q==1?n1:q==2?n2:n3;
@@ -563,7 +559,7 @@ inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
             // is authoritative even when the exported eligibility is stale.
             // Never create a second Index exchange for an admitted source.
             if(token/32<words && DirectTailSlot(ctx,batch,resident,token)==UINT32_MAX && asc_ldcg(mapping+token)==UINT32_MAX){
-                if (words > kDirectWindowWords) {
+                if (sparseWindow) {
                     fresh = InsertWindowToken(bits, token);
                 } else {
                     uint32_t bit=1U<<(token%32);
@@ -579,7 +575,7 @@ inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
     }
     asc_syncthreads();
     // Earlier chunks still need all bits for dedup. Prune only after the last.
-    if(words <= kDirectWindowWords && last && limit && cfg[40]>limit) {
+    if(!sparseWindow && last && limit && cfg[40]>limit) {
         for(uint32_t i=tid;i<words;i+=256)bits[i]=0;
         asc_syncthreads();
         for(uint32_t i=tid;i<limit;i+=256){uint32_t token=ids[i];asc_atomic_or(bits+token/32,1U<<(token%32));}
@@ -590,13 +586,7 @@ inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
 template<bool captureIo, bool predecessorChecked=false>
 __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,
-    uint32_t sequenceHalfWindow) {
-    // Only IDs in the service lane's scoring range can be nominated. Size the
-    // local set by that range; mappings and global covered rows use the full stride.
-    const uint32_t tokenLimit = sequenceHalfWindow
-        ? SequenceWindowEnd(rt_history, rt_resident, sequenceHalfWindow, rt_rounds - 1)
-        : rt_history;
-    const uint32_t windowWords = tokenLimit / 32;
+    uint32_t windowWords) {
     const bool sparseWindow = windowWords > kDirectWindowWords;
     uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;
     uint64_t scanBegin=0,candidateBegin=0,postBegin=0,begin=0;
@@ -833,12 +823,12 @@ if (rt_batchedRows) {
 namespace rotating {
 __aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_splitQ,uint32_t rt_rounds,uint32_t rt_serviceAics,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer, uint32_t epoch, uint32_t core,
     uint32_t lane, LocalTensor<uint32_t> scratch, LocalTensor<uint16_t> flags,
-    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false) {
+    LocalTensor<uint32_t> indices, uint32_t windowWords,bool captureIo = false) {
     // RotateFetch calls AdvanceWindow first, which joins the same lane's
     // predecessor before touching incremental state. A second CQ-independent
     // poll here adds no ordering and delays the resumed score producer.
-    if(captureIo) FastService<true,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
-    else FastService<false,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
+    if(captureIo) FastService<true,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, windowWords);
+    else FastService<false,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, windowWords);
 }
 }
 

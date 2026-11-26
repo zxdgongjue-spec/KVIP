@@ -229,8 +229,14 @@ class LIFetchBinding:
         self.covered = self.window_topk_storage[covered_start:covered_start + covered_bytes]
         self.rank_progress = self.window_topk_storage[-batch*4*32*8:].view(torch.int64).view(batch,4,32)
         self.incremental = self.window_topk_storage[:batch*512].view(torch.int64).view(batch,4,16)
-        blob = np.concatenate((blob, np.array([self.incremental.data_ptr(), prefetch_rank_start,
-                               self.mapping_journal.data_ptr() if self.mapping_journal is not None else 0, 0], dtype="<u8").view("u1")))
+        journal_address = self.mapping_journal.data_ptr() if self.mapping_journal is not None else 0
+        blob = np.concatenate((
+            blob,
+            np.array([self.incremental.data_ptr()], dtype="<u8").view("u1"),
+            # LI1 fills the second word when a graph replay needs a batch-wide dedup plan.
+            np.array([prefetch_rank_start, 0], dtype="<u4").view("u1"),
+            np.array([journal_address, 0], dtype="<u8").view("u1"),
+        ))
         self.context = torch.from_numpy(blob.copy()).to(self.device)
         self.arguments = tuple(arguments) + (self.context,)
         self.bindings = torch.tensor([x.data_ptr() for x in self.arguments] + [0], dtype=torch.uint64, device=self.device)
