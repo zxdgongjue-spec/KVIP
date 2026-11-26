@@ -55,7 +55,7 @@ def cap_times(folder, timing, *, calls=20, source_round=1):
             (('graph', events), ('LI1_to_LI3', li), ('final_topk_through_tail', tail))}
 
 
-def inspect_cap(arm, capture, actual, cap, source):
+def inspect_cap(arm, capture, actual, cap, source, *, expected_calls=20):
     expected = CAPS[arm]
     geometry = capture['geometry']
     if (geometry['history'] != CAPS['cap128k'] or geometry['batch'] != 16 or
@@ -72,7 +72,7 @@ def inspect_cap(arm, capture, actual, cap, source):
         raise ValueError(f'{arm}: incomplete capture state verification')
     counts = cap['measured_requests']
     for key in ('prefetch', 'final'):
-        if len(counts[key]) != 20 or any(type(n) is not int or n < 0 for n in counts[key]):
+        if len(counts[key]) != expected_calls or any(type(n) is not int or n < 0 for n in counts[key]):
             raise ValueError(f'{arm}: incomplete measured request counts')
 
 
