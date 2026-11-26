@@ -9,6 +9,7 @@ import numpy as np
 SUPPORTED_BATCHES = {
     'p2': (1, 2, 4, 8, 16),
     'cold': (1, 2, 4, 8),
+    'cold_w2': (2,),
     'cold_p8': (1,),
     'cold_full': (1, 2, 8),
     'cold_full_w3': (2, 8),
@@ -20,8 +21,8 @@ SUPPORTED_BATCHES = {
 }
 MODES = ('p2', 'cold', 'windows', 'topk', 'get')
 FULL32_MODES = {'cold_full', 'cold_full_w3', 'cold_full_w2'}
-PARTITIONED_MODES = FULL32_MODES | {'cold', 'cold_p8'}
-WINDOW_OVERRIDES = {'windows': 3, 'windows_w2': 2, 'cold_full_w3': 3, 'cold_full_w2': 2}
+PARTITIONED_MODES = FULL32_MODES | {'cold', 'cold_w2', 'cold_p8'}
+WINDOW_OVERRIDES = {'windows': 3, 'windows_w2': 2, 'cold_w2': 2, 'cold_full_w3': 3, 'cold_full_w2': 2}
 TRACE_ROUTES = dict(p2='p2', **dict.fromkeys(PARTITIONED_MODES, 'small_cold'),
                     windows='p2', windows_w2='p2', topk='small_topk', get='p2')
 KERNELS = ('v9_li_kernel', 'v9_li_kernel_1', 'v9_li_kernel_2', 'v9_parallel_terminal')
@@ -34,7 +35,7 @@ GET_BALANCE_FLAG = 2
 def cold_score_parts(mode, batch):
     if mode in FULL32_MODES:
         return 32 // batch
-    return {'cold': 4, 'cold_p8': 8}.get(mode, 2)
+    return {'cold': 4, 'cold_w2': 4, 'cold_p8': 8}.get(mode, 2)
 
 
 def bind(state, mode):
@@ -54,7 +55,7 @@ def bind(state, mode):
 
     library = state.rotating.library
     parts = 2
-    symbol_mode = 'cold_full' if mode in FULL32_MODES else mode
+    symbol_mode = 'cold_full' if mode in FULL32_MODES else mode.removesuffix('_w2')
     if mode in PARTITIONED_MODES:
         choose = getattr(library, f'kvip_small_batch_{symbol_mode}_parts')
         choose.argtypes, choose.restype = [ctypes.c_void_p], ctypes.c_uint32

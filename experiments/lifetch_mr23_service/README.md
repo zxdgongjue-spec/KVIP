@@ -799,3 +799,36 @@ Read `summary.csv` for checked graph Event latency, phase times, and
 early/final Get counts. `raw_kv_ready_delta_us` uses native-window P2;
 `same_window_raw_kv_ready_delta_us` uses P2 at the candidate's window
 count. A trace run validates the actual Cold MIX counts independently.
+
+### Cold part and window matrix with native Hot
+
+`run_full32_a5.sh --cold-window-matrix` uses Q4, 128K history, 16K resident,
+and miss 10% by default. Hot keeps two MIX groups per request, each
+scoring all four query rows over its history slice. The two AIVs in each
+group reduce two query rows each. Only the size of each Cold history slice and
+the window layout vary. At each BS, every arm uses the same fixture,
+binary, and Service AIV count per window.
+
+| Batch | Effective windows | Cold parts per request |
+| --- | --- | --- |
+| 1 | W2 | P2, P4, P8, P32 |
+| 2 | W2 and W4 | P2, P4, P16 |
+| 8 | W2 and W4 | P2, P4 |
+
+W includes resident W0. BS1 has two static Service owner groups, so its
+W4 cell is reported as unsupported. Both window policies keep the 128
+per-window and 512 per-request prefetch caps. W2 therefore offers at most
+256 early Get slots per request, and W4 offers up to 512.
+
+```bash
+runner=experiments/lifetch_mr23_service/run_full32_a5.sh
+bash "$runner" --cold-window-matrix --dry-run
+bash "$runner" --cold-window-matrix --warmup 2 --iterations 5
+bash "$runner" --cold-window-matrix --batch 1 --trace
+```
+
+In `summary.csv`, `same_window_*` compares Cold partitioning against P2
+with the same effective W. `same_parts_w4_*` compares W2 against W4 at the
+same P. Read these deltas with the early and final Get counts. The trace
+run records resident seed hashes and WQE token sets alongside the
+native kernel and business timelines.

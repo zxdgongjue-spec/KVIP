@@ -13,7 +13,9 @@ from run_mr25_handoff import KVAF, ROOT, bench_arguments, collect, git, read, sa
 from run_mr28_baseline_msprof import capture_route
 from run_mr28_dedicated_service import write_summary
 from kvip.operators.lifetch.geometry import li_geometry
-from small_batch import FULL32_MODES, MODES, SUPPORTED_BATCHES, TRACE_ROUTES, WINDOW_OVERRIDES, cold_score_parts
+from small_batch import (
+    FULL32_MODES, MODES, PARTITIONED_MODES, SUPPORTED_BATCHES, TRACE_ROUTES, WINDOW_OVERRIDES, cold_score_parts,
+)
 from terminal_handoff import CHECKED_KERNELS, COLD_GM_STAGE_FIELDS, STAGES
 from workloads import configuration
 
@@ -22,6 +24,11 @@ FOLLOW_UP_ARMS = {1: ('p2', 'cold'), 8: ('p2', 'windows')}
 GRANULARITY_ARMS = {1: ('p2', 'cold', 'cold_p8'), 2: ('p2', 'windows')}
 FULL32_ARMS = {batch: ('p2', 'cold_full') for batch in (1, 2, 8)}
 WINDOW_ARMS = {batch: ('p2', 'windows', 'windows_w2') for batch in (2, 8)}
+COLD_WINDOW_ARMS = {
+    1: ('p2', 'cold', 'cold_p8', 'cold_full'),
+    2: ('p2', 'cold', 'cold_full', 'windows_w2', 'cold_w2', 'cold_full_w2'),
+    8: ('p2', 'cold_full', 'windows_w2', 'cold_full_w2'),
+}
 MAIN = 'df8ad2598e70e4b5e266b15028ab26c601a2bdf2'
 DIRECTION1_MODES = {1: 'cold', 2: 'cold', 4: 'cold', 8: 'windows', 16: 'windows', 32: 'windows'}
 DIRECTION1_MISSES = (5, 10, 15, 20, 25, 30)
@@ -39,9 +46,19 @@ def balanced_arms(batch):
     return tuple(arms)
 
 
+def study_arms(args):
+    if args.cold_window_matrix:
+        return COLD_WINDOW_ARMS
+    if args.full32 or args.balanced:
+        return FULL32_ARMS
+    if args.window_sweep:
+        return WINDOW_ARMS
+    if args.granularity_study:
+        return GRANULARITY_ARMS
+
+
 def plan(args, kvaf):
-    study = FULL32_ARMS if args.full32 or args.balanced else WINDOW_ARMS if args.window_sweep else (
-        GRANULARITY_ARMS if args.granularity_study else None)
+    study = study_arms(args)
     default_batches = (DIRECTION1_MODES if args.direction1_matrix else
                        study or FOLLOW_UP_ARMS)
     batches = tuple(dict.fromkeys(args.batch or default_batches))
@@ -69,6 +86,8 @@ def plan(args, kvaf):
                 if mode not in selected or physical not in SUPPORTED_BATCHES[mode]:
                     continue
                 requested = WINDOW_OVERRIDES.get(mode, 4)
+                if args.cold_window_matrix and batch == 1:
+                    requested = 2
                 geometry = li_geometry(physical, intermediate_fetches=requested, aic_count=32,
                                        service_aics=service_aics)
                 effective = geometry['intermediate_fetches']
@@ -85,6 +104,7 @@ def plan(args, kvaf):
                 parts = cold_score_parts(mode, physical)
                 yield dict(batch=batch, physical_batch=physical, waves=waves, miss_percent=miss,
                            measurement_kind=measurement, mode=mode, requested_windows=requested, effective_windows=effective,
+                           hot_score_parts=2, hot_score_aic=2 * physical, hot_score_aiv=4 * physical,
                            service_aics=service_aics, cold_score_parts=parts, cold_score_groups=physical * parts,
                            service_owner_groups=2 * physical, service_group_slots=service_aics * effective,
                            max_requests_per_service_aiv=(physical + 2 * service_aics - 1) // (2 * service_aics),
@@ -193,7 +213,7 @@ def trace_compare(before, after, *, prefix=''):
                               for req in candidate),
     )
     after.update({f'{prefix}{key}': value for key, value in comparison.items()})
-    if after['variant'] in (FULL32_MODES | {'topk', 'cold_p8'}) and not comparison['resident_seed_match']:
+    if after['variant'] in (PARTITIONED_MODES | {'topk'}) and not comparison['resident_seed_match']:
         raise ValueError(f"Resident Top2048 seed differs from {before['variant']}")
 
 
@@ -213,6 +233,14 @@ def compare_request_counts(before, after, *, prefix=''):
     after[f'{prefix}raw_kv_ready_ratio'] = ratio
     if all(matches.values()):
         after[f'{prefix}matched_get_count_kv_ready_ratio'] = ratio
+
+
+def compare_arms(before, after, *, trace, prefix=''):
+    if trace:
+        trace_compare(before, after, prefix=prefix)
+    else:
+        compare_request_counts(before, after, prefix=prefix)
+        after[f'{prefix}raw_kv_ready_delta_us'] = after['kv_ready_us'] - before['kv_ready_us']
 
 
 def summarize(output, rows):
@@ -245,6 +273,8 @@ def main():
                        help='compare native P2 W4/W3/W2 for BS2 and BS8 with fixed Service lanes')
     route.add_argument('--balanced', action='store_true',
                        help='compare P2 and Cold 32/BS across every feasible W2/W3/W4 at one request per Service AIV')
+    route.add_argument('--cold-window-matrix', action='store_true',
+                       help='keep Hot P2; sweep Cold parts at W2 for BS1 and W2/W4 for BS2/BS8')
     parser.add_argument('--repeats', type=int, default=1, help='repeat the matrix with the same bridge and independent workers')
     parser.add_argument('--trace', action='store_true', help='capture one checked msprof replay per arm')
     parser.add_argument('--dry-run', action='store_true')
@@ -252,8 +282,8 @@ def main():
     parser.add_argument('--iterations', type=int, default=5)
     parser.add_argument('--timeout-seconds', type=int, default=1800)
     args = parser.parse_args()
-    if args.granularity_study or args.full32 or args.window_sweep or args.balanced:
-        study = FULL32_ARMS if args.full32 or args.balanced else WINDOW_ARMS if args.window_sweep else GRANULARITY_ARMS
+    study = study_arms(args)
+    if study:
         if args.group_bs32 or any(batch not in study for batch in args.batch or ()):
             parser.error(f'This study supports only native BS values {tuple(study)}')
     elif not args.direction1_matrix and (args.miss_percent or args.group_bs32
@@ -275,11 +305,17 @@ def main():
         unsupported = [dict(batch=32, miss_percent=miss, accepted=False, status='UNSUPPORTED_NATIVE',
                             reason='Full-chain LIFetch supports up to BS16; use --group-bs32 for two serial BS16 calls')
                        for miss in dict.fromkeys(args.miss_percent or DIRECTION1_MISSES)]
+    if args.cold_window_matrix and 1 in (args.batch or COLD_WINDOW_ARMS):
+        unsupported = [dict(batch=1, miss_percent=miss, requested_windows=4, accepted=False,
+                            status='UNSUPPORTED_NATIVE',
+                            reason='BS1 static rotation has two Service owner groups; all Cold parts use effective W2')
+                       for miss in dict.fromkeys(args.miss_percent or (10,))]
     manifest = dict(status='NOT_RUN', commit=git(ROOT, 'rev-parse', 'HEAD'), main_commit=MAIN,
                     worktree_dirty=bool(git(ROOT, 'status', '--porcelain', '--untracked-files=normal')),
                     kvaf_commit=KVAF, measurement='marked_msprof' if args.trace else 'graph_event',
                     follow_up=args.follow_up, direction1_matrix=args.direction1_matrix,
                     full32=args.full32, window_sweep=args.window_sweep, balanced=args.balanced,
+                    cold_window_matrix=args.cold_window_matrix,
                     granularity_study=args.granularity_study, repeats=args.repeats,
                     scopes=dict(queries=4, history=131072, resident=16384,
                                 miss_percent=sorted({case['miss_percent'] for case in cases + unsupported}),
@@ -298,7 +334,7 @@ def main():
         raise FileNotFoundError('msprof is missing from the active CANN environment')
     output = Path(os.environ['KVIP_AB_OUTPUT']).resolve()
     print(f'Small batch A5 comparison: {output}', flush=True)
-    rows, bases, p4_arms, window_bases = list(unsupported), {}, {}, {}
+    rows, bases, p4_arms, window_bases, w4_arms = list(unsupported), {}, {}, {}, {}
     manifest['status'] = 'RUNNING'
     try:
         for case in cases:
@@ -310,7 +346,7 @@ def main():
             repeat = case['repeat']
             run_dir = output / f'repeat-{repeat:02d}' if args.repeats > 1 else output
             miss = case['miss_percent']
-            if args.direction1_matrix or args.granularity_study or args.full32 or args.window_sweep or args.balanced:
+            if args.direction1_matrix or study:
                 run_dir = run_dir / f'miss{miss:g}'
             print(f"Round {repeat}/{args.repeats}, BS{case['batch']} miss{miss:g} "
                   f"{case['mode']} P{case['cold_score_parts']}/W{case['effective_windows']} "
@@ -318,6 +354,8 @@ def main():
             row = trace_arm(run_dir, case, config, profiler) if args.trace else perf_arm(run_dir, case, config)
             row.update(repeat=repeat, miss_percent=miss, physical_batch=case['physical_batch'],
                        waves=case['waves'],
+                       hot_score_parts=case['hot_score_parts'], hot_score_aic=case['hot_score_aic'],
+                       hot_score_aiv=case['hot_score_aiv'],
                        measurement_kind=case['measurement_kind'], cold_score_groups=case['cold_score_groups'],
                        cold_score_aic=case['cold_score_groups'], cold_score_aiv=2 * case['cold_score_groups'],
                        service_group_slots=case['service_group_slots'],
@@ -326,7 +364,8 @@ def main():
             rows.append(row)
             pair = (repeat, row['batch'], miss)
             window_pair = (*pair, case['effective_windows'])
-            if args.balanced and case['cold_score_parts'] == 2:
+            parts = case['cold_score_parts']
+            if (args.balanced or args.cold_window_matrix) and parts == 2:
                 window_bases[window_pair] = row
             if row['variant'] == 'p2':
                 bases[pair] = row
@@ -334,26 +373,20 @@ def main():
                 before = bases[pair]
                 if any(row[key] != before[key] for key in ('fixture_sha256', 'library_sha256')):
                     raise ValueError('Pair used different fixture or bridge')
-                if args.granularity_study and row['variant'] == 'cold':
+                if (args.granularity_study or args.cold_window_matrix) and row['variant'] == 'cold':
                     p4_arms[pair] = row
-                if args.trace:
-                    trace_compare(before, row)
-                    if row['variant'] == 'cold_p8':
-                        trace_compare(p4_arms[pair], row, prefix='vs_p4_')
+                compare_arms(before, row, trace=args.trace)
+                if row['variant'] == 'cold_p8':
+                    compare_arms(p4_arms[pair], row, trace=args.trace, prefix='vs_p4_')
+                if ((args.balanced and row['variant'] in FULL32_MODES)
+                        or (args.cold_window_matrix and parts > 2)):
+                    compare_arms(window_bases[window_pair], row, trace=args.trace, prefix='same_window_')
+            if args.cold_window_matrix and row['batch'] != 1:
+                parts_pair = (*pair, parts)
+                if case['effective_windows'] == 4:
+                    w4_arms[parts_pair] = row
                 else:
-                    compare_request_counts(before, row)
-                    row['raw_kv_ready_delta_us'] = row['kv_ready_us'] - before['kv_ready_us']
-                    if row['variant'] == 'cold_p8':
-                        p4 = p4_arms[pair]
-                        compare_request_counts(p4, row, prefix='vs_p4_')
-                        row['vs_p4_raw_kv_ready_delta_us'] = row['kv_ready_us'] - p4['kv_ready_us']
-                if args.balanced and row['variant'] in FULL32_MODES:
-                    same_window = window_bases[window_pair]
-                    if args.trace:
-                        trace_compare(same_window, row, prefix='same_window_')
-                    else:
-                        compare_request_counts(same_window, row, prefix='same_window_')
-                        row['same_window_raw_kv_ready_delta_us'] = row['kv_ready_us'] - same_window['kv_ready_us']
+                    compare_arms(w4_arms[parts_pair], row, trace=args.trace, prefix='same_parts_w4_')
             summarize(output, rows)
         manifest['status'] = 'PASS'
         return 0
