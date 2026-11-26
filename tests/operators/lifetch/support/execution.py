@@ -4073,6 +4073,9 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         _, registration, _ = _load_native_operators('c8_offload')
         registration.require_a5_dsa_registration(('lidu_fused_batch_get_prepare_mtp_out',))
     g = initial.geometry
+    windows = config.intermediate_fetches
+    if small_mode == 'adaptive':
+        windows = small_batch.selected_windows(small_mode, g['batch'])
     width = g['token_bytes']
     workers = 40 if fused and config.transport == 'urma' else 2
     borrowed = shared_pool.borrow(torch, device, g['batch'], g['history'], workers) if shared_pool else None
@@ -4150,7 +4153,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                                   if frontier_mode == 2 else [None] * config.iterations)
             state = FusedReplayState(
                 torch, runtime, view, library, initial, pages, logical_addresses,
-                transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
+                transport=config.transport, device=device, aics=aics, windows=windows,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
                 prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024),
                 prefetch_window_limit=getattr(config, "prefetch_window_limit", None),
@@ -4160,7 +4163,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             if profile_replay:
                 shape = state.rotating.runtime_shape
                 if (state.forward.terminal is None or shape.liCores != 2 * g['batch']
-                        or shape.rounds != min(config.intermediate_fetches, shape.liCores)):
+                        or shape.rounds != min(windows, shape.liCores)):
                     raise RuntimeError('Profiling requires the P2 and four-AIV Terminal route')
                 if instruction_replay and hasattr(state.rotating.library, 'kvip_stage_trace_supported'):
                     raise RuntimeError('Instruction collection requires the bridge with KVIP_STAGE_TRACE disabled')
@@ -4318,7 +4321,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 if fused:
                     replica = FusedReplayState(
                         torch, runtime, view, library, initial, pages, logical_addresses,
-                        transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
+                        transport=config.transport, device=device, aics=aics, windows=windows,
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
                         prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024),
                         prefetch_window_limit=getattr(config, 'prefetch_window_limit', None),

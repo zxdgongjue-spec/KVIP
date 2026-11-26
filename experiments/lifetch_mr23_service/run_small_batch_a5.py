@@ -14,7 +14,8 @@ from run_mr28_baseline_msprof import capture_route
 from run_mr28_dedicated_service import write_summary
 from kvip.operators.lifetch.geometry import li_geometry
 from small_batch import (
-    FULL32_MODES, MODES, PARTITIONED_MODES, SUPPORTED_BATCHES, TRACE_ROUTES, WINDOW_OVERRIDES, cold_score_parts,
+    ADAPTIVE_ROUTES, FULL32_MODES, MODES, PARTITIONED_MODES, SUPPORTED_BATCHES, TRACE_ROUTES,
+    cold_score_parts, selected_windows,
 )
 from terminal_handoff import CHECKED_KERNELS, COLD_GM_STAGE_FIELDS, STAGES
 from workloads import configuration
@@ -35,6 +36,15 @@ BS2_TRACE_BASELINES = {
     'both': ('windows_w2', 'cold'),
 }
 BS2_TRACE_PREFIX = {'windows_w2': 'same_window_', 'cold': 'same_parts_w4_'}
+ADAPTIVE_ARMS = {batch: ('p2', mode, 'adaptive') for batch, mode in ADAPTIVE_ROUTES.items()}
+WINDOW_PROBES = {
+    'bs1-p8': {1: ('cold_p8', 'cold_p8_bulk')},
+    'bs2-w3': {2: ('windows', 'windows_early')},
+}
+WINDOW_SCOPE_PHASES = {
+    151: 'previous_wait', 243: 'window_ready', 246: 'p8_cursor',
+    247: 'early_header_enqueue', 250: 'bulk_cursor_mte2',
+}
 MAIN = 'df8ad2598e70e4b5e266b15028ab26c601a2bdf2'
 DIRECTION1_MODES = {1: 'cold', 2: 'cold', 4: 'cold', 8: 'windows', 16: 'windows', 32: 'windows'}
 DIRECTION1_MISSES = (5, 10, 15, 20, 25, 30)
@@ -53,6 +63,10 @@ def balanced_arms(batch):
 
 
 def study_arms(args):
+    if args.adaptive_pw:
+        return ADAPTIVE_ARMS
+    if args.window_probe:
+        return WINDOW_PROBES[args.window_probe]
     if args.bs2_trace_pair:
         return {2: (*BS2_TRACE_BASELINES[args.bs2_trace_pair], 'cold_w2')}
     if args.cold_window_matrix:
@@ -93,9 +107,8 @@ def plan(args, kvaf):
             for mode in modes:
                 if mode not in selected or physical not in SUPPORTED_BATCHES[mode]:
                     continue
-                requested = WINDOW_OVERRIDES.get(mode, 4)
-                if args.cold_window_matrix and batch == 1:
-                    requested = 2
+                native_windows = 2 if batch == 1 and (args.cold_window_matrix or args.adaptive_pw) else 4
+                requested = selected_windows(mode, physical, native_windows)
                 geometry = li_geometry(physical, intermediate_fetches=requested, aic_count=32,
                                        service_aics=service_aics)
                 effective = geometry['intermediate_fetches']
@@ -116,7 +129,34 @@ def plan(args, kvaf):
                            service_aics=service_aics, cold_score_parts=parts, cold_score_groups=physical * parts,
                            service_owner_groups=2 * physical, service_group_slots=service_aics * effective,
                            max_requests_per_service_aiv=(physical + 2 * service_aics - 1) // (2 * service_aics),
+                           window_probe=args.window_probe,
                            arguments=arguments, kernels=CHECKED_KERNELS[f'small_{mode}'])
+
+
+def window_probe_scopes(source, case):
+    names = WINDOW_SCOPE_PHASES
+    counts = {name: 0 for name in names.values()}
+    scopes = []
+    for event in source['traceEvents']:
+        detail = event.get('args', {})
+        phase = detail.get('phase_id')
+        if event.get('ph') != 'X' or detail.get('kernel_id') != 22 or phase not in names:
+            continue
+        window, lane = detail['window_epoch'], detail['service_lane']
+        if lane >= case['physical_batch']:
+            continue
+        name = names[phase]
+        counts[name] += 1
+        scopes.append(dict(window=window, request=lane, scope=name, source_us=event['dur'],
+                           begin_tick=detail['begin_tick'], end_tick=detail['end_tick']))
+    if case['window_probe'] == 'bs1-p8':
+        bulk = case['mode'] == 'cold_p8_bulk'
+        windows = case['effective_windows']
+        if counts['p8_cursor'] != windows or counts['bulk_cursor_mte2'] != (windows if bulk else 0):
+            raise ValueError('P8 cursor trace does not show the planned copy path in every Service window')
+    if case['mode'] != 'windows_early' and counts['early_header_enqueue']:
+        raise ValueError('Header read-ahead unexpectedly ran in the control')
+    return counts, scopes
 
 
 def trace_arm(output, case, config, profiler):
@@ -154,6 +194,11 @@ def trace_arm(output, case, config, profiler):
         fields = COLD_GM_STAGE_FIELDS.get(f"small_{case['mode']}", STAGES)
         for field, interval in zip(fields, capture['intervals'], strict=True):
             row[f'marked_{field}'] = interval['duration_us']
+        if case['mode'] == 'adaptive':
+            row['retired_service_job_count'] = len(report['retired_service_jobs'])
+        if case.get('window_probe'):
+            counts, row['window_scopes'] = window_probe_scopes(capture['source'], case)
+            row.update({f'{name}_scopes': count for name, count in counts.items()})
         return row
     except BaseException:
         manifest['status'] = 'FAILED'
@@ -220,6 +265,10 @@ def trace_compare(before, after, *, prefix=''):
         requests_balanced=sum(max(req['final_posted_counts']) < max(req['final_original_owner_counts'])
                               for req in candidate),
     )
+    if all('prefetch_tokens_in_submit_order_by_window' in item for item in base + candidate):
+        comparison['same_prefetch_post_order'] = all(
+            left['prefetch_tokens_in_submit_order_by_window'] == right['prefetch_tokens_in_submit_order_by_window']
+            for left, right in zip(base, candidate, strict=True))
     after.update({f'{prefix}{key}': value for key, value in comparison.items()})
     if after['variant'] in (PARTITIONED_MODES | {'topk'}) and not comparison['resident_seed_match']:
         raise ValueError(f"Resident Top2048 seed differs from {before['variant']}")
@@ -253,8 +302,7 @@ def compare_arms(before, after, *, trace, prefix=''):
         after[f'{prefix}raw_kv_ready_delta_us'] = after['kv_ready_us'] - before['kv_ready_us']
 
 
-def compare_bs2_trace(before, after):
-    prefix = BS2_TRACE_PREFIX[before['variant']]
+def compare_stage_trace(before, after, prefix):
     compare_arms(before, after, trace=True, prefix=prefix)
     for metric in ('native_first_kernel_to_terminal_us', *(f'marked_{stage}' for stage in STAGES)):
         after[f"{prefix}{metric.removesuffix('_us')}_delta_us"] = after[metric] - before[metric]
@@ -262,7 +310,7 @@ def compare_bs2_trace(before, after):
 
 def summarize(output, rows):
     summary = [{key: value for key, value in row.items()
-                if key not in ('requests', 'per_call_requests')} for row in rows]
+                if key not in ('requests', 'per_call_requests', 'window_scopes')} for row in rows]
     write_summary(output, summary)
     grouped = [row for row in summary if row.get('measurement_kind') == 'serial_bs16x2_graph_event']
     if grouped:
@@ -294,6 +342,10 @@ def main():
                        help='keep Hot P2; sweep Cold parts at W2 for BS1 and W2/W4 for BS2/BS8')
     route.add_argument('--bs2-trace-pair', choices=BS2_TRACE_BASELINES,
                        help='capture BS2 msprof pairs: P2/P4 at W2, W4/W2 at P4, or both')
+    route.add_argument('--adaptive-pw', action='store_true',
+                       help='compare native P2, fixed best P/W and adaptive P/W with retired AIV Service')
+    route.add_argument('--window-probe', choices=WINDOW_PROBES,
+                       help='compare fixed-geometry bulk cursor or early Top2048 header read')
     parser.add_argument('--repeats', type=int, default=1, help='repeat the matrix with the same bridge and independent workers')
     parser.add_argument('--trace', action='store_true', help='capture one checked msprof replay per arm')
     parser.add_argument('--dry-run', action='store_true')
@@ -338,6 +390,7 @@ def main():
                     full32=args.full32, window_sweep=args.window_sweep, balanced=args.balanced,
                     cold_window_matrix=args.cold_window_matrix,
                     bs2_trace_pair=args.bs2_trace_pair,
+                    adaptive_pw=args.adaptive_pw, window_probe=args.window_probe,
                     granularity_study=args.granularity_study, repeats=args.repeats,
                     scopes=dict(queries=4, history=131072, resident=16384,
                                 miss_percent=sorted({case['miss_percent'] for case in cases + unsupported}),
@@ -357,7 +410,8 @@ def main():
     output = Path(os.environ['KVIP_AB_OUTPUT']).resolve()
     print(f'Small batch A5 comparison: {output}', flush=True)
     rows, bases, p4_arms, window_bases, w4_arms = list(unsupported), {}, {}, {}, {}
-    trace_baselines = {}
+    focused_baselines = {}
+    fixed_optimal = {}
     manifest['status'] = 'RUNNING'
     try:
         for case in cases:
@@ -389,9 +443,24 @@ def main():
             if args.bs2_trace_pair:
                 if row['variant'] == 'cold_w2':
                     for mode in BS2_TRACE_BASELINES[args.bs2_trace_pair]:
-                        compare_bs2_trace(trace_baselines[(*pair, mode)], row)
+                        compare_stage_trace(focused_baselines[(*pair, mode)], row, BS2_TRACE_PREFIX[mode])
                 else:
-                    trace_baselines[(*pair, row['variant'])] = row
+                    focused_baselines[(*pair, row['variant'])] = row
+                summarize(output, rows)
+                continue
+            if args.window_probe:
+                control = study[row['batch']][0]
+                if row['variant'] == control:
+                    focused_baselines[pair] = row
+                else:
+                    before = focused_baselines[pair]
+                    if args.trace:
+                        compare_stage_trace(before, row, '')
+                        if not row['resident_seed_match']:
+                            raise ValueError('Resident seed differs within the fixed-geometry window probe')
+                        save(run_dir / 'window_probe_comparison.json', dict(control=before, experiment=row))
+                    else:
+                        compare_arms(before, row, trace=False)
                 summarize(output, rows)
                 continue
             window_pair = (*pair, case['effective_windows'])
@@ -405,11 +474,20 @@ def main():
                 if (args.granularity_study or args.cold_window_matrix) and row['variant'] == 'cold':
                     p4_arms[pair] = row
                 compare_arms(before, row, trace=args.trace)
-                if row['variant'] == 'cold_p8':
+                if row['variant'] == 'cold_p8' and pair in p4_arms:
                     compare_arms(p4_arms[pair], row, trace=args.trace, prefix='vs_p4_')
                 if ((args.balanced and row['variant'] in FULL32_MODES)
                         or (args.cold_window_matrix and parts > 2)):
                     compare_arms(window_bases[window_pair], row, trace=args.trace, prefix='same_window_')
+                if args.adaptive_pw:
+                    if row['variant'] == 'adaptive':
+                        before = fixed_optimal[pair]
+                        if args.trace:
+                            compare_stage_trace(before, row, 'vs_fixed_optimal_')
+                        else:
+                            compare_arms(before, row, trace=False, prefix='vs_fixed_optimal_')
+                    else:
+                        fixed_optimal[pair] = row
             if args.cold_window_matrix and row['batch'] != 1:
                 parts_pair = (*pair, parts)
                 if case['effective_windows'] == 4:

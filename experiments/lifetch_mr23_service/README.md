@@ -852,3 +852,36 @@ Open `lifetch_business_trace.json` for per-core scopes and
 In the root `summary.csv`, the P4/W2 row reports marked stage deltas
 against P2/W2 under `same_window_*` and against P4/W4 under
 `same_parts_w4_*`. These are traced kernel measurements.
+
+### Adaptive P/W, retired AIV Service and fixed-window probes
+
+`--adaptive-pw` compares native P2, the fixed winning Cold P/W, and the
+same P/W selected from the actual BS with dynamic Service. BS1 selects
+P8/W2. BS2 and BS8 select P4/W2. The Score shards stay fixed. The existing
+W0 Service executes on its static lanes. For Cold W1, a worker may claim
+a ready window after its MIX group finishes Score and drains the AIC
+credits. `vs_fixed_optimal_*` isolates the measured change in Service
+ownership at the same P/W. `--batch` can restrict a run to one BS.
+
+`--window-probe bs1-p8` compares scalar cursor reads with one 2 KiB
+GM-to-UB MTE2 at BS1 P8/W2. `--window-probe bs2-w3` compares ordinary
+header loading with early Top2048 header loading at BS2 P2/W3. The
+receiving lane can issue its MTE2 after the previous header is published
+and before the previous Service is complete. Candidate admission, live
+cursors and WQE submission still wait for Service completion.
+
+```bash
+bash "$runner" --adaptive-pw --warmup 2 --iterations 5
+bash "$runner" --window-probe bs1-p8 --warmup 2 --iterations 5
+bash "$runner" --window-probe bs2-w3 --warmup 2 --iterations 5
+bash "$runner" --adaptive-pw --batch 1 --trace
+bash "$runner" --window-probe bs1-p8 --trace
+bash "$runner" --window-probe bs2-w3 --trace
+```
+
+For the two probes, the trace writes `miss10/window_probe_comparison.json`
+with the per-window scopes and Get token evidence. Zero early header
+enqueue events means the read-ahead opportunity did not arise in that
+replay. For dynamic Service, `baseline_stage_report.json` includes each
+logical window/lane, the worker AIV that claimed it, and verifies that
+the worker's MIX group had drained.

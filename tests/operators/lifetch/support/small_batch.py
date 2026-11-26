@@ -6,36 +6,56 @@ import hashlib
 
 import numpy as np
 
+ADAPTIVE_ROUTES = {1: 'cold_p8', 2: 'cold_w2', 8: 'cold_full_w2'}
 SUPPORTED_BATCHES = {
     'p2': (1, 2, 4, 8, 16),
     'cold': (1, 2, 4, 8),
     'cold_w2': (2,),
     'cold_p8': (1,),
+    'cold_p8_bulk': (1,),
     'cold_full': (1, 2, 8),
     'cold_full_w3': (2, 8),
     'cold_full_w2': (2, 8),
     'windows': (2, 4, 8, 16),
+    'windows_early': (2,),
     'windows_w2': (2, 8),
     'topk': (1, 8),
     'get': (1, 8),
+    'adaptive': tuple(ADAPTIVE_ROUTES),
 }
 MODES = ('p2', 'cold', 'windows', 'topk', 'get')
 FULL32_MODES = {'cold_full', 'cold_full_w3', 'cold_full_w2'}
-PARTITIONED_MODES = FULL32_MODES | {'cold', 'cold_w2', 'cold_p8'}
-WINDOW_OVERRIDES = {'windows': 3, 'windows_w2': 2, 'cold_w2': 2, 'cold_full_w3': 3, 'cold_full_w2': 2}
+PARTITIONED_MODES = FULL32_MODES | {'cold', 'cold_w2', 'cold_p8', 'cold_p8_bulk', 'adaptive'}
+WINDOW_OVERRIDES = {'windows': 3, 'windows_early': 3, 'windows_w2': 2,
+                    'cold_w2': 2, 'cold_full_w3': 3, 'cold_full_w2': 2}
 TRACE_ROUTES = dict(p2='p2', **dict.fromkeys(PARTITIONED_MODES, 'small_cold'),
-                    windows='p2', windows_w2='p2', topk='small_topk', get='p2')
+                    windows='p2', windows_w2='p2', windows_early='p2', topk='small_topk', get='p2')
+TRACE_ROUTES['adaptive'] = 'small_retired'
 KERNELS = ('v9_li_kernel', 'v9_li_kernel_1', 'v9_li_kernel_2', 'v9_parallel_terminal')
 COLD_KERNELS = (KERNELS[0], 'v9_li_kernel_threshold_cold_partitioned',
                 'v9_li_kernel_cold_ready_partitioned', KERNELS[3])
+RETIRED_KERNELS = (KERNELS[0], 'v9_li_kernel_threshold_retired_service',
+                   'v9_li_kernel_cold_retired_service', KERNELS[3])
 TOPK_KERNELS = (KERNELS[0], 'v9_li_kernel_resident_topk_high', *KERNELS[1:])
 GET_BALANCE_FLAG = 2
+WINDOW_PROBE_OPTION_OFFSET = 224
+WINDOW_READY_LINE_BYTES = 128
+
+
+def selected_mode(mode, batch):
+    return ADAPTIVE_ROUTES[batch] if mode == 'adaptive' else mode
+
+
+def selected_windows(mode, batch, default=4):
+    mode = selected_mode(mode, batch)
+    return 2 if batch == 1 and mode in ('cold_p8', 'cold_p8_bulk') else WINDOW_OVERRIDES.get(mode, default)
 
 
 def cold_score_parts(mode, batch):
+    mode = selected_mode(mode, batch)
     if mode in FULL32_MODES:
         return 32 // batch
-    return {'cold': 4, 'cold_w2': 4, 'cold_p8': 8}.get(mode, 2)
+    return {'cold': 4, 'cold_w2': 4, 'cold_p8': 8, 'cold_p8_bulk': 8}.get(mode, 2)
 
 
 def bind(state, mode):
@@ -47,23 +67,31 @@ def bind(state, mode):
     baseline_windows = min(4, groups)
     if (state.batch not in SUPPORTED_BATCHES.get(mode, ()) or shape.history != 131072
             or shape.resident != 16384 or shape.indexHeads != 32 or shape.aicCount != 32
-            or shape.liCores != groups or shape.rounds != WINDOW_OVERRIDES.get(mode, baseline_windows)
+            or shape.liCores != groups or shape.rounds != selected_windows(mode, state.batch, baseline_windows)
             or shape.serviceLanes != 2 * (groups // baseline_windows)
             or not state.workspace.tail_bounds.eq(0).all().item()
             or not state.workspace.inputs.query_ends.eq(state.history).all().item()):
         raise ValueError('The small-batch experiments require native dense P2 and the fixed A5 fixture')
 
     library = state.rotating.library
+    retired = mode == 'adaptive'
+    mode = selected_mode(mode, state.batch)
     parts = 2
-    symbol_mode = 'cold_full' if mode in FULL32_MODES else mode.removesuffix('_w2')
+    symbol_mode = 'cold_full' if mode in FULL32_MODES else mode.removesuffix('_w2').removesuffix('_bulk')
+    if retired:
+        symbol_mode = 'cold_retired'
     if mode in PARTITIONED_MODES:
         choose = getattr(library, f'kvip_small_batch_{symbol_mode}_parts')
         choose.argtypes, choose.restype = [ctypes.c_void_p], ctypes.c_uint32
         parts = choose(forward.shape_pointer)
         expected = cold_score_parts(mode, state.batch)
         required = shape.batch * 4 * (shape.history * 2 + 64 * parts)
+        alignment = 64
+        if retired:
+            alignment = 128
+            required += (32 + shape.rounds * shape.serviceLanes) * alignment
         if (parts != expected or state.workspace.compute.nbytes < required
-                or state.workspace.compute.data_ptr() % 64):
+                or state.workspace.compute.data_ptr() % alignment):
             raise ValueError(f'Cold P{expected} geometry or classified-progress capacity is unsupported')
     elif mode == 'topk':
         forward.resident_high_table = state.torch.empty(
@@ -74,6 +102,18 @@ def bind(state, mode):
     elif mode == 'get':
         forward.balance_final_get = True
         forward.set_options()
+
+    if mode in ('cold_p8_bulk', 'windows_early'):
+        option = 1
+        if mode == 'windows_early':
+            forward.window_header_ready = state.torch.zeros(
+                (shape.rounds * shape.serviceLanes, WINDOW_READY_LINE_BYTES),
+                dtype=state.torch.uint8, device=state.device)
+            option = forward.window_header_ready.data_ptr()
+            if not option or option % WINDOW_READY_LINE_BYTES:
+                raise ValueError('The read-ahead flags require aligned GM lines')
+        value = np.asarray([option], dtype='<u8').view('u1')
+        forward.workspace[WINDOW_PROBE_OPTION_OFFSET:WINDOW_PROBE_OPTION_OFFSET + 8].copy_(state.torch.from_numpy(value))
 
     if mode in PARTITIONED_MODES or mode == 'topk':
         launch = getattr(library, f'kvip_small_batch_{symbol_mode}_forward')
@@ -102,6 +142,9 @@ def trace_evidence(state, report):
         if np.any(logical < 0) or np.any(logical >= cold_history):
             raise ValueError(f'Request {b}: invalid logical source mapping')
         offsets = np.cumsum([0, *req['prefetch_by_window']])
+        if report.get('small_batch_mode') in ('cold_p8', 'cold_p8_bulk', 'windows', 'windows_early'):
+            req['prefetch_tokens_in_submit_order_by_window'] = [
+                logical[a:z].tolist() for a, z in zip(offsets, offsets[1:])]
         req['prefetch_tokens_by_window'] = [sorted(logical[a:z].tolist()) for a, z in zip(offsets, offsets[1:])]
         req['final_get_tokens'] = sorted(logical[early:].tolist())
         req['final_get_slots'] = [[int(token), int(slot)] for token, slot in zip(logical[early:], targets[early:])]
@@ -125,10 +168,12 @@ def capture_resident_seed(state, stream, mode):
     launches = [(KERNELS[0], li_groups)]
     if mode == 'topk':
         launches.append((TOPK_KERNELS[1], state.batch * 8))
-    launches.append((COLD_KERNELS[1] if mode in PARTITIONED_MODES else KERNELS[1], li_groups))
+    threshold = (RETIRED_KERNELS[1] if mode == 'adaptive'
+                 else COLD_KERNELS[1] if mode in PARTITIONED_MODES else KERNELS[1])
+    launches.append((threshold, li_groups))
     for symbol, blocks in launches:
         launch = getattr(state.rotating.library, f'aclrtlaunch_{symbol}')
-        extra = [cold_score_parts(mode, state.batch)] if symbol == COLD_KERNELS[1] else []
+        extra = [cold_score_parts(mode, state.batch)] if symbol in (COLD_KERNELS[1], RETIRED_KERNELS[1]) else []
         launch.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p] + [ctypes.c_uint32] * len(extra)
         launch.restype = ctypes.c_uint32
         status = launch(blocks, stream.npu_stream, forward.bindings.data_ptr(), *extra)
