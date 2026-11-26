@@ -76,6 +76,6 @@ def save_checked(directory, group, inputs, reference, metadata, outputs, *, expe
     result = check_scores(inputs, reference, outputs)
     # The standalone native LI reference is part of this result archive, even
     # if a later run prunes its build or native LI cache.
-    extra = {'strong_serial': reference} if metadata.get('origin') in ('fresh', 'validated-cache') else {}
+    extra = {'strong_serial': reference} if metadata.get('origin') in ('fresh', 'validated-cache', 'near512-sharded-native') else {}
     np.savez_compressed(directory / 'score_topk_ids.npz', fused=np.asarray(outputs), **extra)
     atomic_json(directory / 'score_topk_check.json', dict(group=group, native_reference=metadata, **result))

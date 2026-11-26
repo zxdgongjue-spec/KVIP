@@ -101,6 +101,8 @@ def worker(args):
         operand_hashes[name] = digest(getattr(inputs, name))
     if operand_hashes != receipt['native_reference']['identity']['inputs']:
         raise ValueError(f'G{args.group}: captured mainline operands do not match the archived strong serial')
+    if args.pr31_shape:
+        from pr31_capacity_input import bind_workload
     if args.ablation_policy:
         from correctness import topk_fingerprint
         from score_equivalence import CapturedScoreOracle, save_checked
@@ -142,12 +144,23 @@ def worker(args):
                            page_count=pages.page_count, kv_payload='synthetic identity C8; actual KV not captured',
                            source_paths=paths)
     history_cap = None
+    shape_proof = {}
+    reference_metadata = oracle_source(args, receipt)
     if args.history_cap:
         from cap_pair_input import bind_capacity
         if (inputs.geometry['history'] != 131328 or np.max(inputs.query_ends) > 131075
                 or not np.array_equal(inputs.query_ends, receipt['native_reference']['effective_native_ends'])):
             raise ValueError('Expected the original 128K capture and the same active bounds as the strong serial')
-        sequence, inputs, pages, history_cap = bind_capacity(sequence, inputs, pages, args.history_cap, digest)
+        if args.pr31_shape:
+            sequence, inputs, pages, history_cap, serial, shape_proof = bind_workload(
+                args, sequence, inputs, pages, operand_hashes, serial, torch, torch_npu)
+            if args.pr31_shape == 'wide-long':
+                reference_metadata = dict(origin='near512-sharded-native',
+                                          effective_native_ends=inputs.query_ends.tolist(),
+                                          short_reference=reference_metadata,
+                                          inputs=shape_proof['long_workload']['long_operand_sha256'])
+        else:
+            sequence, inputs, pages, history_cap = bind_capacity(sequence, inputs, pages, args.history_cap, digest)
         cfg.history = args.history_cap
     folder = case_path(args)
     folder.mkdir(parents=True, exist_ok=False)
@@ -363,7 +376,7 @@ def worker(args):
     if len(samples) != args.iterations:
         raise ValueError('Incomplete mainline profiler capture')
     library, = library_paths
-    device_proof = {}
+    device_proof = dict(shape_proof)
     if feature_checks is not None:
         check_times = feature_checks.receipt()
         device_proof['validation'] = check_times
@@ -440,7 +453,7 @@ def worker(args):
         # The worker already holds the full decoded capture and verified native
         # reference. Certify each raw output here before releasing those arrays.
         started = perf_counter()
-        save_checked(fused, args.group, inputs, serial, oracle_source(args, receipt), measured,
+        save_checked(fused, args.group, inputs, serial, reference_metadata, measured,
                      expected_calls=args.iterations)
         result['topk_set_digests'] = [topk_fingerprint(value) for value in measured]
         atomic_json(fused / 'path_result.json', result)
@@ -516,13 +529,24 @@ def parse_args(argv=None):
                        help='Audit each Q’s GET/CQ receipts for 10 timed calls and their separate diagnostic replay')
     modes.add_argument('--history-cap', type=int, choices=(131328, 524544),
                        help='Physical Q4 history capacity for the same 128K captured input')
-    parser.add_argument('--original-128k', action='store_true',
+    shapes = parser.add_mutually_exclusive_group()
+    shapes.add_argument('--pr31-shape', choices=('wide-short', 'wide-long'),
+                        help='Bind the certified 128K donor at 512K capacity, optionally extending the visible rows')
+    parser.add_argument('--narrow-proof', type=Path, help='Completed PR31 128K mainline_checks.json for the donor')
+    shapes.add_argument('--original-128k', action='store_true',
                         help='Audit the native 128K Q4 capture and its device binding on the paced ten-call graph')
     parser.add_argument('--production-graph', action='store_true',
                         help='Use the production graph containing 20 independent calls at the specified capacity')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parsed = parser.parse_args(argv)
     parsed.iterations = 10 if parsed.ablation_policy else 20
+    if bool(parsed.pr31_shape) != bool(parsed.narrow_proof):
+        parser.error('--pr31-shape and --narrow-proof must be passed together')
+    if parsed.pr31_shape:
+        if parsed.ablation_policy != 'paced' or parsed.revision != '58155892a4f3b7a3bf9789d6055fa4a0f1e95c07':
+            parser.error('--pr31-shape requires the paced PR31 head')
+        parsed.history_cap = 524544
+        parsed.production_graph = True
     if parsed.original_128k:
         if parsed.ablation_policy != 'paced':
             parser.error('--original-128k requires --ablation-policy paced')

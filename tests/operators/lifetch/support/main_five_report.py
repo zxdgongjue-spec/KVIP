@@ -147,6 +147,20 @@ def measured_parallel(root, group, arm, revision, owner, native, old_receipt, ar
             raise ValueError(f'G{group}: loaded binary differs from the recorded build')
     receipt = read(folder / 'score_topk_check.json')
     source = receipt['native_reference']
+    if proof.get('pr31_shape') == 'wide-long':
+        from correctness import topk_fingerprint
+        long = proof['long_workload']
+        if (config.get('history') != 524544 or inputs['geometry']['history'] != 524544
+                or long['source_kind'] != 'rank_preserving_short_capture' or long['native_queries'] != 64
+                or long['new_winners'] != 0 or long['source_oracle_digest'] != topk_fingerprint(native)
+                or source['origin'] != 'near512-sharded-native' or source['inputs'] != long['long_operand_sha256']
+                or source['effective_native_ends'] != proof['history_cap']['effective_ends']):
+            raise ValueError(f'G{group}: missing independently certified full-length native reference')
+        with np.load(folder / 'score_topk_ids.npz', allow_pickle=False) as raw:
+            native = raw['strong_serial']
+        from native_li_reference import check_positions
+        check_positions(native, np.asarray(source['effective_native_ends']))
+        source = source['short_reference']
     expected_origin = 'native-only-oracle' if old_receipt.get('reference_kind') == 'native-only' else 'completed-owner-archive'
     if (source['origin'] != expected_origin or Path(source['archive_path']).resolve() != owner.resolve()
             or source['identity'] != old_receipt['native_reference']['identity']):
