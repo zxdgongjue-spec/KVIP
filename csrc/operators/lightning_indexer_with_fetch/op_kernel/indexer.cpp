@@ -93,6 +93,9 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, [[maybe_unuse
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
         if constexpr (Phase == SequenceLiPhase::Cold) {
             if (parts > 2) op.vectorService.BindPartitionedCold(P(12), parts);
+            if constexpr (!WaitColdPeers && !RetireService) {
+                op.vectorService.BindWindowQTrial(parts);
+            }
         } else if constexpr (Phase == SequenceLiPhase::DedicatedCold || Phase == SequenceLiPhase::DynamicScore ||
             Phase == SequenceLiPhase::DynamicService) {
             op.vectorService.BindDedicatedCold(P(12));
@@ -256,6 +259,12 @@ extern "C" __global__ __aicore__ void v9_li_kernel_threshold_cold_partitioned(GM
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     if ASCEND_IS_AIV {
+#if !V9_UBMEM
+        const auto args = reinterpret_cast<__gm__ const uint64_t*>(bindings);
+        const auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(args[14]));
+        const auto trial = kvip_window_q::LoadTrial(reinterpret_cast<GM_ADDR>(args[15]), shape, parts);
+        if (trial.scratch) kvip_window_q::Reset(trial, AscendC::GetBlockIdx());
+#endif
         ResetPartitionedColdProgress(bindings, parts);
         RunLi<SequenceLiPhase::Threshold>(bindings);
     }

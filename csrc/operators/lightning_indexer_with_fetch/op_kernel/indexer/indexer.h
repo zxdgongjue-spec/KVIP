@@ -1005,6 +1005,13 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(
                     }
                 }
             }
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+            if constexpr (Phase == SequenceLiPhase::Cold && !WaitColdPeers && !RetireService) {
+                if ASCEND_IS_AIV {
+                    vectorService.RunWindowQHelper(halfTokens);
+                }
+            }
+#endif
         }
 
         KVIP_TRACE_RECORD(eventDrain, stageTrace_, traceKernel, kvip_trace::LiEventsDrain, 0, 0);

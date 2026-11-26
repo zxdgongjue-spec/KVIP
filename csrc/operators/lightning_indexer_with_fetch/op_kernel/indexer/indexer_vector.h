@@ -4,6 +4,7 @@
 #include "retired_service.h"
 #include "window_frontier.h"
 #include "window_overlap_probe.h"
+#include "window_q_parallel.h"
 #endif
 #if KVIP_STREAMING_LI
 #include "pipeline_types.h"
@@ -84,6 +85,26 @@ public:
         rotationCore_ = (physical / parts) * 2 + part / (parts / 2);
         coldProgress_ = compute + kvip_cold_score::ScoreBytes(runtimeShape_.batch, runtimeShape_.history);
         coldProgressGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(coldProgress_));
+    }
+
+    __aicore__ inline void BindWindowQTrial(uint32_t parts) {
+        windowQTrial_ = kvip_window_q::LoadTrial(streamingWorkspace_, runtimeShape_, parts);
+    }
+
+    __aicore__ inline void RunWindowQHelper(uint32_t half) {
+        // G1, G2, G3 supply a vector peer to each request. G4 retains
+        // both W1 owners and G0 remains dedicated to the original W0.
+        const uint32_t worker = blockId_ / 2;
+        if (!windowQTrial_.scratch || worker == 0 || worker >= windowQTrial_.workers) return;
+        const uint32_t row = blockId_ % 2;
+        DrainColdPublication();
+        kvip_window_q::Wait(windowQTrial_.scratch, row, 0);
+        RunParallelWindowQueries(row, worker, half);
+        auto completion = kvip_window_q::Signal(windowQTrial_.scratch, row, worker);
+        completion->calls = incrementalCalls_;
+        completion->scanned = incrementalScanned_;
+        completion->candidates = incrementalCandidates_;
+        kvip_window_q::Publish(windowQTrial_.scratch, row, worker, 1);
     }
 
     __aicore__ inline void BindDedicatedCold(GM_ADDR compute) {
@@ -470,6 +491,7 @@ private:
     }
     GM_ADDR coldProgress_ = nullptr;
     uint32_t coldParts_ = 0;
+    kvip_window_q::Trial windowQTrial_;
     uint32_t rotationCore_ = 0;
     GlobalTensor<uint32_t> coldProgressGm_;
     GM_ADDR dedicatedProgress_ = nullptr;
