@@ -81,7 +81,8 @@ inline uint32_t Parts(uint32_t batch, uint32_t history, uint32_t resident, uint3
 
 inline uint32_t ReadyParts(uint32_t batch, uint32_t history, uint32_t resident, uint32_t half,
     uint32_t rounds, uint32_t aics) {
-    if ((batch != 1 && batch != 8) || aics > kMaxParts || aics < batch * kReadyParts ||
+    const bool supportedBatch = batch == 1 || batch == 2 || batch == 4 || batch == 8;
+    if (!supportedBatch || aics > kMaxParts || aics < batch * kReadyParts ||
         !CompleteWindows(history, resident, half, rounds, kReadyParts))
         return 2;
     return kReadyParts;

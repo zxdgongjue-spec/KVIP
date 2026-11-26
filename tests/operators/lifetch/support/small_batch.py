@@ -6,7 +6,14 @@ import hashlib
 
 import numpy as np
 
-MODES = ('p2', 'cold', 'windows', 'topk', 'get')
+SUPPORTED_BATCHES = {
+    'p2': (1, 2, 4, 8, 16),
+    'cold': (1, 2, 4, 8),
+    'windows': (2, 4, 8, 16),
+    'topk': (1, 8),
+    'get': (1, 8),
+}
+MODES = tuple(SUPPORTED_BATCHES)
 TRACE_ROUTES = dict(p2='p2', cold='small_cold', windows='p2', topk='small_topk', get='p2')
 KERNELS = ('v9_li_kernel', 'v9_li_kernel_1', 'v9_li_kernel_2', 'v9_parallel_terminal')
 COLD_KERNELS = (KERNELS[0], 'v9_li_kernel_threshold_cold_partitioned',
@@ -20,10 +27,12 @@ def bind(state, mode):
 
     forward = dense_terminal(state)
     shape = state.rotating.runtime_shape
-    if (mode not in MODES or state.batch not in (1, 8) or shape.history != 131072
+    groups = 2 * state.batch
+    baseline_windows = min(4, groups)
+    if (state.batch not in SUPPORTED_BATCHES.get(mode, ()) or shape.history != 131072
             or shape.resident != 16384 or shape.indexHeads != 32 or shape.aicCount != 32
-            or shape.liCores != 2 * state.batch or shape.rounds != (3 if mode == 'windows' else min(4, 2*state.batch))
-            or shape.serviceLanes != state.batch * 2 // min(4, 2*state.batch) * 2
+            or shape.liCores != groups or shape.rounds != (3 if mode == 'windows' else baseline_windows)
+            or shape.serviceLanes != 2 * (groups // baseline_windows)
             or not state.workspace.tail_bounds.eq(0).all().item()
             or not state.workspace.inputs.query_ends.eq(state.history).all().item()):
         raise ValueError('The small-batch experiments require native dense P2 and the fixed A5 fixture')

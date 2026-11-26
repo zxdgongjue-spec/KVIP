@@ -36,10 +36,10 @@ def read(path):
     return json.loads(path.read_text())
 
 
-def collect(directory, mode, batch, *, stage_fields=STAGES):
-    row = dict(variant=mode, batch=batch, miss_percent=10, accepted=False,
+def collect(directory, mode, batch, *, stage_fields=STAGES, miss_percent=10):
+    row = dict(variant=mode, batch=batch, miss_percent=miss_percent, accepted=False,
                reason='Missing completed report')
-    folder = directory / mode / 'miss10' / f'case-b{batch}'
+    folder = directory / mode / f'miss{miss_percent:g}' / f'case-b{batch}'
     if not (folder / 'report.json').is_file():
         return row
     case = read(folder / 'report.json')

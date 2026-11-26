@@ -689,3 +689,54 @@ details. The CSV gives the Resident, window and Final Top2048 source
 scopes, and the Final Get queue and CQ summary. Compare the maximal
 per-lane scope union and event coverage. Interpret these as measured
 source scopes with possible overlap.
+
+### Direction 1 batch and miss matrix
+
+The matrix compares the main native P2 route in the shared bridge with one
+optimization per batch. Both arms use the same fixture and threshold-driven
+prefetch. Keep the 128K history, 16K resident, Q4/G32, seed 43, total
+prefetch budget 512, per-window cap 128 and rank start 1024.
+
+| Batch | P2 baseline | Candidate | Service AIV per window |
+| --- | --- | --- | ---: |
+| 1 | P2/W2 | Cold P4/W2 | 2 |
+| 2 | P2/W4 | Cold P4/W4 | 2 |
+| 4 | P2/W4 | Cold P4/W4 | 4 |
+| 8 | P2/W4 | P2/W3 | 8 |
+| 16 | P2/W4 | P2/W3 | 16 |
+| 32 grouped | 2× BS16 P2/W4 | 2× BS16 P2/W3 | 16 per wave |
+
+Supported native sizes run against requested miss rates 5%, 10%, 15%,
+20%, 25% and 30%. The runner labels the six BS32 cells as
+UNSUPPORTED_NATIVE by default. Add --group-bs32 for a separately
+labeled comparison. This captures two independent BS16 states as serial
+calls in one device graph, and reports its full Event time in kv_ready_us.
+The per-call stage/Get statistics and native_subcall_kv_ready_us are per
+BS16 wave. The grouped Get totals are in the _per_group columns. Grouped rows
+are also written to bs32-grouped/summary.csv and bs32-grouped/summary.json
+under the run directory. Grouped BS32 uses two captured calls and reuses
+the same synthetic content pattern across waves.
+
+```bash
+# Preview all 36 scenario pairs, including grouped BS32.
+bash experiments/lifetch_mr23_service/run_small_batch_a5.sh \
+  --direction1-matrix --group-bs32 --dry-run
+
+# Run all 36 pairs in the A5 container.
+bash experiments/lifetch_mr23_service/run_small_batch_a5.sh \
+  --direction1-matrix --group-bs32 --warmup 1 --iterations 5
+
+# Start with one pair at a new native shape.
+bash experiments/lifetch_mr23_service/run_small_batch_a5.sh \
+  --direction1-matrix --batch 2 --miss-percent 10 --warmup 1 --iterations 5
+```
+
+Use repeatable --batch and --miss-percent to select subsets. Each arm
+gets its own worker, with one bridge build per timing run. Summary rows
+pair by repeat, batch and requested miss and include the checked route,
+fixture hash, actual fixture miss per Q, KV ready and prefetch/final/total
+Get. The requested rate controls residency of the four-query selected
+union. The exact per-Q miss varies with Q overlap. The raw ratio includes
+prefetch redistribution and differences in total Get. The matched-count
+ratio requires equal early and final request counts for every request and
+invocation.

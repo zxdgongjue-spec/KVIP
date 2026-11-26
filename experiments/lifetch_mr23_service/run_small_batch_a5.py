@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Benchmark one change at a time on the A5 BS1/BS8 P2 fixture."""
+"""Benchmark one change at a time on the native A5 P2 fixture."""
 
 import argparse
 import json
@@ -12,40 +12,60 @@ from types import SimpleNamespace
 from run_mr25_handoff import KVAF, MAIN, ROOT, bench_arguments, collect, git, read, save
 from run_mr28_baseline_msprof import capture_route
 from run_mr28_dedicated_service import write_summary
-from small_batch import MODES, TRACE_ROUTES
+from kvip.operators.lifetch.geometry import li_geometry
+from small_batch import MODES, SUPPORTED_BATCHES, TRACE_ROUTES
 from terminal_handoff import CHECKED_KERNELS, COLD_GM_STAGE_FIELDS, STAGES
 from workloads import configuration
 
 
 FOLLOW_UP_ARMS = {1: ('p2', 'cold'), 8: ('p2', 'windows')}
+DIRECTION1_MODES = {1: 'cold', 2: 'cold', 4: 'cold', 8: 'windows', 16: 'windows', 32: 'windows'}
+DIRECTION1_MISSES = (5, 10, 15, 20, 25, 30)
+NATIVE_BATCH_LIMIT = 16
 
 
 def plan(args, kvaf):
-    batches = tuple(dict.fromkeys(args.batch or (1, 8)))
+    default_batches = DIRECTION1_MODES if args.direction1_matrix else FOLLOW_UP_ARMS
+    batches = tuple(dict.fromkeys(args.batch or default_batches))
+    misses = tuple(dict.fromkeys(args.miss_percent or (DIRECTION1_MISSES if args.direction1_matrix else (10,))))
     selected = set(args.variant or MODES) | {'p2'}
     for batch in batches:
-        modes = FOLLOW_UP_ARMS[batch] if args.follow_up else MODES
-        for mode in modes:
-            if mode not in selected or (batch == 1 and mode == 'windows'):
-                continue
-            requested = 3 if mode == 'windows' else 4
-            effective = min(requested, batch * 2)
-            service_aics = batch * 2 // min(4, batch * 2)
-            arguments = bench_arguments(kvaf, (batch,))
-            for key, value in (
-                ('--kvaf-server', os.environ.get('KVIP_KVAF_SERVER', '127.0.0.1:28986')),
-                ('--warmup', args.warmup), ('--iterations', 1 if args.trace else args.iterations),
-                ('--intermediate-fetches', requested), ('--timeout-seconds', args.timeout_seconds),
-            ):
-                arguments[arguments.index(key) + 1] = str(value)
-            arguments.extend(('--prefetch-window-limit', '128'))
-            yield dict(batch=batch, mode=mode, requested_windows=requested, effective_windows=effective,
-                       service_aics=service_aics, cold_score_groups=batch * (4 if mode == 'cold' else 2),
-                       arguments=arguments, kernels=CHECKED_KERNELS[f'small_{mode}'])
+        physical = min(batch, NATIVE_BATCH_LIMIT)
+        waves = batch // physical
+        if waves > 1 and not args.group_bs32:
+            continue
+        if args.direction1_matrix:
+            modes = ('p2', DIRECTION1_MODES[batch])
+        else:
+            modes = FOLLOW_UP_ARMS[batch] if args.follow_up else MODES
+        service_aics = li_geometry(physical, intermediate_fetches=4, aic_count=32)['service_aics_per_window']
+        iterations = 1 if args.trace else args.iterations
+        for miss in misses:
+            for mode in modes:
+                if mode not in selected or physical not in SUPPORTED_BATCHES[mode]:
+                    continue
+                requested = 3 if mode == 'windows' else 4
+                geometry = li_geometry(physical, intermediate_fetches=requested, aic_count=32,
+                                       service_aics=service_aics)
+                effective = geometry['intermediate_fetches']
+                arguments = bench_arguments(kvaf, (physical,))
+                for key, value in (
+                    ('--kvaf-server', os.environ.get('KVIP_KVAF_SERVER', '127.0.0.1:28986')),
+                    ('--miss-percent', miss),
+                    ('--warmup', args.warmup), ('--iterations', waves if waves > 1 else iterations),
+                    ('--intermediate-fetches', requested), ('--timeout-seconds', args.timeout_seconds),
+                ):
+                    arguments[arguments.index(key) + 1] = str(value)
+                arguments.extend(('--prefetch-window-limit', '128'))
+                measurement = 'serial_bs16x2_graph_event' if waves > 1 else 'native'
+                yield dict(batch=batch, physical_batch=physical, waves=waves, miss_percent=miss,
+                           measurement_kind=measurement, mode=mode, requested_windows=requested, effective_windows=effective,
+                           service_aics=service_aics, cold_score_groups=physical * (4 if mode == 'cold' else 2),
+                           arguments=arguments, kernels=CHECKED_KERNELS[f'small_{mode}'])
 
 
 def trace_arm(output, case, config, profiler):
-    args = SimpleNamespace(batch=case['batch'], miss_percent=10)
+    args = SimpleNamespace(batch=case['batch'], miss_percent=case['miss_percent'])
     case_output = output / f'bs{case["batch"]}' / case['mode']
     case_output.mkdir(parents=True)
     manifest = dict(**case, status='RUNNING')
@@ -82,19 +102,37 @@ def perf_arm(output, case, config):
     config.mr25_handoff = f'small_{case["mode"]}'
     code = launch(config, case_output / config.mr25_handoff)
     fields = COLD_GM_STAGE_FIELDS.get(config.mr25_handoff, STAGES)
-    row = collect(case_output, config.mr25_handoff, case['batch'], stage_fields=fields)
+    physical = case['physical_batch']
+    miss = case['miss_percent']
+    row = collect(case_output, config.mr25_handoff, physical, stage_fields=fields, miss_percent=miss)
     expected_parts = 4 if case['mode'] == 'cold' else 2
     if (code or not row['accepted'] or row.get('available_aiv') != 64 or row.get('effective_aic') != 32
             or row.get('windows') != case['effective_windows'] or row.get('service_lanes') != case['service_aics'] * 2
             or row.get('cold_score_parts') != expected_parts or row.get('small_batch_mode') != case['mode']
             or row.get('prefetch_window_limit') != 128):
         raise RuntimeError(f'{case["mode"]} did not complete as planned. See {case_output / config.mr25_handoff}')
-    result_path = case_output / config.mr25_handoff / 'miss10' / f'case-b{case["batch"]}' / 'fused/path_result.json'
-    result = read(result_path)
+    miss_dir = case_output / config.mr25_handoff / f'miss{miss:g}'
+    result = read(miss_dir / f'case-b{physical}' / 'fused/path_result.json')
     row['per_call_requests'] = result['pipeline_counts']
     row['variant'] = case['mode']
-    print(f'BS{case["batch"]} {case["mode"]}: KV ready {row["kv_ready_us"]:.2f} µs, '
-          f'prefetch / final Get {row["prefetch_requests_per_call"]:.2f} / {row["final_get_requests_per_call"]:.2f}', flush=True)
+    fixture = read(miss_dir / 'fixture/fixture.json')['full_chain_fixture']
+    if fixture['requested_miss_percent'] != miss:
+        raise ValueError('Fixture miss rate disagrees with the trial plan')
+    for q, rate in enumerate(fixture['actual_miss_percent_per_query']):
+        row[f'fixture_miss_percent_q{q}'] = rate
+    if case['waves'] > 1:
+        (timing,) = result['rounds'].values()
+        if timing['graph_calls'] != case['waves'] or not timing['graph_event_us'] > 0:
+            raise ValueError('Grouped case requires two checked BS16 calls in one device graph')
+        row['native_subcall_kv_ready_us'] = row['kv_ready_us']
+        row['kv_ready_us'] = row['fused_event_us'] = timing['graph_event_us']
+        row.update({f'{field}_per_group': sum(record[field] for record in row['per_call_requests'])
+                    for field in ('prefetch_requests', 'final_get_requests', 'total_get_requests')})
+    row['batch'] = case['batch']
+    timing_label, get_unit = ('2xBS16 graph', 'group') if case['waves'] > 1 else ('KV ready', 'call')
+    early, final = (row[f'{field}_per_{get_unit}'] for field in ('prefetch_requests', 'final_get_requests'))
+    print(f'BS{case["batch"]} {case["mode"]}: {timing_label} {row["kv_ready_us"]:.2f} µs, '
+          f'prefetch / final Get per {get_unit} {early:.2f} / {final:.2f}', flush=True)
     return row
 
 
@@ -136,16 +174,27 @@ def compare_request_counts(before, after):
 
 
 def summarize(output, rows):
-    write_summary(output, [{key: value for key, value in row.items()
-                            if key not in ('requests', 'per_call_requests')} for row in rows])
+    summary = [{key: value for key, value in row.items()
+                if key not in ('requests', 'per_call_requests')} for row in rows]
+    write_summary(output, summary)
+    grouped = [row for row in summary if row.get('measurement_kind') == 'serial_bs16x2_graph_event']
+    if grouped:
+        directory = output / 'bs32-grouped'
+        directory.mkdir(exist_ok=True)
+        write_summary(directory, grouped)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--batch', type=int, choices=(1, 8), action='append')
+    parser.add_argument('--batch', type=int, choices=tuple(DIRECTION1_MODES), action='append')
+    parser.add_argument('--miss-percent', type=int, choices=DIRECTION1_MISSES, action='append',
+                        help='select one miss rate in the direction-1 matrix')
+    parser.add_argument('--group-bs32', action='store_true',
+                        help='measure BS32 as one graph containing two serial BS16 forwards')
     route = parser.add_mutually_exclusive_group()
     route.add_argument('--variant', choices=MODES, action='append', help='include one single-change arm; P2 is automatic')
     route.add_argument('--follow-up', action='store_true', help='BS1 P2/P4 and BS8 W4/W3 only')
+    route.add_argument('--direction1-matrix', action='store_true', help='sweep first-direction P4 or W3 against native P2')
     parser.add_argument('--repeats', type=int, default=1, help='repeat the matrix with the same bridge and independent workers')
     parser.add_argument('--trace', action='store_true', help='capture one checked msprof replay per arm')
     parser.add_argument('--dry-run', action='store_true')
@@ -153,6 +202,11 @@ def main():
     parser.add_argument('--iterations', type=int, default=5)
     parser.add_argument('--timeout-seconds', type=int, default=1800)
     args = parser.parse_args()
+    if not args.direction1_matrix and (args.miss_percent or args.group_bs32
+                                       or any(batch not in FOLLOW_UP_ARMS for batch in args.batch or ())):
+        parser.error('Expanded batch sizes, miss rates and grouped BS32 require --direction1-matrix')
+    if args.group_bs32 and args.trace:
+        parser.error('Grouped BS32 uses a two-call graph Event, incompatible with the single-call trace')
     if args.warmup is None:
         args.warmup = 0 if args.trace else 1
     if args.warmup < 0 or min(args.iterations, args.repeats, args.timeout_seconds) < 1:
@@ -162,16 +216,25 @@ def main():
     kvaf = Path(os.environ.get('KVIP_KVAF_ROOT', a5 / 'KVAF-unified-813f1750'))
     matrix = list(plan(args, kvaf))
     cases = [dict(case, repeat=repeat) for repeat in range(1, args.repeats + 1) for case in matrix]
+    unsupported = []
+    if args.direction1_matrix and 32 in (args.batch or DIRECTION1_MODES) and not args.group_bs32:
+        unsupported = [dict(batch=32, miss_percent=miss, accepted=False, status='UNSUPPORTED_NATIVE',
+                            reason='Full-chain LIFetch supports up to BS16; use --group-bs32 for two serial BS16 calls')
+                       for miss in dict.fromkeys(args.miss_percent or DIRECTION1_MISSES)]
     manifest = dict(status='NOT_RUN', commit=git(ROOT, 'rev-parse', 'HEAD'), main_commit=MAIN,
                     worktree_dirty=bool(git(ROOT, 'status', '--porcelain', '--untracked-files=normal')),
                     kvaf_commit=KVAF, measurement='marked_msprof' if args.trace else 'graph_event',
-                    follow_up=args.follow_up, repeats=args.repeats,
-                    scopes=dict(queries=4, history=131072, resident=16384, miss_percent=10,
+                    follow_up=args.follow_up, direction1_matrix=args.direction1_matrix, repeats=args.repeats,
+                    scopes=dict(queries=4, history=131072, resident=16384,
+                                miss_percent=sorted({case['miss_percent'] for case in cases + unsupported}),
                                 aic=32, aiv=64, prefetch_limit=512, per_window_limit=128, rank_start=1024),
-                    cases=cases, bs1_windows='P2 already uses effective W2; fewer windows leave the sequence-split route')
+                    cases=cases, unsupported_scenarios=unsupported,
+                    bs1_windows='P2 already uses effective W2; fewer windows leave the sequence-split route')
     if args.dry_run:
         print(json.dumps(manifest, indent=2))
         return 0
+    if not cases:
+        parser.error('No runnable scenario selected; BS32 requires --group-bs32')
     if git(kvaf, 'rev-parse', 'HEAD') != KVAF:
         raise ValueError(f'Use the pinned KVAF checkout at {KVAF}')
     profiler = shutil.which(os.environ.get('KVIP_MSPROF', 'msprof')) if args.trace else None
@@ -179,7 +242,7 @@ def main():
         raise FileNotFoundError('msprof is missing from the active CANN environment')
     output = Path(os.environ['KVIP_AB_OUTPUT']).resolve()
     print(f'Small batch A5 comparison: {output}', flush=True)
-    rows, bases = [], {}
+    rows, bases = list(unsupported), {}
     manifest['status'] = 'RUNNING'
     try:
         for case in cases:
@@ -190,12 +253,17 @@ def main():
             config.msprof_build_dir = output / 'trace_bridge'
             repeat = case['repeat']
             run_dir = output / f'repeat-{repeat:02d}' if args.repeats > 1 else output
-            print(f"Round {repeat}/{args.repeats}, BS{case['batch']} {case['mode']} W{case['effective_windows']}",
-                  flush=True)
+            miss = case['miss_percent']
+            if args.direction1_matrix:
+                run_dir = run_dir / f'miss{miss:g}'
+            print(f"Round {repeat}/{args.repeats}, BS{case['batch']} miss{miss:g} "
+                  f"{case['mode']} W{case['effective_windows']}", flush=True)
             row = trace_arm(run_dir, case, config, profiler) if args.trace else perf_arm(run_dir, case, config)
-            row['repeat'] = repeat
+            row.update(repeat=repeat, miss_percent=miss, physical_batch=case['physical_batch'],
+                       waves=case['waves'],
+                       measurement_kind=case['measurement_kind'])
             rows.append(row)
-            pair = (repeat, row['batch'])
+            pair = (repeat, row['batch'], miss)
             if row['variant'] == 'p2':
                 bases[pair] = row
             else:
