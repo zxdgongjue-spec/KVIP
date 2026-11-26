@@ -832,3 +832,23 @@ with the same effective W. `same_parts_w4_*` compares W2 against W4 at the
 same P. Read these deltas with the early and final Get counts. The trace
 run records resident seed hashes and WQE token sets alongside the
 native kernel and business timelines.
+
+For the two BS2 comparisons from the matrix, use the scoped msprof runner:
+
+```bash
+bash "$runner" --bs2-trace-pair both
+# P2/W2 vs P4/W2
+bash "$runner" --bs2-trace-pair parts
+# P4/W4 vs P4/W2
+bash "$runner" --bs2-trace-pair windows
+```
+
+`both` captures P4/W2 once. This mode enables trace capture automatically
+and uses miss 10% and one checked replay per arm by default. Under the
+printed run directory, `miss10/bs2/windows_w2` is P2/W2,
+`miss10/bs2/cold_w2` is P4/W2, and `miss10/bs2/cold` is P4/W4.
+Open `lifetch_business_trace.json` for per-core scopes and
+`lifetch_msprof_trace.json` for the CANN timeline in each arm directory.
+In the root `summary.csv`, the P4/W2 row reports marked stage deltas
+against P2/W2 under `same_window_*` and against P4/W4 under
+`same_parts_w4_*`. These are traced kernel measurements.

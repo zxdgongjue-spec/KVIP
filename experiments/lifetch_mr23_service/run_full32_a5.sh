@@ -9,7 +9,7 @@ case "${1:-}" in
 esac
 for arg in "$@"; do
     case "$arg" in
-        --window-sweep|--balanced|--cold-window-matrix)
+        --window-sweep|--balanced|--cold-window-matrix|--bs2-trace-pair|--bs2-trace-pair=*)
             exec bash "$here/run_small_batch_a5.sh" "$@"
             ;;
     esac

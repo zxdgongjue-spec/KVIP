@@ -29,6 +29,12 @@ COLD_WINDOW_ARMS = {
     2: ('p2', 'cold', 'cold_full', 'windows_w2', 'cold_w2', 'cold_full_w2'),
     8: ('p2', 'cold_full', 'windows_w2', 'cold_full_w2'),
 }
+BS2_TRACE_BASELINES = {
+    'parts': ('windows_w2',),
+    'windows': ('cold',),
+    'both': ('windows_w2', 'cold'),
+}
+BS2_TRACE_PREFIX = {'windows_w2': 'same_window_', 'cold': 'same_parts_w4_'}
 MAIN = 'df8ad2598e70e4b5e266b15028ab26c601a2bdf2'
 DIRECTION1_MODES = {1: 'cold', 2: 'cold', 4: 'cold', 8: 'windows', 16: 'windows', 32: 'windows'}
 DIRECTION1_MISSES = (5, 10, 15, 20, 25, 30)
@@ -47,6 +53,8 @@ def balanced_arms(batch):
 
 
 def study_arms(args):
+    if args.bs2_trace_pair:
+        return {2: (*BS2_TRACE_BASELINES[args.bs2_trace_pair], 'cold_w2')}
     if args.cold_window_matrix:
         return COLD_WINDOW_ARMS
     if args.full32 or args.balanced:
@@ -236,11 +244,20 @@ def compare_request_counts(before, after, *, prefix=''):
 
 
 def compare_arms(before, after, *, trace, prefix=''):
+    if any(not before[key] or before[key] != after[key] for key in ('fixture_sha256', 'library_sha256')):
+        raise ValueError(f'{before["variant"]}/{after["variant"]} used different fixture or bridge')
     if trace:
         trace_compare(before, after, prefix=prefix)
     else:
         compare_request_counts(before, after, prefix=prefix)
         after[f'{prefix}raw_kv_ready_delta_us'] = after['kv_ready_us'] - before['kv_ready_us']
+
+
+def compare_bs2_trace(before, after):
+    prefix = BS2_TRACE_PREFIX[before['variant']]
+    compare_arms(before, after, trace=True, prefix=prefix)
+    for metric in ('native_first_kernel_to_terminal_us', *(f'marked_{stage}' for stage in STAGES)):
+        after[f"{prefix}{metric.removesuffix('_us')}_delta_us"] = after[metric] - before[metric]
 
 
 def summarize(output, rows):
@@ -275,6 +292,8 @@ def main():
                        help='compare P2 and Cold 32/BS across every feasible W2/W3/W4 at one request per Service AIV')
     route.add_argument('--cold-window-matrix', action='store_true',
                        help='keep Hot P2; sweep Cold parts at W2 for BS1 and W2/W4 for BS2/BS8')
+    route.add_argument('--bs2-trace-pair', choices=BS2_TRACE_BASELINES,
+                       help='capture BS2 msprof pairs: P2/P4 at W2, W4/W2 at P4, or both')
     parser.add_argument('--repeats', type=int, default=1, help='repeat the matrix with the same bridge and independent workers')
     parser.add_argument('--trace', action='store_true', help='capture one checked msprof replay per arm')
     parser.add_argument('--dry-run', action='store_true')
@@ -282,6 +301,8 @@ def main():
     parser.add_argument('--iterations', type=int, default=5)
     parser.add_argument('--timeout-seconds', type=int, default=1800)
     args = parser.parse_args()
+    if args.bs2_trace_pair:
+        args.trace = True
     study = study_arms(args)
     if study:
         if args.group_bs32 or any(batch not in study for batch in args.batch or ()):
@@ -316,6 +337,7 @@ def main():
                     follow_up=args.follow_up, direction1_matrix=args.direction1_matrix,
                     full32=args.full32, window_sweep=args.window_sweep, balanced=args.balanced,
                     cold_window_matrix=args.cold_window_matrix,
+                    bs2_trace_pair=args.bs2_trace_pair,
                     granularity_study=args.granularity_study, repeats=args.repeats,
                     scopes=dict(queries=4, history=131072, resident=16384,
                                 miss_percent=sorted({case['miss_percent'] for case in cases + unsupported}),
@@ -335,6 +357,7 @@ def main():
     output = Path(os.environ['KVIP_AB_OUTPUT']).resolve()
     print(f'Small batch A5 comparison: {output}', flush=True)
     rows, bases, p4_arms, window_bases, w4_arms = list(unsupported), {}, {}, {}, {}
+    trace_baselines = {}
     manifest['status'] = 'RUNNING'
     try:
         for case in cases:
@@ -363,6 +386,14 @@ def main():
                        max_requests_per_service_aiv=case['max_requests_per_service_aiv'])
             rows.append(row)
             pair = (repeat, row['batch'], miss)
+            if args.bs2_trace_pair:
+                if row['variant'] == 'cold_w2':
+                    for mode in BS2_TRACE_BASELINES[args.bs2_trace_pair]:
+                        compare_bs2_trace(trace_baselines[(*pair, mode)], row)
+                else:
+                    trace_baselines[(*pair, row['variant'])] = row
+                summarize(output, rows)
+                continue
             window_pair = (*pair, case['effective_windows'])
             parts = case['cold_score_parts']
             if (args.balanced or args.cold_window_matrix) and parts == 2:
@@ -371,8 +402,6 @@ def main():
                 bases[pair] = row
             else:
                 before = bases[pair]
-                if any(row[key] != before[key] for key in ('fixture_sha256', 'library_sha256')):
-                    raise ValueError('Pair used different fixture or bridge')
                 if (args.granularity_study or args.cold_window_matrix) and row['variant'] == 'cold':
                     p4_arms[pair] = row
                 compare_arms(before, row, trace=args.trace)
