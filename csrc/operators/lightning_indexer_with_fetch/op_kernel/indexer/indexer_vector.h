@@ -166,7 +166,12 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query, uint32_t scanHis
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow);
 #else
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow,
-            streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U));
+            streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U)
+#if !V9_UBMEM
+            , runtimeShape_.batch==1 && streamingWorkspace_
+                ? reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->fixedPostFixture : 0
+#endif
+        );
 #endif
     }
     __aicore__ inline void LoadSequenceSplitThresholds(uint32_t batch) {
@@ -770,14 +775,26 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                                            ? info.validS2Len - info.s2Idx * s2BaseSize_
                                            : QLICommon::KScaleTiles * s2BaseSize_;
         //kScaleGm  -->  kScaleUB_
+#if KVIP_LARGE_BATCH_LI
+        QLICommon::ColdStamp<HardEvent::MTE2_S>(info.coldLine, 2);
+#endif
         GetKeyScale(info, kScaleUB_, info.bIdx, curS2Idx, getLen);
+#if KVIP_LARGE_BATCH_LI
+        QLICommon::ColdStamp<HardEvent::MTE2_S>(info.coldLine, 3);
+#endif
         SetFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_KSCALE + kScalepingpong);
         WaitFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_KSCALE + kScalepingpong);
     }
     WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
 
     //CV同步
+#if KVIP_LARGE_BATCH_LI
+    QLICommon::ColdStamp<HardEvent::V_S>(info.coldLine, 0);
+#endif
     CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_CV_EVENT + info.loop % 2);   //V核等C核计算完mm1，mm1Res已搬运到UB
+#if KVIP_LARGE_BATCH_LI
+    QLICommon::ColdStamp<HardEvent::V_S>(info.coldLine, 1);
+#endif
     LocalTensor<SCORE_T> outBase;
     if (std::is_same_v<SCORE_T, uint16_t>) {
         outBase = vec1OutUB_[pingpong * (UB_BANK_STRIDE / sizeof(uint16_t))];
@@ -791,6 +808,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     auto qkBase = resMm1UB_[pingpong * (UB_BANK_STRIDE / sizeof(float))];
     auto qkVLstride = (UB_BANK_DEPTH_STRIDE / sizeof(float)) / 2 * constInfo_.mBaseSize;
 
+#if KVIP_LARGE_BATCH_LI
+    QLICommon::ColdStamp<HardEvent::V_S>(info.coldLine, 4);
+#endif
 #if !V9_UBMEM
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {
 #else
@@ -812,6 +832,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                                         qScaleBase, UB_BANK_DEPTH_STRIDE / sizeof(SCALE_T),
                                         gSize_, curAivS1ProcNum);
     }
+#if KVIP_LARGE_BATCH_LI
+    QLICommon::ColdStamp<HardEvent::V_S>(info.coldLine, 5);
+#endif
 #if !V9_UBMEM
     if (info.LoadQuery()) {
 #else
@@ -837,6 +860,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     copyOutParams.blockLen = s2BaseSize_ * sizeof(SCORE_T);
     copyOutParams.srcStride = (UB_BANK_DEPTH_STRIDE - copyOutParams.blockLen) / 32;
     copyOutParams.dstStride = (QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_) - s2BaseSize_) * sizeof(SCORE_T);
+#if KVIP_LARGE_BATCH_LI
+    QLICommon::ColdStamp<HardEvent::MTE3_S>(info.coldLine, 6);
+#endif
     DataCopyPad(scoreGm[vec1OutGmOffset], outBase, copyOutParams);
 #if SIM_CAPTURE_HITS
 #if !V9_UBMEM
@@ -857,6 +883,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     }
 #endif
 
+#if KVIP_LARGE_BATCH_LI
+    QLICommon::ColdStamp<HardEvent::MTE3_S>(info.coldLine, 7);
+#endif
 #if !KVIP_LARGE_BATCH_LI
 #if KVIP_FIXED_SCORE_SHARDS
     if (!fixedHelper_)

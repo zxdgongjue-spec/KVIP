@@ -53,7 +53,23 @@ struct QLIType {
     using scaleType = SCALE_T;
 };
 
+#if KVIP_LARGE_BATCH_LI
+// One completion fence per active boundary, in an explicit diagnostic replay.
+// Event 7 is private to each pipe-to-scalar direction in the BS32 LI scorer.
+template <HardEvent Event>
+__aicore__ inline void ColdStamp(__gm__ uint64_t* line, uint32_t field) {
+    if (!line) return;
+    SetFlag<Event>(EVENT_ID7);
+    WaitFlag<Event>(EVENT_ID7);
+    line[field] = GetSystemCycle();
+}
+#endif
+
 struct RunInfo {
+#if KVIP_LARGE_BATCH_LI
+    __gm__ uint64_t* coldLine = nullptr;
+#endif
+
     uint32_t loop;
     uint32_t bN2Idx;
     uint32_t bIdx;

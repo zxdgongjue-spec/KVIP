@@ -1,4 +1,5 @@
 #include "terminal_runtime_abi.h"
+#include "../fixed_post_fixture.h"
 #include "large_batch_li.h"
 #include "window_types.h"
 #if defined(__CCE_AICORE__)
@@ -31,6 +32,25 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void CaptureTerminalAssignments(
   asc_stcg(savedSources+first+i,asc_ldcg(sources+i));
   asc_stcg(savedDestinations+first+i,asc_ldcg(destinations+i));
  }
+ asc_threadfence();
+}
+// A frozen test case includes its score-equivalent tied winners and compact
+// misses. The real TopK runs first in every graph. Both posting policies then
+// consume exactly the same captured input to cross-Q dedup.
+__simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void FixedTerminalInputs(
+ __gm__ fixed_post::Query* saved,bool record,uint32_t count,
+ __ubuf__ uint32_t* winners,__ubuf__ uint32_t* misses) {
+ const uint32_t tid=threadIdx.x;
+ for(uint32_t i=tid;i<2048;i+=256) {
+  if(record) {
+   asc_stcg(saved->winners+i,winners[i]);
+   if(i<count)asc_stcg(saved->misses+i,misses[i]);
+  }else{
+   winners[i]=asc_ldcg(saved->winners+i);
+   if(i<count)misses[i]=asc_ldcg(saved->misses+i);
+  }
+ }
+ if(record && !tid)asc_stcg(&saved->candidates,count);
  asc_threadfence();
 }
 __simt_callee__ inline void RetireShared(
@@ -141,6 +161,23 @@ __aicore__ inline void RunTerminalRow(GM_ADDR binding, uint32_t b, uint32_t q){
  }else{
   topkError=op.template TerminalQueryRuntime<false>(query,scanHistory);
  }
+ auto fixed=(!LargeBatch && s.batch==1 && a->fixedPostFixture)?
+    reinterpret_cast<__gm__ fixed_post::Fixture*>(a->fixedPostFixture):nullptr;
+ auto fixedQuery=fixed?&fixed->queries[q]:nullptr;
+ const uint32_t fixedMode=fixed?fixed->mode:0;
+ if(fixedQuery){
+  const bool record=fixedMode==fixed_post::kRecord;
+  auto meta=reinterpret_cast<__gm__ uint32_t*>(rotating::TopKHeader(ctx))+query*32;
+  const uint32_t count=record?meta[6]:fixedQuery->candidates;
+  Simt::VF_CALL<FixedTerminalInputs>(Simt::Dim3{256,1,1},fixedQuery,record,count,
+    reinterpret_cast<__ubuf__ uint32_t*>(op.TerminalIds().GetPhyAddr()),
+    reinterpret_cast<__ubuf__ uint32_t*>(op.TerminalCompact().GetPhyAddr()));
+  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+  if(!record){
+   meta[6]=count;
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
+  }
+ }
  uint32_t ownError=topkError;if(profile)ts[2]=GetSystemCycle();Signal(flags,q,generation);
  auto postWork=op.TerminalWork(),postIds=op.TerminalCompact(),postScratch=op.TerminalScratch();
  auto compact=reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048;
@@ -185,14 +222,14 @@ __aicore__ inline void RunTerminalRow(GM_ADDR binding, uint32_t b, uint32_t q){
  // Consume the original compact UB result directly; compact destinations use postWork.
  // MERGED_OUTPUT_BEFORE_WQE
  if(profile)ts[6]=GetSystemCycle();
- Simt::VF_CALL<PackUniqueLocal<LargeBatch>>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(postIds.GetPhyAddr()),width,counts[0],counts[1],counts[2],counts[3],q,mapping,reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postControl.GetPhyAddr()),(reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+uint64_t(b)*1),reinterpret_cast<__gm__ uint64_t*>(rotating::RequestAddressTable(ctx,b,owner,s.history)),reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postWork[2048].GetPhyAddr()),s.resident,reinterpret_cast<__ubuf__ uint32_t*>(postWork[4096].GetPhyAddr()),activeLru,slotCapacity,capacityCounted,capacityPass==0,headers,priorSlots,(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity),(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+uint64_t(b)*rotating::kChangeCapacity),(uint64_t(tailEnd)<<32)|tailBegin,tailCapacity,reinterpret_cast<__gm__ uint32_t*>(runtime->templates)+query*32,args,reinterpret_cast<__ubuf__ uint32_t*>(op.TerminalIds().GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postControl[8].GetPhyAddr()),(reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history),flags,generation,s.history,reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+query*2048,owner*uint32_t(ctx->outputStride),update,s.batch,query);
+ Simt::VF_CALL<PackUniqueLocal<LargeBatch>>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(postIds.GetPhyAddr()),width,counts[0],counts[1],counts[2],counts[3],q,mapping,reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postControl.GetPhyAddr()),(reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+uint64_t(b)*1),reinterpret_cast<__gm__ uint64_t*>(rotating::RequestAddressTable(ctx,b,owner,s.history)),reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postWork[2048].GetPhyAddr()),s.resident,reinterpret_cast<__ubuf__ uint32_t*>(postWork[4096].GetPhyAddr()),activeLru,slotCapacity,capacityCounted,capacityPass==0,headers,priorSlots,(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity),(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+uint64_t(b)*rotating::kChangeCapacity),(uint64_t(tailEnd)<<32)|tailBegin,tailCapacity,reinterpret_cast<__gm__ uint32_t*>(runtime->templates)+query*32,args,reinterpret_cast<__ubuf__ uint32_t*>(op.TerminalIds().GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postControl[8].GetPhyAddr()),(reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history),flags,generation,s.history,reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+query*2048,owner*uint32_t(ctx->outputStride),update,s.batch,query,fixedQuery,fixedMode);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  if(!postControl.GetValue(14))break;
  }
  if(profile)ts[11]=GetSystemCycle();
  uint32_t own=postControl.GetValue(0);
  uint32_t total=postControl.GetValue(13);
- const auto batches=rotating::PlanTerminalBatches(own,total,priorSlots);
+ const auto batches=rotating::PlanTerminalBatches(own,total,fixedMode==fixed_post::kOne ? total : priorSlots);
  uint32_t slotBase=postControl.GetValue(1);
  if(profile){ts[20]=own;ts[21]=own;ts[22]=slotBase;}
  if(profile)ts[12]=GetSystemCycle();

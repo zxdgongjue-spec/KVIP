@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 namespace pipeline_ab {
 constexpr uint32_t kResolveCores=KVIP_OUTPUT_WORKER?3:2;
 constexpr uint32_t kRawQueryFlag=12;
@@ -22,7 +23,9 @@ struct alignas(128) Args {
  uint64_t queryBitmaps, queryErrors, updateBindings, denseShadow, packedFetch;
  uint64_t completedFlags, liveCount, completedRows, completedEvents; // Completed snapshots, separate from live URMA state.
  uint64_t completedMapping, completedJournal;
+ uint64_t fixedPostFixture;  // Optional BS1 paired experiment, in previously zero padding.
 };
+static_assert(offsetof(Args,fixedPostFixture)==192 && sizeof(Args)==256, "fixed post probe binding");
 }
 
 namespace rotating {

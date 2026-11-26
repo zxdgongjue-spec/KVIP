@@ -13,6 +13,7 @@ namespace kvaf_device { using ubmem_device::CleanCacheLines; constexpr uint32_t 
 #include "simt_api/device_sync_functions.h"
 #include "simt_api/device_warp_functions.h"
 #include "context.h"
+#include "fixed_post_fixture.h"
 #include "indexer/ranked_candidates.h"
 #include "../../common/lifetch/prefetch_budget.h"
 
@@ -587,10 +588,31 @@ inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
     }
 }
 
+// Save the real admitted IDs once. On a paired replay the ordinary scorer and
+// window union still execute. Publish the saved IDs (and their dense covered
+// bits when BatchBuild needs them) so warp arbitration cannot change traffic.
+__simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void FixedWindowAdmissions(
+    __gm__ fixed_post::Window* saved, bool record, uint32_t count,
+    __ubuf__ uint32_t* ids, __ubuf__ uint32_t* bits, uint32_t denseWords) {
+    const uint32_t tid=threadIdx.x;
+    if (record) {
+        for (uint32_t i=tid;i<count;i+=256) asc_stcg(saved->ids+i,ids[i]);
+        if (!tid) { asc_stcg(&saved->count,count); asc_stcg(&saved->seen,1U); }
+    } else {
+        for (uint32_t i=tid;i<denseWords;i+=256) bits[i]=0;
+        asc_syncthreads();
+        for (uint32_t i=tid;i<count;i+=256) {
+            uint32_t token=asc_ldcg(saved->ids+i);
+            ids[i]=token;
+            if (denseWords) asc_atomic_or(bits+token/32,1U<<(token%32));
+        }
+    }
+    asc_threadfence();
+}
 template<bool captureIo, bool predecessorChecked=false>
 __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,
-    uint32_t sequenceHalfWindow) {
+    uint32_t sequenceHalfWindow, uint64_t fixtureAddress) {
     // Only IDs in the service lane's scoring range can be nominated. Size the
     // local set by that range; mappings and global covered rows use the full stride.
     const uint32_t tokenLimit = sequenceHalfWindow
@@ -679,6 +701,16 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         }
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
         candidateCount=cfg.GetValue(40);if(candidateCount>kCandidateCapacity)candidateCount=kCandidateCapacity;
+        if (fixtureAddress && rt_batch==1 && epoch<4) {
+            auto fixture=reinterpret_cast<__gm__ fixed_post::Fixture*>(fixtureAddress);
+            const bool record=fixture->mode==fixed_post::kRecord;
+            auto saved=&fixture->windows[epoch];
+            candidateCount=record ? (candidateCount<available?candidateCount:available) : saved->count;
+            Simt::VF_CALL<FixedWindowAdmissions>(Simt::Dim3{256,1,1},saved,record,candidateCount,
+                reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),rt_batchedRows && !sparseWindow ? windowWords : 0);
+            SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        }
 
 
         V9_FETCH_PROFILE(scanTicks+=GetSystemCycle()-scanBegin;totalCandidates+=candidateCount;)
@@ -833,12 +865,12 @@ if (rt_batchedRows) {
 namespace rotating {
 __aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_splitQ,uint32_t rt_rounds,uint32_t rt_serviceAics,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer, uint32_t epoch, uint32_t core,
     uint32_t lane, LocalTensor<uint32_t> scratch, LocalTensor<uint16_t> flags,
-    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false) {
+    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false,uint64_t fixtureAddress = 0) {
     // RotateFetch calls AdvanceWindow first, which joins the same lane's
     // predecessor before touching incremental state. A second CQ-independent
     // poll here adds no ordering and delays the resumed score producer.
-    if(captureIo) FastService<true,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
-    else FastService<false,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
+    if(captureIo) FastService<true,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow, fixtureAddress);
+    else FastService<false,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow, fixtureAddress);
 }
 }
 

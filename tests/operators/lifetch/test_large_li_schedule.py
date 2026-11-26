@@ -157,7 +157,9 @@ template<int,int> void CrossCoreWaitFlag(int id) {
     int bit=id + (lane==1?16:0);
     while (!flags[bit].exchange(0)) std::this_thread::yield();
 }
+enum class HardEvent { V_S, FIX_S, M_S, MTE2_S, MTE3_S };
 namespace QLICommon {
+template<HardEvent> void ColdStamp(uint64_t*, unsigned) {}
 struct ConstInfo {
     static constexpr int QLI_SYNC_MODE4=4, CROSS_VC_EVENT=0, CROSS_CV_EVENT=2, AIV0_AIV1_OFFSET=16;
 };
@@ -172,6 +174,7 @@ template<class T> struct QuantLightningIndexerKernel {
     void ProcessLargeScore(uint32_t,uint32_t,bool,bool,bool);
     Service vectorService, matmulService;
     uint32_t assignedRow_=0;
+    uint64_t* coldDrain_=nullptr;
     void CalcGS1LoopParams(uint32_t) {}
     void CalcS2LoopParams(uint32_t,uint32_t) {}
     void ScanSequenceHalf(uint32_t begin,uint32_t end,uint32_t,uint32_t&,uint32_t&,bool) {

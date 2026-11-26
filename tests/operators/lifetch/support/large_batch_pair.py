@@ -261,7 +261,7 @@ def read_selected(state, inputs, fused):
         from correctness import validate_terminal_receipts
 
         status = terminal.owner.core_status.cpu().numpy().view(np.uint64)
-        validate_terminal_receipts(counts, status, terminal.queue_views)
+        validate_terminal_receipts(counts, status, terminal.queue_views, single_batch=getattr(state, "single_post_probe", False))
         prefetch = state.rotating.rows[:, 9].cpu().numpy()
         if np.any(prefetch < 0) or np.any(prefetch > 2048):
             raise ValueError("Prefetch exceeded the per-request reservation")
@@ -602,6 +602,13 @@ def run(args):
     kernel = args.kvaf_root / "build-npu/bin/kvaf_execute_batch_get_kernels.o"
     with kernel.open("rb") as stream:
         sdk_kernel_sha = hashlib.file_digest(stream, "sha256").hexdigest()
+    probe = getattr(args, "fixed_probe", None)
+    if probe:
+        workload_ok = ((probe == "cold" and args.batch == 32 and args.group in (2, 10)) or
+                       (probe == "post-pair" and args.batch == 1 and args.group == 17))
+        if (not workload_ok or npu != "3" or args.arm != "fused" or args.compare_archived_pair
+                or args.reuse_serial_archive or args.prepared is None):
+            raise ValueError("Fixed Q4 diagnostics require their exact NPU3 fused workload and archived serial oracle")
     if args.arm == "fused" and args.serial_result is None:
         raise ValueError("The fused arm requires the matching strong serial result")
     sequence, donors = load(args.trace.resolve(), args.group, args.round, args.batch, args.cohort, args.prepared)
@@ -646,6 +653,9 @@ def run(args):
     previous = None
     if fused:
         base = identity
+        if probe:
+            from fixed_q4_probe_worker import checked_archive
+            base = checked_archive(identity, args.serial_result)
         if args.compare_archived_pair:
             base, previous = compute_reference(args.serial_result.parent, identity, args.output)
         expected, reference = reference_identity(args.serial_result, base, repo)
@@ -701,11 +711,19 @@ def run(args):
     )
     proofs = {}
     scratch_existed = (args.output / "export_only_prof_dir").exists()
-    ex.measure_replay_batch = partial(measured_replays, ex, proofs, serial)
+    if probe:
+        from fixed_q4_probe_worker import measure_probe
+        ex.measure_replay_batch = partial(measure_probe, ex, proofs, serial, args)
+    else:
+        ex.measure_replay_batch = partial(measured_replays, ex, proofs, serial)
     result = ex.run_path(cfg, args.output / "path", sequence, pages, fused=fused)
     workers = (32 if args.batch > 16 else 40) if fused else 2
     if result["correctness"] != "PASS" or result["failures"] or result["runtime_workers"] != workers:
         raise ValueError(f"{args.arm}: production replay failed or used incorrect worker count")
+    if probe:
+        atomic_json(args.output / "PROBE_RESULT.json", dict(
+            probe=probe, identity=identity, reference=str(args.serial_result), result=proofs))
+        return
     values = proofs["samples"]
     if len(values) != CALLS:
         raise ValueError("Incomplete timed replay")
@@ -861,6 +879,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--serial-result", type=Path)
     parser.add_argument("--compare-archived-pair", action="store_true")
+    parser.add_argument("--fixed-probe", choices=("cold", "post-pair"))
     parser.add_argument(
         "--keep-trace", action="store_true", help="Keep the raw profiler timeline after successful attribution"
     )

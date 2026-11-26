@@ -96,6 +96,9 @@ public:
     GM_ADDR rotationContext_ = nullptr;
 #if KVIP_LARGE_BATCH_LI
     uint32_t assignedRow_ = 0;
+    __gm__ uint64_t* coldLines_ = nullptr;
+    uint32_t coldMask_ = 0, coldPhase_ = 0;
+    __gm__ uint64_t* coldDrain_ = nullptr;
     __aicore__ inline void ProcessLargeScore(uint32_t begin, uint32_t end, bool cold, bool loadThreshold = true,
                                             bool banksPrimed = false);
     __aicore__ inline void ProcessLargeThreshold(uint32_t query);
@@ -704,6 +707,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
         if ((tile - begin) % QLICommon::KScaleTiles == 0) ++scaleLoop;
         QLICommon::RunInfo info;
         CalcRunInfo(loop, tile, info, 0, scaleLoop);
+#if KVIP_LARGE_BATCH_LI
+        if (coldLines_ && (tile & coldMask_) == coldPhase_) info.coldLine = coldLines_ + tile * 16;
+#endif
 #if !V9_UBMEM
         info.isFirstS2InnerLoop = loop == 0 || (newQuery && tile == begin);
 #else

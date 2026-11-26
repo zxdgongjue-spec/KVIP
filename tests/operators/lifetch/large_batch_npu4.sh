@@ -8,6 +8,7 @@ reuse_serial=
 archive=
 fixed=0
 fixed_archive=
+probe_archive=
 batches=(20 24 28 32)
 groups=(10 4 17 7 2)
 if (( $# )); then
@@ -15,6 +16,9 @@ if (( $# )); then
         archive=$(cd "$2" && pwd)
     elif [[ $# == 2 && $1 == --reuse-g10-bs20-serial ]]; then
         reuse_serial=$2
+    elif [[ $1 == --fixed-q4-probes && $# == 2 ]]; then
+        fixed=1
+        probe_archive=$(cd "$2" && pwd)
     elif [[ $1 == --fixed-q4 && $# -le 2 ]]; then
         fixed=1
         if (( $# == 2 )); then
@@ -34,7 +38,7 @@ if (( $# )); then
         validate_selection '1 2 4 8 16 20 24 28 32' "${batches[@]}" &&
             validate_selection '10 4 17 7 2' "${groups[@]}" || { echo "Invalid FIXED_Q4_BATCHES/GROUPS" >&2; exit 2; }
     else
-        echo "Usage: $0 [--fixed-q4 [LARGE_ARCHIVE] | --candidate-only RESULT_ROOT | --reuse-g10-bs20-serial RESULT_ROOT]" >&2
+        echo "Usage: $0 [--fixed-q4 [LARGE_ARCHIVE] | --fixed-q4-probes NPU3_ARCHIVE | --candidate-only RESULT_ROOT | --reuse-g10-bs20-serial RESULT_ROOT]" >&2
         exit 2
     fi
 fi
@@ -51,11 +55,17 @@ elif [[ ${PEER_PHYSICAL_NPU:-4} == 3 || ${ASCEND_RT_VISIBLE_DEVICES:-4} == 3 ]];
     exit 2
 fi
 export PEER_PHYSICAL_NPU="$peer_physical_npu" ASCEND_RT_VISIBLE_DEVICES="$peer_physical_npu"
+if [[ -n $probe_archive ]]; then
+    [[ $peer_physical_npu == 3 && $(<"$probe_archive/physical_npu.txt") == 3 &&
+       $(<"$probe_archive/native.txt") == af52a02b97daddadd5d93b9d100f2ff1b03b499d ]] ||
+        { echo "Expected the fixed Q4 measurement archive for physical NPU3" >&2; exit 1; }
+fi
 area="$work/peer-baseline"
 sources="$work/fused-scan-sources"
 mkdir -p "$area" "$sources"
 prefix=largebs-q4
 if (( fixed )); then prefix=fixed-q4; fi
+if [[ -n $probe_archive ]]; then prefix=fixed-q4-li-tail; fi
 out=$(mktemp -d "$area/$prefix.XXXXXX")
 echo "RESULT_ROOT=$out"
 log="$out/run.log"
@@ -140,7 +150,7 @@ printf '%s\n' "$peer_physical_npu" > "$out/physical_npu.txt"
 cat /proc/sys/kernel/random/boot_id > "$out/boot_id.txt"
 printf '%s\n' "$actual" > "$out/kvaf_tree.txt"
 git -C "$sdk" rev-parse HEAD > "$out/kvaf.txt"
-if (( fixed )); then
+if (( fixed )) && [[ -z $probe_archive ]]; then
     args=("$out")
     if [[ -n $fixed_archive ]]; then args+=("$fixed_archive"); fi
     fixed_archive=$("$PYTHON" -B "$workers/large_batch_placement.py" archive "${args[@]}")
@@ -148,7 +158,7 @@ if (( fixed )); then
 fi
 # Use the same registered CPU memory placement for the serial and fused arms.
 placement="auto auto"
-if [[ -z $archive && -z $fixed_archive ]]; then
+if [[ -z $archive && -z $fixed_archive && -z $probe_archive ]]; then
     placement=$("$PYTHON" -B "$workers/large_batch_placement.py" find "$out")
 fi
 read -r planned_node planned_adapter <<<"$placement"
@@ -225,7 +235,9 @@ run_arm() (
           --kvaf-server "127.0.0.1:$port" --output "$dir")
     if (( fixed )); then args+=(--prepared "$out/g$group/donors"); fi
     if [[ $arm == fused ]]; then
-        if [[ -n $archive ]]; then
+        if [[ -n $probe_archive ]]; then
+            args+=(--serial-result "$probe_archive/${pair#"$out/"}"/serial --fixed-probe "$probe_kind")
+        elif [[ -n $archive ]]; then
             args+=(--serial-result "$archive/g$group/bs$batch/serial" --compare-archived-pair)
         else
             args+=(--serial-result "$pair/serial")
@@ -276,6 +288,58 @@ run_pair() {
         rm -f -- "$pair/$arm/worker.log" "$pair/$arm/cpu.log"
     done
 }
+
+if [[ -n $probe_archive ]]; then
+    # These cases all have their own original two-worker serial outputs.
+    # Fail before opening a queue if any input, placement or oracle is missing.
+    for marker in host machine_id physical_npu kvaf kvaf_tree; do
+        cmp -s "$out/$marker.txt" "$probe_archive/$marker.txt" ||
+            { echo "Archive mismatch in $marker: $probe_archive"; exit 1; }
+    done
+    rows=(1 3 4 8 12 14 0 2 5 6 7 9 10 11 13 15)
+    cells=(g2/bs32 g10/bs32)
+    for r in "${rows[@]}"; do cells+=("g17/bs1/cohort$r"); done
+    evidence=(summary.txt archive.txt native.txt physical_npu.txt)
+    for cell in "${cells[@]}"; do
+        evidence+=("$cell/fused/PROBE_RESULT.json")
+        for file in serial/{ARM_RESULT.json,selected.npy,thp.json,path/path_result.json} fused/{ARM_RESULT.json,thp.json}; do
+            [[ -s $probe_archive/$cell/$file ]] || { echo "Missing archive file: $probe_archive/$cell/$file"; exit 1; }
+        done
+    done
+    echo "CONFIG physical_NPU=3 logical_device=0 serial=archive_only source=$probe_archive" >&3
+    printf '%s\n' "$probe_archive" > "$out/archive.txt"
+    last_group=
+    for cell in "${cells[@]}"; do
+        IFS=/ read -r group batch cohort <<<"$cell"
+        group=${group#g}
+        batch=${batch#bs}
+        cohort=${cohort#cohort}
+        if [[ $group != "$last_group" ]]; then
+            if [[ -n $last_group ]]; then rm -rf -- "$out/g$last_group/donors"; fi
+            trace=$(bash "$helpers/peer_g2_input.sh" "$work" "$group")
+            mkdir -p "$out/g$group"
+            "$PYTHON" -B "$workers/large_batch_input.py" "$trace" "$group" "$out/g$group/donors"
+            last_group=$group
+        fi
+        pair="$out/$cell"
+        mkdir -p "$pair"
+        old="$probe_archive/$cell"
+        "$PYTHON" -B "$workers/large_batch_placement.py" compare "$old/serial/thp.json" "$old/fused/thp.json"
+        read -r node adapter < <("$PYTHON" -B "$workers/large_batch_placement.py" get "$old/fused/thp.json")
+        set_cpu_placement "$node" "$adapter" archived
+        probe_kind=cold
+        if [[ $batch == 1 ]]; then probe_kind=post-pair; fi
+        echo "CASE_BEGIN G$group BS$batch donor=${cohort:-all} probe=$probe_kind" >&3
+        run_arm "$group" "$batch" "$trace" fused "$pair" "${cohort:-0}"
+        "$PYTHON" -B "$workers/large_batch_placement.py" compare "$old/fused/thp.json" "$pair/fused/thp.json"
+        "$PYTHON" -B "$workers/fixed_q4_probe_report.py" case "$pair/fused/PROBE_RESULT.json" | tee -a "$out/summary.txt" >&3
+    done
+    rm -rf -- "$out/g$last_group/donors"
+    "$PYTHON" -B "$workers/fixed_q4_probe_report.py" summary "$out" | tee -a "$out/summary.txt" >&3
+    tar -czf "$out/li-tail-probes.tar.gz" -C "$out" "${evidence[@]}"
+    echo "RETURN_FILE=$out/li-tail-probes.tar.gz" >&3
+    exit 0
+fi
 
 for group in "${groups[@]}"; do
     trace=$(bash "$helpers/peer_g2_input.sh" "$work" "$group")

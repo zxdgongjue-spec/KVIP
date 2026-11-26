@@ -50,23 +50,48 @@ __aicore__ inline void QuantLightningIndexerKernel<T>::ProcessLargeScore(uint32_
     ScanSequenceHalf(begin, end, cold ? 0 : 2, loop, scaleLoop, true);
     if ASCEND_IS_AIV {
         vectorService.FreeEventID();
+        QLICommon::ColdStamp<HardEvent::V_S>(coldDrain_, 0);
         CrossCoreWaitFlag<Flags::QLI_SYNC_MODE4, PIPE_V>(acknowledged);
+        QLICommon::ColdStamp<HardEvent::V_S>(coldDrain_, 1);
     } else {
         matmulService.FreeEventID();
         // Balance both return credits of both vector lanes, including an
         // untouched ping/pong bank on a one-tile job, before the next job.
+        QLICommon::ColdStamp<HardEvent::FIX_S>(coldDrain_, 0);
         for (uint32_t v = 0; v < 2; ++v) {
             CrossCoreWaitFlag<Flags::QLI_SYNC_MODE4, PIPE_FIX>(Flags::CROSS_VC_EVENT +
                                                                v * Flags::AIV0_AIV1_OFFSET);
             CrossCoreWaitFlag<Flags::QLI_SYNC_MODE4, PIPE_FIX>(Flags::CROSS_VC_EVENT +
                                                                v * Flags::AIV0_AIV1_OFFSET + 1);
         }
+        QLICommon::ColdStamp<HardEvent::FIX_S>(coldDrain_, 1);
         // These flags, separate from both score buffers, acknowledge both
         // credits. A fast V cannot prime a still-set credit for the next job.
         CrossCoreSetFlag<Flags::QLI_SYNC_MODE4, PIPE_FIX>(acknowledged);
         CrossCoreSetFlag<Flags::QLI_SYNC_MODE4, PIPE_FIX>(acknowledged + Flags::AIV0_AIV1_OFFSET);
     }
     PipeBarrier<PIPE_ALL>();
+    // Measure empty brackets on the same role and clock. This quantifies the
+    // timer/fence floor separately from the cost of deliberately draining work.
+    if (coldDrain_) {
+        QLICommon::ColdStamp<HardEvent::MTE2_S>(coldDrain_, 2);
+        QLICommon::ColdStamp<HardEvent::MTE2_S>(coldDrain_, 3);
+        if ASCEND_IS_AIV {
+            QLICommon::ColdStamp<HardEvent::V_S>(coldDrain_, 4);
+            QLICommon::ColdStamp<HardEvent::V_S>(coldDrain_, 5);
+            QLICommon::ColdStamp<HardEvent::MTE3_S>(coldDrain_, 6);
+            QLICommon::ColdStamp<HardEvent::MTE3_S>(coldDrain_, 7);
+            QLICommon::ColdStamp<HardEvent::V_S>(coldDrain_, 10);
+            QLICommon::ColdStamp<HardEvent::V_S>(coldDrain_, 11);
+        } else {
+            QLICommon::ColdStamp<HardEvent::M_S>(coldDrain_, 4);
+            QLICommon::ColdStamp<HardEvent::M_S>(coldDrain_, 5);
+            QLICommon::ColdStamp<HardEvent::FIX_S>(coldDrain_, 6);
+            QLICommon::ColdStamp<HardEvent::FIX_S>(coldDrain_, 7);
+            QLICommon::ColdStamp<HardEvent::FIX_S>(coldDrain_, 10);
+            QLICommon::ColdStamp<HardEvent::FIX_S>(coldDrain_, 11);
+        }
+    }
 }
 } // namespace QLIKernel
 
@@ -83,6 +108,7 @@ struct Inputs {
     __gm__ pipeline_ab::Args* stream;
     __gm__ uint32_t* flags;
     __gm__ uint32_t* stagedMisses;
+    __gm__ uint64_t* coldProbe;
     rotating::RuntimeShape shape;
     uint32_t core, vecLane, helpers;
 
@@ -92,6 +118,7 @@ struct Inputs {
         auto binding = reinterpret_cast<__gm__ terminal_runtime::Binding*>(terminal);
         stream = reinterpret_cast<__gm__ pipeline_ab::Args*>(binding->pipeline);
         flags = reinterpret_cast<__gm__ uint32_t*>(binding->reserved[2]);
+        coldProbe = reinterpret_cast<__gm__ uint64_t*>(binding->reserved[8]);
         stagedMisses = reinterpret_cast<__gm__ uint32_t*>(binding->reserved[4]);
         shape = rotating::LoadRuntimeShape(ctx);
         if ASCEND_IS_AIV {
@@ -386,6 +413,18 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint3
     TPipe pipe;
     Indexer op;
     input.Init(op, pipe, plan.row, false);
+    // The test binds only one BS32 request. Each role owns entire cache lines.
+    // Record all valid tiles and the drain handshake after each of the three windows.
+    const uint32_t tileLimit = large_li::CeilDiv(input.shape.history, 128);
+    if (input.Trace() && input.coldProbe && input.shape.batch == 32 &&
+        input.coldProbe[0] == plan.row && input.coldProbe[1] == tileLimit &&
+        input.coldProbe[2] && input.shape.rounds == 4) {
+        uint32_t role = 0;
+        if ASCEND_IS_AIV { role = 1 + input.vecLane; }
+        op.coldMask_ = uint32_t(input.coldProbe[2]) - 1;
+        op.coldPhase_ = uint32_t(input.coldProbe[3]);
+        op.coldLines_ = input.coldProbe + 16 + role * (tileLimit + 3) * 16;
+    }
     const bool overlap = large_li::CanOverlapBanks(plan.tiles, plan.quota, input.shape.rounds);
     if ASCEND_IS_AIV {
         if (overlap) QLIKernel::PrimeLargeBanks();
@@ -408,6 +447,11 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint3
         const uint32_t suffix = large_li::LaterSuffix(span, plan.start, plan.tiles, plan.quota, planCount, epoch);
         const uint32_t cut = span.end - suffix;
         if (span.begin < cut) {
+            if (op.coldLines_) {
+                op.coldDrain_ = op.coldLines_ + (tileLimit + epoch - 1) * 16;
+                op.coldDrain_[8] = span.begin;
+                op.coldDrain_[9] = cut;
+            }
             op.ProcessLargeScore(span.begin, cut, true, !thresholdLoaded, overlap);
             thresholdLoaded = true;
         }
@@ -461,6 +505,10 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint3
                 input.Stamp(plan.row, q, 3, end);
             }
         }
+    }
+    if (op.coldLines_) {
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(op.coldLines_ + plan.start * 16),
+                                     uint64_t(tileLimit + 3 - plan.start) * 128);
     }
 }
 } // namespace

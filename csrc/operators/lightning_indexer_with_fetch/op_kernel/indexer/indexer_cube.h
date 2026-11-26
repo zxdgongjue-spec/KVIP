@@ -156,8 +156,14 @@ QLIMatmul<QLIT>::InitMm1GlobalTensor(const GlobalTensor<int32_t> &blkTableGm, co
 template <typename QLIT>
 __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &runInfo)
 {
+#if KVIP_LARGE_BATCH_LI
+    QLICommon::ColdStamp<HardEvent::FIX_S>(runInfo.coldLine, 0);
+#endif
     CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT + runInfo.loop % 2);
     CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT + runInfo.loop % 2 + QLICommon::ConstInfo::AIV0_AIV1_OFFSET);
+#if KVIP_LARGE_BATCH_LI
+    QLICommon::ColdStamp<HardEvent::FIX_S>(runInfo.coldLine, 1);
+#endif
     uint64_t s2GmBaseOffset = runInfo.s2Idx * constInfo_.s2BaseSize;
     uint64_t s1gProcessSize = runInfo.actMBaseSize;
     uint64_t s2ProcessSize = runInfo.actualSingleProcessSInnerSize;
@@ -356,6 +362,9 @@ template <typename QLIT>
 __aicore__ inline void QLIMatmul<QLIT>::KeyNd2NzForPA(uint64_t s2L1RealSize, uint64_t s2GmOffset,
                                                     const QLICommon::RunInfo &runInfo)
 {
+#if KVIP_LARGE_BATCH_LI
+    QLICommon::ColdStamp<HardEvent::MTE2_S>(runInfo.coldLine, 2);
+#endif
     uint64_t s2L1Offset = 0;
     while (s2L1Offset < s2L1RealSize) {
         uint64_t s2BlkId = (s2L1Offset + s2GmOffset) / constInfo_.kCacheBlockSize;
@@ -380,6 +389,9 @@ __aicore__ inline void QLIMatmul<QLIT>::KeyNd2NzForPA(uint64_t s2L1RealSize, uin
 
         s2L1Offset += s2Mte2Size;
     }
+#if KVIP_LARGE_BATCH_LI
+    QLICommon::ColdStamp<HardEvent::MTE2_S>(runInfo.coldLine, 3);
+#endif
 }
 
 // batch, s1, n2, g, d
@@ -446,11 +458,17 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeL0c(uint64_t s1gL0RealSize, uint6
     mmadParams.k = constInfo_.headDim;
     mmadParams.cmatrixInitVal = true;
     mmadParams.cmatrixSource = false;
+#if KVIP_LARGE_BATCH_LI
+    QLICommon::ColdStamp<HardEvent::M_S>(runInfo.coldLine, 4);
+#endif
     Mmad(cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET], queryL0_[(l0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET],
          keyL0_[(l0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET], mmadParams);
     if ((mmadParams.m / 16) * (mmadParams.n / 16) < 10) {
         PipeBarrier<PIPE_M>();
     }
+#if KVIP_LARGE_BATCH_LI
+    QLICommon::ColdStamp<HardEvent::M_S>(runInfo.coldLine, 5);
+#endif
 }
 
 template <typename QLIT>
@@ -485,8 +503,14 @@ __aicore__ inline void QLIMatmul<QLIT>::Fixp(uint64_t s1gGmOffset, uint64_t s2Gm
         fixpipeParams.params.srcNdStride = ((fixpipeParams.mSize + 15) / 16) * fixpipeParams.nSize;
         fixpipeParams.params.dstNdStride = constInfo_.s2BaseSize * constInfo_.mBaseSize / 2;
     }
+#if KVIP_LARGE_BATCH_LI
+    QLICommon::ColdStamp<HardEvent::FIX_S>(runInfo.coldLine, 6);
+#endif
     Fixpipe<QK_T, QK_T, QLI_CFG_ROW_MAJOR_UB>(mm1ResUB_[(runInfo.loop % 2) * constInfo_.s2BaseSize / 2],
                                                 cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET], fixpipeParams);
+#if KVIP_LARGE_BATCH_LI
+    QLICommon::ColdStamp<HardEvent::FIX_S>(runInfo.coldLine, 7);
+#endif
 }
 
 template <typename QLIT>
