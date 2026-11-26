@@ -43,8 +43,11 @@ def check_scores(inputs, selected, serial):
     return exact
 
 
-def large_account(events, scope, elapsed, *, fused=True, batch=32):
-    """Recognize CANN device names and task types in one restored graph."""
+KERNEL_SUFFIX = r"(?:(?:_[0-9]+)|(?:_mix_ai[cv])|(?:_ai[cv]))*"
+
+
+def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False):
+    """Read raw, scope-relative CANN records, including both sides of MIX tasks."""
     from decimal import Decimal
 
     spans = [e for e in events if e.get("ph") == "X" and e.get("name") == scope]
@@ -66,8 +69,7 @@ def large_account(events, scope, elapsed, *, fused=True, batch=32):
     elif fused and batch < 16:
         names = {"LI1": ("v9_li_fixed_hot",), "LI2": ("v9_li_kernel_1",),
                  "LI3": ("v9_li_fixed_cold",), "tail": ("v9_parallel_terminal",)}
-    suffix = r"(?:(?:_[0-9]+)|(?:_mix_ai[cv])|(?:_ai[cv]))*"
-    names_re = {key: re.compile("(?:" + "|".join(aliases) + ")" + suffix, re.I) for key, aliases in names.items()}
+    names_re = {key: re.compile("(?:" + "|".join(aliases) + ")" + KERNEL_SUFFIX, re.I) for key, aliases in names.items()}
     stages = {key: [] for key in names}
     hardware_pids = {
         e.get("pid")
@@ -99,7 +101,11 @@ def large_account(events, scope, elapsed, *, fused=True, batch=32):
                 continue
         start = float(Decimal(str(e["ts"])) - base)
         stop = start + float(e.get("dur", 0))
+        if stop <= 0 or start >= duration:
+            continue
         if not 0 <= start < stop <= duration:
+            if strict_bounds:
+                raise ValueError(f"Invalid device interval in {scope}: {symbol!r} [{start}, {stop}]")
             continue
         if key is None:
             raise ValueError(f"Unattributed device task {symbol!r} ({task_type or cat}) in {scope}")
@@ -112,7 +118,13 @@ def large_account(events, scope, elapsed, *, fused=True, batch=32):
             else {"MIX_AIC": "aic", "MIX_AIV": "aiv", "KERNEL_MIX_AIC": "aic", "KERNEL_MIX_AIV": "aiv"}.get(task_type)
         )
         stages[key].append((start, stop, role, (e.get("pid"), stream, task), symbol))
+    return stages
+
+
+def fixed_invocation_intervals(stages, scope):
+    """Validate the launches of exactly one invocation; merge paired AIC/AIV records."""
     if "pr30_li" in stages:
+        stages = stages.copy()
         # With a profiler-supplied "_1" suffix the hot kernel name can equal
         # the threshold kernel's raw name. Recover the original three launches
         # in stream order, then verify each symbol and any mixed-task pair.
@@ -124,7 +136,7 @@ def large_account(events, scope, elapsed, *, fused=True, batch=32):
         if len(launches) != 3:
             raise ValueError(f"{scope}: expected three separate PR30 LI launches, got {len(launches)}")
         for i, (name, launch) in enumerate(zip(("v9_li_kernel", "v9_li_kernel_1", "v9_li_kernel_2"), launches), 1):
-            if any(not re.fullmatch(name + suffix, r[4], re.I) for r in launch):
+            if any(not re.fullmatch(name + KERNEL_SUFFIX, r[4], re.I) for r in launch):
                 raise ValueError(f"{scope}: wrong PR30 LI{i} kernel, expected {name}, got {launch}")
             stages[f"LI{i}"] = launch
     intervals = {}
@@ -138,14 +150,17 @@ def large_account(events, scope, elapsed, *, fused=True, batch=32):
             intervals[key] = [(min(a[0], b[0]), max(a[1], b[1]))]
         else:
             raise ValueError(f"{scope}: expected one attributable {key} launch, got {records}")
-    return dict(intervals_us=intervals, event_us=elapsed)
+    return intervals
 
 
-def stage_sample(accounting, fused):
-    """Separate active kernels, inter-kernel gaps, and graph event overhead."""
-    if "error" in accounting:
-        raise ValueError(f"Device attribution failed: {accounting}")
-    stages = accounting["intervals_us"]
+def large_account(events, scope, elapsed, *, fused=True, batch=32):
+    """Recognize CANN device names and task types in one restored graph."""
+    stages = fixed_stage_records(events, scope, fused=fused, batch=batch)
+    return dict(intervals_us=fixed_invocation_intervals(stages, scope), event_us=elapsed)
+
+
+def fixed_kernel_stages(stages, fused):
+    """Compute durations on the device clock, without assigning a graph event."""
     expected = ("LI1", "LI23", "tail") if fused else ("li", "lidu_prepare", "fetch")
     if fused and "LI2" in stages:
         expected = ("LI1", "LI2", "LI3", "tail")
@@ -158,19 +173,25 @@ def stage_sample(accounting, fused):
         raise ValueError(f"Unordered production kernel boundaries: {intervals}")
     active = {k: b - a for k, (a, b) in zip(expected, intervals)}
     span = intervals[-1][1] - intervals[0][0]
-    event = float(accounting["event_us"])
-    if not math.isfinite(event) or event <= 0 or event < span - 2:
-        raise ValueError(f"Inconsistent graph event {event} and kernel span {span}")
     sample = dict(
-        graph=event,
         LI=sum(active[k] for k in expected[:-1]) if fused else active["li"],
         tail=active["tail"] if fused else active["lidu_prepare"] + active["fetch"],
         span=span,
         inter_kernel_gap=span - sum(active.values()),
-        event_minus_span=event - span,
     )
     sample.update({k: active[k] for k in (expected[:-1] if fused else ("lidu_prepare", "fetch"))})
     return sample
+
+
+def stage_sample(accounting, fused):
+    """Separate active kernels, inter-kernel gaps, and graph event overhead."""
+    if "error" in accounting:
+        raise ValueError(f"Device attribution failed: {accounting}")
+    sample = fixed_kernel_stages(accounting["intervals_us"], fused)
+    event = float(accounting["event_us"])
+    if not math.isfinite(event) or event <= 0 or event < sample["span"] - 2:
+        raise ValueError(f"Inconsistent graph event {event} and kernel span {sample['span']}")
+    return dict(sample, graph=event, event_minus_span=event - sample["span"])
 
 
 def verify_abc(slots, ids, bounds, resident, stride):
@@ -232,7 +253,7 @@ def check_ordered_index(state, start, before_valid):
     return state.batch
 
 
-def mutable_snapshots(state, fused):
+def mutable_buffers(state, fused):
     """Save the mutable tensors restored by reset() after preparing one frozen round.
 
     Queue state and transport leases are live throughout. The query, key lengths,
@@ -247,7 +268,11 @@ def mutable_snapshots(state, fused):
         targets = [
             getattr(state.native, name) for name in ("forward", "reverse", "cursors", "output", "preferred", "bitmap")
         ]
-    return [(target, target.clone()) for target in targets]
+    return targets
+
+
+def mutable_snapshots(state, fused):
+    return [(target, target.clone()) for target in mutable_buffers(state, fused)]
 
 
 def read_selected(state, inputs, fused):
@@ -634,6 +659,10 @@ def run(args):
         f"Q_ends_min/max={inputs.query_ends.min()}/{inputs.query_ends.max()}",
         flush=True,
     )
+    if args.packed_ten:
+        if args.serial_result is None or args.reuse_serial_archive or args.compare_archived_pair:
+            raise ValueError("Packed measurements require the matching single-call serial oracle")
+        identity["protocol"] = "ten_independent_states_one_graph_one_event_v1"
     if args.reuse_serial_archive:
         if args.arm != "serial":
             raise ValueError("Only the completed serial arm can be reused")
@@ -644,7 +673,10 @@ def run(args):
     fused = args.arm == "fused"
     serial = None
     previous = None
-    if fused:
+    if args.packed_ten:
+        from fixed_q4_packed_archive import load_archived_oracle
+        serial = load_archived_oracle(args.serial_result, identity, repo)
+    elif fused:
         base = identity
         if args.compare_archived_pair:
             base, previous = compute_reference(args.serial_result.parent, identity, args.output)
@@ -666,7 +698,7 @@ def run(args):
             raise ValueError("Strong serial output shape mismatch")
     cfg = configuration(
         [
-            "diagnose",
+            "bench" if args.packed_ten else "diagnose",
             "--transport",
             "urma",
             "--input",
@@ -692,20 +724,26 @@ def run(args):
             "--warmup",
             str(WARMUP),
             "--iterations",
-            "1",
-            "--level",
-            "1",
+            str(CALLS) if args.packed_ten else "1",
+            *([] if args.packed_ten else ["--level", "1"]),
             "--output",
             str(args.output),
         ]
     )
     proofs = {}
     scratch_existed = (args.output / "export_only_prof_dir").exists()
-    ex.measure_replay_batch = partial(measured_replays, ex, proofs, serial)
-    result = ex.run_path(cfg, args.output / "path", sequence, pages, fused=fused)
+    if args.packed_ten:
+        from fixed_q4_packed_worker import measure_packed, save_packed
+        benchmark = partial(measure_packed, ex, proofs, serial)
+    else:
+        benchmark = partial(measured_replays, ex, proofs, serial)
+    result = ex.run_path(cfg, args.output / "path", sequence, pages, fused=fused, measure=benchmark)
     workers = (32 if args.batch > 16 else 40) if fused else 2
     if result["correctness"] != "PASS" or result["failures"] or result["runtime_workers"] != workers:
         raise ValueError(f"{args.arm}: production replay failed or used incorrect worker count")
+    if args.packed_ten:
+        save_packed(args, identity, inputs, proofs, workers, scratch_existed)
+        return
     values = proofs["samples"]
     if len(values) != CALLS:
         raise ValueError("Incomplete timed replay")
@@ -849,6 +887,7 @@ def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arm", choices=("serial", "fused"), required=True)
+    parser.add_argument("--packed-ten", action="store_true", help="Capture and time ten independent states in one graph")
     parser.add_argument("--trace", type=Path, required=True)
     parser.add_argument("--group", type=int, choices=GROUPS, required=True)
     parser.add_argument("--round", type=int, default=1)

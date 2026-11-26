@@ -8,6 +8,7 @@ reuse_serial=
 archive=
 fixed=0
 fixed_archive=
+packed_archive=
 batches=(20 24 28 32)
 groups=(10 4 17 7 2)
 if (( $# )); then
@@ -15,12 +16,16 @@ if (( $# )); then
         archive=$(cd "$2" && pwd)
     elif [[ $# == 2 && $1 == --reuse-g10-bs20-serial ]]; then
         reuse_serial=$2
-    elif [[ $1 == --fixed-q4 && $# -le 2 ]]; then
+    elif [[ $1 == --fixed-q4 && $# -le 2 || $1 == --fixed-q4-packed && $# == 2 ]]; then
         fixed=1
-        if (( $# == 2 )); then
+        default_batches="1 2 4 8 16 20 24 28 32"
+        if [[ $1 == --fixed-q4-packed ]]; then
+            default_batches="16 32 1 2 4 8 20 24 28"
+            packed_archive=$(cd "$2" && pwd)
+        elif (( $# == 2 )); then
             fixed_archive=$2
         fi
-        read -ra batches <<<"${FIXED_Q4_BATCHES:-1 2 4 8 16 20 24 28 32}"
+        read -ra batches <<<"${FIXED_Q4_BATCHES:-$default_batches}"
         read -ra groups <<<"${FIXED_Q4_GROUPS:-10 4 17 7 2}"
         validate_selection() {
             local valid=$1 seen=' ' v
@@ -34,7 +39,7 @@ if (( $# )); then
         validate_selection '1 2 4 8 16 20 24 28 32' "${batches[@]}" &&
             validate_selection '10 4 17 7 2' "${groups[@]}" || { echo "Invalid FIXED_Q4_BATCHES/GROUPS" >&2; exit 2; }
     else
-        echo "Usage: $0 [--fixed-q4 [LARGE_ARCHIVE] | --candidate-only RESULT_ROOT | --reuse-g10-bs20-serial RESULT_ROOT]" >&2
+        echo "Usage: $0 [--fixed-q4-packed FIXED_ARCHIVE | --fixed-q4 [LARGE_ARCHIVE] | --candidate-only RESULT_ROOT | --reuse-g10-bs20-serial RESULT_ROOT]" >&2
         exit 2
     fi
 fi
@@ -56,12 +61,20 @@ sources="$work/fused-scan-sources"
 mkdir -p "$area" "$sources"
 prefix=largebs-q4
 if (( fixed )); then prefix=fixed-q4; fi
-out=$(mktemp -d "$area/$prefix.XXXXXX")
+if [[ -n $packed_archive ]]; then prefix=fixed-q4-packed; fi
+if [[ -n $packed_archive && -n ${PEER_PACKED_RESUME:-} ]]; then
+    out=$(cd "$PEER_PACKED_RESUME" && pwd)
+    [[ $out == "$area/$prefix."* && $(<"$out/packed_source.txt") == "$packed_archive" &&
+       $(<"$out/native.txt") == "$(git -C "$root" rev-parse HEAD)" &&
+       $(<"$out/physical_npu.txt") == "$peer_physical_npu" ]] || { echo "Wrong packed resume directory: $out" >&2; exit 2; }
+else
+    out=$(mktemp -d "$area/$prefix.XXXXXX")
+fi
 echo "RESULT_ROOT=$out"
 log="$out/run.log"
 # A single transcript for setup/driver errors, with compact results on stdout.
 exec 3>&1
-exec >"$log" 2>&1
+exec >>"$log" 2>&1
 trap 'rc=$?; if ((rc)); then tail -25 "$log" >&3; printf "FAILED rc=%s LOG=%s\n" "$rc" "$log" >&3; fi' EXIT
 export PEER_LOCAL_ONLY=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export PATH="/usr/local/python3.12.13/bin:$PATH"
@@ -78,7 +91,7 @@ sdk_rev=813f1750a50b7e6c92d5f5397f2fbc05befef6da
 sdk="$sources/unified-sdk-813f1750-d6cfd392"
 workers="$root/tests/operators/lifetch/support"
 host_tools="$out/host-tools"
-mkdir "$host_tools"
+mkdir -p "$host_tools"
 if ! git -C "$root" cat-file -e "$support_rev^{commit}" 2>/dev/null; then
     git -C "$root" fetch -q --no-tags https://gitcode.com/CacheOS/KVIP.git refs/heads/test/lifetch-pr30-fast-accounting
 fi
@@ -140,7 +153,11 @@ printf '%s\n' "$peer_physical_npu" > "$out/physical_npu.txt"
 cat /proc/sys/kernel/random/boot_id > "$out/boot_id.txt"
 printf '%s\n' "$actual" > "$out/kvaf_tree.txt"
 git -C "$sdk" rev-parse HEAD > "$out/kvaf.txt"
-if (( fixed )); then
+if [[ -n $packed_archive ]]; then
+    printf '%s\n' "$packed_archive" > "$out/packed_source.txt"
+    "$PYTHON" -B "$workers/fixed_q4_packed_report.py" verify-source "$out" "$packed_archive" "$root"
+    echo "CONFIG packed_calls=10 blocks=2 groups=${groups[*]} batches=${batches[*]} physical_NPU=$peer_physical_npu archive=$packed_archive" >&3
+elif (( fixed )); then
     args=("$out")
     if [[ -n $fixed_archive ]]; then args+=("$fixed_archive"); fi
     fixed_archive=$("$PYTHON" -B "$workers/large_batch_placement.py" archive "${args[@]}")
@@ -148,7 +165,7 @@ if (( fixed )); then
 fi
 # Use the same registered CPU memory placement for the serial and fused arms.
 placement="auto auto"
-if [[ -z $archive && -z $fixed_archive ]]; then
+if [[ -z $archive && -z $fixed_archive && -z $packed_archive ]]; then
     placement=$("$PYTHON" -B "$workers/large_batch_placement.py" find "$out")
 fi
 read -r planned_node planned_adapter <<<"$placement"
@@ -224,7 +241,9 @@ run_arm() (
     args=(--trace "$trace" --group "$group" --batch "$batch" --cohort "$cohort" --arm "$arm" --kvaf-root "$sdk"
           --kvaf-server "127.0.0.1:$port" --output "$dir")
     if (( fixed )); then args+=(--prepared "$out/g$group/donors"); fi
-    if [[ $arm == fused ]]; then
+    if [[ -n $packed_archive ]]; then
+        args+=(--packed-ten --serial-result "$packed_oracle")
+    elif [[ $arm == fused ]]; then
         if [[ -n $archive ]]; then
             args+=(--serial-result "$archive/g$group/bs$batch/serial" --compare-archived-pair)
         else
@@ -277,11 +296,49 @@ run_pair() {
     done
 }
 
+run_packed_cohort() {
+    local group=$1 batch=$2 trace=$3 cohort=$4 pair=$5
+    local block arm ref dir backup packed_oracle placement node adapter result
+    local -a order
+    packed_oracle=$("$PYTHON" -B "$workers/fixed_q4_packed_archive.py" oracle-dir "$packed_archive" "$group" "$batch" "$cohort")
+    ref="$packed_oracle/thp.json"
+    placement=$("$PYTHON" -B "$workers/large_batch_placement.py" get "$ref")
+    read -r node adapter <<<"$placement"
+    set_cpu_placement "$node" "$adapter" archived
+    for block in 1 2; do
+        dir="$pair/block$block"
+        mkdir -p "$dir"
+        order=(serial fused)
+        if (( block == 2 )); then order=(fused serial); fi
+        for arm in "${order[@]}"; do
+            result="$dir/$arm"
+            if [[ -f $result/placement_verified && -s $result/packed_result.json ]]; then
+                "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref" "$result/thp.json"
+                continue
+            fi
+            if [[ -e $result ]]; then
+                backup=$(mktemp -d "$dir/incomplete.XXXXXX")
+                mv -- "$result" "$backup/"
+            fi
+            printf 'CASE_BEGIN G%s BS%s cohort=%s block=%s arm=%s\n' "$group" "$batch" "$cohort" "$block" "$arm" >&3
+            run_arm "$group" "$batch" "$trace" "$arm" "$dir" "$cohort"
+            [[ -s $result/packed_result.json ]]
+            "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref" "$result/thp.json"
+            touch "$result/placement_verified"
+        done
+    done
+}
+
 for group in "${groups[@]}"; do
     trace=$(bash "$helpers/peer_g2_input.sh" "$work" "$group")
     if (( fixed )); then
         mkdir -p "$out/g$group"
-        "$PYTHON" -B "$workers/large_batch_input.py" "$trace" "$group" "$out/g$group/donors"
+        if [[ ! -f $out/g$group/donors/source.json ]]; then
+            donor_stage=$(mktemp -d "$out/g$group/donors-prepare.XXXXXX")
+            "$PYTHON" -B "$workers/large_batch_input.py" "$trace" "$group" "$donor_stage/bank"
+            mv "$donor_stage/bank" "$out/g$group/donors"
+            rmdir "$donor_stage"
+        fi
     fi
     for batch in "${batches[@]}"; do
         cohorts=1
@@ -296,9 +353,15 @@ for group in "${groups[@]}"; do
         for ((cohort=0; cohort<cohorts; cohort++)); do
             pair="$out/g$group/bs$batch"
             if (( cohorts > 1 )); then pair="$pair/cohort$cohort"; fi
-            run_pair "$group" "$batch" "$trace" "$cohort" "$pair"
+            if [[ -n $packed_archive ]]; then
+                run_packed_cohort "$group" "$batch" "$trace" "$cohort" "$pair"
+            else
+                run_pair "$group" "$batch" "$trace" "$cohort" "$pair"
+            fi
         done
-        if (( fixed && batch == 16 )); then
+        if [[ -n $packed_archive ]]; then
+            "$PYTHON" -B "$workers/fixed_q4_packed_report.py" cell "$out" "$group" "$batch" | tee -a "$out/summary.txt" >&3
+        elif (( fixed && batch == 16 )); then
             for block in 1 2; do
                 d="$out/pr30/block$block/g$group"
                 mkdir -p "$d"
@@ -327,7 +390,10 @@ for group in "${groups[@]}"; do
     done
     if (( fixed )); then rm -rf -- "$out/g$group/donors"; fi
 done
-if (( fixed )); then
+if [[ -n $packed_archive ]]; then
+    "$PYTHON" -B "$workers/fixed_q4_packed_report.py" summary "$out" --groups "${groups[@]}" --batches "${batches[@]}" | tee -a "$out/summary.txt" >&3
+    target_rc=0
+elif (( fixed )); then
     "$PYTHON" -B "$workers/fixed_q4_summary.py" "$out" --batches "${batches[@]}" --groups "${groups[@]}" | tee -a "$out/summary.txt" >&3
     target_rc=0
     if (( ${#batches[@]} == 9 && ${#groups[@]} == 5 )); then

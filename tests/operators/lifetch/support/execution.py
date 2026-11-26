@@ -3716,10 +3716,18 @@ class NativeReplayState:
         pass  # No lease: caller owns the ordinary KVAF Runtime and table.
 
 
-def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
+def measure_replay_batch(torch, states, sequence, config, directory, *, fused, profile=None, frozen=None):
     """One graph contains iterations independent cache states, reused per round."""
     from diagnostics import algorithm_before, algorithm_after
     from performance import profile_graph_batch
+    profile = profile or profile_graph_batch
+    reset = (lambda state: state.reset()) if frozen is None else frozen.reset
+    def prepare(state, inputs):
+        if frozen is None:
+            state.prepare(inputs)
+        elif inputs is not frozen.inputs:
+            raise ValueError('Frozen batch received a different replay round')
+        # The frozen reset has already restored every mutable input to this round.
     directory = Path(directory)
     stream = torch.npu.current_stream(states[0].device)
     graph = torch.npu.NPUGraph()
@@ -3743,7 +3751,10 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
         nonlocal pending
         pending = True
         for i, state in enumerate(states):
-            if not compact or (label == 'measured' and i in (0, len(states) - 1)):
+            if frozen is not None and label == 'measured':
+                checks.check(f'measured/input{i}/round{inputs.source_round}',
+                             lambda: frozen.validate(state, inputs, i))
+            elif not compact or (label == 'measured' and i in (0, len(states) - 1)):
                 check = f'{label}/input{i}/round{inputs.source_round}'
                 try:
                     checks.check(check, lambda state=state: state.validate(inputs))
@@ -3755,7 +3766,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
     resources = None
     try:
         for state in states:
-            state.reset()
+            reset(state)
             if fused:
                 state.forward.set_diagnostics(False)
         # KVAF registers each distinct caller output lazily on its first Get.
@@ -3772,7 +3783,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             elif fused:
                 state.check_completion()
             pending = False
-            state.reset()
+            reset(state)
         stream.synchronize()
         def forward_batch():
             for state in states:
@@ -3788,7 +3799,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 resources = scopes.enter_context(capture_native_get(states[0].native.owner.session.runtime,
                                                                     capture, forward_batch))
                 for state in states:
-                    state.reset()
+                    reset(state)
             with torch.npu.graph(graph, stream=capture):
                 forward_batch()
             capture.synchronize()
@@ -3799,28 +3810,28 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                     lease.retain_graph(graph)
         for warmup in range(config.warmup):
             for state in states:
-                state.reset()
+                reset(state)
             for inputs in sequence:
                 for state in states:
-                    state.prepare(inputs)
+                    prepare(state, inputs)
                 stream.synchronize()
                 replay()
                 stream.synchronize()
                 validate_all(inputs, f'warmup{warmup}')
         for state in states:
-            state.reset()
+            reset(state)
         rounds = {}
         for inputs in sequence:
             before = []
             for state in states:
-                state.prepare(inputs)
+                prepare(state, inputs)
                 if fused and config.mode == 'diagnose':
                     initial = algorithm_before(state.rotating)
                     initial['logical_ids'] = state.input_layout.copy()
                     before.append(initial)
             stream.synchronize()
             folder = directory / 'diagnose' / f'round-{inputs.source_round}'
-            measured = profile_graph_batch(torch, TrackedGraph(), calls=len(states), folder=folder,
+            measured = profile(torch, TrackedGraph(), calls=len(states), folder=folder,
                                            serial=not fused, transport=config.transport, stream=stream)
             validate_all(inputs, 'measured')
             rounds[inputs.source_round] = measured['timing']
@@ -3843,13 +3854,13 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
         if fused and config.mode == 'diagnose' and config.level >= 2:
             clock_mhz = states[0].forward.calibrate_counter_mhz()
             for state in states:
-                state.reset()
+                reset(state)
                 state.forward.counter_clock_mhz = clock_mhz
                 state.forward.set_diagnostics(True)
             for inputs in sequence:
                 detail_before = []
                 for state in states:
-                    state.prepare(inputs)
+                    prepare(state, inputs)
                     initial = None
                     if getattr(state.forward, 'terminal', None) is not None:
                         initial = algorithm_before(state.rotating)
@@ -3939,7 +3950,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 resources.close()
 
 
-def run_path(config, directory, sequence, pages, *, fused, round_check=None, shared_pool=None):
+def run_path(config, directory, sequence, pages, *, fused, round_check=None, shared_pool=None, measure=None):
     import acl
     import kvaf
     import torch
@@ -4069,7 +4080,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
                 batch_states.append(replica)
             replay_stage(f'one graph with {len(batch_states)} independent inputs; event + profiler')
-            result = measure_replay_batch(torch, batch_states, sequence, config, directory, fused=fused)
+            benchmark = measure or measure_replay_batch
+            result = benchmark(torch, batch_states, sequence, config, directory, fused=fused)
             if checks.failures:
                 result['correctness'] = 'FAIL'
                 result['failures'] = checks.failures + result['failures']
