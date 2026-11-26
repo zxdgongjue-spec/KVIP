@@ -588,7 +588,7 @@ def run(args):
     import torch_npu
 
     npu = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
-    if npu not in ("0", "4") or os.environ.get("PEER_PHYSICAL_NPU", npu) != npu:
+    if npu not in ("0", "3", "4") or os.environ.get("PEER_PHYSICAL_NPU", npu) != npu:
         raise ValueError("Set PEER_PHYSICAL_NPU and ASCEND_RT_VISIBLE_DEVICES to the selected physical NPU")
     repo = Path(__file__).resolve().parents[4]
     revision = subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip()

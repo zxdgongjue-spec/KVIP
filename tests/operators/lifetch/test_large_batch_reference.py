@@ -132,3 +132,67 @@ def test_large_archive_uses_same_input_host_and_raw_timings(tmp_path):
     (pair / "serial/ARM_RESULT.json").write_text(json.dumps(record))
     with pytest.raises(ValueError, match="raw|samples"):
         ref.compute_reference(pair, identity, output)
+
+
+def test_fixed_archive_and_placement_match_host_and_card(tmp_path):
+    from large_batch_placement import find, find_archive
+
+    out = tmp_path / "fixed-q4.live"
+    old = tmp_path / "largebs-q4.foreign"
+    for d in (out, old):
+        d.mkdir()
+        (d/"host.txt").write_text("localhost")
+        (d/"machine_id.txt").write_text("B24")
+        (d/"physical_npu.txt").write_text("3")
+    (old/"native.txt").write_text(ref.COMPUTE_BASELINE)
+    (old/"physical_npu.txt").write_text("4")
+    for group in (10, 4, 17, 7, 2):
+        for batch in (20, 24, 28, 32):
+            pair = old / f"g{group}/bs{batch}"
+            for arm in ("serial", "fused"):
+                d = pair / arm
+                (d/"path").mkdir(parents=True)
+                (d/"path/path_result.json").touch()
+                (d/"ARM_RESULT.json").touch()
+                (d/"thp.json").write_text(json.dumps(dict(status="measured", page_mode="thp", coverage_min_pct=100,
+                    ub_device="local-adapter", numa_pages_overlapping_vmas={"7": 8})))
+            (pair/"serial/selected.npy").touch()
+    assert find_archive(out, old) is None and find(out) == ("auto", "auto")
+    (old/"physical_npu.txt").write_text("3")
+    (old/"machine_id.txt").write_text("B20")
+    assert find_archive(out) is None and find(out) == ("auto", "auto")
+    (old/"machine_id.txt").write_text("B24")
+    assert find_archive(out) == old and find(out) == ("7", "local-adapter")
+    local_native = old.rename(tmp_path / "fixed-q4.previous")
+    (local_native/"native.txt").write_text("this-rev")
+    (out/"native.txt").write_text("this-rev")
+    assert find_archive(out) == local_native
+    (out/"native.txt").write_text("different-rev")
+    assert find_archive(out) is None
+    (out/"native.txt").write_text("this-rev")
+    (local_native/"g7/bs20/serial/selected.npy").unlink()
+    assert find_archive(out) is None
+
+
+def test_fixed_summary_requires_per_arm_physical_card(tmp_path):
+    from fixed_q4_summary import report
+
+    (tmp_path/"physical_npu.txt").write_text("3")
+    (tmp_path/"host.txt").write_text("server24")
+    identity = dict(group=7, batch=16, native="candidate", physical_npu=3, host="server24", calls=10,
+                    donor_rows=list(range(16)))
+    row = dict(checked_queries=640, checked_rows=160, full_KV_Index_checked_rows=16, ordered_Index_diagnostic_rows=16)
+    for arm, graph in (("serial", 100.), ("fused", 75.)):
+        d = tmp_path / "g7/bs16" / arm
+        d.mkdir(parents=True)
+        sample = dict(graph=graph, LI=30., tail=30.)
+        record = dict(arm=arm, identity=identity, samples=[sample]*10,
+                      mean_p50_us={k: [v, v] for k, v in sample.items()}, **row)
+        (d/"ARM_RESULT.json").write_text(json.dumps(record))
+    report(tmp_path, [7], [16])
+    result = json.loads((tmp_path/"fixed_q4_summary.json").read_text())
+    assert result["physical_npu"] == 3 and result["cells"][0]["passed"]
+    record["identity"]["physical_npu"] = 4
+    (d/"ARM_RESULT.json").write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="Incomplete fused evidence"):
+        report(tmp_path, [7], [16])

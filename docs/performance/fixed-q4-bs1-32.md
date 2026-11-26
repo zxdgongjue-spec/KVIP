@@ -36,17 +36,22 @@
 
 大批量最终是否获益，取决于尾队少做的事能否抵掉 LI 多出的时间。B20 同时记录整图、LI 和尾部，并报告预筛命中数量。BS16 的 G2、G10 尤须单独看。按已有跨轮数据估算，PR30 的 G2 约 287 µs，历史强串行的八折约 239 µs，两者相差约 48 µs。仅沿用 PR30 分工，无法据此承诺这项收益。
 
-## 如何在 B20 NPU4 看结果
+## 小批量跨窗切换时如何释放 K 缓冲
+
+G2、BS8 的一个半窗有 150 个冷区块，两个算分组各扫 75 块。矩阵核的一次 K 搬运能装两块。第 75 块算完时，如果按整份请求的结束位置才归还缓冲，核跳到下一窗时就会等待自己仍占用的缓冲。B20 的首次 eager 调用因此在同步时报告 AI Core 超时（507014）。修复后，每个算分组处理完自己当前这段的最后一块就归还 K 缓冲，四个 Q 的数据留到该请求的最后一段才释放。BS2、BS4 的奇数分片走相同规则。B24 命令从 G2、BS8 开始，覆盖发生故障的第 0 组请求。
+
+## 如何在 B24 NPU3 看结果
 
 在本分支的干净检出目录执行：
 
 ```bash
 export PEER_G2_WORK=/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold
-export PEER_PHYSICAL_NPU=4 ASCEND_RT_VISIBLE_DEVICES=4 PEER_LOCAL_ONLY=1
-unset KVAF_CPU_UB_DEVICE FIXED_Q4_BATCHES FIXED_Q4_GROUPS
+export PEER_PHYSICAL_NPU=3 ASCEND_RT_VISIBLE_DEVICES=3 PEER_LOCAL_ONLY=1
+export FIXED_Q4_GROUPS="2 7 10 4 17" FIXED_Q4_BATCHES="8 32 16 1 2 4 20 24 28"
+unset KVAF_CPU_UB_DEVICE
 bash tests/operators/lifetch/large_batch_npu4.sh --fixed-q4
 ```
 
-运行 G10、G4、G17、G7、G2。BS1/2/4/8 用 16/8/4/2 组不重叠的请求子集，按同一输入配对，从而覆盖原 trace 的全部 16 行。九档五组共 175 组配对输入。每个单次事件都从恢复好的状态开始，同一输入预热 4 次、正式计时 10 次。大 BS 优先复用 B20 已核实的强串行归档。小 BS 对缺少匹配记录的实际形状测原生 LI、LIDU 和双 GET worker。只启动各次回放所需的本机 KVAF 临时进程。用真实搬运核验逐 Q 的 TopK 得分等价、KV、有序 Index 和队列完成状态。截止同分允许选择不同 ID。
+运行 G10、G4、G17、G7、G2。BS1/2/4/8 用 16/8/4/2 组不重叠的请求子集，按同一输入配对，从而覆盖原 trace 的全部 16 行。九档五组共 175 组配对输入。每个单次事件都从恢复好的状态开始，同一输入预热 4 次、正式计时 10 次。大 BS 优先复用同机同物理卡、输入和计时条件均匹配的强串行归档，缺失时在本卡实测。小 BS 对缺少匹配记录的实际形状测原生 LI、LIDU 和双 GET worker。只启动各次回放所需的本机 KVAF 临时进程。用真实搬运核验逐 Q 的 TopK 得分等价、KV、有序 Index 和队列完成状态。截止同分允许选择不同 ID。
 
-每个 BS × trace 报整图、LI、尾部均值和 P50，并列出各小批子集收益。最终 `ACCEPTANCE` 的第一项要求 45/45 个整图均值均不高于同输入强串行的 80%。BS16 再单独用 PR30 的事件包住十次独立图内调用，两轮等权，逐组与发表时原始两轮核对，不能用十个独立事件的均值或核跨度 P50 代替。公开整图参考值依次为 G10 304.4、G4 309.5、G17 334.5、G7 437.1、G2 287.2 µs。五组均持平或更快才通过第二项。退出码 3 表示测量完成但性能门槛尚未全部证实。每次结果保存在开头打印的 RESULT_ROOT。其中 fixed_q4_summary.json 留存所有单次事件汇总，fixed_q4_acceptance.json 留存五项 PR30 对照及最终判定。
+每个 BS × trace 报整图、LI、尾部均值和 P50，并列出各小批子集收益。最终 `ACCEPTANCE` 的第一项要求 45/45 个整图均值均不高于同输入强串行的 80%。BS16 再单独用 PR30 的事件包住十次独立图内调用，两轮等权。B24 NPU3 在同卡上实测 PR30 与候选，第一轮先 PR30，第二轮先候选，两者使用同一份 TopK 参照、同一 NUMA 节点与同一网卡。B20 NPU4 继续与发表时原始两轮核对。公开整图参考值依次为 G10 304.4、G4 309.5、G17 334.5、G7 437.1、G2 287.2 µs。五组均持平或更快才通过第二项。退出码 3 表示测量完成但性能门槛尚未全部证实。每次结果保存在开头打印的 RESULT_ROOT。其中 fixed_q4_summary.json 留存所有单次事件汇总，fixed_q4_acceptance.json 留存五项 PR30 对照及最终判定。

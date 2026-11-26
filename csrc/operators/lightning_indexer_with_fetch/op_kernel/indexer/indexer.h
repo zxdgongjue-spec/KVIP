@@ -709,7 +709,15 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
 #else
         info.isFirstS2InnerLoop = loop == 0;
 #endif
+#if KVIP_FIXED_SCORE_SHARDS
+        // A split can stop after the first 128 tokens of a 256-token K bank.
+        // Retire that bank before jumping to a different span. Q remains
+        // resident across both window boundaries and the hot-to-ABC jump.
+        info.isLastS2InnerLoop = tile + 1 == end;
+        info.retainQuery = !last;
+#else
         info.isLastS2InnerLoop = last && tile + 1 == end;
+#endif
 #if !V9_UBMEM
         info.reuseQuery = newQuery && tile == begin;
 #endif

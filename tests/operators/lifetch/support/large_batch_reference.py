@@ -23,9 +23,10 @@ def compute_reference(directory, identity, output):
         value = (old / name).read_text().strip()
         if not value or value != (new / name).read_text().strip():
             raise ValueError(f"Archived comparison differs in {name}")
-    if (old / "native.txt").read_text().strip() != COMPUTE_BASELINE:
-        raise ValueError("Expected the measured large-batch compute baseline")
-    base = dict(identity, native=COMPUTE_BASELINE)
+    baseline_revision = (old / "native.txt").read_text().strip()
+    if baseline_revision not in (COMPUTE_BASELINE, identity["native"]):
+        raise ValueError("Expected the verified compute baseline or the same measurement revision")
+    base = dict(identity, native=baseline_revision)
     for arm, workers in (("serial", 2), ("fused", 32)):
         path = directory / arm
         record = json.loads((path / "ARM_RESULT.json").read_text())

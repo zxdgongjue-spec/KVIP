@@ -48,7 +48,7 @@ class LargeBatchReplay(unittest.TestCase):
     def test_packed_and_single_event_gates_are_independent(self):
         cells = [dict(group=g, batch=b, serial_graph_us=100, fused_graph_us=80)
                  for g in PUBLISHED_EVENT_PER_CALL for b in FIXED_BATCHES]
-        packed = [dict(group=g, context_matched=True, new_packed_us=[110, 90], published_packed_us=[99, 101])
+        packed = [dict(group=g, context_matched=True, new_packed_us=[110, 90], reference_packed_us=[99, 101])
                   for g in PUBLISHED_EVENT_PER_CALL]
         self.assertEqual(combined_pass(cells, packed), (45, 5))
         cells[0]['fused_graph_us'] = 80.01

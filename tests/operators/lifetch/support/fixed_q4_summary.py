@@ -10,12 +10,12 @@ from large_batch_input import FIXED_BATCHES, GROUPS
 from reporting import atomic_json
 
 
-def read_arm(path, group, batch, arm):
+def read_arm(path, group, batch, arm, physical, host):
     data = json.loads((path / 'ARM_RESULT.json').read_text())
     identity = data['identity']
     calls = identity['calls']
     if (data['arm'] != arm or (identity['group'], identity['batch']) != (group, batch)
-            or calls != 10 or identity['physical_npu'] != 4 or len(data['samples']) != calls
+            or calls != 10 or identity['physical_npu'] != physical or identity['host'] != host or len(data['samples']) != calls
             or data['checked_queries'] != calls * batch * 4 or data['checked_rows'] != calls * batch
             or data['full_KV_Index_checked_rows'] != batch
             or (arm == 'fused' and data['ordered_Index_diagnostic_rows'] != batch)):
@@ -28,7 +28,7 @@ def read_arm(path, group, batch, arm):
     return data
 
 
-def summarize_cell(root, group, batch):
+def summarize_cell(root, group, batch, physical, host):
     pieces = []
     samples = {arm: [] for arm in ('serial', 'fused')}
     n = max(1, 16 // batch)
@@ -36,9 +36,9 @@ def summarize_cell(root, group, batch):
         case_dir = root / f'g{group}/bs{batch}'
         if n > 1:
             case_dir = case_dir / f'cohort{i}'
-        fused = read_arm(case_dir / 'fused', group, batch, 'fused')
+        fused = read_arm(case_dir / 'fused', group, batch, 'fused', physical, host)
         serial_dir = Path(fused['comparison_archive']) if 'comparison_archive' in fused else case_dir
-        serial = read_arm(serial_dir / 'serial', group, batch, 'serial')
+        serial = read_arm(serial_dir / 'serial', group, batch, 'serial', physical, host)
         fi, si = fused['identity'], serial['identity']
         if dict(si, native=fi['native']) != fi:
             raise ValueError(f"Different operands, hardware or timing protocol at {case_dir}")
@@ -59,7 +59,11 @@ def summarize_cell(root, group, batch):
 
 
 def report(root, groups, batches):
-    cells = [summarize_cell(root, group, batch) for group in groups for batch in batches]
+    physical = int((root / 'physical_npu.txt').read_text())
+    host = (root / 'host.txt').read_text().strip()
+    if physical not in (3, 4) or not host:
+        raise ValueError(f"Missing or unsupported matrix measurement identity at {root}")
+    cells = [summarize_cell(root, group, batch, physical, host) for group in groups for batch in batches]
     full = set(groups) == set(GROUPS) and set(batches) == set(FIXED_BATCHES)
     for cell in cells:
         cohort_pass = sum(v['passed'] for v in cell['cohorts'])
@@ -68,7 +72,7 @@ def report(root, groups, batches):
               f"saved_us={cell['graph_saved_us']:+.2f} gain_pct={cell['graph_gain_pct']:+.2f} "
               f"target20={'PASS' if cell['passed'] else 'MISS'} cohorts_at_target={cohort_pass}/{len(cell['cohorts'])}")
     passed = sum(c['passed'] for c in cells)
-    out = dict(protocol='one_restored_graph_per_device_event_with_profiler',
+    out = dict(protocol='one_restored_graph_per_device_event_with_profiler', physical_npu=physical, host=host,
                complete=full, passed=full and passed == len(cells), cells=cells)
     atomic_json(root / 'fixed_q4_summary.json', out)
     print(f"SINGLE_EVENT_TARGET cells_at_target={passed}/{len(cells)} full_matrix={int(full)} "

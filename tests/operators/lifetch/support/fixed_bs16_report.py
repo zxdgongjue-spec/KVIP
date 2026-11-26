@@ -54,9 +54,14 @@ def evaluate_packed(out, group, archive):
         return path.read_text().strip() if path.is_file() else ''
 
     revision = local_field('native')
-    matched = archive.is_dir() and same_local_device(archive, (local_field('host'), local_field('machine_id'),
-                                              Path('/proc/sys/kernel/random/boot_id').read_text().strip()))
-    comparable_archive = matched
+    card = local_field('physical_npu')
+    if card not in ('3', '4'):
+        raise ValueError(f'Unexpected physical NPU {card}')
+    live = card == '3'
+    comparable_archive = not live and archive.is_dir() and same_local_device(
+        archive, (local_field('host'), local_field('machine_id'),
+                  Path('/proc/sys/kernel/random/boot_id').read_text().strip()))
+    matched = live or comparable_archive
     if comparable_archive:
         if (local_field('kvaf') != (archive/'kvaf.txt').read_text().strip() or
                 local_field('kvaf_tree') != (archive/'kvaf_tree.txt').read_text().strip()):
@@ -64,33 +69,43 @@ def evaluate_packed(out, group, archive):
         if ((archive/'paced.txt').read_text().strip() != PACED or
                 (archive/'kvaf_tree.txt').read_text().strip() != '1de18e8315137d7a0227c3ae4c82afd45b5fe743'):
             raise ValueError(f'Unexpected PR30 build or SDK in {archive}')
-    actual, published = [], []
+    actual, reference = [], []
     for i in (1, 2):
         block = out/'pr30'/f'block{i}'
         owner = Path((block/f'g{group}/candidate/oracle.txt').read_text().strip())
         event, placement, controls, snapshot = packed_block(block, group, 'candidate', revision, owner, True)
         actual.append(event)
-        expected = PUBLISHED_EVENT_PER_CALL[group][i-1]
-        if comparable_archive:
-            from li_restore_archive import check_snapshot
-            from ranked_integration_sets import INPUT_AND_RESULTS
+        if live:
+            ref_owner = Path((block/f'g{group}/pr30_reference/oracle.txt').read_text().strip())
+            if ref_owner.resolve() != owner.resolve():
+                raise ValueError(f'G{group} block {i}: candidate and PR30 used different score oracles')
+            ref, old_placement, old_controls, prior_snapshot = packed_block(
+                block, group, 'pr30_reference', PACED, ref_owner, True)
+        elif comparable_archive:
             from main_five_report import case_folder
             previous = archive/f'block{i}'
             folder = case_folder(previous, group, 'paced')
             prior_owner = Path(read(folder/'score_topk_check.json')['native_reference']['archive_path'])
             ref, old_placement, old_controls, prior_snapshot = packed_block(previous, group, 'paced', PACED, prior_owner, False)
-            if not isclose(ref, expected, abs_tol=.006):
+            if not isclose(ref, PUBLISHED_EVENT_PER_CALL[group][i-1], abs_tol=.006):
                 raise ValueError(f'{archive}: G{group} block {i} differs from the published event')
+        if live or comparable_archive:
             if snapshot != prior_snapshot:
+                from li_restore_archive import check_snapshot
+                from ranked_integration_sets import INPUT_AND_RESULTS
                 check_snapshot(group, INPUT_AND_RESULTS[group][0], prior_snapshot, snapshot)
             if controls != old_controls or pair_placement(placement, old_placement, local_baseline=True) != 'matched':
                 matched = False
-            published.append(ref)
+            reference.append(ref)
         else:
-            published.append(expected)
-    diff = mean(published) - mean(actual)
-    return dict(group=group, new_packed_us=actual, published_packed_us=published, saved_us=diff,
-                context_matched=bool(matched), passed=bool(matched and diff >= 0))
+            reference.append(PUBLISHED_EVENT_PER_CALL[group][i-1])
+    diff = mean(reference) - mean(actual)
+    result = dict(group=group, physical_npu=int(card), reference_kind='same_card_live' if live else 'published_archive',
+                  new_packed_us=actual, reference_packed_us=reference, saved_us=diff,
+                  context_matched=bool(matched), passed=bool(matched and diff >= 0))
+    if not live:
+        result['published_packed_us'] = reference
+    return result
 
 
 def combined_pass(cells, packed):
@@ -106,7 +121,7 @@ def combined_pass(cells, packed):
         if not all(isfinite(v) and v > 0 for v in (baseline, fused)):
             raise ValueError('Invalid single-event graph time')
         serial += fused <= 0.8 * baseline
-    parity = sum(row['context_matched'] and mean(row['new_packed_us']) <= mean(row['published_packed_us'])
+    parity = sum(row['context_matched'] and mean(row['new_packed_us']) <= mean(row['reference_packed_us'])
                  for row in packed)
     return serial, parity
 
@@ -121,7 +136,8 @@ def main(out):
         row = evaluate_packed(out, group, archive)
         packed.append(row)
         print(f'PR30 G{group} BS16 packed_graph_mean_us={mean(row["new_packed_us"]):.2f} '
-              f'published_mean_us={mean(row["published_packed_us"]):.2f} saved_us={row["saved_us"]:+.2f} '
+              f'reference={row["reference_kind"]} NPU={row["physical_npu"]} '
+              f'reference_mean_us={mean(row["reference_packed_us"]):.2f} saved_us={row["saved_us"]:+.2f} '
               f'context={"matched" if row["context_matched"] else "unverified"} '
               f'gate={"PASS" if row["passed"] else "NOT_MET"}')
     serial, parity = combined_pass(summary['cells'], packed)

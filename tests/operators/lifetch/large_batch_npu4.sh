@@ -18,9 +18,7 @@ if (( $# )); then
     elif [[ $1 == --fixed-q4 && $# -le 2 ]]; then
         fixed=1
         if (( $# == 2 )); then
-            fixed_archive=$(cd "$2" && pwd)
-        elif [[ -d "$work/peer-baseline/largebs-q4.DcP0Xb" ]]; then
-            fixed_archive="$work/peer-baseline/largebs-q4.DcP0Xb"
+            fixed_archive=$2
         fi
         read -ra batches <<<"${FIXED_Q4_BATCHES:-1 2 4 8 16 20 24 28 32}"
         read -ra groups <<<"${FIXED_Q4_GROUPS:-10 4 17 7 2}"
@@ -40,6 +38,19 @@ if (( $# )); then
         exit 2
     fi
 fi
+peer_physical_npu=4
+if (( fixed )); then
+    peer_physical_npu=${PEER_PHYSICAL_NPU:-${ASCEND_RT_VISIBLE_DEVICES:-4}}
+    if [[ $peer_physical_npu != 3 && $peer_physical_npu != 4 ]] ||
+        [[ -n ${ASCEND_RT_VISIBLE_DEVICES:-} && $ASCEND_RT_VISIBLE_DEVICES != "$peer_physical_npu" ]]; then
+        echo "Select one matching physical card (3 or 4) for PEER_PHYSICAL_NPU and ASCEND_RT_VISIBLE_DEVICES" >&2
+        exit 2
+    fi
+elif [[ ${PEER_PHYSICAL_NPU:-4} == 3 || ${ASCEND_RT_VISIBLE_DEVICES:-4} == 3 ]]; then
+    echo "Use --fixed-q4 to run the matrix on physical NPU3" >&2
+    exit 2
+fi
+export PEER_PHYSICAL_NPU="$peer_physical_npu" ASCEND_RT_VISIBLE_DEVICES="$peer_physical_npu"
 area="$work/peer-baseline"
 sources="$work/fused-scan-sources"
 mkdir -p "$area" "$sources"
@@ -52,7 +63,7 @@ log="$out/run.log"
 exec 3>&1
 exec >"$log" 2>&1
 trap 'rc=$?; if ((rc)); then tail -25 "$log" >&3; printf "FAILED rc=%s LOG=%s\n" "$rc" "$log" >&3; fi' EXIT
-export PEER_LOCAL_ONLY=1 ASCEND_RT_VISIBLE_DEVICES=4 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+export PEER_LOCAL_ONLY=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export PATH="/usr/local/python3.12.13/bin:$PATH"
 unset PEER_RANKED_INPUT PEER_RANKED_HASH_FILE
 if [[ -r /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
@@ -75,11 +86,10 @@ git -C "$root" archive "$support_rev" tests/operators/lifetch/{peer_g2_input.sh,
 helpers="$host_tools/tests/operators/lifetch"
 source "$helpers/support/peer_node_prepare.sh"
 # Protect this run against a second invocation using the same physical card.
-exec 9>"$sources/largebs-$(</proc/sys/kernel/random/boot_id)-npu4.lock"
-flock -n 9 || { echo 'A large-batch replay is already running on NPU4'; exit 1; }
+exec 9>"$sources/largebs-$(</proc/sys/kernel/random/boot_id)-npu$peer_physical_npu.lock"
+flock -n 9 || { echo "A large-batch replay is already running on NPU$peer_physical_npu"; exit 1; }
 exec 8>"$sdk.lock"
 flock 8
-peer_physical_npu=4
 baseline="$work/adaptive-sources/peer-serial-da318bdb"
 clean="$area/KVAF-de4fd37e"
 peer_prepare_node "$root" "$baseline" "$clean" "$work" "$out"
@@ -120,12 +130,22 @@ export PYTHONPATH="$root/python:$sdk/build-npu/python:$lidu/torch_extension${PYT
 export KVAF_BATCH_GET_KERNEL="$sdk/build-npu/bin/kvaf_execute_batch_get_kernels.o"
 export KVAF_BATCH_PUT_KERNEL="$sdk/build-npu/bin/kvaf_execute_batch_put_kernels.o"
 cpu="$sdk/build-cpu/runtime/kvaf_cpu_service"
-export PEER_PHYSICAL_NPU=4
+if [[ $ASCEND_RT_VISIBLE_DEVICES != "$peer_physical_npu" || $PEER_PHYSICAL_NPU != "$peer_physical_npu" ]]; then
+    echo "Dependency setup changed the selected physical card" >&2
+    exit 1
+fi
 printf '%s\n' "$(git -C "$root" rev-parse HEAD)" > "$out/native.txt"
 if [[ -r /etc/machine-id ]]; then cat /etc/machine-id > "$out/machine_id.txt"; fi
-printf '4\n' > "$out/physical_npu.txt"
+printf '%s\n' "$peer_physical_npu" > "$out/physical_npu.txt"
+cat /proc/sys/kernel/random/boot_id > "$out/boot_id.txt"
 printf '%s\n' "$actual" > "$out/kvaf_tree.txt"
 git -C "$sdk" rev-parse HEAD > "$out/kvaf.txt"
+if (( fixed )); then
+    args=("$out")
+    if [[ -n $fixed_archive ]]; then args+=("$fixed_archive"); fi
+    fixed_archive=$("$PYTHON" -B "$workers/large_batch_placement.py" archive "${args[@]}")
+    printf 'CONFIG physical_NPU=%s logical_NPU=0 large_serial=%s\n' "$peer_physical_npu" "${fixed_archive:-fresh_same_card}" >&3
+fi
 # Use the same registered CPU memory placement for the serial and fused arms.
 placement="auto auto"
 if [[ -z $archive && -z $fixed_archive ]]; then
@@ -194,9 +214,9 @@ run_arm() (
     grep -Fq "LISTEN address=127.0.0.1 port=$port" "$dir/cpu.log" || { tail -20 "$dir/cpu.log"; exit 1; }
     "$PYTHON" -B "$helpers/support/peer_thp.py" --unified-sdk --pid "$server" --log "$dir/cpu.log" --output "$dir/thp.json" --timeout 7200 &
     monitor=$!
-    if [[ $arm == candidate ]]; then
+    if [[ $arm == candidate || $arm == pr30_reference ]]; then
         (cd "$dir" && timeout --kill-after=30s 7200s bash "$root/tests/operators/lifetch/fixed_bs16_pr30.sh" \
-            "$root" "$work" "$out" "$group" "$trace" "$sdk" "127.0.0.1:$port" "$dir") >"$dir/worker.log" 2>&1 || { tail -25 "$dir/worker.log"; exit 1; }
+            "$root" "$work" "$out" "$group" "$trace" "$sdk" "127.0.0.1:$port" "$dir" "$arm") >"$dir/worker.log" 2>&1 || { tail -25 "$dir/worker.log"; exit 1; }
         wait "$monitor"
         monitor=
         return
@@ -245,6 +265,10 @@ run_pair() {
         fi
     fi
     if [[ ! -d $pair/serial ]]; then run_arm "$group" "$batch" "$trace" serial "$pair" "$cohort"; fi
+    if (( fixed )) && [[ $planned_node == auto || $planned_adapter == auto ]]; then
+        read -r planned_node planned_adapter < <("$PYTHON" -B "$workers/large_batch_placement.py" get "$pair/serial/thp.json")
+        set_cpu_placement "$planned_node" "$planned_adapter" archived
+    fi
     run_arm "$group" "$batch" "$trace" fused "$pair" "$cohort"
     "$PYTHON" -B "$workers/large_batch_placement.py" compare "$pair/serial/thp.json" "$pair/fused/thp.json"
     for arm in serial fused; do
@@ -280,14 +304,23 @@ for group in "${groups[@]}"; do
                 mkdir -p "$d"
                 published=${PEER_PR30_PUBLISHED_ARCHIVE:-$work/peer-baseline/pr30-feature-live-main-ten.aYyvMS}
                 thp="$published/block$block/g$group/paced/thp.json"
-                if [[ -f $thp ]] && cmp -s "$published/host.txt" "$out/host.txt" &&
+                if [[ $peer_physical_npu == 4 && -f $thp ]] && cmp -s "$published/host.txt" "$out/host.txt" &&
                     cmp -s "$published/physical_npu.txt" "$out/physical_npu.txt" &&
                     cmp -s "$published/machine_id.txt" "$out/machine_id.txt"; then
                     read -r node adapter < <("$PYTHON" -B "$workers/large_batch_placement.py" get "$thp")
                     set_cpu_placement "$node" "$adapter" published
                 fi
-                echo "CASE_BEGIN G$group BS16 PR30_PROTOCOL block=$block" >&3
-                run_arm "$group" 16 "$trace" candidate "$d"
+                packed_arms=(candidate)
+                if [[ $peer_physical_npu == 3 ]]; then
+                    if (( block == 1 )); then packed_arms=(pr30_reference candidate); else packed_arms=(candidate pr30_reference); fi
+                fi
+                for packed_arm in "${packed_arms[@]}"; do
+                    echo "CASE_BEGIN G$group BS16 PR30_PROTOCOL block=$block arm=$packed_arm physical_NPU=$peer_physical_npu" >&3
+                    run_arm "$group" 16 "$trace" "$packed_arm" "$d"
+                done
+                if [[ $peer_physical_npu == 3 ]]; then
+                    "$PYTHON" -B "$workers/large_batch_placement.py" compare "$d/pr30_reference/thp.json" "$d/candidate/thp.json"
+                fi
                 set_cpu_placement "$planned_node" "$planned_adapter"
             done
         fi
