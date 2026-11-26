@@ -124,6 +124,7 @@ extern "C" uint32_t kvip_streaming_flag_count(){return pipeline_ab::kFlagCount;}
 extern "C" uint32_t aclrtlaunch_v9_parallel_terminal(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_large_hot(uint32_t,void*,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_large_threshold_cold(uint32_t,void*,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_large_middle_cold(uint32_t,void*,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_parallel_terminal_large(uint32_t,void*,void*);
 extern "C" uint32_t kvip_parallel_tail_supported(const rotating::RuntimeShape* shape) {
     if (shape && rotating::NativeLargeBatch(shape->batch, shape->aicCount))
@@ -145,5 +146,15 @@ extern "C" uint32_t kvip_parallel_tail_forward(void* bindings,void* terminal,
     if(!result)result=aclrtlaunch_v9_li_kernel_1(shape->liCores,stream,bindings);
     if(!result)result=aclrtlaunch_v9_li_kernel_2(shape->liCores,stream,bindings);
     if(!result)result=aclrtlaunch_v9_parallel_terminal(shape->batch*4,stream,terminal);
+    return result;
+}
+
+extern "C" uint32_t kvip_parallel_tail_middle_forward(void* bindings, void* terminal, void* stream,
+                                                       const rotating::RuntimeShape* shape) {
+    if (!bindings || !terminal || !stream || !kvip_parallel_tail_supported(shape) ||
+        !rotating::NativeLargeBatch(shape->batch, shape->aicCount) || shape->rounds != 5) return 100000;
+    uint32_t result = aclrtlaunch_v9_li_large_hot(shape->liCores, stream, bindings, terminal);
+    if (!result) result = aclrtlaunch_v9_li_large_middle_cold(shape->liCores, stream, bindings, terminal);
+    if (!result) result = aclrtlaunch_v9_parallel_terminal_large(64, stream, terminal);
     return result;
 }

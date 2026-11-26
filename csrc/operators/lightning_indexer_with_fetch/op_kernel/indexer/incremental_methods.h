@@ -94,6 +94,14 @@ __aicore__ inline void ExportWindowCold(uint32_t query, uint32_t cutoff = 0) {
         ctx->incremental,runtimeShape_.batch,runtimeShape_.history,b));
     uint64_t rankClocks[5];
     uint32_t bitmapLength=runtimeShape_.history, limit=ctx->windowLimit/4, minimum=limit/2, rankCut=UINT32_MAX;
+#if KVIP_LARGE_SPLIT_MIDDLE
+    // Header[3] is the nomination count written by this Q at the previous
+    // epoch. Its row's preceding post is complete before the header DMA.
+    const uint32_t early = rankedEpoch_ == 3 ?
+        uint32_t(incrementalMetadata_.GetValue(incrementalMetadataIndex_ * 16 + 3)) : 0;
+    limit = large_li::MiddleAllowance(limit, rankedEpoch_, early);
+    minimum = limit / 2;
+#endif
 #if KVIP_PARALLEL_TERMINAL
     if (rankedEpoch_==runtimeShape_.rounds) {
         // PackUncovered masks all IDs >= valid before consulting this row.

@@ -27,7 +27,9 @@ class LIFetchForward(StreamingLIFetchForward):
             self.terminal = TerminalLeaseBinding(rotating)
             self.terminal.attach_workspace(self)
             rotating.parallel_terminal = self.terminal
-            self.terminal_function = rotating.library.kvip_parallel_tail_forward
+            self.terminal_function = (rotating.library.kvip_parallel_tail_middle_forward
+                                      if getattr(rotating, "split_middle_window", False)
+                                      else rotating.library.kvip_parallel_tail_forward)
             self.terminal_function.argtypes = [ctypes.c_void_p] * 4
             self.terminal_function.restype = ctypes.c_uint32
 

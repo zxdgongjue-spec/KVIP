@@ -32,6 +32,7 @@ class LIFetchBinding:
         window_limit=None,
         li_tiling="auto",
         intermediate_fetches=32,
+        split_middle_window=False,
         aic_count=32,
         service_aics=0,
         final_workers=0,
@@ -106,6 +107,10 @@ class LIFetchBinding:
             if fn(self.shape_pointer) != expected:
                 raise ValueError(f"V9 binary contract mismatch: {name}")
         prefetch_limit, window_limit = prefetch_budget(prefetch_limit, window_limit, intermediate_fetches)
+        if split_middle_window and (batch not in LARGE_BATCHES or intermediate_fetches != 5 or
+                                    prefetch_limit != 1024 or window_limit != 256):
+            raise ValueError("Splitting the large-batch middle window requires 5 rounds and a 256/1024 budget")
+        self.split_middle_window = split_middle_window
         self.prefetch_limit = prefetch_limit
         geometry = li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)
         if geometry["logical_aic_tasks"] > aic_count or not geometry["intermediate_fetches"]:

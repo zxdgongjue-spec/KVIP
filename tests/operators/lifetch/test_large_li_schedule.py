@@ -49,6 +49,43 @@ int main() {
         }
         assert(helper<=budget && lowerHelper>=budget);
     }
+    // Every 128-token row length up to the padded 512K capacity, including
+    // empty and one-tile middle windows. A split must preserve both original
+    // checkpoints and the exact amount assigned to a shared helper.
+    for (uint32_t tiles = 0; tiles <= 4098; ++tiles) {
+        const uint32_t resident = 128, end = resident + tiles;
+        const auto left = large_li::Window(resident, end, 4, 1);
+        const auto middle = large_li::Window(resident, end, 4, 2);
+        const auto right = large_li::Window(resident, end, 4, 3);
+        const auto a = large_li::MiddleWindow(resident, end, 2);
+        const auto b = large_li::MiddleWindow(resident, end, 3);
+        assert(large_li::MiddleWindow(resident,end,1).begin == left.begin);
+        assert(large_li::MiddleWindow(resident,end,1).end == left.end && left.end == a.begin);
+        assert(a.begin == middle.begin && a.end == b.begin && b.end == middle.end);
+        assert(a.end - a.begin <= b.end - b.begin && b.end - b.begin <= a.end - a.begin + 1);
+        assert(large_li::MiddleWindow(resident,end,4).begin == b.end && b.end == right.begin);
+        assert(large_li::MiddleWindow(resident,end,4).end == end);
+        for (uint32_t rows : {0, 1, 2, 3, 7}) {
+            for (uint32_t quota : {0U, tiles / 7, tiles / 3, tiles / 2, tiles}) {
+                const auto early = large_li::MiddleSuffix(resident, tiles, quota, rows, 2);
+                const auto late = large_li::MiddleSuffix(resident, tiles, quota, rows, 3);
+                assert(early <= a.end - a.begin && late <= b.end - b.begin);
+                assert(early + late == large_li::LaterSuffix(middle,resident,tiles,quota,rows,2));
+                assert(large_li::MiddleSuffix(resident, tiles, quota, rows, 1) ==
+                       large_li::LaterSuffix(left,resident,tiles,quota,rows,1));
+                assert(large_li::MiddleSuffix(resident, tiles, quota, rows, 4) ==
+                       large_li::LaterSuffix(right,resident,tiles,quota,rows,3));
+            }
+        }
+    }
+    for (uint32_t quota : {64, 256}) {
+        assert(large_li::MiddleAllowance(quota, 2, 0) == quota / 2);
+        for (uint32_t early = 0; early <= quota / 2; ++early) {
+            assert(early + large_li::MiddleAllowance(quota, 3, early) == quota);
+            for (uint32_t epoch : {0, 1, 4})
+                assert(large_li::MiddleAllowance(quota, epoch, early) == quota);
+        }
+    }
     // 890 cold pages on a pair of owners plus their helper.
     const uint32_t expected[] = {98,117,117};
     for(uint32_t e=1;e<=3;++e) {
@@ -115,7 +152,7 @@ def test_cube_vector_flags_drain_between_rows(tmp_path):
     if not compiler:
         pytest.skip("C++ compiler required for mixed-core protocol")
     native = (Path(__file__).resolve().parents[3] / "csrc/operators/lightning_indexer_with_fetch"
-              / "op_kernel/indexer_large.cpp").read_text()
+              / "op_kernel/indexer/large_pipeline.h").read_text()
     finish = native.index("} // namespace QLIKernel")
     begin = native.rindex("template <class T>", 0, native.index("::ProcessLargeScore("))
     range_impl = native[begin:finish]

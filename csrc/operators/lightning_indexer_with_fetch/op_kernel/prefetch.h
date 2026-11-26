@@ -644,7 +644,14 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         const uint32_t lower=ctx->lruSlots?0:rt_resident;
         uint32_t candidateCount=0;
         uint32_t available=requests<ctx->prefetchLimit?ctx->prefetchLimit-requests:0;
+#if KVIP_LARGE_SPLIT_MIDDLE
+        const uint32_t early = epoch == 3 ?
+            state.GetValue(offsetof(Row, epochCount) / sizeof(uint32_t) + 2) : 0;
+        const uint32_t windowLimit = large_li::MiddleAllowance(ctx->windowLimit, epoch, early);
+        if (available > windowLimit) available = windowLimit;
+#else
         if(available>ctx->windowLimit)available=ctx->windowLimit;
+#endif
         V9_FETCH_PROFILE(scanBegin=GetSystemCycle();)
         // Counts occupy spare incremental metadata, exported alongside TopK.
         GlobalTensor<uint32_t> metadata,compact;

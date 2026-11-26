@@ -30,8 +30,13 @@ __aicore__ inline void AdvanceLargeWindowPair(uint32_t row, uint32_t epoch, uint
     rankedEpoch_ = epoch;
     rankTrace_ = trace;
     incrementalCalls_ = incrementalScanned_ = incrementalCandidates_ = 0;
+#if KVIP_LARGE_SPLIT_MIDDLE
+    // The owner passed its row's physical tile end after joining both producers.
+    const uint32_t end = ready;
+#else
     const uint32_t end = Min(ready, rotating::Trigger(runtimeShape_.history, runtimeShape_.resident,
                                                        runtimeShape_.rounds, epoch) * 128);
+#endif
     rankHalf_ = 0;
     rankReady_ = ready;
     for (uint32_t i = 0; i < 2; ++i) {

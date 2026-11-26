@@ -112,5 +112,31 @@ LARGE_LI_DEVICE constexpr Slice Window(uint32_t residentTile, uint32_t scanTile,
     return {residentTile + n * (epoch - 1) / (rounds - 1), residentTile + n * epoch / (rounds - 1)};
 }
 
+// Physical epochs 2 and 3 share the old middle window. Form their boundary
+// from the two original integer tile positions, including for ragged rows.
+LARGE_LI_DEVICE constexpr Slice MiddleWindow(uint32_t resident, uint32_t scan, uint32_t epoch) {
+    const uint32_t original = epoch <= 2 ? epoch : epoch - 1;
+    const Slice span = Window(resident, scan, 4, original);
+    const uint32_t mid = span.begin + (span.end - span.begin) / 2;
+    return epoch == 2 ? Slice{span.begin, mid} : epoch == 3 ? Slice{mid, span.end} : span;
+}
+
+LARGE_LI_DEVICE constexpr uint32_t MiddleSuffix(uint32_t resident, uint32_t total, uint32_t quota,
+                                                uint32_t rows, uint32_t epoch) {
+    const uint32_t original = epoch <= 2 ? epoch : epoch - 1;
+    const Slice span = Window(resident, resident + total, 4, original);
+    const uint32_t suffix = LaterSuffix(span, resident, total, quota, rows, original);
+    if (original != 2 || !suffix) return suffix;
+    const uint32_t length = span.end - span.begin;
+    const uint32_t early = uint32_t(uint64_t(length / 2) * suffix / length);
+    return epoch == 2 ? early : suffix - early;
+}
+
+// Use the same rule for a Q's nominations and a row's actual admissions.
+// Leftover budget at the new midpoint remains available until the old boundary.
+LARGE_LI_DEVICE constexpr uint32_t MiddleAllowance(uint32_t full, uint32_t epoch, uint32_t earlyUsed) {
+    return epoch == 2 ? full / 2 : epoch == 3 ? full - (earlyUsed < full ? earlyUsed : full) : full;
+}
+
 #undef LARGE_LI_DEVICE
 } // namespace large_li
