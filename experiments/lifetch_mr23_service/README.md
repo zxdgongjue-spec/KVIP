@@ -560,3 +560,31 @@ The overlap fields describe phase intervals and can include waits.
 `timing_eligible` specifies whether the per-request total Get workload
 is comparable. The pipeline row also reports the comparison against
 `cold_gm_fenced`.
+
+### BS16 Cold Score with native P2 window visibility
+
+This two-arm benchmark fixes BS16, Q4, history 131072, resident 16384,
+miss 10%, four windows, seed 43 and the original prefetch policy.
+
+```bash
+export KVIP_A5_DEVICE=0
+bash experiments/lifetch_mr23_service/run_mr28_cold_frontier.sh \
+    --warmup 2 --iterations 10
+```
+
+The benchmark first runs native P2 with visibility capture enabled. Each
+measured invocation records the two classified cursors actually observed
+by Service for every request, Q and window. The candidate builds the full
+raw Cold Score in GM and completes resident Top2048. In the original
+Cold T2 scan and Service order, each replayed window waits for classification
+through the saved frontier clipped to its own window cap. Ranking and next-Q
+preloading then use those recorded values. The candidate still selects
+candidates and submits Gets through the original Service.
+
+Both measured arms also retain the actual source tokens before Terminal
+retires them. `cold_frontier.json` records the evidence for each invocation.
+`strict_comparison.json` reports any difference in the device-applied
+frontiers, each request's per-window prefetch and final Get token
+multisets, or per-Q final Get counts. The script exits nonzero on a
+mismatch and preserves the raw KV-ready result in `summary.csv`.
+The graph Event includes the experiment's capture and replay overhead.

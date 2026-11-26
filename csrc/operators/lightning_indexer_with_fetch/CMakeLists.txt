@@ -58,6 +58,7 @@ ascendc_include_directories(parallel_terminal_kernel PRIVATE ${CMAKE_CURRENT_SOU
   ${KVAF_INCLUDE} ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
 ascendc_compile_options(parallel_terminal_kernel PRIVATE -DKVIP_PARALLEL_TERMINAL=1
   -DKVIP_STAGE_TRACE=$<BOOL:${KVIP_STAGE_TRACE}>
+  -DKVIP_WINDOW_FRONTIER=$<BOOL:${KVIP_HOT_SCORE_PARTITION}>
   -O2 -g --cce-auto-sync=off -mllvm -user-reserved-ub-size=223232
   -DV9_USER_UB_BYTES=223232 -DV9_BATCH_POST=2 -DSIM_Q=4 -DSIM_CAPTURE_HITS=1
   -DV9_SIMULATION=0 -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WORKER=1 -DROTATION_PUBLISH_TILES=1)

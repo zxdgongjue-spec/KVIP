@@ -1,5 +1,8 @@
 #include "stage_trace.h"
 #include "prefetch.h"
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+#include "window_frontier.h"
+#endif
 #if KVIP_STREAMING_LI
 #include "pipeline_types.h"
 #include "staged_topk_classify.h"

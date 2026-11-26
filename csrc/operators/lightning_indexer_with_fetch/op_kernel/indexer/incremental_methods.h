@@ -624,6 +624,35 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half,uint32_t lane)
     }
     uint32_t cap=half?rotating::SequenceWindowEnd(runtimeShape_.history,runtimeShape_.resident,half,epoch):
         rotating::Trigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,epoch)*128;
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    // The benchmark uses the native BS16 shape with one row per Service
+    // lane. Record the staged snapshot before TopK and next-Q preloading.
+    if (stagedMetadata && ownedQueries == kvip_window_frontier::kQueries) {
+        const auto mode = kvip_window_frontier::ActiveMode(streamingWorkspace_);
+        if (mode == kvip_window_frontier::Capture || mode == kvip_window_frontier::Replay) {
+            const auto table = kvip_window_frontier::Table(streamingWorkspace_);
+            const auto record = kvip_window_frontier::Row(table, runtimeShape_.batch, epoch, lane);
+            auto words = reinterpret_cast<__gm__ uint64_t*>(record);
+            if (mode == kvip_window_frontier::Replay) {
+                kvaf_device::CleanCacheLines(record, kvip_window_frontier::kRowBytes);
+            }
+            for (uint32_t q = 0; q < kvip_window_frontier::kQueries; ++q) {
+                const auto metadataIndex = q * 16 + 4;
+                if (mode == kvip_window_frontier::Capture) {
+                    words[q] = incrementalMetadata_.GetValue(metadataIndex);
+                } else {
+                    const auto saved = words[q];
+                    const auto observed = incrementalMetadata_.GetValue(metadataIndex);
+                    auto cursor = reinterpret_cast<__gm__ uint32_t*>(ctx->progress) + (lane * 4 + q) * 32;
+                    kvip_window_frontier::WaitClassified(cursor, observed, saved, cap);
+                    incrementalMetadata_.SetValue(metadataIndex, saved);
+                    words[kvip_window_frontier::kQueries + q] = incrementalMetadata_.GetValue(metadataIndex);
+                }
+            }
+            kvaf_device::CleanCacheLines(record, kvip_window_frontier::kRowBytes);
+        }
+    }
+#endif
 #if KVIP_SERVICE_UB_CANDIDATES
     // Fall back for a sparse/not-yet-ready row. The GM path can legitimately
     // retain a skipped Q's old count and IDs, which the private arena lacks.

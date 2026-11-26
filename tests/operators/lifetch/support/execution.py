@@ -3708,6 +3708,11 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
     checks = CorrectnessRecorder()
     handoff = getattr(config, 'mr25_handoff', None)
     handoff_samples, handoff_counts = [], []
+    frontier_mode = getattr(config, 'mr28_cold_frontier_mode', 0)
+    if frontier_mode:
+        import cold_frontier
+
+        frontier_invocations, frontier_issues = [], []
     pending = False
     def replay():
         nonlocal pending
@@ -3805,6 +3810,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                     initial = algorithm_before(state.rotating)
                     initial['logical_ids'] = state.input_layout.copy()
                     before.append(initial)
+                if frontier_mode:
+                    cold_frontier.prepare_capture(state, frontier_mode)
             stream.synchronize()
             folder = directory / 'diagnose' / f'round-{inputs.source_round}'
             progress(directory.parent, f'REPLAY profiled graph replay round {inputs.source_round}')
@@ -3824,10 +3831,18 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                     kernel_route=handoff if checked_kernels else None))
                 for index, state in enumerate(states):
                     rotating = state.rotating
-                    records = request_counts(rotating.rows.cpu().numpy(), rotating.final_posts.cpu().numpy(),
+                    rows = rotating.rows.cpu().numpy()
+                    records = request_counts(rows, rotating.final_posts.cpu().numpy(),
                                              rotating.rounds, config.prefetch_tokens)
                     handoff_counts.extend(dict(source_round=inputs.source_round, invocation=index, **record)
                                           for record in records)
+                    if frontier_mode:
+                        try:
+                            frontier_invocations.append(cold_frontier.read_invocation(
+                                state, frontier_mode, inputs.source_round, index, rows, records))
+                        except ValueError as error:
+                            frontier_issues.append(dict(source_round=inputs.source_round, invocation=index,
+                                                        reason=str(error)))
             rounds[inputs.source_round] = measured['timing']
             samples = []
             for i, item in enumerate(measured['samples']):
@@ -3937,6 +3952,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                           mean_us=sum(t['mean_us'] for t in rounds.values()), samples=1))
         if handoff:
             result.update(handoff_stage_samples=handoff_samples, pipeline_counts=handoff_counts)
+        if frontier_mode:
+            result['cold_frontier'] = dict(mode=frontier_mode, invocations=frontier_invocations, issues=frontier_issues)
         return result
     except BaseException as error:
         if pending:
@@ -3978,6 +3995,11 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     prefetch_trial = handoff in ('baseline', 'ub', 'batch') and hasattr(config, 'service_post_chunk')
     ub_candidates = getattr(config, 'service_ub_candidates', False)
     post_chunk = getattr(config, 'service_post_chunk', 0)
+    frontier_mode = getattr(config, 'mr28_cold_frontier_mode', 0)
+    if frontier_mode:
+        import cold_frontier
+
+        cold_frontier.check_config(config, sequence, handoff)
 
     baseline_trace = getattr(config, 'msprof_baseline', False)
     instruction_replay = getattr(config, 'msprof_instruction_replay', False)
@@ -4026,6 +4048,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             aics != 32 or device_resources['aiv'] < 64 or 'Ascend950' not in soc):
         raise ValueError(f"BS16 Service comparison targets A5 with 32 MIX groups, got {soc} "
                          f"with {aics} effective AICs and {device_resources['aiv']} AIVs")
+    if frontier_mode and device_resources['aiv'] != cold_frontier.GEOMETRY['aiv']:
+        raise ValueError('Cold frontier requires 64 available AIVs')
     if profile_replay:
         if aics != 32 or 'Ascend950' not in soc:
             raise ValueError(f'Baseline stage trace targets A5 with 32 effective AICs; got {soc}, AICs={aics}')
@@ -4100,6 +4124,13 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 shape = UbmemGeometry(g['batch'], g['history'], g['resident'], g['heads'], width,
                                       aics, config.intermediate_fetches, soc)
                 library = build_ubmem_library(cache_dir=build / 'lifetch_ubmem', cann=cann, shape=shape)
+            if frontier_mode:
+                with Path(library).open('rb') as binary:
+                    binary_sha = hashlib.file_digest(binary, 'sha256').hexdigest()
+                frontier_header = cold_frontier.header(config.mr28_cold_frontier_fixture_sha256, binary_sha,
+                                                       config.iterations)
+                frontier_tapes = (cold_frontier.load_tapes(config.mr28_cold_frontier_tape, frontier_header)
+                                  if frontier_mode == 2 else [None] * config.iterations)
             state = FusedReplayState(
                 torch, runtime, view, library, initial, pages, logical_addresses,
                 transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
@@ -4128,6 +4159,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 from terminal_handoff import bind_dedicated_service
 
                 bind_dedicated_service(state, dedicated_service)
+            if frontier_mode:
+                cold_frontier.attach(state, frontier_mode, frontier_tapes[0])
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
@@ -4245,7 +4278,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             replay_stage('first eager correctness PASS')
         if config.mode in ('bench', 'diagnose'):
             batch_states.append(state)
-            for _ in range(1, config.iterations):
+            for index in range(1, config.iterations):
                 if fused:
                     replica = FusedReplayState(
                         torch, runtime, view, library, initial, pages, logical_addresses,
@@ -4261,6 +4294,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                             raise RuntimeError('Unified Score partition changed between graph invocations')
                     if dedicated_service is not None:
                         bind_dedicated_service(replica, dedicated_service)
+                    if frontier_mode:
+                        cold_frontier.attach(replica, frontier_mode, frontier_tapes[index])
                 else:
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
                 batch_states.append(replica)
@@ -4278,8 +4313,9 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                                               score_parts=2, score_blocks=shape.liCores, windows=shape.rounds,
                                               service_lanes=shape.serviceLanes, terminal_tasks=4 * g['batch'])
                 if score_trial or prefetch_trial:
-                    with Path(library).open('rb') as binary:
-                        binary_sha = hashlib.file_digest(binary, 'sha256').hexdigest()
+                    if not frontier_mode:
+                        with Path(library).open('rb') as binary:
+                            binary_sha = hashlib.file_digest(binary, 'sha256').hexdigest()
                     result['handoff_route'].update(library_sha256=binary_sha, local_counts=partition_trial)
                 if prefetch_trial:
                     result['handoff_route'].update(service_ub_candidates=ub_candidates,
@@ -4310,6 +4346,10 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 if getattr(config, 'mr28_cold_gm_experiment', False):
                     result['handoff_route'].update(cold_score_writeback=dedicated_service != 'p2',
                                                    cold_gm_row_consumer=dedicated_service == 'cold_gm_pipeline')
+            if frontier_mode:
+                evidence = result.pop('cold_frontier')
+                result['handoff_route']['cold_frontier_mode'] = frontier_mode
+                atomic_json(directory / cold_frontier.FILE_NAME, dict(header=frontier_header, **evidence))
             atomic_json(directory / 'path_result.json', result)
             return result
         state.reset()
@@ -4416,6 +4456,8 @@ def run_synthetic_batch(config, directory, *, shared_pool=None):
         from terminal_handoff import fixture_hash
 
         fixture_sha256 = fixture_hash(fixture)
+        if getattr(config, 'mr28_cold_frontier_mode', 0):
+            config.mr28_cold_frontier_fixture_sha256 = fixture_sha256
     h, r, heads = config.history, config.resident, config.index_heads
     # The previous synthetic runner treats physical fixture rows as logical
     # tokens. Preserve that identity and the exact Q/Index/scale bit patterns.

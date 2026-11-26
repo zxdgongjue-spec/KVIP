@@ -3,6 +3,9 @@
 #if defined(__CCE_AICORE__)
 #include "shadow_exchange_parallel.h"
 #include "stage_trace.h"
+#if KVIP_WINDOW_FRONTIER
+#include "window_frontier.h"
+#endif
 using namespace pipeline_ab;
 // Reuse dead TopK scratch: the original hash checks and swap plans need 20.5 KiB.
 constexpr uint32_t TAIL_SRCSET=0, TAIL_DSTSET=2048, TAIL_PLAN_SRC=4096,
@@ -229,7 +232,12 @@ extern "C" __global__ __aicore__ void v9_parallel_terminal(GM_ADDR binding){
  // Include the actual prior-prefetch Index work, after all output readers join.
  uint32_t first=total*q/4,last=total*(q+1)/4,n=total<=rotating::kChangeCapacity?last-first:0;
  auto src=(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity)+first;auto dst=(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+uint64_t(b)*rotating::kChangeCapacity)+first;
- if(profile){
+ bool captureAssignments=profile;
+#if KVIP_WINDOW_FRONTIER
+ captureAssignments=captureAssignments ||
+  kvip_window_frontier::ActiveMode(reinterpret_cast<GM_ADDR>(a))!=kvip_window_frontier::Off;
+#endif
+ if(captureAssignments){
   Simt::VF_CALL<CaptureTerminalAssignments>(Simt::Dim3{512,1,1},src,dst,
    reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+uint64_t(b)*rotating::kChangeCapacity,
    reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+uint64_t(b)*rotating::kChangeCapacity,first,n);
