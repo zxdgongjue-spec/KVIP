@@ -6,13 +6,17 @@ root=$(cd "$(dirname "$0")/../../.." && pwd)
 work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold}
 reuse_serial=
 archive=
+four_window=
 if (( $# )); then
     if [[ $# == 2 && $1 == --candidate-only ]]; then
         archive=$(cd "$2" && pwd)
+    elif [[ $# == 3 && $1 == --split-middle ]]; then
+        archive=$(cd "$2" && pwd)
+        four_window=$(cd "$3" && pwd)
     elif [[ $# == 2 && $1 == --reuse-g10-bs20-serial ]]; then
         reuse_serial=$2
     else
-        echo "Usage: $0 [--candidate-only RESULT_ROOT | --reuse-g10-bs20-serial RESULT_ROOT]" >&2
+        echo "Usage: $0 [--split-middle SERIAL_ROOT FOUR_WINDOW_ROOT | --candidate-only RESULT_ROOT | --reuse-g10-bs20-serial RESULT_ROOT]" >&2
         exit 2
     fi
 fi
@@ -167,6 +171,9 @@ run_arm() (
     if [[ $arm == fused ]]; then
         if [[ -n $archive ]]; then
             args+=(--serial-result "$archive/g$group/bs$batch/serial" --compare-archived-pair)
+            if [[ -n $four_window ]]; then
+                args+=(--four-window-result "$four_window/g$group/bs$batch/fused")
+            fi
         else
             args+=(--serial-result "$pair/serial")
         fi
@@ -175,7 +182,12 @@ run_arm() (
     wait "$monitor"
     monitor=
 )
-for group in 10 4 17 7 2; do
+groups=(10 4 17 7 2)
+if [[ -n $four_window ]]; then
+    groups=(7 2 10 4 17)
+    echo "CONFIG archived_serial=$archive archived_four_window=$four_window measured=split_middle calls=10 prefetch_limit=1024" >&3
+fi
+for group in "${groups[@]}"; do
     trace=$(bash "$helpers/peer_g2_input.sh" "$work" "$group")
     for batch in 20 24 28 32; do
         pair="$out/g$group/bs$batch"
@@ -183,11 +195,12 @@ for group in 10 4 17 7 2; do
         echo "CASE_BEGIN G$group BS$batch" >&3
         if [[ -n $archive ]]; then
             ref="$archive/g$group/bs$batch"
-            "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref/serial/thp.json" "$ref/fused/thp.json"
-            read -r node adapter < <("$PYTHON" -B "$workers/large_batch_placement.py" get "$ref/fused/thp.json")
+            fused_ref="${four_window:-$archive}/g$group/bs$batch/fused"
+            "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref/serial/thp.json" "$fused_ref/thp.json"
+            read -r node adapter < <("$PYTHON" -B "$workers/large_batch_placement.py" get "$fused_ref/thp.json")
             set_cpu_placement "$node" "$adapter" archived
             run_arm "$group" "$batch" "$trace" fused "$pair"
-            "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref/fused/thp.json" "$pair/fused/thp.json"
+            "$PYTHON" -B "$workers/large_batch_placement.py" compare "$fused_ref/thp.json" "$pair/fused/thp.json"
             grep -E '^(CHECK|TIMING|TRAFFIC|DIAGNOSTIC|SAVED) ' "$pair/fused/worker.log" | tee -a "$out/summary.txt" >&3
             rm -f -- "$pair/fused/worker.log" "$pair/fused/cpu.log"
             continue

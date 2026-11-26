@@ -43,7 +43,7 @@ def check_scores(inputs, selected, serial):
     return exact
 
 
-def large_account(events, scope, elapsed, *, fused=True):
+def large_account(events, scope, elapsed, *, fused=True, split_middle=False):
     """Recognize CANN device names and task types in one restored graph."""
     from decimal import Decimal
 
@@ -52,8 +52,9 @@ def large_account(events, scope, elapsed, *, fused=True):
         raise ValueError(f"Expected one profiler scope {scope}, found {len(spans)}")
     base = Decimal(str(spans[0]["ts"]))
     duration = float(spans[0]["dur"])
+    cold_kernel = "v9_li_large_middle_cold" if split_middle else "v9_li_large_threshold_cold"
     names = (
-        {"LI1": ("v9_li_large_hot",), "LI23": ("v9_li_large_threshold_cold",), "tail": ("v9_parallel_terminal_large",)}
+        {"LI1": ("v9_li_large_hot",), "LI23": (cold_kernel,), "tail": ("v9_parallel_terminal_large",)}
         if fused
         else {
             "li": ("quantlightningindexer",),
@@ -334,15 +335,15 @@ def li_intervals(words, batch, mhz):
     return dict(clock_mhz=mhz, spans=details, per_query_cycle_stamps=stamps.tolist())
 
 
-def last_row_windows(events, li):
+def last_row_windows(events, li, rounds=4):
     """Partition the last row owner's LI3 interval, using stamps from the same diagnostic replay."""
     stamps = np.asarray(li["per_query_cycle_stamps"], dtype=np.int64)
     batch = len(stamps)
     words = np.asarray(events, dtype=np.uint64)
     # The first two uint64s are service entry/exit. The pad holds rank entry/join.
-    if words.size != 4 * batch * 16 or stamps.shape != (batch, 4, 4):
+    if words.size != rounds * batch * 16 or stamps.shape != (batch, 4, 4):
         return {"available": False, "reason": "window_record_shape"}
-    events = words.reshape(4, batch, 16)
+    events = words.reshape(rounds, batch, 16)
     row = int(stamps[:, 0, 3].argmax())
     start, finish = map(int, stamps[row, 0, 2:4])
     windows = events[:, row]
@@ -498,7 +499,8 @@ def measured_replays(ex, proofs, serial, torch, states, sequence, config, direct
         data = json.loads(trace.read_text())
         events = data["traceEvents"] if isinstance(data, dict) else data
         for scope, event_us in zip(scopes, elapsed):
-            account = large_account(events, scope, event_us, fused=fused)
+            account = large_account(events, scope, event_us, fused=fused,
+                                    split_middle=getattr(config, "split_middle_window", False))
             measurements.append(stage_sample(account, fused))
         if fused:
             mhz = state.forward.calibrate_counter_mhz()
@@ -529,7 +531,16 @@ def measured_replays(ex, proofs, serial, torch, states, sequence, config, direct
             proofs["separate_LI_diagnostic"] = li_intervals(state.forward.times.cpu().numpy(), state.batch, mhz)
             # Keep the existing instrumented replay's raw per-request records.
             # The two arrays use different device ABIs and are timed only once.
-            proofs["separate_window_event_u64"] = state.rotating.events.cpu().numpy().view("<u8").tolist()
+            events = state.rotating.events.cpu().numpy().view("<u8")
+            proofs["separate_window_event_u64"] = events.tolist()
+            if getattr(config, "split_middle_window", False):
+                from large_batch_window_use import window_use
+
+                proofs["window_use"] = window_use(
+                    events, state.forward.events_src.cpu().numpy(),
+                    state.workspace.topk.cpu().numpy().reshape(state.batch, 4, 2048),
+                    state.rotating.rows[:, 9].cpu().numpy(), mhz,
+                )
             stamps = terminal.times.cpu().numpy()
             proofs["separate_terminal_query_stamps"] = stamps.tolist()
             proofs["separate_terminal_teams"] = tail_team_intervals(stamps, mhz)
@@ -617,7 +628,7 @@ def run(args):
     if fused:
         base = identity
         if args.compare_archived_pair:
-            base, previous = compute_reference(args.serial_result.parent, identity, args.output)
+            base, previous = compute_reference(args.serial_result.parent, identity, args.output, args.four_window_result)
         expected, reference = reference_identity(args.serial_result, base, repo)
         old = json.loads((args.serial_result / "ARM_RESULT.json").read_text())
         path = args.serial_result / "selected.npy"
@@ -658,7 +669,8 @@ def run(args):
             "--prefetch-tokens",
             "1024",
             "--intermediate-fetches",
-            "4",
+            "5" if args.four_window_result else "4",
+            *(["--split-middle-window"] if args.four_window_result else []),
             "--warmup",
             str(WARMUP),
             "--iterations",
@@ -709,9 +721,13 @@ def run(args):
         ]
         if previous is not None:
             summary["last_row_LI3_windows"] = last_row_windows(
-                proofs["separate_window_event_u64"], proofs["separate_LI_diagnostic"]
+                proofs["separate_window_event_u64"], proofs["separate_LI_diagnostic"],
+                rounds=cfg.intermediate_fetches,
             )
-            summary["comparison_archive"] = str(args.serial_result.parent)
+            summary["comparison_archive"] = str(args.four_window_result or args.serial_result.parent)
+            if args.four_window_result:
+                summary["serial_archive"] = str(args.serial_result)
+                summary["window_policy"] = "split_middle_window"
             old_times = previous["mean_p50_us"]
             summary["vs_previous_fused_saved_mean_p50_us"] = {
                 k: [a - b for a, b in zip(old_times[k], times[k])] for k in ("graph", "LI1", "LI23", "LI", "tail")
@@ -749,6 +765,23 @@ def run(args):
         )
     )
     print(f"TIMING {tag}", *(f"{k}_mean/P50_us={times[k][0]:.2f}/{times[k][1]:.2f}" for k in ("graph", "LI", "tail")))
+    if args.four_window_result:
+        for name, control in (("strong_serial", old), ("four_window", previous)):
+            print(f"TIMING {tag} archived_{name}",
+                  *(f"{k}_mean/P50_us={control['mean_p50_us'][k][0]:.2f}/{control['mean_p50_us'][k][1]:.2f}"
+                    for k in ("graph", "LI", "tail")))
+        four_events = np.asarray(previous["separate_window_event_u64"], dtype=np.uint64).reshape(4, args.batch, 16)
+        if not np.all((four_events[:, :, 2] >> 32) == np.arange(4)[:, None]) or not np.all(
+            (four_events[:, :, 3] & 0xffffffff) == 1
+        ):
+            raise ValueError("Incomplete archived four-window diagnostic epochs")
+        posted = four_events[:, :, 10].sum(axis=1).tolist()
+        use = proofs["window_use"]
+        lead = use["useful_mid_lead_to_next_ready_us"]
+        print(f"DIAGNOSTIC {tag} separate_calls=1 archived_four_posted_tokens={posted}",
+              f"five_posted_tokens={use['posted_by_epoch']} five_used_by_final_topk_tokens={use['useful_by_epoch']}",
+              f"mid_last_post_to_two_thirds_ready_us={lead:.2f}" if lead is not None
+              else "mid_last_post_to_two_thirds_ready_us=NA")
     if previous is not None:
         print(
             f"TIMING {tag} graph_boundaries",
@@ -800,7 +833,7 @@ def run(args):
         )
         if previous is not None:
             print(
-                f"SAVED {tag} vs_previous_fused",
+                f"SAVED {tag} vs_four_window" if args.four_window_result else f"SAVED {tag} vs_previous_fused",
                 *(
                     f"{k}_mean/P50_us={a:+.2f}/{b:+.2f}"
                     for k, (a, b) in summary["vs_previous_fused_saved_mean_p50_us"].items()
@@ -822,7 +855,12 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--serial-result", type=Path)
     parser.add_argument("--compare-archived-pair", action="store_true")
+    parser.add_argument("--four-window-result", type=Path,
+                        help="measure five windows using this separate four-window fused archive")
     parser.add_argument(
         "--keep-trace", action="store_true", help="Keep the raw profiler timeline after successful attribution"
     )
-    run(parser.parse_args())
+    args = parser.parse_args()
+    if args.four_window_result and not (args.arm == "fused" and args.compare_archived_pair and args.serial_result):
+        parser.error("--four-window-result requires a fused candidate and its archived serial control")
+    run(args)

@@ -135,6 +135,8 @@ def configuration(argv=None):
             command.add_argument('--prefetch-rank-start', type=int, default=1024,
                                  help='URMA initial admission rank (1..2048); progresses to 2048 by per-Q coverage')
             command.add_argument('--intermediate-fetches', type=int, default=8)
+            command.add_argument('--split-middle-window', action='store_true',
+                                 help='large real Q4 replay: split the middle cold interval, sharing its quota')
             command.add_argument('--warmup', type=int, default=4, help='whole-graph warmup repetitions')
             command.add_argument('--iterations', type=int, default=20, help='independent complete invocations captured in one measured graph')
         if mode == 'diagnose':
@@ -185,9 +187,12 @@ def configuration(argv=None):
             parser.error('prefetch-rank-start must be in 1..2048')
         if args.transport != 'urma' and args.prefetch_rank_start != 1024:
             parser.error('prefetch-rank-start requires the URMA ranked prefetch path')
+        if args.split_middle_window and (args.input != 'real' or args.transport != 'urma'
+                                         or args.prefetch_tokens != 1024 or args.intermediate_fetches != 5):
+            parser.error('split-middle-window requires real URMA, five windows and a 1024-token limit')
         if (args.warmup < 0 or args.iterations <= 0 or not 1 <= args.intermediate_fetches <= 32
                 or not 0 <= args.prefetch_tokens <= 2048
-                or args.prefetch_tokens % args.intermediate_fetches):
+                or (not args.split_middle_window and args.prefetch_tokens % args.intermediate_fetches)):
             parser.error('invalid timing or prefetch configuration')
     if args.mode == 'diagnose':
         if 'all' in args.stages and len(args.stages) != 1:

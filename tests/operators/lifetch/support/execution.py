@@ -3275,7 +3275,8 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None):
+                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None,
+                 split_middle_window=False):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3327,6 +3328,7 @@ class FusedReplayState:
                     torch, library, self.workspace.arguments(self.storage), owner,
                     batch=self.batch, history=self.history, resident=self.resident,
                     intermediate_fetches=windows, prefetch_limit=prefetch_tokens,
+                    **(dict(split_middle_window=True, window_limit=256) if split_middle_window else {}),
                     prefetch_rank_start=prefetch_rank_start,
                     aic_count=aics, token_bytes=self.token_bytes, **binding)
             update_type = UbmemIndexUpdate if ubmem else DirectIndexUpdate
@@ -4017,7 +4019,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 torch, runtime, view, library, initial, pages, logical_addresses,
                 transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
-                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024))
+                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024),
+                split_middle_window=getattr(config, "split_middle_window", False))
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
@@ -4063,7 +4066,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         torch, runtime, view, library, initial, pages, logical_addresses,
                         transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
-                        prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease)
+                        prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease,
+                        split_middle_window=getattr(config, 'split_middle_window', False))
                     replica.failure_directory = directory
                 else:
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)

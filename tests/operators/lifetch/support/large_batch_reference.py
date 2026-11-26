@@ -17,17 +17,28 @@ G10_BS20_SHA = "80b7b26e7bb7a663025c4c4f99a41c5ac4f58ce50b1a438c79154e240f0a6035
 COMPUTE_BASELINE = "d2d9d482759ca852decf2ef2899b0604a4afcdb7"
 
 
-def compute_reference(directory, identity, output):
-    old, new = directory.parents[1], output.parents[2]
+FOUR_WINDOW_REV = "d8c302883f5df58c6442dedbf224ff3c7dc03d03"
+
+
+def check_archive_root(old, new, revision):
     for name in ("host.txt", "machine_id.txt", "physical_npu.txt"):
         value = (old / name).read_text().strip()
         if not value or value != (new / name).read_text().strip():
             raise ValueError(f"Archived comparison differs in {name}")
-    if (old / "native.txt").read_text().strip() != COMPUTE_BASELINE:
-        raise ValueError("Expected the measured large-batch compute baseline")
+    if (old / "native.txt").read_text().strip() != revision:
+        raise ValueError(f"Expected archived native commit {revision} at {old}")
+
+
+def compute_reference(directory, identity, output, four_window=None):
+    new = output.parents[2]
+    check_archive_root(directory.parents[1], new, COMPUTE_BASELINE)
+    fused_path = directory / "fused" if four_window is None else four_window
+    fused_revision = COMPUTE_BASELINE if four_window is None else FOUR_WINDOW_REV
+    if four_window is not None:
+        check_archive_root(four_window.parents[2], new, fused_revision)
     base = dict(identity, native=COMPUTE_BASELINE)
     for arm, workers in (("serial", 2), ("fused", 32)):
-        path = directory / arm
+        path = directory / arm if arm == "serial" else fused_path
         record = json.loads((path / "ARM_RESULT.json").read_text())
         proof = json.loads((path / "path/path_result.json").read_text())
         if (
@@ -48,7 +59,7 @@ def compute_reference(directory, identity, output):
             v = [s[key] for s in record["samples"]]
             if any(not math.isfinite(t) or t <= 0 for t in v) or [mean(v), median(v)] != record["mean_p50_us"][key]:
                 raise ValueError(f"Archived {arm} {key} timing disagrees with samples")
-        if arm == "fused" and record["identity"] != base:
+        if arm == "fused" and record["identity"] != dict(identity, native=fused_revision):
             raise ValueError("Previous fused input, runtime or protocol differs")
     if len(record["traffic"]) != identity["calls"]:
         raise ValueError("Incomplete previous fused traffic measurements")

@@ -122,6 +122,20 @@ def test_large_archive_uses_same_input_host_and_raw_timings(tmp_path):
     base, fused = ref.compute_reference(pair, identity, output)
     assert base == baseline and fused["mean_p50_us"]["graph"] == [4, 4]
     assert len(fused["traffic"]) == 10
+    # The compute-optimized control contains only its own fused arms.
+    four = tmp_path / "four"
+    four_fused = four / "g2/bs32/fused"
+    (four_fused / "path").mkdir(parents=True)
+    for filename in ("host.txt", "machine_id.txt", "physical_npu.txt"):
+        (four / filename).write_bytes((old / filename).read_bytes())
+    (four / "native.txt").write_text(ref.FOUR_WINDOW_REV)
+    prior = dict(fused, identity=dict(identity, native=ref.FOUR_WINDOW_REV))
+    (four_fused / "ARM_RESULT.json").write_text(json.dumps(prior))
+    (four_fused / "path/path_result.json").write_bytes((pair / "fused/path/path_result.json").read_bytes())
+    assert ref.compute_reference(pair, identity, output, four_fused) == (baseline, prior)
+    (four / "native.txt").write_text(ref.COMPUTE_BASELINE)
+    with pytest.raises(ValueError, match="native commit"):
+        ref.compute_reference(pair, identity, output, four_fused)
     with pytest.raises(ValueError, match="input"):
         ref.compute_reference(pair, dict(identity, sequence_sha256="changed"), output)
     (new / "machine_id.txt").write_text("other")

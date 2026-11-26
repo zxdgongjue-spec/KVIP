@@ -43,6 +43,17 @@ def fixture():
 
 
 class LargeBatchReplay(unittest.TestCase):
+    def test_split_middle_rounds_and_shared_quota_are_opt_in(self):
+        from workloads import configuration
+
+        args = ["diagnose", "--transport", "urma", "--input", "real", "--trace-root", "/tmp",
+                "--group", "7", "--round-range", "1:1", "--prefetch-tokens", "1024", "--intermediate-fetches", "5"]
+        self.assertTrue(configuration([*args, "--split-middle-window"]).split_middle_window)
+        with self.assertRaises(SystemExit):
+            configuration(args)
+        with self.assertRaises(SystemExit):
+            configuration([*args[:-1], "4", "--split-middle-window"])
+
     def test_last_row_window_clock_partition(self):
         stamps = np.zeros((20, 4, 4), dtype=np.uint64)
         stamps[:, :, 2:] = (100, 200)
@@ -99,6 +110,11 @@ class LargeBatchReplay(unittest.TestCase):
         ]:
             events.append(dict(name=name, ph="X", cat="kernel", ts=a, dur=d))
         got = stage_sample(large_account(events, "measured", 25), True)
+        five = [dict(event, name=event["name"].replace("large_threshold_cold", "large_middle_cold"))
+                for event in events]
+        self.assertEqual(stage_sample(large_account(five, "measured", 25, split_middle=True), True), got)
+        with self.assertRaisesRegex(ValueError, "Unattributed device task"):
+            large_account(events, "measured", 25, split_middle=True)
         self.assertEqual(
             (got["graph"], got["LI"], got["tail"], got["span"], got["inter_kernel_gap"]), (25, 13, 5, 23, 5)
         )
