@@ -67,7 +67,7 @@ def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False, exp
     if expected_li23 is not None:
         if not fused or batch not in (20, 24, 28, 32):
             raise ValueError("An experimental cold kernel requires a large fused batch")
-        if expected_li23 == "v9_li_large_bs32_split_role" and batch != 32:
+        if expected_li23 in ("v9_li_large_bs32_split_role", "v9_li_large_bs32_shared_final") and batch != 32:
             raise ValueError("Split-role requires BS32")
         names["LI23"] = (expected_li23,)
     if batch == 16 and fused:
@@ -731,7 +731,7 @@ def run(args):
     if policy and (not args.packed_ten or not args.compare_packed_candidate or not fused
                    or args.batch not in (20, 24, 28, 32)):
         raise ValueError(f"{policy} requires a fresh packed BS20/24/28/32 fused candidate")
-    if policy == "split-role":
+    if policy in ("split-role", "shared-final"):
         # Frozen 128K inputs carry Q4 lookahead in 256-aligned physical storage.
         # For all five captures each row ends on the same 128-token score tile.
         if (args.batch != 32 or inputs.geometry["history"] != 131328
@@ -942,7 +942,7 @@ if __name__ == "__main__":
     windows = parser.add_mutually_exclusive_group()
     windows.add_argument("--large-two-cold", dest="large_window_policy", action="store_const", const="two-cold",
                          help="Measure the isolated three-window large-batch cold kernel")
-    windows.add_argument("--large-window-policy", choices=("two-cold", "split-role"),
+    windows.add_argument("--large-window-policy", choices=("two-cold", "split-role", "shared-final"),
                          help="Measure the selected large-batch cold kernel in the packed candidate")
     parser.add_argument("--window-density", action="store_true", help="Collect post timestamps in one separate large-BS call")
     parser.add_argument("--compare-packed-candidate", action="store_true", help="Use the original strong serial selection for a modified fusion kernel")

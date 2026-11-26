@@ -91,6 +91,15 @@ class PackedAttribution(unittest.TestCase):
             with self.subTest(batch=batch), self.assertRaisesRegex(ValueError, "requires BS32"):
                 packed_account(events, "scope", 1000, fused=True, batch=batch, expected_li23=symbol)
 
+    def test_new_shared_final_cannot_be_attributed_as_an_older_cold_kernel(self):
+        symbol = "v9_li_large_bs32_shared_final"
+        events = fixture(["v9_li_large_hot", symbol, "v9_parallel_terminal_large"])
+        self.assertEqual(packed_account(events, "scope", 1000, batch=32, fused=True, expected_li23=symbol)["calls"], 10)
+        with self.assertRaisesRegex(ValueError, "Unattributed"):
+            packed_account(events, "scope", 1000, batch=32, fused=True, expected_li23="v9_li_large_bs32_split_role")
+        with self.assertRaisesRegex(ValueError, "requires BS32"):
+            packed_account(events, "scope", 1000, batch=24, fused=True, expected_li23=symbol)
+
     def test_stage_p50_uses_the_ten_observed_spans(self):
         events = fixture(["v9_li_large_hot", "v9_li_large_threshold_cold", "v9_parallel_terminal_large"])
         tails = [e for e in events if e["name"].startswith("v9_parallel_terminal")]
@@ -116,3 +125,30 @@ class PackedAttribution(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_shared_final_timing_image_cannot_be_used_for_trace():
+    import ctypes
+    from types import SimpleNamespace
+
+    import pytest
+    from large_two_cold import attach
+
+    entry = ctypes.CFUNCTYPE(ctypes.c_uint32)(lambda: 0)
+    regular = SimpleNamespace(aclrtlaunch_v9_li_large_hot=entry, aclrtlaunch_v9_parallel_terminal_large=entry)
+    class Forward:
+        terminal = object()
+        diagnostics_enabled = False
+
+    state = SimpleNamespace(rotating=SimpleNamespace(library=regular), forward=Forward())
+    for trace in (False, True):
+        def launch(*args):
+            return len(args)
+        launch.window_policy = "shared-final"
+        launch.trace_only = trace
+        attach(state, launch)
+        state.forward.diagnostics_enabled = trace
+        assert state.forward.terminal_function(1, 2, 3, 4) == 6
+        state.forward.diagnostics_enabled = not trace
+        with pytest.raises(ValueError, match="diagnostic flag"):
+            state.forward.terminal_function(1, 2, 3, 4)

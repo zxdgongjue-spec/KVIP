@@ -15,7 +15,7 @@ if [[ $large_cold_windows != 2 && $large_cold_windows != 3 ]]; then
     echo "PEER_LARGE_COLD_WINDOWS must be 2 or 3" >&2; exit 2
 fi
 bs32_li=${PEER_BS32_LI:-}
-if [[ -n $bs32_li && $bs32_li != split-role ]]; then
+if [[ -n $bs32_li && $bs32_li != split-role && $bs32_li != shared-final ]]; then
     echo "Unknown PEER_BS32_LI=$bs32_li" >&2; exit 2
 fi
 batches=(20 24 28 32)
@@ -195,7 +195,7 @@ if [[ -n $packed_archive ]]; then
         echo "WINDOW_SCHEDULE BS$large_batches first=256 cold=384,384 row_limit=1024" >&3
     fi
     if [[ -n $bs32_li ]]; then
-        echo 'WINDOW_SCHEDULE BS32 policy=split-role first=256 cold=256,256,256 row_limit=1024' >&3
+        echo "WINDOW_SCHEDULE BS32 policy=$bs32_li first=256 cold=256,256,256 row_limit=1024" >&3
     fi
     echo "CONFIG packed_calls=10 blocks=2 groups=${groups[*]} batches=${batches[*]} physical_NPU=$peer_physical_npu archive=$packed_archive" >&3
 elif (( fixed )); then
@@ -286,8 +286,8 @@ run_arm() (
         args+=(--packed-ten --serial-result "$packed_oracle")
         if (( packed_candidate )); then args+=(--compare-packed-candidate); fi
         if (( packed_candidate && batch == 32 )) && [[ ${pair##*/} == block1 ]]; then args+=(--window-density); fi
-        if (( packed_candidate && batch == 32 )) && [[ $bs32_li == split-role ]]; then
-            args+=(--large-window-policy split-role)
+        if (( packed_candidate && batch == 32 )) && [[ -n $bs32_li ]]; then
+            args+=(--large-window-policy "$bs32_li")
         elif (( packed_candidate && batch > 16 && large_cold_windows == 2 )); then
             args+=(--large-two-cold)
         fi
@@ -374,12 +374,15 @@ run_packed_cohort() {
             [[ -s $result/packed_result.json ]]
             if (( packed_candidate && batch == 32 && block == 1 )); then
                 grep ' WINDOW_DIAG ' "$result/worker.log" | tee -a "$out/summary.txt" >&3
-                if [[ $bs32_li == split-role ]]; then
+                if [[ -n $bs32_li ]]; then
                     grep ' SPLIT_ROLE_DIAG ' "$result/worker.log" | tee -a "$out/summary.txt" >&3
+                    if [[ $bs32_li == shared-final ]]; then
+                        grep ' FINAL_PAIR_DIAG ' "$result/worker.log" | tee -a "$out/summary.txt" >&3
+                    fi
                 fi
             fi
             if (( packed_candidate && batch > 16 && large_cold_windows == 2 )) ||
-                { (( packed_candidate && batch == 32 )) && [[ $bs32_li == split-role ]]; }; then
+                { (( packed_candidate && batch == 32 )) && [[ -n $bs32_li ]]; }; then
                 grep '^WINDOWS ' "$result/worker.log" | tee -a "$out/summary.txt" >&3
             fi
             "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref" "$result/thp.json"

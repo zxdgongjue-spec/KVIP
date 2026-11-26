@@ -96,3 +96,30 @@ def test_split_role_scores_can_cross_two_earlier_windows():
     # Score segment 3 runs through window 1 and 2, separated by a ready wait.
     a = split_role_intervals(early, events, li)["rows"][0]
     assert a["score_service_overlap_matrix_us"][2] == [0., .5, 6., 0.]
+
+
+def test_shared_final_rank_clocks_match_the_post_owner():
+    from copy import deepcopy
+    from window_density import split_role_intervals
+
+    clocks = [0] * 64
+    clocks[:8] = [10, 40, 42, 62, 63, 106, 115, 128]
+    intervals = [(8, 8, 30), (31, 41, 52), (53, 64, 78), (79, 108, 143)]
+    events = []
+    for epoch, (wait, ready, end) in enumerate(intervals):
+        clocks[16 + 3 * epoch:19 + 3 * epoch] = [wait, ready, end]
+        events.append([event(epoch, ready + 1, ready + 2, end - 1, 0)])
+    clocks[28:31] = [114, 125, 132]
+    events[-1][0][0] = 133
+    events[-1][0][13:15] = [114, 132]
+    li = dict(clock_mhz=1., per_query_cycle_stamps=[[[1, 3, 7, 149]] * 4])
+    rank = split_role_intervals(clocks, events, li, shared_final=True)["rows"][0]["shared_final"]
+    assert (rank["v0_rank_us"], rank["v1_rank_us"], rank["rank_overlap_us"], rank["v1_join_us"]) == (13, 11, 10, 7)
+    incomplete = clocks.copy()
+    incomplete[7] = 0
+    with pytest.raises(ValueError, match="Invalid shared final"):
+        split_role_intervals(incomplete, events, li, shared_final=True)
+    wrong_writer = deepcopy(events)
+    wrong_writer[3][0][13] = clocks[6]
+    with pytest.raises(ValueError, match="Invalid shared final"):
+        split_role_intervals(clocks, wrong_writer, li, shared_final=True)

@@ -5,13 +5,16 @@ import hashlib
 from pathlib import Path
 import subprocess
 import tempfile
+import weakref
 
 from kvip.runtime.build import build_failure
 from kvip.runtime.build import kvaf_build_paths
 
 
-WINDOW_GRANTS = {"two-cold": (256, 384, 384), "split-role": (256, 256, 256, 256)}
-COLD_SYMBOL = {"two-cold": "v9_li_large_two_cold", "split-role": "v9_li_large_bs32_split_role"}
+SPLIT_ROLE_POLICIES = ("split-role", "shared-final")
+WINDOW_GRANTS = {"two-cold": (256, 384, 384), **{p: (256, 256, 256, 256) for p in SPLIT_ROLE_POLICIES}}
+COLD_SYMBOL = {"two-cold": "v9_li_large_two_cold", "split-role": "v9_li_large_bs32_split_role",
+               "shared-final": "v9_li_large_bs32_shared_final"}
 
 
 def build(experiment_source, normal_library, sdk_build, soc, policy="two-cold", *, trace_sibling=False):
@@ -21,14 +24,15 @@ def build(experiment_source, normal_library, sdk_build, soc, policy="two-cold", 
     # The normal build ID covers CANN, compiler, KVAF and all included operator sources.
     digest = hashlib.sha256()
     digest.update(f"{policy}:{soc}:trace_sibling={int(trace_sibling)}".encode())
-    if policy == "split-role":
+    if policy in SPLIT_ROLE_POLICIES:
         source = (experiment_source.resolve().parents[4] / "csrc/operators/lightning_indexer_with_fetch"
                   / "op_kernel/indexer_large_dualrole.cpp")
         if not source.is_file():
             raise FileNotFoundError(f"Missing split-role device implementation: {source}")
         # The isolated TU also consumes the regular Cube, vector and score scheduling code.
         for path in (source, source.with_name("indexer_large.cpp"), source.parent / "indexer/indexer_cube.h",
-                     source.parent / "indexer/indexer_vector.h", source.parent / "indexer/large_bs_split_owner.h"):
+                     source.parent / "indexer/indexer_vector.h", source.parent / "indexer/large_bs_split_owner.h",
+                     source.parent / "indexer/large_window_pair.h"):
             digest.update(path.name.encode())
             digest.update(path.read_bytes())
     for source in sorted(experiment_source.iterdir()):
@@ -47,7 +51,8 @@ def build(experiment_source, normal_library, sdk_build, soc, policy="two-cold", 
             with tempfile.TemporaryDirectory(dir=folder, prefix="compile-") as tmp, log.open("w") as output:
                 configure = ["cmake", "-S", str(experiment_source), "-B", tmp,
                              f"-DSOC_VERSION={soc}", f"-DASCEND_CANN_PACKAGE_PATH={cann}",
-                             f"-DKVIP_EXPERIMENT_SPLIT_ROLE={'ON' if policy == 'split-role' else 'OFF'}",
+                             f"-DKVIP_EXPERIMENT_SPLIT_ROLE={'ON' if policy in SPLIT_ROLE_POLICIES else 'OFF'}",
+                             f"-DKVIP_BS32_SHARE_FINAL={'ON' if policy == 'shared-final' else 'OFF'}",
                              f"-DTRACE_SIBLING={'ON' if trace_sibling else 'OFF'}",
                              f"-DKVAF_INCLUDE={headers}"]
                 compile_kernel = ["cmake", "--build", tmp, "--target", "two_cold_bridge", "--parallel", "2"]
@@ -58,10 +63,11 @@ def build(experiment_source, normal_library, sdk_build, soc, policy="two-cold", 
                         raise build_failure(log, f"large-batch {policy} kernel", result.returncode)
                 (Path(tmp) / library.name).replace(library)
     experimental = ctypes.CDLL(str(library))
-    launch = (experimental.kvip_test_bs32_split_role_forward if policy == "split-role"
+    launch = (experimental.kvip_test_bs32_split_role_forward if policy in SPLIT_ROLE_POLICIES
               else experimental.kvip_test_two_cold_forward)
     launch.argtypes = [ctypes.c_void_p] * 6
     launch.restype = ctypes.c_uint32
+    launch.trace_only = trace_sibling
     launch.window_policy = policy
     launch.window_limit = max(WINDOW_GRANTS[policy])
     launch.source_fingerprint = f"{normal_library.parent.name}/{build_id}"
@@ -74,5 +80,12 @@ def attach(state, launch):
         raise ValueError("Large-batch window experiment requires the four-Q private terminal path")
     hot = ctypes.cast(regular.aclrtlaunch_v9_li_large_hot, ctypes.c_void_p)
     tail = ctypes.cast(regular.aclrtlaunch_v9_parallel_terminal_large, ctypes.c_void_p)
-    state.forward.terminal_function = lambda a, b, stream, shape: launch(a, b, stream, shape, hot, tail)
+    owner = weakref.ref(state.forward)
+
+    def forward(a, b, stream, shape):
+        if launch.window_policy == "shared-final" and owner().diagnostics_enabled != launch.trace_only:
+            raise ValueError("Select the dedicated shared-final cold image matching the diagnostic flag")
+        return launch(a, b, stream, shape, hot, tail)
+
+    state.forward.terminal_function = forward
     state.large_window_launch = launch

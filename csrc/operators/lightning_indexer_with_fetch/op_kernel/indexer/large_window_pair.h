@@ -4,6 +4,8 @@
 __aicore__ inline void AdvanceLargeWindowPair(uint32_t row, uint32_t epoch, uint32_t ready
 #if KVIP_TEST_SIBLING_TRACE
                                               , uint64_t scoreBegin, uint64_t scoreEnd
+#elif KVIP_BS32_SHARE_FINAL && KVIP_TEST_SPLIT_ROLE_TRACE
+                                              , uint64_t* rankBegin
 #endif
 ) {
     auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
@@ -12,7 +14,12 @@ __aicore__ inline void AdvanceLargeWindowPair(uint32_t row, uint32_t epoch, uint
     auto previous = events + (epoch - 1) * runtimeShape_.serviceLanes + row;
     const bool trace = streamingWorkspace_ &&
         (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U);
+#if KVIP_BS32_SHARE_FINAL && KVIP_TEST_SPLIT_ROLE_TRACE
+    // The replay uses this separate image for all shared-final diagnostics.
+    if (trace && first) {  // V1 owns the public timestamps and Post.
+#else
     if (trace && !first) {
+#endif
         events[epoch * runtimeShape_.serviceLanes + row].waitBegin = GetSystemCycle();
     }
 #if KVIP_TEST_SIBLING_TRACE
@@ -23,6 +30,9 @@ __aicore__ inline void AdvanceLargeWindowPair(uint32_t row, uint32_t epoch, uint
     } while (!reinterpret_cast<__gm__ volatile rotating::Event*>(previous)->complete);
 
     const uint64_t begin = trace ? GetSystemCycle() : 0;
+#if KVIP_BS32_SHARE_FINAL && KVIP_TEST_SPLIT_ROLE_TRACE
+    *rankBegin = begin;
+#endif
 #if KVIP_TEST_SIBLING_TRACE
     if (trace) {
         // Two cold epochs, two separate cache lines. Store only after all
@@ -76,7 +86,11 @@ __aicore__ inline void AdvanceLargeWindowPair(uint32_t row, uint32_t epoch, uint
     WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
     incrementalMetadataActive_ = false;
     exportWindowCold_ = false;
+#if KVIP_BS32_SHARE_FINAL && KVIP_TEST_SPLIT_ROLE_TRACE
+    if (trace && first) {
+#else
     if (trace && !first) {
+#endif
         auto stamp = reinterpret_cast<__gm__ uint64_t*>(events[epoch * runtimeShape_.serviceLanes + row].pad);
         stamp[2] = begin;
     }

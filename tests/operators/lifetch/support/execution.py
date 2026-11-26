@@ -4027,12 +4027,12 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             if config.transport == 'urma':
                 (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers, soc=soc)
                 if large_window_policy:
-                    from large_two_cold import build as build_window, WINDOW_GRANTS
+                    from large_two_cold import build as build_window, WINDOW_GRANTS, SPLIT_ROLE_POLICIES
                     grants = WINDOW_GRANTS[large_window_policy]
                     if (g['batch'] not in (20, 24, 28, 32) or aics != 32 or
                             config.intermediate_fetches != len(grants) or config.prefetch_tokens != sum(grants)):
                         raise ValueError(f"Incompatible shape or budget for {large_window_policy}")
-                    if large_window_policy == "split-role" and (
+                    if large_window_policy in SPLIT_ROLE_POLICIES and (
                         g['batch'] != 32 or g['history'] != 131328 or g['resident'] != 16384 or
                         g['heads'] != 32 or width != 656):
                         raise ValueError("Split-role requires BS32/Q4/32 heads, 128K history and 16K hot slots")
@@ -4382,6 +4382,10 @@ class StreamingForward(LIFetchForward):
 
     def set_deferred_fetch(self, enabled):
         self.set_options(deferred_fetch=enabled)
+
+    def set_options(self, *, diagnostics=False, deferred_fetch=False):
+        super().set_options(diagnostics=diagnostics, deferred_fetch=deferred_fetch)
+        self.diagnostics_enabled = diagnostics
 
     def set_diagnostics(self, enabled):
         self.set_options(diagnostics=enabled)

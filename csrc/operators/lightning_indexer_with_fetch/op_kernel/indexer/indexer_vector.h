@@ -195,6 +195,9 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query, uint32_t scanHis
             streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U));
 #endif
     }
+#if KVIP_BS32_SHARE_FINAL
+    bool usePeerRankLayout_ = false;
+#endif
     __aicore__ inline void LoadSequenceSplitThresholds(uint32_t batch) {
         constexpr uint32_t count = SIM_Q * 2048;
         constexpr uint32_t rowBytes = count * 6 + SIM_Q * 256;
@@ -521,7 +524,11 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe, bool topkOnly)
     streamingTopkOnly_ = topkOnly;
 #endif
 #if KVIP_BS32_SCORE_WINDOW_ROLES
-    if (!topkOnly && !(blockId_ % 2)) {
+    if (!topkOnly && !(blockId_ % 2)
+#if KVIP_BS32_SHARE_FINAL
+        && !usePeerRankLayout_
+#endif
+    ) {
         // V0 holds both Q pairs, while V1 owns the workspace for ranking and posting.
         pipe->InitBuffer(resMm1Buf_, 2 * constInfo_.mBaseSize * s2BaseSize_ * sizeof(QK_T));
         resMm1UB_ = resMm1Buf_.Get<QK_T>();

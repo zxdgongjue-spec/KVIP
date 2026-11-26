@@ -27,7 +27,11 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan) {
                 }
             }
 #if KVIP_TEST_SPLIT_ROLE_TRACE
+#if KVIP_BS32_SHARE_FINAL
+            uint64_t serviceClocks[15]{};  // Last three: V1 rank start/end and both-pairs joined.
+#else
             uint64_t serviceClocks[12]{};
+#endif
 #endif
             for (uint32_t epoch = 0; epoch < input.shape.rounds; ++epoch) {
                 const uint32_t end = epoch ? large_li::Window(plan.start, plan.end, input.shape.rounds, epoch).end : plan.start;
@@ -42,7 +46,38 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan) {
 #endif
                 PublishProgress(input, plan.row, 0, 4, end);
                 op.vectorService.AllocEventID();
+#if KVIP_BS32_SHARE_FINAL
+                if (epoch && epoch + 1 == input.shape.rounds) {
+                    op.vectorService.AdvanceLargeWindowPair(plan.row, epoch, end * 128
+#if KVIP_TEST_SPLIT_ROLE_TRACE
+                                                            , &serviceClocks[12]
+#endif
+                    );
+#if KVIP_TEST_SPLIT_ROLE_TRACE
+                    serviceClocks[13] = GetSystemCycle();
+#endif
+                    input.Wait(plan.row, 6, epoch);
+#if KVIP_TEST_SPLIT_ROLE_TRACE
+                    serviceClocks[14] = GetSystemCycle();
+                    if (input.Trace()) {
+                        auto event = reinterpret_cast<__gm__ rotating::Event*>(input.ctx->events) +
+                                     epoch * input.shape.serviceLanes + plan.row;
+                        auto stamp = reinterpret_cast<__gm__ uint64_t*>(event->pad);
+                        auto peer = input.Line(plan.row, 6);
+                        stamp[3] = serviceClocks[14];
+                        stamp[4] = uint64_t(op.vectorService.incrementalCalls_ + peer[1]) |
+                                   (uint64_t(op.vectorService.incrementalScanned_ + peer[2]) << 16) |
+                                   (uint64_t(op.vectorService.incrementalCandidates_ + peer[3]) << 40);
+                        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event), 128);
+                    }
+#endif
+                    op.vectorService.PostWindow(epoch, 0);
+                } else {
+                    op.vectorService.RotateFetch(epoch, 0);
+                }
+#else
                 op.vectorService.RotateFetch(epoch, 0);
+#endif
                 op.vectorService.FreeEventID();
 #if KVIP_TEST_SPLIT_ROLE_TRACE
                 serviceClocks[3 * epoch + 2] = GetSystemCycle();
@@ -86,7 +121,11 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan) {
         }
     }
 #if KVIP_TEST_SPLIT_ROLE_TRACE
+#if KVIP_BS32_SHARE_FINAL
+    uint64_t scoreClocks[8]{};  // Last two: V0 ranks Q0/Q1 after the preceding window commits.
+#else
     uint64_t scoreClocks[6]{};
+#endif
 #endif
     bool loaded = false;
     for (uint32_t epoch = 1; epoch < input.shape.rounds; ++epoch) {
@@ -103,6 +142,39 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan) {
             scoreClocks[2 * (epoch - 1) + 1] = GetSystemCycle();
 #endif
             input.Signal(plan.row, 5, epoch);
+#if KVIP_BS32_SHARE_FINAL
+            if (epoch + 1 == input.shape.rounds) {
+                // The last score DMA and Cube credits are already joined. Give V0
+                // the ordinary ranking workspace before reading the previous winners.
+                pipe.Destroy();
+                TPipe rankPipe;
+                Indexer rankOp;
+                rankOp.vectorService.usePeerRankLayout_ = true;
+                input.Init(rankOp, rankPipe, plan.row, false);
+                rankOp.vectorService.AllocEventID();
+                rankOp.vectorService.AdvanceLargeWindowPair(plan.row, epoch, span.end * 128
+#if KVIP_TEST_SPLIT_ROLE_TRACE
+                                                            , &scoreClocks[6]
+#endif
+                );
+                rankOp.vectorService.FreeEventID();
+#if KVIP_TEST_SPLIT_ROLE_TRACE
+                scoreClocks[7] = GetSystemCycle();
+                if (input.Trace()) {
+                    auto line = input.Line(plan.row, 6);
+                    line[1] = rankOp.vectorService.incrementalCalls_;
+                    line[2] = rankOp.vectorService.incrementalScanned_;
+                    line[3] = rankOp.vectorService.incrementalCandidates_;
+                    SaveSplitRoleClocks(input, plan.row, 0, scoreClocks);
+                }
+#endif
+                // The same-stream hot kernel resets this cache line on every call.
+                // The previous GET CQ state is independent of this ranking handoff.
+                input.Signal(plan.row, 6, epoch);
+                rankPipe.Destroy();
+                return;
+            }
+#endif
         }
     }
 #if KVIP_TEST_SPLIT_ROLE_TRACE

@@ -115,7 +115,7 @@ def measure_packed(ex, proofs, serial, torch, states, sequence, config, director
         stream.synchronize()
         sibling_checks = score_spans = None
         trace_args = getattr(state, "large_window_build_args", None)
-        split_trace = launch is not None and launch.window_policy == "split-role"
+        split_trace = launch is not None and launch.window_policy in ("split-role", "shared-final")
         if split_trace and not trace_args:
             raise ValueError("Split-role diagnostics require their dedicated trace kernel")
         original_launch = state.forward.terminal_function
@@ -159,7 +159,7 @@ def measure_packed(ex, proofs, serial, torch, states, sequence, config, director
                             sibling_checks=sibling_checks, score_spans=score_spans)
         if split_trace:
             from window_density import split_role_intervals
-            density["split_role"] = split_role_intervals(clocks, events, li)
+            density["split_role"] = split_role_intervals(clocks, events, li, shared_final=launch.window_policy == "shared-final")
         if sum(e["posted_tokens"] for e in density["epochs"]) != traffic["prefetch"]:
             raise ValueError("Doorbells disagree with the independent row GET counters")
         proofs["window_density"] = density
@@ -204,6 +204,12 @@ def save_packed(args, identity, inputs, proofs, workers, scratch_existed):
             roles = density["split_role"]
             row = roles["rows"][roles["last_li3_row"]]
             fmt = lambda values: "/".join(f"{v:.2f}" for v in values)
+            if "shared_final" in row:
+                final = row["shared_final"]
+                print(f"G{args.group} BS{args.batch} FINAL_PAIR_DIAG last_LI3_row={row['row']} "
+                      f"V0_V1_final_rank_us={final['v0_rank_us']:.2f}/{final['v1_rank_us']:.2f} "
+                      f"rank_overlap_us={final['rank_overlap_us']:.2f} "
+                      f"V1_wait_after_own_rank_us={final['v1_join_us']:.2f}")
             print(f"G{args.group} BS{args.batch} SPLIT_ROLE_DIAG last_LI3_row={roles['last_li3_row']} "
                   f"last_window_row={roles['last_window_row']} score3_us={fmt(row['score_us'])} "
                   f"wait_ready3_us={fmt(row['wait_ready_us'])} "

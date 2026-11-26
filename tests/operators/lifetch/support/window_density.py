@@ -133,7 +133,7 @@ def summarize(events, li, token_bytes, *, winners=None, sources=None, sibling_ch
     return result
 
 
-def split_role_intervals(clocks, events, li):
+def split_role_intervals(clocks, events, li, *, shared_final=False):
     """Trace only. Pair each row's three V0 score spans with all four V1 service spans."""
     from math import isfinite
 
@@ -180,6 +180,18 @@ def split_role_intervals(clocks, events, li):
                             score_service_overlap_matrix_us=overlaps,
                             score_overlapped_by_service_us=[sum(matches) for matches in overlaps],
                             post_window_to_li3_end_us=(li_end - service[-1][2]) / mhz))
+        if shared_final:
+            v0_start, v0_end = map(int, clocks[row * 64 + 6:row * 64 + 8])
+            v1_start, v1_end, joined = map(int, clocks[offset + 12:offset + 15])
+            event = events[3][row]
+            if not (max(score[-1][1], events[2][row][1]) <= v0_start < v0_end <= joined
+                    and service[-1][1] <= v1_start < v1_end <= joined <= event[0]
+                    and int(event[13]) == v1_start and int(event[14]) == joined):
+                raise ValueError(f"Invalid shared final ranking clocks at row {row}")
+            per_row[-1]["shared_final"] = dict(v0_rank_us=(v0_end - v0_start) / mhz,
+                v1_rank_us=(v1_end - v1_start) / mhz, v1_join_us=(joined - v1_end) / mhz,
+                rank_overlap_us=max(0, min(v0_end, v1_end) - max(v0_start, v1_start)) / mhz,
+                v0_rank_cycles=[v0_start, v0_end], v1_rank_cycles=[v1_start, v1_end], joined_cycle=joined)
     # Resolve coincident last finishes to the lowest row ID and record how many tied.
     last_li3, last_window = max(li_ends), max(window_ends)
     return dict(clock_mhz=mhz, rows=per_row, last_li3_row=li_ends.index(last_li3),

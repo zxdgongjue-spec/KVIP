@@ -1,6 +1,14 @@
 // Isolated device entry. The regular hot and terminal launches keep their original images.
 #define KVIP_BS32_SCORE_WINDOW_ROLES 1
+#if KVIP_BS32_SHARE_FINAL
 #if KVIP_TEST_SPLIT_ROLE_TRACE
+#define QLIKernel QLIKernelBS32SharedFinalTrace
+#define v9_li_large_bs32_split_role v9_li_large_bs32_shared_final_trace
+#else
+#define QLIKernel QLIKernelBS32SplitRole
+#define v9_li_large_bs32_split_role v9_li_large_bs32_shared_final
+#endif
+#elif KVIP_TEST_SPLIT_ROLE_TRACE
 #define QLIKernel QLIKernelBS32SplitRoleTrace
 #define v9_li_large_bs32_split_role v9_li_large_bs32_split_role_trace
 #else
