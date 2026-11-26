@@ -106,7 +106,7 @@ For another A5 SKU, pass its concrete CANN target with `--soc`; `Ascend950` alon
 is not a valid target for this CANN build API. The NPU test discovers the device
 SoC through ACL unless `--soc` is specified.
 
-The build pins KVAF `main` at `813f1750a50b7e6c92d5f5397f2fbc05befef6da`.
+The build pins KVAF `main` at `87e261ae4d07d4868cfdbb306d15f3f137edfc3d`.
 KVIP applies its unified Runtime LIFetch patches and the UBmem device headers
 when selected. Preparation can reuse an already patched checkout.
 `--prepare-only` prepares the dependency without replacing the active build selection;

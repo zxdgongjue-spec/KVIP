@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-REVISION = "813f1750a50b7e6c92d5f5397f2fbc05befef6da"
+REVISION = "87e261ae4d07d4868cfdbb306d15f3f137edfc3d"
 
 
 def call(command, cwd=None, env=None):
@@ -56,7 +56,6 @@ def prepare_dependency(root, transport):
     if head != REVISION:
         raise RuntimeError(f"Expected KVAF main revision {REVISION}, found {head}")
     patches = [
-        (ROOT / "scripts/patches/kvaf-aiv-direct-get-capacity.patch", ()),
         (ROOT / "scripts/patches/kvaf-main-fused-device.patch", ()),
     ]
     lease_fix = ROOT / "scripts/patches/kvaf-prepared-get-lease.patch"
@@ -85,6 +84,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kvaf-root", type=Path, help="existing checkout; otherwise download to third_party/KVAF")
     parser.add_argument("--prepare-only", action="store_true", help="prepare pinned source, without CANN builds")
+    parser.add_argument("--with-aicpu", action="store_true", help="build and install KVAF AICPU backends")
     parser.add_argument("--skip-kvaf-build", action="store_true", help="use an already rebuilt KVAF")
     parser.add_argument("--skip-lidu-build", action="store_true", help="reuse existing LIDU vendor/Python libraries")
     parser.add_argument("--cann", type=Path, default=Path("/usr/local/Ascend/cann"))
@@ -123,7 +123,7 @@ def main():
                     target,
                     "--jobs",
                     args.jobs,
-                    *(["--without-aicpu"] if target == "npu" else []),
+                    *(["--without-aicpu"] if target == "npu" and not args.with_aicpu else []),
                 ],
                 cwd=dependency,
                 env=env,
