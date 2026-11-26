@@ -740,3 +740,35 @@ union. The exact per-Q miss varies with Q overlap. The raw ratio includes
 prefetch redistribution and differences in total Get. The matched-count
 ratio requires equal early and final request counts for every request and
 invocation.
+
+### BS1 and BS2 Cold Score rerun
+
+On A5, run the paired timing and msprof experiment from the same checkout.
+
+```bash
+export KVIP_A5_DEVICE=0
+bash experiments/lifetch_mr23_service/run_small_batch_cold_a5.sh
+```
+
+The script runs two independent graph timing rounds (one warmup and five
+invocations per graph), followed by one checked msprof replay per arm. Each
+mode builds once and prints its own output directory. The timings use
+`summary.csv`; open each `miss10/bs{1,2}/{p2,cold}/lifetch_msprof_trace.json` and
+`lifetch_business_trace.json` in the trace output directory for attribution.
+Add `--dry-run` to print both plans.
+
+Both arms keep each batch's native window geometry and original prefetch.
+BS1 uses W2 and moves from 2 to 4 Cold MIX groups. BS2 uses W4, two Service
+AIV per window, and moves from 4 to 8 Cold MIX groups. The fixture is Q4,
+history 131072, resident 16384, miss 10%, with a total prefetch budget of 512
+and a per-window cap of 128. Compare each P4 row with its same-batch P2
+row in the same round, including the per-request Get count comparison.
+
+Pass the trace run's `miss10` directory to the offline analyzer.
+
+```bash
+python3 -B experiments/lifetch_mr23_service/analyze_small_batch_trace.py \
+  "$TRACE_OUTPUT/miss10" --format csv
+```
+
+Set `TRACE_OUTPUT` to the second `Run output` directory printed by the script.
