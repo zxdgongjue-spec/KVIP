@@ -23,8 +23,8 @@ def test_midpoint_reports_unique_wanted_prefetch_excluding_terminal_reads():
     report = window_use(records, src, winners, [4, 1], 2)
     assert report["posted_by_epoch"] == [0, 1, 3, 1, 0]
     assert report["useful_by_epoch"] == [0, 1, 3, 0, 0]
-    assert report["useful_mid_lead_to_next_ready_us"] == pytest.approx((20 * 2 + 60) / 3 / 2)
-    assert window_use(records, src, winners + 10000, [4, 1], 2)["useful_mid_lead_to_next_ready_us"] is None
+    assert report["useful_mid_post_to_owner_next_window_us"] == pytest.approx((20 * 2 + 60) / 3 / 2)
+    assert window_use(records, src, winners + 10000, [4, 1], 2)["useful_mid_post_to_owner_next_window_us"] is None
 
     with pytest.raises(ValueError, match="prefix"):
         window_use(records, src, winners, [5, 1], 2)

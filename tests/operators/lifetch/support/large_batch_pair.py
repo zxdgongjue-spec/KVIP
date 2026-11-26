@@ -536,10 +536,16 @@ def measured_replays(ex, proofs, serial, torch, states, sequence, config, direct
             if getattr(config, "split_middle_window", False):
                 from large_batch_window_use import window_use
 
+                # Row words 9 and 16..20 hold total and per-window admissions.
+                # Cross-check these business counters with the diagnostic doorbell journal.
+                admissions = state.rotating.rows[:, 9:21].cpu().numpy()
+                window_posts = events.reshape(5, state.batch, 16)[:, :, 10].T
+                if not np.array_equal(window_posts, admissions[:, 7:12]):
+                    raise ValueError("Per-window diagnostic and request admission counts disagree")
                 proofs["window_use"] = window_use(
                     events, state.forward.events_src.cpu().numpy(),
                     state.workspace.topk.cpu().numpy().reshape(state.batch, 4, 2048),
-                    state.rotating.rows[:, 9].cpu().numpy(), mhz,
+                    admissions[:, 0], mhz,
                 )
             stamps = terminal.times.cpu().numpy()
             proofs["separate_terminal_query_stamps"] = stamps.tolist()
@@ -777,11 +783,11 @@ def run(args):
             raise ValueError("Incomplete archived four-window diagnostic epochs")
         posted = four_events[:, :, 10].sum(axis=1).tolist()
         use = proofs["window_use"]
-        lead = use["useful_mid_lead_to_next_ready_us"]
+        lead = use["useful_mid_post_to_owner_next_window_us"]
         print(f"DIAGNOSTIC {tag} separate_calls=1 archived_four_posted_tokens={posted}",
               f"five_posted_tokens={use['posted_by_epoch']} five_used_by_final_topk_tokens={use['useful_by_epoch']}",
-              f"mid_last_post_to_two_thirds_ready_us={lead:.2f}" if lead is not None
-              else "mid_last_post_to_two_thirds_ready_us=NA")
+              f"mid_last_post_to_owner_two_thirds_window_us={lead:.2f}" if lead is not None
+              else "mid_last_post_to_owner_two_thirds_window_us=NA")
     if previous is not None:
         print(
             f"TIMING {tag} graph_boundaries",

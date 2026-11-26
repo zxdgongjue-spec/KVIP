@@ -47,10 +47,11 @@ def window_use(events, src, physical_winners, prefetch_rows, clock_mhz):
             hits = int(np.count_nonzero(used[start:end]))
             if epoch == 2 and hits:
                 last_doorbell = int(record[12])
-                next_ready = int(records[3, row, 4])
-                if not 0 < last_doorbell <= next_ready:
+                # waitBegin belongs to the posting vector just before it checks the prior window.
+                next_owner_entry = int(records[3, row, 4])
+                if not 0 < last_doorbell <= next_owner_entry:
                     raise ValueError("Missing midpoint doorbell or next window timestamp")
-                lead_ticks += hits * (next_ready - last_doorbell)
+                lead_ticks += hits * (next_owner_entry - last_doorbell)
             posted[epoch] += end - start
             useful[epoch] += hits
             start = end
@@ -58,4 +59,4 @@ def window_use(events, src, physical_winners, prefetch_rows, clock_mhz):
             raise ValueError("Window admissions do not cover the request's prefetch prefix")
 
     return dict(posted_by_epoch=posted, useful_by_epoch=useful,
-                useful_mid_lead_to_next_ready_us=lead_ticks / clock_mhz / useful[2] if useful[2] else None)
+                useful_mid_post_to_owner_next_window_us=lead_ticks / clock_mhz / useful[2] if useful[2] else None)
