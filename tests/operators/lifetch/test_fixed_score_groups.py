@@ -175,6 +175,14 @@ template<class T> struct QuantLightningIndexerKernel {
         + native[start:end] + "\n}\n"
         + r"""
 int main() {
+    // A disjoint recent range can reuse the same Q after the hot range.
+    QuantLightningIndexerKernel<int> recent;
+    recent.matmulService.history = 32;
+    unsigned loop = 0, scale = 0;
+    recent.ScanSequenceHalf(0, 3, 0, loop, scale, false);
+    assert(!recent.matmulService.occupied && !recent.matmulService.releases);
+    recent.ScanSequenceHalf(20, 21, 0, loop, scale, true);
+    assert(!recent.matmulService.occupied && recent.matmulService.loads == 1 && recent.matmulService.releases == 1);
     for (unsigned history : {131072u,131328u}) for (unsigned batch : {1u,2u,4u,8u}) {
         rotating::RuntimeShape s{};
         s.batch=batch; s.history=history; s.resident=16384; s.indexHeads=32; s.aicCount=32;
