@@ -772,3 +772,29 @@ python3 -B experiments/lifetch_mr23_service/analyze_small_batch_trace.py \
 ```
 
 Set `TRACE_OUTPUT` to the second `Run output` directory printed by the script.
+
+## BS1 P8 游标批读与 BS2 W3 跨窗预读
+
+两项实验各有同几何基线。A5 固定 H128K、resident 16K、Q4/G32、miss 10%、32 AIC/64 AIV，沿用总预取预算 512、每窗上限 128 和 rank 起点 1024。
+
+| 入口 | 基线 | 实验 |
+| --- | --- | --- |
+| `--window-probe bs1-p8` | `cold_p8`，P8/W2，逐项读取游标 | `cold_p8_bulk`，P8/W2，每请求一次 2 KiB MTE2 批读 |
+| `--window-probe bs2-w3` | `windows`，原生 P2/W3 | `windows_early`，P2/W3，提前搬运前窗 Top2048 header |
+
+仓库和 KVAF 依赖由联网宿主机同步。复用已共享的目录。KVAF 依赖未准备时，在宿主机执行 `bash experiments/lifetch_mr23_service/run_small_batch_a5.sh --prepare-deps`。扩展或服务未编译时，在 A5 容器内执行同一脚本的 `--build-deps`。
+
+在 A5 容器内，选择容器可见的逻辑卡号。每条命令依次跑本组基线与优化版。
+
+```bash
+export KVIP_A5_DEVICE=0
+runner=experiments/lifetch_mr23_service/run_small_batch_a5.sh
+bash "$runner" --window-probe bs1-p8 --warmup 2 --iterations 10
+bash "$runner" --window-probe bs2-w3 --warmup 2 --iterations 10
+bash "$runner" --window-probe bs1-p8 --trace
+bash "$runner" --window-probe bs2-w3 --trace
+```
+
+计时输出在 `Run output` 所示路径的 `summary.csv`，包含 Graph Event KV ready 与预取、最终 Get、总 Get。trace 输出中的 `window_probe_comparison.json` 给出逐请求逐窗的游标及 ready-load、前窗等待、Top2048 header 提前投递、预取 token 及其提交顺序、最终 Get token 和原生 kernel interval。每一臂的 `lifetch_msprof_trace.json` 可打开查看。trace 时钟与独立 Graph Event 计时分别报告。
+
+BS2 W3 首版只把已发布的 512B Top2048 header 搬到后窗的私有 UB。实时游标、候选筛选、覆盖图和 WQE 仍按原前窗 `complete` 推进。报告中的 `early_header_enqueues` 为零时，此 trace 没有捕获实际提前搬运。游标或取样时序变化可能影响逐窗 token，报告保留差异和实际 Get 计数。

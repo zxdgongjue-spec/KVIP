@@ -4151,7 +4151,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 prefetch_window_limit=getattr(config, "prefetch_window_limit", None),
                 service_aics=getattr(config, "small_batch_service_aics", 0))
             if small_mode is not None:
-                small_batch.bind(state, small_mode)
+                small_cold_parts = small_batch.bind(state, small_mode)
             if profile_replay:
                 shape = state.rotating.runtime_shape
                 if (state.forward.terminal is None or shape.liCores != 2 * g['batch']
@@ -4240,9 +4240,9 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 if cold_parts != expected_parts:
                     raise ValueError(f'Expected Cold P{expected_parts}, got P{cold_parts}')
             trace_route = small_batch.TRACE_ROUTES[small_mode] if small_mode is not None else cold_route or 'p2'
-            if small_mode == 'cold':
-                cold_parts = 4
-            trace = StageBuffer(state, cold_route=trace_route)
+            if small_mode is not None:
+                cold_parts = small_cold_parts
+            trace = StageBuffer(state, cold_route=trace_route, cold_parts=cold_parts)
             replay_stage(f'calibrating device counter and warming up unmarked {cold_route or "p2"}')
             pending = True
             counter_mhz = state.forward.calibrate_counter_mhz()
@@ -4318,8 +4318,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024),
                         prefetch_window_limit=getattr(config, 'prefetch_window_limit', None),
                         service_aics=getattr(config, "small_batch_service_aics", 0), lease=state.lease)
-                    if small_mode is not None:
-                        small_batch.bind(replica, small_mode)
+                    if small_mode is not None and small_batch.bind(replica, small_mode) != small_cold_parts:
+                        raise RuntimeError('Cold partition changed between small-batch graph invocations')
                     replica.failure_directory = directory
                     if partition_trial:
                         if bind_score_partition(replica, hot=hot_partition, cold=cold_partition) != score_parts:
@@ -4355,7 +4355,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 if small_mode is not None:
                     result['handoff_route'].update(available_aiv=device_resources['aiv'], small_batch_mode=small_mode,
                                                    prefetch_window_limit=config.prefetch_window_limit,
-                                                   cold_score_parts=4 if small_mode == 'cold' else 2)
+                                                   cold_score_parts=small_cold_parts)
                 if prefetch_trial:
                     result['handoff_route'].update(service_ub_candidates=ub_candidates,
                                                    service_post_chunk=post_chunk)

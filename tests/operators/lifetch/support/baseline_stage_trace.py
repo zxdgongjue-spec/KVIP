@@ -120,6 +120,9 @@ PHASES = {
     243: 'Stage window state and ready cursors',
     244: 'Drain and publish window state',
     245: 'Prepare LI per-query run info',
+    246: 'P8 cursor read and ready-prefix fold',
+    247: 'Enqueue next-window Top2048 header read',
+    250: 'P8 bulk cursor GM to UB with fence',
     DYNAMIC_SCORE_JOB: 'Dynamically assigned Score fragment',
     DYNAMIC_SERVICE_JOB: 'Dynamically assigned Service window',
 }
@@ -226,7 +229,7 @@ def scoped_msprof(prof, output, device_id):
 class StageBuffer:
     """Attach a private trace buffer only for one already-bound native call."""
 
-    def __init__(self, state, *, cold_route='p2'):
+    def __init__(self, state, *, cold_route='p2', cold_parts=4):
         self.forward = state.forward
         library = self.forward.rotating.library
         probe = getattr(library, 'kvip_stage_trace_supported', None)
@@ -246,6 +249,8 @@ class StageBuffer:
             'full_p2': 'kvip_parallel_tail_unified_p2_profile_forward',
             'full_uniform': 'kvip_parallel_tail_unified_partitioned_profile_forward',
         }[cold_route]
+        if cold_route == 'small_cold' and cold_parts == 8:
+            profile_symbol = 'kvip_small_batch_cold_p8_profile_forward'
         self.profile_forward = getattr(library, profile_symbol)
         self.profile_forward.argtypes = [ctypes.c_void_p] * 4
         self.profile_forward.restype = ctypes.c_uint32
@@ -313,7 +318,7 @@ def decode(raw):
 
 
 def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_scopes=False,
-                 cold_route='p2', score_parts=2):
+                 cold_route='p2', score_parts=2, cold_parts=4):
     phases = defaultdict(set)
     bodies = defaultdict(set)
     for event in events:
@@ -371,7 +376,11 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
     four_aiv = set(range(4 * batch))
     two_aic = set(range(64, 64 + 2 * batch))
     p4_lanes = set(range(8 * batch)) | set(range(64, 64 + 4 * batch))
-    cold_lanes = {'cold_p4': p4_lanes, 'small_cold': p4_lanes, 'small_topk': four_aiv | two_aic,
+    if cold_route == 'small_cold' and cold_parts not in (4, 8):
+        raise ValueError(f'Unsupported small-batch Cold trace part count {cold_parts}')
+    small_cold_groups = batch * (cold_parts if cold_route == 'small_cold' else 4)
+    small_cold_lanes = set(range(2 * small_cold_groups)) | set(range(64, 64 + small_cold_groups))
+    cold_lanes = {'cold_p4': p4_lanes, 'small_cold': small_cold_lanes, 'small_topk': four_aiv | two_aic,
                   'dedicated': four_aiv | set(range(64, 88)),
                   'static_ready': four_aiv | set(range(64, 88)),
                   'dynamic': four_aiv | two_aic,
@@ -696,12 +705,12 @@ def render(events, counter_mhz, *, cold_route='p2'):
         recorded_lane_spans[lane].append((begin, end))
         kernel = event['kernel']
         kernel_stage, entry = kernels[kernel]
-        args = dict(kernel_entry=entry, phase_id=phase, block=event['block'], subblock=event['subblock'],
+        args = dict(kernel_id=kernel, kernel_entry=entry, phase_id=phase, block=event['block'], subblock=event['subblock'],
                     core_type=core_type, raw_core_id=event['core'], raw_core_id_hex=hex(event['core']),
                     iteration=event['iteration'], detail=event['detail'], begin_tick=begin, end_tick=end)
         window_epoch = None
         category = kernel_stage
-        if kernel in (20, 22) and (phase in (21, 22, 25, *range(150, 156), 243, 244,
+        if kernel in (20, 22) and (phase in (21, 22, 25, *range(150, 156), 243, 244, 246, 247, 250,
                                              DEDICATED_DRIVER_WAIT, DEDICATED_READY_SNAPSHOT, 230, 231,
                                              DYNAMIC_SCORE_JOB, DYNAMIC_SERVICE_JOB)
                                    or phase in PIPE_SCOPES):
@@ -736,7 +745,7 @@ def render(events, counter_mhz, *, cold_route='p2'):
             args.update(request_row=event['detail'] >> 24, query=(event['detail'] >> 20) & NO_QUERY)
         elif phase in (21, 22, 152, 153, 230, 231):
             args['request_row'] = event['detail']
-        elif phase in (25, 150, 151, 243, 244, DEDICATED_DRIVER_WAIT):
+        elif phase in (25, 150, 151, 243, 244, 246, 247, 250, DEDICATED_DRIVER_WAIT):
             args['service_lane'] = event['detail']
         elif phase == 154:
             args['request_or_service_lane'] = event['detail']
@@ -903,7 +912,7 @@ def write_capture(directory, raw, counter_mhz, state, library, config, soc, mspr
     cold_route = trace_route or comparison_route or 'p2'
     events = decode(raw)
     verify_route(events, state.batch, require_pipe_scopes=True, require_handoff_scopes=True,
-                 cold_route=cold_route, score_parts=score_parts)
+                 cold_route=cold_route, score_parts=score_parts, cold_parts=cold_parts)
     if comparison_route is None and getattr(config, 'prefetch_window_limit', None) is not None:
         shape = state.rotating.runtime_shape
         expected_service = {(epoch, lane) for epoch in range(shape.rounds) for lane in range(shape.serviceLanes)}

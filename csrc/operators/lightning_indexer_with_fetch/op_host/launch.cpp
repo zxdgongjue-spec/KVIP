@@ -396,6 +396,24 @@ static uint32_t LaunchSmallBatchCold(void* bindings,void* terminal,void* stream,
     return LaunchParallelTail<Profile>(bindings,terminal,stream,shape,2,parts,false,true);
 }
 
+extern "C" uint32_t kvip_small_batch_cold_p8_parts(const rotating::RuntimeShape* shape) {
+    constexpr uint32_t parts = 8;
+    if (!kvip_parallel_tail_supported(shape) || shape->batch != 1 || shape->liCores != 2 ||
+        shape->rounds != 2 || shape->serviceAics != 1 ||
+        shape->aicCount < parts || shape->aicCount > kvip_cold_score::kMaxParts)
+        return 0;
+    const auto half = rotating::SequenceHalfWindow(*shape);
+    return kvip_cold_score::CompleteWindows(shape->history, shape->resident, half, shape->rounds, parts) ? parts : 0;
+}
+
+template<bool Profile>
+static uint32_t LaunchSmallBatchColdP8(void* bindings, void* terminal, void* stream,
+                                      const rotating::RuntimeShape* shape) {
+    const auto parts = kvip_small_batch_cold_p8_parts(shape);
+    if (!parts) return 100000;
+    return LaunchParallelTail<Profile>(bindings, terminal, stream, shape, 2, parts, false, true);
+}
+
 template<bool Profile>
 static uint32_t LaunchSmallBatchTopK(void* bindings,void* terminal,void* stream,const rotating::RuntimeShape* shape) {
     if(!kvip_parallel_tail_supported(shape) || (shape->batch!=1 && shape->batch!=8) ||
@@ -409,6 +427,11 @@ extern "C" uint32_t kvip_small_batch_cold_forward(void* bindings,void* terminal,
     return LaunchSmallBatchCold<false>(bindings,terminal,stream,shape);
 }
 
+extern "C" uint32_t kvip_small_batch_cold_p8_forward(void* bindings, void* terminal, void* stream,
+                                                  const rotating::RuntimeShape* shape) {
+    return LaunchSmallBatchColdP8<false>(bindings, terminal, stream, shape);
+}
+
 extern "C" uint32_t kvip_small_batch_topk_forward(void* bindings,void* terminal,void* stream,
     const rotating::RuntimeShape* shape) {
     return LaunchSmallBatchTopK<false>(bindings,terminal,stream,shape);
@@ -418,6 +441,11 @@ extern "C" uint32_t kvip_small_batch_topk_forward(void* bindings,void* terminal,
 extern "C" uint32_t kvip_small_batch_cold_profile_forward(void* bindings,void* terminal,void* stream,
     const rotating::RuntimeShape* shape) {
     return LaunchSmallBatchCold<true>(bindings,terminal,stream,shape);
+}
+
+extern "C" uint32_t kvip_small_batch_cold_p8_profile_forward(void* bindings, void* terminal, void* stream,
+                                                          const rotating::RuntimeShape* shape) {
+    return LaunchSmallBatchColdP8<true>(bindings, terminal, stream, shape);
 }
 
 extern "C" uint32_t kvip_small_batch_topk_profile_forward(void* bindings,void* terminal,void* stream,

@@ -442,7 +442,28 @@ extern "C" __global__ __aicore__ void v9_li_kernel_cold_gm_batch(GM_ADDR binding
 extern "C" __global__ __aicore__ void v9_li_kernel_1(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-    if ASCEND_IS_AIV { RunLi<SequenceLiPhase::Threshold>(bindings); }
+    if ASCEND_IS_AIV {
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+        using namespace AscendC;
+        if (GetBlockIdx() == 0) {
+            const auto args = reinterpret_cast<__gm__ const uint64_t*>(bindings);
+            auto ready = kvip_window_probe::Ready(kvip_window_probe::Option(reinterpret_cast<GM_ADDR>(args[15])));
+            if (ready) {
+                const auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(args[14]));
+                if (kvip_window_probe::EarlyShape(shape)) {
+                    // Threshold completes before Cold on every graph replay.
+                    for (uint32_t i = 0; i < shape.rounds * shape.serviceLanes; ++i) {
+                        auto flag = ready + i * kvip_window_probe::kReadyWords;
+                        *flag = 0;
+                        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flag),
+                            kvip_window_probe::kReadyBytes);
+                    }
+                }
+            }
+        }
+#endif
+        RunLi<SequenceLiPhase::Threshold>(bindings);
+    }
 #endif
 }
 

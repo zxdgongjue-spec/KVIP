@@ -44,13 +44,14 @@ def capture_arm(directory, manifest):
         raise ValueError(f'Source binary or native timeline missing in {directory.name}')
     return dict(route=route, batch=int(report_path.parent.name.removeprefix('case-b')),
                 counter_mhz=float(report['counter_mhz']), score_parts=report.get('hot_parts', 2),
-                raw=raw, native=native)
+                cold_parts=report.get('cold_parts') or 4, raw=raw, native=native)
 
 
 def render_arm(arm):
     route = arm['route']
     decoded = decode(arm['raw'].read_bytes())
-    verify_route(decoded, arm['batch'], cold_route=route, score_parts=arm['score_parts'])
+    verify_route(decoded, arm['batch'], cold_route=route, score_parts=arm['score_parts'],
+                 cold_parts=arm.get('cold_parts', 4))
     source, _ = render(decoded, arm['counter_mhz'], cold_route=route)
     _, vendor, intervals = verified_vendor_timeline([arm['native']], cold_route=route)
     device = device_business_view(vendor, intervals)

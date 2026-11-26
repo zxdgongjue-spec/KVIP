@@ -58,7 +58,8 @@ enum Phase : uint32_t {
     LiScoreOutputDrain = 237, ResidentMinVf = 238, ResidentVictimIdsMte2 = 239,
     ResidentVictimClassifyVf = 240, ResidentHitBitmapMte3 = 241,
     ResidentWindowSeed = 242, WindowReadyLoad = 243, WindowStateFlush = 244,
-    ResidentQuerySetup = 245
+    ResidentQuerySetup = 245, WindowCursorLoad = 246, EarlyTopKHeaderEnqueue = 247,
+    BulkCursorMte2 = 250
 };
 
 // Separate IDs for opt-in scheduling; leave the LI handoff range distinct.
