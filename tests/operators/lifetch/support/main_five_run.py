@@ -516,11 +516,18 @@ def parse_args(argv=None):
                        help='Audit each Q’s GET/CQ receipts for 10 timed calls and their separate diagnostic replay')
     modes.add_argument('--history-cap', type=int, choices=(131328, 524544),
                        help='Physical Q4 history capacity for the same 128K captured input')
+    parser.add_argument('--original-128k', action='store_true',
+                        help='Audit the native 128K Q4 capture and its device binding on the paced ten-call graph')
     parser.add_argument('--production-graph', action='store_true',
                         help='Use the production graph containing 20 independent calls at the specified capacity')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parsed = parser.parse_args(argv)
     parsed.iterations = 10 if parsed.ablation_policy else 20
+    if parsed.original_128k:
+        if parsed.ablation_policy != 'paced':
+            parser.error('--original-128k requires --ablation-policy paced')
+        parsed.history_cap = 131328
+        parsed.production_graph = True
     if parsed.production_graph and not parsed.history_cap:
         parser.error('--production-graph requires --history-cap')
     return parsed

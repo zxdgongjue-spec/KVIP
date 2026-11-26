@@ -2,8 +2,8 @@
 # Five captured BS16/Q4 groups on one physical NPU4 with the unified KVAF SDK.
 set -eo pipefail
 if (( $# < 3 || $# > 5 )) || [[ ! $2 =~ ^[a-f0-9]{40}$ || ! $3 =~ ^[a-f0-9]{40}$ ||
-    ( $# == 4 && $4 != cap-pair ) || ( $# == 5 && $4 != active-history && $4 != pr30-parity && $4 != near512 && $4 != near512-five && $4 != near512-locality && $4 != pr30-feature-steps && $4 != pr30-feature-live-main ) ]]; then
-    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA [cap-pair | active-history ARCHIVED_CAP_PAIR | pr30-parity ARCHIVED_ACTIVE_HISTORY | {near512,near512-five} ARCHIVED_PR30_PARITY | near512-locality ARCHIVED_ACTIVE_HISTORY | {pr30-feature-steps,pr30-feature-live-main} {ARCHIVED_UNIFIED_MAIN,auto-local}]" >&2
+    ( $# == 4 && $4 != cap-pair ) || ( $# == 5 && $4 != active-history && $4 != pr30-parity && $4 != near512 && $4 != near512-five && $4 != near512-locality && $4 != pr30-feature-steps && $4 != pr30-feature-live-main && $4 != pr-head-parity ) ]]; then
+    echo "Usage: bash unified_main_npu4.sh KVIP_REPO READER_SHA NATIVE_SHA [cap-pair | active-history ARCHIVED_CAP_PAIR | pr30-parity ARCHIVED_ACTIVE_HISTORY | {near512,near512-five} ARCHIVED_PR30_PARITY | near512-locality ARCHIVED_ACTIVE_HISTORY | {pr30-feature-steps,pr30-feature-live-main} {ARCHIVED_UNIFIED_MAIN,auto-local} | pr-head-parity auto-local]" >&2
     exit 2
 fi
 repo=$1
@@ -11,7 +11,12 @@ reader=$2
 main=$3
 mode=${4:-single}
 live_feature_main=0
-if [[ $mode == pr30-feature-live-main ]]; then
+head_parity=0
+if [[ $mode == pr-head-parity ]]; then
+    head_parity=1
+    live_feature_main=1
+    mode=pr30-feature-steps
+elif [[ $mode == pr30-feature-live-main ]]; then
     live_feature_main=1
     mode=pr30-feature-steps
 fi
@@ -20,7 +25,7 @@ name=unified_main
 prefix=unified-main-five
 auto_feature_reference=0
 feature_prior=
-if [[ $main != "$upstream" ]]; then
+if [[ $main != "$upstream" && $head_parity == 0 ]]; then
     git -C "$repo" merge-base --is-ancestor 54acdb9c54853441d08898a2623407f4492a83a4 "$main" || {
         echo "Expected a native build containing the window-rank and paced-GET PR" >&2
         exit 2
@@ -28,7 +33,18 @@ if [[ $main != "$upstream" ]]; then
     name=long_history_candidate
     prefix=long-history-five
 fi
-if [[ $mode == pr30-feature-steps ]]; then
+if (( head_parity )); then
+    pr30=4bd5d90eaffe9db71ffc64778f9a0cf81bc2e872
+    pr31=58155892a4f3b7a3bf9789d6055fa4a0f1e95c07
+    pr31_table=cfe2b52f6403d5edd612c314bc7110525a5f5789
+    if [[ $main != "$pr30" || ${5:-} != auto-local ]]; then
+        echo 'Expected the pinned PR30 head and auto-local for the 128K PR comparison' >&2
+        exit 2
+    fi
+    prefix=pr-head-cap128-ten
+    auto_feature_reference=1
+    archive=auto-local
+elif [[ $mode == pr30-feature-steps ]]; then
     dualcut=bba4372065e549d0f2291bc08458d6250d4fa161
     paced=b261b4885edd79dabac822a2e6e3790c7f226ad6
     if [[ $5 == auto-local ]]; then
@@ -103,6 +119,14 @@ fi
 if [[ -r /usr/local/Ascend/nnal/atb/set_env.sh ]]; then source /usr/local/Ascend/nnal/atb/set_env.sh; fi
 set -euo pipefail
 # Serialize checkout/preparation of the shared build cache, but not NPU replay.
+if (( head_parity )); then
+    # The BS20..32 launcher uses this same card. Wait before taking the SDK lock.
+    exec 7>"$sources/largebs-$(</proc/sys/kernel/random/boot_id)-npu4.lock"
+    if ! flock -n 7; then
+        echo "WAITING_FOR_PHYSICAL_NPU4"
+        flock 7
+    fi
+fi
 exec 8>"$sources/unified-sdk-${sdk:0:8}-${upstream:0:8}.lock"
 flock 8
 checkout() {
@@ -120,7 +144,11 @@ checkout() {
 }
 reader_src=$(checkout "$reader")
 main_src=$(checkout "$main")
-if [[ $mode == pr30-feature-steps ]]; then
+if (( head_parity )); then
+    pr30_src=$main_src
+    pr31_src=$(checkout "$pr31")
+    pr31_table_src=$(checkout "$pr31_table")
+elif [[ $mode == pr30-feature-steps ]]; then
     dualcut_src=$(checkout "$dualcut")
     paced_src=$(checkout "$paced")
 fi
@@ -167,7 +195,8 @@ baseline="$work/adaptive-sources/peer-serial-da318bdb"
 peer_physical_npu=4
 source "$support/peer_node_prepare.sh"
 dependency_mode=full
-if [[ $name == long_history_candidate || $mode == pr30-feature-steps ]]; then dependency_mode=fused-only; fi
+# The published PR30 code requests LIDU registration even on its fused path.
+if [[ $head_parity == 0 && ( $name == long_history_candidate || $mode == pr30-feature-steps ) ]]; then dependency_mode=fused-only; fi
 peer_prepare_node "$repo" "$baseline" "$clean" "$work" "$out" "$dependency_mode"
 sdk_src="$sources/unified-sdk-${sdk:0:8}-${upstream:0:8}"
 if ! git -C "$clean" cat-file -e "$sdk^{commit}" 2>/dev/null; then
@@ -243,17 +272,27 @@ if [[ $mode == pr30-parity ]]; then
         for g in "${missing[@]}"; do reference[$g]=$ref_out; done
     fi
 elif [[ $mode == pr30-feature-steps ]]; then
-    printf '%s\n' "$main" >"$out/mainline.txt"
-    printf '%s\n' "$dualcut" >"$out/dualcut.txt"
-    printf '%s\n' "$paced" >"$out/paced.txt"
-    if (( live_feature_main )); then printf '1\n' >"$out/live_main.txt"; fi
+    if (( head_parity )); then
+        arm_names=(pr30 pr31 pr31_table)
+        printf '%s\n' "$pr30" >"$out/pr30.txt"
+        printf '%s\n' "$pr31" >"$out/pr31.txt"
+        printf '%s\n' "$pr31_table" >"$out/pr31_table.txt"
+    else
+        arm_names=(mainline dualcut paced)
+        printf '%s\n' "$main" >"$out/mainline.txt"
+        printf '%s\n' "$dualcut" >"$out/dualcut.txt"
+        printf '%s\n' "$paced" >"$out/paced.txt"
+        if (( live_feature_main )); then printf '1\n' >"$out/live_main.txt"; fi
+    fi
     for block in 1 2; do
         mkdir -p "$out/block$block"
-        for field in live_main mainline dualcut paced reader physical_npu host boot_id machine_id kvaf kvaf_tree reference; do
+        for field in live_main "${arm_names[@]}" reader physical_npu host boot_id machine_id kvaf kvaf_tree reference; do
             if [[ -f "$out/$field.txt" ]]; then cp "$out/$field.txt" "$out/block$block/"; fi
         done
     done
-    if (( live_feature_main )); then
+    if (( head_parity )); then
+        echo "CONFIG measured=pr30,pr31,pr31_table model_limit=131072 physical_slots=131328 input=original_trace blocks=2 reverse_order=1 groups=10,4,17,7,2 physical_NPU=4 BS16_Q4 warmup=4 calls_per_arm_per_block=10"
+    elif (( live_feature_main )); then
         echo "CONFIG measured=mainline,dualcut,paced blocks=2 reverse_order=1 groups=10,4,17,7,2 physical_NPU=4 BS16_Q4 warmup=4 calls_per_arm_per_block=10 placement_and_oracle_archive=$archive"
     else
         echo "CONFIG baseline=$archive measured=dualcut,paced blocks=2 reverse_order=1 groups=10,4,17,7,2 physical_NPU=4 BS16_Q4 warmup=4 calls_per_arm_per_block=10 archived_main_calls=20"
@@ -401,6 +440,7 @@ PY_DEVICE
     if [[ $mode == pr30-parity ]]; then args+=(--production-graph); fi
     if [[ $mode == pr30-feature-steps ]]; then
         case $label in
+            pr30|pr31|pr31_table) args+=(--ablation-policy paced --original-128k);;
             mainline|dualcut) args+=(--ablation-policy single);;
             paced) args+=(--ablation-policy paced);;
             *) exit 2;;
@@ -467,7 +507,27 @@ run_group() (
                 group_reference=$("$PYTHON" -B "$support/feature_host_reference.py" "$area" "$g" baseline)
             fi
         fi
-        if [[ -n $group_reference ]]; then
+        anchor=
+        if (( head_parity )) && [[ -d ${PEER_PR30_TIMING_ARCHIVE:-} ]]; then
+            if anchor=$("$PYTHON" -B "$support/pr_head_anchor.py" "$PEER_PR30_TIMING_ARCHIVE" "$out" "$g"); then
+                anchor_paths=()
+                while IFS= read -r path; do anchor_paths+=("$path"); done <<< "$anchor"
+                if [[ ${#anchor_paths[@]} != 2 || ! -d ${anchor_paths[0]} || ! -f ${anchor_paths[1]} ]]; then
+                    echo "Invalid PR30 archive paths for G$g" >&2
+                    exit 1
+                fi
+            else
+                rc=$?
+                if (( rc != 3 )); then exit "$rc"; fi
+                anchor=
+            fi
+        fi
+        if [[ -n $anchor ]]; then
+            owner=${anchor_paths[0]}
+            placement=${anchor_paths[1]}
+            group_reference=$(cd "$PEER_PR30_TIMING_ARCHIVE" && pwd -P)
+            echo "G$g PLACEMENT_AND_ORACLE_REFERENCE=$group_reference"
+        elif [[ -n $group_reference ]]; then
             owner=$("$PYTHON" -B - "$support" "$group_reference" "$g" <<'PY_OWNER'
 import sys
 from pathlib import Path
@@ -502,9 +562,9 @@ PY_OWNER
             out="$result_root/block$block"
             if (( live_feature_main )); then
                 case $g in
-                    10|2) order=(mainline dualcut paced);;
-                    4|7)  order=(dualcut paced mainline);;
-                    17)   order=(paced mainline dualcut);;
+                    10|2) order=("${arm_names[@]}");;
+                    4|7)  order=("${arm_names[1]}" "${arm_names[2]}" "${arm_names[0]}");;
+                    17)   order=("${arm_names[2]}" "${arm_names[0]}" "${arm_names[1]}");;
                 esac
                 if [[ $block == 2 ]]; then order=("${order[2]}" "${order[1]}" "${order[0]}"); fi
             else
@@ -528,6 +588,9 @@ PY_OWNER
             for label in "${order[@]}"; do
                 (
                     case $label in
+                        pr30) main=$pr30; main_src=$pr30_src;;
+                        pr31) main=$pr31; main_src=$pr31_src;;
+                        pr31_table) main=$pr31_table; main_src=$pr31_table_src;;
                         dualcut) main=$dualcut; main_src=$dualcut_src;;
                         paced) main=$paced; main_src=$paced_src;;
                     esac
@@ -539,7 +602,11 @@ PY_OWNER
                 )
                 if [[ -z $placement ]]; then placement="$out/g$g/$label/thp.json"; fi
             done
-            "$PYTHON" -B "$support/pr30_feature_steps.py" "$out" "$g" "$owner"
+            if (( head_parity )); then
+                "$PYTHON" -B "$support/pr_head_parity_report.py" "$out" "$g" "$owner"
+            else
+                "$PYTHON" -B "$support/pr30_feature_steps.py" "$out" "$g" "$owner"
+            fi
         done
         exit
     fi
@@ -606,7 +673,9 @@ for g in 10 4 17 7 2; do
     if (( code )); then failed+=("$g"); fi
 done
 if ((${#failed[@]})); then echo "REPLAY_FAILED groups=${failed[*]} RESULT_ROOT=$out" >&2; exit 1; fi
-if [[ $mode == pr30-feature-steps ]]; then
+if (( head_parity )); then
+    "$PYTHON" -B "$support/pr_head_parity_report.py" "$out" --summary
+elif [[ $mode == pr30-feature-steps ]]; then
     for block in 1 2; do
         echo "BLOCK_SUMMARY block=$block"
         "$PYTHON" -B "$support/pr30_feature_steps.py" "$out/block$block" --summary

@@ -15,10 +15,17 @@ from main_five_run import FeatureReplayChecks, parse_args
     (['--history-cap', '131328', '--production-graph'], 20),
     (['--ablation-policy', 'single'], 10),
     (['--ablation-policy', 'paced'], 10),
+    (['--ablation-policy', 'paced', '--original-128k'], 10),
 ])
 def test_parent_and_device_worker_agree_on_replay_count(mode, expected):
     args = ['--main', '.', '--trace', '.', '--owner-archive', '.', '--kvaf-root', '.',
             '--output', '.', '--kvaf-server', '127.0.0.1:1', '--group', '7', *mode]
+    if '--original-128k' in mode:
+        for worker in ([], ['--worker']):
+            cfg = parse_args([*args, *worker])
+            assert (cfg.history_cap, cfg.production_graph, cfg.ablation_policy) == (131328, True, 'paced')
+        with pytest.raises(SystemExit):
+            parse_args([*args[:args.index('--ablation-policy')], '--original-128k'])
     assert parse_args(args).iterations == expected
     assert parse_args([*args, '--worker']).iterations == expected
 
