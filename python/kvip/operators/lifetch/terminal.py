@@ -100,6 +100,17 @@ class TerminalLeaseBinding:
         # Large-batch scheduler layout is four 128-byte lines (TerminalRowSchedule).
         self.row_schedule = torch.zeros((4, 32), dtype=torch.int32, device=device) if shape.batch > 16 else None
         self.li_ready = torch.empty((shape.batch, 8, 32), dtype=torch.int32, device=device) if shape.batch > 16 else None
+        self.large_staged_misses = (
+            torch.empty((shape.batch, 4, 2048), dtype=torch.int32, device=device) if shape.batch > 16 else None
+        )
+        groups_fn = getattr(self.rotating.library, "kvip_fixed_q4_score_groups", None)
+        self.fixed_score_ready = None
+        if groups_fn is not None:
+            groups_fn.argtypes = [ctypes.POINTER(type(shape))]
+            groups_fn.restype = ctypes.c_uint32
+            groups = groups_fn(ctypes.byref(shape))
+            if groups:
+                self.fixed_score_ready = torch.empty((2 * groups, 32), dtype=torch.int32, device=device)
         blob = struct.pack(
             "<6Q2I9Q",
             forward.workspace.data_ptr(),
@@ -113,7 +124,9 @@ class TerminalLeaseBinding:
             self.capacity.data_ptr(),
             0 if self.row_schedule is None else self.row_schedule.data_ptr(),
             0 if self.li_ready is None else self.li_ready.data_ptr(),
-            *([0] * 6),
+            0 if self.fixed_score_ready is None else self.fixed_score_ready.data_ptr(),
+            0 if self.large_staged_misses is None else self.large_staged_misses.data_ptr(),
+            *([0] * 4),
         )
         if len(blob) != 128:
             raise AssertionError("Terminal runtime ABI packing changed")

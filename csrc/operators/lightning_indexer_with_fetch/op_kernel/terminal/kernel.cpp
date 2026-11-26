@@ -116,7 +116,31 @@ __aicore__ inline void RunTerminalRow(GM_ADDR binding, uint32_t b, uint32_t q){
  GlobalTensor<uint16_t> scores;op.InitVecWorkspaceTensor(scores);GlobalTensor<bfloat16_t> weights;GlobalTensor<float> qs,ks;GlobalTensor<int32_t> out,blocks;out.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(ctx->selected));op.InitVecInputTensor(weights,qs,ks,out,blocks);
  auto ends=reinterpret_cast<__gm__ const uint32_t*>(ctx->queryEnds);
  uint32_t scanHistory=LargeBatch ? large_li::ScanHistory(s,ends,b) : rotating::ActiveScanHistory(s,ends,b);
- op.AllocEventID();if(profile)ts[1]=GetSystemCycle();uint32_t topkError=op.template TerminalQueryRuntime<LargeBatch>(query,scanHistory);
+ op.AllocEventID();if(profile)ts[1]=GetSystemCycle();
+ uint32_t topkError=0;
+ if constexpr (LargeBatch) {
+  auto ready=reinterpret_cast<__gm__ uint32_t*>(runtime->reserved[2])+(b*8+q)*32;
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ready),128);
+  const uint32_t stagedCount=*reinterpret_cast<__gm__ volatile uint32_t*>(ready);
+  if(runtime->reserved[4] && large_li::HasStagedMisses(stagedCount)){
+   op.LoadPublishedLargeIds(query);
+   auto meta=op.IncrementalMeta(query);
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
+   const uint32_t count=stagedCount-large_li::kStagedBase;
+   meta[3]=count;
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
+   if(count){
+    GlobalTensor<uint32_t> staged;
+    staged.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(runtime->reserved[4])+query*2048);
+    DataCopy(op.TerminalCompact(),staged,(count+7)/8*8);
+   }
+   SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
+  }else{
+   topkError=op.template TerminalQueryRuntime<true>(query,scanHistory);
+  }
+ }else{
+  topkError=op.template TerminalQueryRuntime<false>(query,scanHistory);
+ }
  uint32_t ownError=topkError;if(profile)ts[2]=GetSystemCycle();Signal(flags,q,generation);
  auto postWork=op.TerminalWork(),postIds=op.TerminalCompact(),postScratch=op.TerminalScratch();
  auto compact=reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048;

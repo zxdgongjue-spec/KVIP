@@ -49,6 +49,22 @@ int main() {
         }
         assert(helper<=budget && lowerHelper>=budget);
     }
+    assert(!large_li::HasStagedMisses(0) && !large_li::HasStagedMisses(1));
+    for (unsigned n=0;n<=2048;++n) assert(large_li::HasStagedMisses(large_li::kStagedBase+n));
+    assert(!large_li::HasStagedMisses(2051));
+    assert(large_li::CanStagePublishedMisses(131071,131072,1,131072,1));
+    assert(!large_li::CanStagePublishedMisses(131071,131072,1,131071,1)); // remaining suffix
+    assert(!large_li::CanStagePublishedMisses(131071,131072,1,131072,0)); // boundary ties
+    assert(!large_li::CanStagePublishedMisses(131073,131200,1,131200,7)); // packed bitmap limit
+    assert(!large_li::CanStagePublishedMisses(0,131072,1,131072,3));
+    assert(!large_li::CanStagePublishedMisses(3,131072,0,131072,3));
+    for (uint32_t n=0;n<256;++n) for (uint32_t quota=0;quota<=n;++quota)
+        for (uint32_t rounds=2;rounds<=8;++rounds) if (large_li::CanOverlapBanks(n,quota,rounds))
+            for (uint32_t e=1;e<rounds;++e) {
+                auto span=large_li::Window(128,128+n,rounds,e);
+                for (uint32_t rows=1;rows<=7;++rows)
+                    assert(large_li::LaterSuffix(span,128,n,quota,rows,e)<span.end-span.begin);
+            }
     // 890 cold pages on a pair of owners plus their helper.
     const uint32_t expected[] = {98,117,117};
     for(uint32_t e=1;e<=3;++e) {
@@ -117,7 +133,7 @@ def test_cube_vector_flags_drain_between_rows(tmp_path):
     native = (Path(__file__).resolve().parents[3] / "csrc/operators/lightning_indexer_with_fetch"
               / "op_kernel/indexer_large.cpp").read_text()
     finish = native.index("} // namespace QLIKernel")
-    begin = native.rindex("template <class T>", 0, native.index("::ProcessLargeScore("))
+    begin = native.index("__aicore__ inline void PrimeLargeBanks(")
     range_impl = native[begin:finish]
     source = tmp_path / "mixed_flags.cpp"
     source.write_text(
@@ -153,7 +169,7 @@ struct Service {
     void LoadSequenceSplitThresholds(uint32_t) { ++thresholdsLoaded; }
 };
 template<class T> struct QuantLightningIndexerKernel {
-    void ProcessLargeScore(uint32_t,uint32_t,bool,bool);
+    void ProcessLargeScore(uint32_t,uint32_t,bool,bool,bool);
     Service vectorService, matmulService;
     uint32_t assignedRow_=0;
     void CalcGS1LoopParams(uint32_t) {}
@@ -182,7 +198,9 @@ int main() {
         for (int r=0;r<100;++r) {
             bool loaded = false;
             for (uint32_t n:{0,1,2,3,7,16}) {
-                op.ProcessLargeScore(32,32+n,true,!loaded);
+                const bool early = (r%2 == 0) && n != 0;
+                if (lane>=0 && early) { PrimeLargeBanks(); std::this_thread::yield(); }
+                op.ProcessLargeScore(32,32+n,true,!loaded,early);
                 loaded |= n != 0;
             }
         }

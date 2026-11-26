@@ -16,7 +16,7 @@ import subprocess
 
 import numpy as np
 
-from large_batch_input import BATCHES, GROUPS, input_digest, load
+from large_batch_input import FIXED_BATCHES, GROUPS, input_digest, load
 from large_batch_reference import compute_reference, reference_identity, stage_serial
 from reporting import atomic_json
 from workloads import ReplayPagePlan, configuration
@@ -43,7 +43,7 @@ def check_scores(inputs, selected, serial):
     return exact
 
 
-def large_account(events, scope, elapsed, *, fused=True):
+def large_account(events, scope, elapsed, *, fused=True, batch=32):
     """Recognize CANN device names and task types in one restored graph."""
     from decimal import Decimal
 
@@ -61,6 +61,11 @@ def large_account(events, scope, elapsed, *, fused=True):
             "fetch": ("kvafexecutebatchgetaivkernelv2", "kvafexecutebatchgetaivkernelv3"),
         }
     )
+    if batch == 16 and fused:
+        names = {"pr30_li": ("v9_li_kernel",), "tail": ("v9_parallel_terminal",)}
+    elif fused and batch < 16:
+        names = {"LI1": ("v9_li_fixed_hot",), "LI2": ("v9_li_kernel_1",),
+                 "LI3": ("v9_li_fixed_cold",), "tail": ("v9_parallel_terminal",)}
     suffix = r"(?:(?:_[0-9]+)|(?:_mix_ai[cv])|(?:_ai[cv]))*"
     names_re = {key: re.compile("(?:" + "|".join(aliases) + ")" + suffix, re.I) for key, aliases in names.items()}
     stages = {key: [] for key in names}
@@ -106,7 +111,22 @@ def large_account(events, scope, elapsed, *, fused=True):
             if variant
             else {"MIX_AIC": "aic", "MIX_AIV": "aiv", "KERNEL_MIX_AIC": "aic", "KERNEL_MIX_AIV": "aiv"}.get(task_type)
         )
-        stages[key].append((start, stop, role, (e.get("pid"), stream, task)))
+        stages[key].append((start, stop, role, (e.get("pid"), stream, task), symbol))
+    if "pr30_li" in stages:
+        # With a profiler-supplied "_1" suffix the hot kernel name can equal
+        # the threshold kernel's raw name. Recover the original three launches
+        # in stream order, then verify each symbol and any mixed-task pair.
+        launches = []
+        for record in sorted(stages.pop("pr30_li"), key=lambda r: r[:2]):
+            if not launches or record[0] >= max(r[1] for r in launches[-1]):
+                launches.append([])
+            launches[-1].append(record)
+        if len(launches) != 3:
+            raise ValueError(f"{scope}: expected three separate PR30 LI launches, got {len(launches)}")
+        for i, (name, launch) in enumerate(zip(("v9_li_kernel", "v9_li_kernel_1", "v9_li_kernel_2"), launches), 1):
+            if any(not re.fullmatch(name + suffix, r[4], re.I) for r in launch):
+                raise ValueError(f"{scope}: wrong PR30 LI{i} kernel, expected {name}, got {launch}")
+            stages[f"LI{i}"] = launch
     intervals = {}
     for key, records in stages.items():
         if len(records) == 1:
@@ -127,6 +147,8 @@ def stage_sample(accounting, fused):
         raise ValueError(f"Device attribution failed: {accounting}")
     stages = accounting["intervals_us"]
     expected = ("LI1", "LI23", "tail") if fused else ("li", "lidu_prepare", "fetch")
+    if fused and "LI2" in stages:
+        expected = ("LI1", "LI2", "LI3", "tail")
     if set(stages) != set(expected) or any(len(stages[k]) != 1 for k in expected):
         raise ValueError(f"Unexpected production kernel sequence: {stages}")
     intervals = [stages[k][0] for k in expected]
@@ -141,13 +163,13 @@ def stage_sample(accounting, fused):
         raise ValueError(f"Inconsistent graph event {event} and kernel span {span}")
     sample = dict(
         graph=event,
-        LI=active["LI1"] + active["LI23"] if fused else active["li"],
+        LI=sum(active[k] for k in expected[:-1]) if fused else active["li"],
         tail=active["tail"] if fused else active["lidu_prepare"] + active["fetch"],
         span=span,
         inter_kernel_gap=span - sum(active.values()),
         event_minus_span=event - span,
     )
-    sample.update({k: active[k] for k in (("LI1", "LI23") if fused else ("lidu_prepare", "fetch"))})
+    sample.update({k: active[k] for k in (expected[:-1] if fused else ("lidu_prepare", "fetch"))})
     return sample
 
 
@@ -372,7 +394,7 @@ def last_row_windows(events, li):
 def tail_team_intervals(stamps, mhz):
     # One row holds one four-Q team until its last Q retires. Queue waits are
     # inside this interval; the time between row assignments is outside it.
-    if stamps.ndim != 3 or stamps.shape[1:] != (4, 32) or len(stamps) not in BATCHES or not mhz > 0:
+    if stamps.ndim != 3 or stamps.shape[1:] != (4, 32) or len(stamps) not in FIXED_BATCHES or not mhz > 0:
         raise ValueError("Invalid terminal diagnostic shape or clock")
     starts, finishes = stamps[:, :, 0], stamps[:, :, 10]
     if np.any(starts <= 0) or np.any(finishes <= starts):
@@ -436,7 +458,8 @@ def measured_replays(ex, proofs, serial, torch, states, sequence, config, direct
             raise ValueError("Unexpected number of per-query terminal queues")
         proofs["jettys_each"] = int(terminal.owner.context["jettys_per_core"])
         proofs["bound_private_queues"] = len(terminal.queue_views)
-        if int(terminal.owner.context["worker_count"]) != 32 or proofs["jettys_each"] != (5 * state.batch + 31) // 32:
+        expected_workers, expected_jettys = (32, (5 * state.batch + 31) // 32) if state.batch > 16 else (40, 2)
+        if int(terminal.owner.context["worker_count"]) != expected_workers or proofs["jettys_each"] != expected_jettys:
             raise ValueError("Unexpected fused queue resource geometry")
         state.forward.set_diagnostics(False)
     selected_calls, measurements, traffic = [], [], []
@@ -498,7 +521,7 @@ def measured_replays(ex, proofs, serial, torch, states, sequence, config, direct
         data = json.loads(trace.read_text())
         events = data["traceEvents"] if isinstance(data, dict) else data
         for scope, event_us in zip(scopes, elapsed):
-            account = large_account(events, scope, event_us, fused=fused)
+            account = large_account(events, scope, event_us, fused=fused, batch=state.batch)
             measurements.append(stage_sample(account, fused))
         if fused:
             mhz = state.forward.calibrate_counter_mhz()
@@ -526,7 +549,14 @@ def measured_replays(ex, proofs, serial, torch, states, sequence, config, direct
             check_scores(inputs, diagnostic_ids, serial[0])
             state.validate(inputs)
             proofs["ordered_Index_diagnostic_rows"] = check_ordered_index(state, before, before_valid)
-            proofs["separate_LI_diagnostic"] = li_intervals(state.forward.times.cpu().numpy(), state.batch, mhz)
+            if state.batch > 16:
+                handoff = terminal.li_ready[:, :4, 0].cpu().numpy()
+                if np.any((handoff < 1) | (handoff > 2 + 2048)):
+                    raise ValueError("Incomplete large-batch LI-to-terminal classification handoff")
+                early = handoff >= 2
+                proofs["prior_classified_queries"] = int(early.sum())
+                proofs["prior_classified_rows"] = int(np.all(early, axis=1).sum())
+                proofs["separate_LI_diagnostic"] = li_intervals(state.forward.times.cpu().numpy(), state.batch, mhz)
             # Keep the existing instrumented replay's raw per-request records.
             # The two arrays use different device ABIs and are timed only once.
             proofs["separate_window_event_u64"] = state.rotating.events.cpu().numpy().view("<u8").tolist()
@@ -574,7 +604,7 @@ def run(args):
         sdk_kernel_sha = hashlib.file_digest(stream, "sha256").hexdigest()
     if args.arm == "fused" and args.serial_result is None:
         raise ValueError("The fused arm requires the matching strong serial result")
-    sequence, donors = load(args.trace.resolve(), args.group, args.round, args.batch)
+    sequence, donors = load(args.trace.resolve(), args.group, args.round, args.batch, args.cohort, args.prepared)
     inputs = sequence.inputs
     pages = ReplayPagePlan(sequence)
     fingerprint = input_digest(inputs, pages, donors)
@@ -673,7 +703,7 @@ def run(args):
     scratch_existed = (args.output / "export_only_prof_dir").exists()
     ex.measure_replay_batch = partial(measured_replays, ex, proofs, serial)
     result = ex.run_path(cfg, args.output / "path", sequence, pages, fused=fused)
-    workers = 32 if fused else 2
+    workers = (32 if args.batch > 16 else 40) if fused else 2
     if result["correctness"] != "PASS" or result["failures"] or result["runtime_workers"] != workers:
         raise ValueError(f"{args.arm}: production replay failed or used incorrect worker count")
     values = proofs["samples"]
@@ -749,6 +779,10 @@ def run(args):
         )
     )
     print(f"TIMING {tag}", *(f"{k}_mean/P50_us={times[k][0]:.2f}/{times[k][1]:.2f}" for k in ("graph", "LI", "tail")))
+    if args.prepared is not None and fused:
+        stage_names = ("LI1", "LI2", "LI3") if args.batch <= 16 else ("LI1", "LI23")
+        print(f"TIMING {tag} measured_kernels",
+              *(f"{k}_mean/P50_us={times[k][0]:.2f}/{times[k][1]:.2f}" for k in stage_names))
     if previous is not None:
         print(
             f"TIMING {tag} graph_boundaries",
@@ -774,8 +808,11 @@ def run(args):
             ),
         )
     if fused:
-        spans = proofs["separate_LI_diagnostic"]["spans"]
-        print(f"DIAGNOSTIC {tag} separate_calls=1", *(f"{k}={v:.2f}" for k, v in spans.items()))
+        if "separate_LI_diagnostic" in proofs:
+            spans = proofs["separate_LI_diagnostic"]["spans"]
+            print(f"DIAGNOSTIC {tag} separate_calls=1", *(f"{k}={v:.2f}" for k, v in spans.items()),
+                  f"prior_classified_queries={proofs['prior_classified_queries']}/{args.batch * 4} "
+                  f"prior_classified_rows={proofs['prior_classified_rows']}/{args.batch}")
         if previous is not None:
             windows = summary["last_row_LI3_windows"]
             if windows["available"]:
@@ -815,7 +852,9 @@ if __name__ == "__main__":
     parser.add_argument("--trace", type=Path, required=True)
     parser.add_argument("--group", type=int, choices=GROUPS, required=True)
     parser.add_argument("--round", type=int, default=1)
-    parser.add_argument("--batch", type=int, choices=BATCHES, required=True)
+    parser.add_argument("--batch", type=int, choices=FIXED_BATCHES, required=True)
+    parser.add_argument("--cohort", type=int, default=0)
+    parser.add_argument("--prepared", type=Path)
     parser.add_argument("--kvaf-root", type=Path, required=True)
     parser.add_argument("--kvaf-server")
     parser.add_argument("--reuse-serial-archive", type=Path)

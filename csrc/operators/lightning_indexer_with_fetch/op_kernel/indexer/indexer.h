@@ -88,12 +88,16 @@ public:
 public:
     rotating::RuntimeShape runtimeShape_;
     bool sequenceSplit_ = false;
+#if KVIP_FIXED_SCORE_SHARDS
+    __gm__ uint32_t* fixedReady_ = nullptr;
+#endif
     bool sequenceTopKOnly_ = false;
 #if !V9_UBMEM
     GM_ADDR rotationContext_ = nullptr;
 #if KVIP_LARGE_BATCH_LI
     uint32_t assignedRow_ = 0;
-    __aicore__ inline void ProcessLargeScore(uint32_t begin, uint32_t end, bool cold, bool loadThreshold = true);
+    __aicore__ inline void ProcessLargeScore(uint32_t begin, uint32_t end, bool cold, bool loadThreshold = true,
+                                            bool banksPrimed = false);
     __aicore__ inline void ProcessLargeThreshold(uint32_t query);
 #endif
 #endif
@@ -467,6 +471,8 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
     if (sequenceSplit_) {
 #if KVIP_LARGE_BATCH_LI
         splitCoreInfo.bN2Start = assignedRow_;
+#elif KVIP_FIXED_SCORE_SHARDS
+        splitCoreInfo.bN2Start = (aiCoreIdx % runtimeShape_.liCores) / 2;
 #else
         splitCoreInfo.bN2Start = aiCoreIdx / 2;
 #endif
@@ -485,6 +491,8 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
                                     (uint64_t)constInfo.s2BaseSize)  * sizeof(SCORE_T);
 #if KVIP_LARGE_BATCH_LI
     const uint32_t scoreRow = assignedRow_;
+#elif KVIP_FIXED_SCORE_SHARDS
+    uint32_t scoreRow = sequenceSplit_ ? splitCoreInfo.bN2Start : aiCoreIdx;
 #else
     uint32_t scoreRow = sequenceSplit_ ? aiCoreIdx / 2 : aiCoreIdx;
 #endif
@@ -770,6 +778,13 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
 {
     uint32_t batch = splitCoreInfo.bN2Start;
     uint32_t shard = aiCoreIdx % 2;
+#if KVIP_FIXED_SCORE_SHARDS
+    const uint32_t parts = fixed_score::GroupsPerRow(runtimeShape_.batch) / 2;
+    const uint32_t part = aiCoreIdx / runtimeShape_.liCores;
+    const uint32_t recentPart = shard * parts + part, recentParts = 2 * parts;
+#else
+    const uint32_t recentPart = shard, recentParts = 2;
+#endif
     CalcGS1LoopParams(batch);
     CalcS2LoopParams(batch, 0);
 
@@ -812,7 +827,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
             bool hasRecent = false;
             if (potentiallyRecent) {
                 auto recentRange = kvip_recent_index::RecentRange(ctxRecent, tempLoopInfo.bIdx, recentEnd);
-                auto recentTiles = kvip_recent_index::Tiles(recentRange, shard, 2);
+                auto recentTiles = kvip_recent_index::Tiles(recentRange, recentPart, recentParts);
                 hasRecent = recentTiles.begin != recentTiles.end;
             }
 #endif
@@ -820,8 +835,13 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
 #if !V9_UBMEM
             // Keep Q and its scale until the shard's recent tail finishes. Key
             // and key-scale banks still drain at each discontinuous range.
+#if KVIP_FIXED_SCORE_SHARDS
+            auto hot = fixed_score::Split(shard * half, (shard + 1) * half, part, parts);
+            ScanSequenceHalf(hot.begin, hot.end, shard, loop, scaleLoop, !hasRecent, false);
+#else
             ScanSequenceHalf(shard * half, (shard + 1) * half, shard, loop, scaleLoop, !hasRecent, false);
-            if (hasRecent) ScoreRecent(loop, 0, shard, 2, true);
+#endif
+            if (hasRecent) ScoreRecent(loop, 0, recentPart, recentParts, true);
 #else
             ScanSequenceHalf(shard * half, (shard + 1) * half, shard, loop, scaleLoop, true);
 #endif
@@ -836,6 +856,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
             uint32_t half = halfTokens / S2_BASE_SIZE;
             uint32_t serviceEpoch = rotating::ServiceRank(runtimeShape_.batch, runtimeShape_.splitQ,
                                                           aiCoreIdx) / runtimeShape_.serviceAics;
+#if KVIP_FIXED_SCORE_SHARDS
+            if (part != 0) serviceEpoch = runtimeShape_.rounds;
+#endif
             uint32_t serviceHalf = halfTokens;
             if ASCEND_IS_AIV {
 #if KVIP_URMA_WINDOW_LI
@@ -848,14 +871,45 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
                 }
 #endif
                 vectorService.LoadSequenceSplitThresholds(batch);
-                vectorService.PrepareRotationProgress();
+#if KVIP_FIXED_SCORE_SHARDS
+                // The original half-owner can publish its own contiguous
+                // prefix tile by tile. Helpers never expose a hole.
+                if (!part)
+#endif
+                    vectorService.PrepareRotationProgress();
                 if (serviceEpoch == 0) vectorService.RotateFetch(0, serviceHalf);
             }
             uint32_t begin = resident_ / S2_BASE_SIZE + shard * half;
             for (uint32_t epoch = 1; epoch < runtimeShape_.rounds; ++epoch, begin += 2 * half) {
                 uint32_t end = begin + half;
                 if (end > scanEnd / S2_BASE_SIZE) end = scanEnd / S2_BASE_SIZE;
+#if KVIP_FIXED_SCORE_SHARDS
+                auto slice = fixed_score::Split(begin, end, part, parts);
+                ScanSequenceHalf(slice.begin, slice.end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
+                if ASCEND_IS_AIV {
+                    // Each original half has multiple disjoint producers. Make
+                    // its contiguous end visible only after this lane of each
+                    // producer has written its two queries' scores and hit bits.
+                    SetFlag<HardEvent::MTE3_S>(EVENT_ID5);
+                    WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
+                    uint32_t lane = tmpBlockIdx % 2;
+                    if (part) {
+                        auto line = fixedReady_ + tmpBlockIdx * 32;
+                        *line = epoch;
+                        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(line), 128);
+                    } else {
+                        for (uint32_t other = 1; other < parts; ++other) {
+                            auto line = fixedReady_ + ((aiCoreIdx + other * runtimeShape_.liCores) * 2 + lane) * 32;
+                            do {
+                                kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(line), 128);
+                            } while (*reinterpret_cast<__gm__ volatile uint32_t*>(line) < epoch);
+                        }
+                        vectorService.PublishFixedHalf(batch, lane, shard, end * S2_BASE_SIZE);
+                    }
+                }
+#else
                 ScanSequenceHalf(begin, end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
+#endif
                 if ASCEND_IS_AIV {
                     if (serviceEpoch == epoch) vectorService.RotateFetch(epoch, serviceHalf);
                 }

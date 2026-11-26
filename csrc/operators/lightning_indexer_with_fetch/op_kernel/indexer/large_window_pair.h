@@ -57,3 +57,33 @@ __aicore__ inline void AdvanceLargeWindowPair(uint32_t row, uint32_t epoch, uint
         stamp[2] = begin;
     }
 }
+
+// The final window and its single posting owner have both published this row.
+// Reuse the finalized positive-cutoff winners. Ineligible queries retain the
+// full suffix/zero-cutoff selection in the four-owner terminal.
+__aicore__ inline uint32_t StagePublishedLargeMisses(uint32_t query, uint32_t scan, uint32_t valid,
+                                                  __gm__ uint32_t* destination) {
+    auto meta = IncrementalMeta(query);
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta), 128);
+    if (!large_li::CanStagePublishedMisses(valid, scan, meta[0], uint32_t(meta[1]), uint16_t(meta[2]))) return 0;
+    auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+    auto covered = reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddress(
+        ctx->incremental, runtimeShape_.batch, runtimeShape_.history, query / 4));
+    auto compact = incrementalNew_.template ReinterpretCast<uint32_t>();
+    LoadPublishedLargeIds(query);
+    SetFlag<HardEvent::MTE2_V>(EVENT_ID5);
+    WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
+    auto count = kvip_prefetch_rank::CollectPositiveFinalMisses(indicesOutLocal_, compact, topkSharedTmpLocal_[128],
+                                                                covered, valid);
+    if (count) {
+        GlobalTensor<uint32_t> ids;
+        ids.SetGlobalBuffer(destination + query * 2048);
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID5);
+        WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
+        DataCopy(ids, compact, (count + 7) / 8 * 8);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID5);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
+    }
+    // 1 already means the LI2 threshold is ready. Preserve zero misses as 2.
+    return large_li::kStagedBase + count;
+}

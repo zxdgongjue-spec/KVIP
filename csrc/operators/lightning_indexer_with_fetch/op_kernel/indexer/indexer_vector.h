@@ -57,6 +57,22 @@ public:
         rotationProgressGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(
             reinterpret_cast<__gm__ rotating::Context*>(p)->progress));
     }
+#if KVIP_FIXED_SCORE_SHARDS
+    bool fixedHelper_ = false;
+    __aicore__ inline void PublishFixedHalf(uint32_t row, uint32_t lane, uint32_t half, uint32_t end) {
+        auto values = scoreOutLocal_.template ReinterpretCast<uint32_t>();
+        Duplicate(values, end, 16);
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        DataCopyExtParams publish{2, 32, 0, 96, 0};
+        DataCopyPad(rotationProgressGm_[(row * SIM_Q + lane * 2) * 32 + half * 16], values, publish);
+        SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+        // The temporary DMA source aliases the original per-tile table.
+        // Regenerate it before the first tile of the next contiguous prefix.
+        rotationProgressBase_ = UINT32_MAX;
+    }
+#endif
     __aicore__ inline void PrepareRotationProgress() {
         // Prefix scores have been published; this 4KB output is dead until final TopK.
         PipeBarrier<PIPE_ALL>();
@@ -842,6 +858,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 #endif
 
 #if !KVIP_LARGE_BATCH_LI
+#if KVIP_FIXED_SCORE_SHARDS
+    if (!fixedHelper_)
+#endif
 #if !V9_UBMEM
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident && (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
 #else

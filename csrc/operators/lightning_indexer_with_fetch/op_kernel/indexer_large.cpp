@@ -2,9 +2,9 @@
 // translation unit. Each block is a resident group of one cube and two vectors.
 #define KVIP_URMA_WINDOW_LI 1
 #define KVIP_LARGE_BATCH_LI 1
+#include "large_batch_li.h"
 #include "terminal/window_types.h"
 #include "terminal/terminal_runtime_abi.h"
-#include "large_batch_li.h"
 
 #if defined(__CCE_AICORE__)
 namespace QLIKernel {
@@ -19,8 +19,17 @@ template <class T> __aicore__ inline void QuantLightningIndexerKernel<T>::Proces
     PipeBarrier<PIPE_ALL>();
 }
 
+// Fixpipe writes these two private banks at the start of each vector's UB.
+// Rank and Post use different buffers reserved by the same live TPipe.
+__aicore__ inline void PrimeLargeBanks() {
+    using Flags = QLICommon::ConstInfo;
+    CrossCoreSetFlag<Flags::QLI_SYNC_MODE4, PIPE_V>(Flags::CROSS_VC_EVENT);
+    CrossCoreSetFlag<Flags::QLI_SYNC_MODE4, PIPE_V>(Flags::CROSS_VC_EVENT + 1);
+}
+
 template <class T>
-__aicore__ inline void QuantLightningIndexerKernel<T>::ProcessLargeScore(uint32_t begin, uint32_t end, bool cold, bool loadThreshold) {
+__aicore__ inline void QuantLightningIndexerKernel<T>::ProcessLargeScore(uint32_t begin, uint32_t end, bool cold,
+                                                                         bool loadThreshold, bool banksPrimed) {
     if (begin == end) {
         return;
     }
@@ -33,8 +42,7 @@ __aicore__ inline void QuantLightningIndexerKernel<T>::ProcessLargeScore(uint32_
         if (cold && loadThreshold) {
             vectorService.LoadSequenceSplitThresholds(assignedRow_);
         }
-        CrossCoreSetFlag<Flags::QLI_SYNC_MODE4, PIPE_V>(Flags::CROSS_VC_EVENT);
-        CrossCoreSetFlag<Flags::QLI_SYNC_MODE4, PIPE_V>(Flags::CROSS_VC_EVENT + 1);
+        if (!banksPrimed) PrimeLargeBanks();
     } else {
         matmulService.AllocEventID();
     }
@@ -74,6 +82,7 @@ struct Inputs {
     __gm__ rotating::Context* ctx;
     __gm__ pipeline_ab::Args* stream;
     __gm__ uint32_t* flags;
+    __gm__ uint32_t* stagedMisses;
     rotating::RuntimeShape shape;
     uint32_t core, vecLane, helpers;
 
@@ -83,6 +92,7 @@ struct Inputs {
         auto binding = reinterpret_cast<__gm__ terminal_runtime::Binding*>(terminal);
         stream = reinterpret_cast<__gm__ pipeline_ab::Args*>(binding->pipeline);
         flags = reinterpret_cast<__gm__ uint32_t*>(binding->reserved[2]);
+        stagedMisses = reinterpret_cast<__gm__ uint32_t*>(binding->reserved[4]);
         shape = rotating::LoadRuntimeShape(ctx);
         if ASCEND_IS_AIV {
             core = GetBlockIdx() / 2;
@@ -376,7 +386,9 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint3
     TPipe pipe;
     Indexer op;
     input.Init(op, pipe, plan.row, false);
+    const bool overlap = large_li::CanOverlapBanks(plan.tiles, plan.quota, input.shape.rounds);
     if ASCEND_IS_AIV {
+        if (overlap) QLIKernel::PrimeLargeBanks();
         if (!input.vecLane) {
             if (input.Trace()) {
                 uint64_t start = GetSystemCycle();
@@ -395,11 +407,15 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint3
         const auto span = large_li::Window(plan.start, plan.end, input.shape.rounds, epoch);
         const uint32_t suffix = large_li::LaterSuffix(span, plan.start, plan.tiles, plan.quota, planCount, epoch);
         const uint32_t cut = span.end - suffix;
-        if (span.begin != cut) {
-            op.ProcessLargeScore(span.begin, cut, true, !thresholdLoaded);
+        if (span.begin < cut) {
+            op.ProcessLargeScore(span.begin, cut, true, !thresholdLoaded, overlap);
             thresholdLoaded = true;
         }
         if ASCEND_IS_AIV {
+            // After ProcessLargeScore acknowledges BOTH old credits per lane,
+            // the cube may fill the next two banks while these lanes rank the
+            // current window and its single owner rings the doorbell.
+            if (overlap && epoch + 1 < input.shape.rounds) QLIKernel::PrimeLargeBanks();
             // One scorer always produces Q0/Q1; its sibling produces Q2/Q3.
             // Only the matching helper's suffix contributes to this pair.
             if (suffix) {
@@ -410,6 +426,31 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint3
             op.vectorService.AdvanceLargeWindowPair(plan.row, epoch, span.end * 128);
             FinishPair(input, plan, op, epoch);
             op.vectorService.FreeEventID();
+        }
+    }
+    if ASCEND_IS_AIV {
+        if (input.stagedMisses) {
+            // Probe once; a late row, an outstanding own Post or an ineligible Q
+            // simply defers its exact classification to its original tail owner.
+            auto last = reinterpret_cast<__gm__ rotating::Event*>(input.ctx->events) +
+                        (input.shape.rounds - 1) * input.shape.serviceLanes;
+            const uint32_t peer = (plan.row + input.shape.batch / 2) % input.shape.batch;
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(last + peer), 128);
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(last + plan.row), 128);
+            auto events = reinterpret_cast<__gm__ volatile rotating::Event*>(last);
+            if (!events[peer].complete && events[plan.row].complete) {
+                auto ends = reinterpret_cast<__gm__ const uint32_t*>(input.ctx->queryEnds);
+                const uint32_t scan = large_li::ScanHistory(input.shape, ends, plan.row);
+                op.vectorService.AllocEventID();
+                for (uint32_t q = 2 * input.vecLane; q < 2 * input.vecLane + 2; ++q) {
+                    const uint32_t query = plan.row * 4 + q;
+                    const uint32_t valid = ends ? Min(ends[query], input.shape.history) : input.shape.history;
+                    const uint32_t staged = op.vectorService.StagePublishedLargeMisses(
+                        query, scan, valid, input.stagedMisses);
+                    if (staged) input.Signal(plan.row, q, staged);
+                }
+                op.vectorService.FreeEventID();
+            }
         }
     }
     pipe.Destroy();

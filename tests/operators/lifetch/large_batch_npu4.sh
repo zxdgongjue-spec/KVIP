@@ -1,25 +1,51 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Five real Q4 traces, four native batch sizes, paired with the strong two-worker serial path.
+# Five real Q4 traces paired with the strong two-worker serial path.
 set -eo pipefail
 root=$(cd "$(dirname "$0")/../../.." && pwd)
 work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold}
 reuse_serial=
 archive=
+fixed=0
+fixed_archive=
+batches=(20 24 28 32)
+groups=(10 4 17 7 2)
 if (( $# )); then
     if [[ $# == 2 && $1 == --candidate-only ]]; then
         archive=$(cd "$2" && pwd)
     elif [[ $# == 2 && $1 == --reuse-g10-bs20-serial ]]; then
         reuse_serial=$2
+    elif [[ $1 == --fixed-q4 && $# -le 2 ]]; then
+        fixed=1
+        if (( $# == 2 )); then
+            fixed_archive=$(cd "$2" && pwd)
+        elif [[ -d "$work/peer-baseline/largebs-q4.DcP0Xb" ]]; then
+            fixed_archive="$work/peer-baseline/largebs-q4.DcP0Xb"
+        fi
+        read -ra batches <<<"${FIXED_Q4_BATCHES:-1 2 4 8 16 20 24 28 32}"
+        read -ra groups <<<"${FIXED_Q4_GROUPS:-10 4 17 7 2}"
+        validate_selection() {
+            local valid=$1 seen=' ' v
+            shift
+            (( $# > 0 )) || return 1
+            for v do
+                [[ " $valid " == *" $v "* && "$seen" != *" $v "* ]] || return 1
+                seen+="$v "
+            done
+        }
+        validate_selection '1 2 4 8 16 20 24 28 32' "${batches[@]}" &&
+            validate_selection '10 4 17 7 2' "${groups[@]}" || { echo "Invalid FIXED_Q4_BATCHES/GROUPS" >&2; exit 2; }
     else
-        echo "Usage: $0 [--candidate-only RESULT_ROOT | --reuse-g10-bs20-serial RESULT_ROOT]" >&2
+        echo "Usage: $0 [--fixed-q4 [LARGE_ARCHIVE] | --candidate-only RESULT_ROOT | --reuse-g10-bs20-serial RESULT_ROOT]" >&2
         exit 2
     fi
 fi
 area="$work/peer-baseline"
 sources="$work/fused-scan-sources"
 mkdir -p "$area" "$sources"
-out=$(mktemp -d "$area/largebs-q4.XXXXXX")
+prefix=largebs-q4
+if (( fixed )); then prefix=fixed-q4; fi
+out=$(mktemp -d "$area/$prefix.XXXXXX")
 echo "RESULT_ROOT=$out"
 log="$out/run.log"
 # A single transcript for setup/driver errors, with compact results on stdout.
@@ -98,9 +124,11 @@ export PEER_PHYSICAL_NPU=4
 printf '%s\n' "$(git -C "$root" rev-parse HEAD)" > "$out/native.txt"
 if [[ -r /etc/machine-id ]]; then cat /etc/machine-id > "$out/machine_id.txt"; fi
 printf '4\n' > "$out/physical_npu.txt"
+printf '%s\n' "$actual" > "$out/kvaf_tree.txt"
+git -C "$sdk" rev-parse HEAD > "$out/kvaf.txt"
 # Use the same registered CPU memory placement for the serial and fused arms.
 placement="auto auto"
-if [[ -z $archive ]]; then
+if [[ -z $archive && -z $fixed_archive ]]; then
     placement=$("$PYTHON" -B "$workers/large_batch_placement.py" find "$out")
 fi
 read -r planned_node planned_adapter <<<"$placement"
@@ -126,20 +154,24 @@ set_cpu_placement() {
             if taskset -c "$cpus" true >/dev/null 2>&1; then command=(taskset -c "$cpus" "$cpu"); fi
         fi
     fi
-    if [[ ${3:-} == archived ]] && {
+    if [[ ${3:-} == archived || ${3:-} == published ]] && {
         [[ $ub_device != "$adapter" || ${#command[@]} == 1 ]] ||
-        [[ $planned_node != auto && $planned_node != "$node" ]] ||
-        [[ $planned_adapter != auto && $planned_adapter != "$adapter" ]]
+        [[ ${3:-} == archived && $planned_node != auto && $planned_node != "$node" ]] ||
+        [[ ${3:-} == archived && $planned_adapter != auto && $planned_adapter != "$adapter" ]]
     }; then
         echo "Archived NUMA=$node UB=$adapter conflicts with current placement or binding permissions" >&2
         return 1
     fi
     if [[ -n $ub_device && $ub_device != auto ]]; then command+=(--ub-device "$ub_device"); fi
 }
+if [[ -n $fixed_archive ]]; then
+    read -r planned_node planned_adapter < <("$PYTHON" -B "$workers/large_batch_placement.py" get "$fixed_archive/g10/bs20/fused/thp.json")
+fi
 set_cpu_placement "$planned_node" "$planned_adapter"
+export PYTHON
 run_arm() (
     set -euo pipefail
-    local group=$1 batch=$2 trace=$3 arm=$4 pair=$5
+    local group=$1 batch=$2 trace=$3 arm=$4 pair=$5 cohort=${6:-0}
     dir="$pair/$arm"
     mkdir "$dir"
     port=$("$PYTHON" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
@@ -162,8 +194,16 @@ run_arm() (
     grep -Fq "LISTEN address=127.0.0.1 port=$port" "$dir/cpu.log" || { tail -20 "$dir/cpu.log"; exit 1; }
     "$PYTHON" -B "$helpers/support/peer_thp.py" --unified-sdk --pid "$server" --log "$dir/cpu.log" --output "$dir/thp.json" --timeout 7200 &
     monitor=$!
-    args=(--trace "$trace" --group "$group" --batch "$batch" --arm "$arm" --kvaf-root "$sdk"
+    if [[ $arm == candidate ]]; then
+        (cd "$dir" && timeout --kill-after=30s 7200s bash "$root/tests/operators/lifetch/fixed_bs16_pr30.sh" \
+            "$root" "$work" "$out" "$group" "$trace" "$sdk" "127.0.0.1:$port" "$dir") >"$dir/worker.log" 2>&1 || { tail -25 "$dir/worker.log"; exit 1; }
+        wait "$monitor"
+        monitor=
+        return
+    fi
+    args=(--trace "$trace" --group "$group" --batch "$batch" --cohort "$cohort" --arm "$arm" --kvaf-root "$sdk"
           --kvaf-server "127.0.0.1:$port" --output "$dir")
+    if (( fixed )); then args+=(--prepared "$out/g$group/donors"); fi
     if [[ $arm == fused ]]; then
         if [[ -n $archive ]]; then
             args+=(--serial-result "$archive/g$group/bs$batch/serial" --compare-archived-pair)
@@ -175,47 +215,94 @@ run_arm() (
     wait "$monitor"
     monitor=
 )
-for group in 10 4 17 7 2; do
-    trace=$(bash "$helpers/peer_g2_input.sh" "$work" "$group")
-    for batch in 20 24 28 32; do
-        pair="$out/g$group/bs$batch"
-        mkdir -p "$pair"
-        echo "CASE_BEGIN G$group BS$batch" >&3
-        if [[ -n $archive ]]; then
-            ref="$archive/g$group/bs$batch"
-            "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref/serial/thp.json" "$ref/fused/thp.json"
-            read -r node adapter < <("$PYTHON" -B "$workers/large_batch_placement.py" get "$ref/fused/thp.json")
-            set_cpu_placement "$node" "$adapter" archived
-            run_arm "$group" "$batch" "$trace" fused "$pair"
-            "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref/fused/thp.json" "$pair/fused/thp.json"
-            grep -E '^(CHECK|TIMING|TRAFFIC|DIAGNOSTIC|SAVED) ' "$pair/fused/worker.log" | tee -a "$out/summary.txt" >&3
-            rm -f -- "$pair/fused/worker.log" "$pair/fused/cpu.log"
-            continue
+run_pair() {
+    local group=$1 batch=$2 trace=$3 cohort=$4 pair=$5
+    mkdir -p "$pair"
+    echo "CASE_BEGIN G$group BS$batch cohort=$cohort" >&3
+    if [[ -n $archive ]]; then
+        ref="$archive/g$group/bs$batch"
+        "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref/serial/thp.json" "$ref/fused/thp.json"
+        read -r node adapter < <("$PYTHON" -B "$workers/large_batch_placement.py" get "$ref/fused/thp.json")
+        set_cpu_placement "$node" "$adapter" archived
+        run_arm "$group" "$batch" "$trace" fused "$pair" "$cohort"
+        "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref/fused/thp.json" "$pair/fused/thp.json"
+        grep -E '^(CHECK|TIMING|TRAFFIC|DIAGNOSTIC|SAVED) ' "$pair/fused/worker.log" | tee -a "$out/summary.txt" >&3
+        rm -f -- "$pair/fused/worker.log" "$pair/fused/cpu.log"
+        return
+    fi
+    if [[ -n $reuse_serial && $group == 10 && $batch == 20 ]]; then
+        staged=$(mktemp -d "$pair/serial-import.XXXXXX")
+        if "$PYTHON" -B "$workers/large_batch_pair.py" --arm serial --trace "$trace" --group 10 --batch 20 \
+            --kvaf-root "$sdk" --output "$staged" --reuse-serial-archive "$reuse_serial" >"$staged/worker.log" 2>&1 &&
+            read -r archived_node archived_adapter < <("$PYTHON" -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["node"],r["adapter"])' "$staged/serial_reference.json") &&
+            set_cpu_placement "$archived_node" "$archived_adapter" archived >>"$staged/worker.log" 2>&1; then
+            mv "$staged" "$pair/serial"
+            echo "REUSED G10 BS20 serial source=$reuse_serial NUMA=$archived_node UB=$archived_adapter" >&3
+        else
+            printf 'REMEASURE G10 BS20 serial reason=%s\n' "$(tail -1 "$staged/worker.log")" >&3
+            rm -rf -- "$staged"
+            set_cpu_placement "$planned_node" "$planned_adapter"
         fi
-        if [[ -n $reuse_serial && $group == 10 && $batch == 20 ]]; then
-            staged=$(mktemp -d "$pair/serial-import.XXXXXX")
-            if "$PYTHON" -B "$workers/large_batch_pair.py" --arm serial --trace "$trace" --group 10 --batch 20 \
-                --kvaf-root "$sdk" --output "$staged" --reuse-serial-archive "$reuse_serial" >"$staged/worker.log" 2>&1 &&
-                read -r archived_node archived_adapter < <("$PYTHON" -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["node"],r["adapter"])' "$staged/serial_reference.json") &&
-                set_cpu_placement "$archived_node" "$archived_adapter" archived >>"$staged/worker.log" 2>&1; then
-                mv "$staged" "$pair/serial"
-                echo "REUSED G10 BS20 serial source=$reuse_serial NUMA=$archived_node UB=$archived_adapter" >&3
-            else
-                printf 'REMEASURE G10 BS20 serial reason=%s\n' "$(tail -1 "$staged/worker.log")" >&3
-                rm -rf -- "$staged"
-                set_cpu_placement "$planned_node" "$planned_adapter"
+    fi
+    if [[ ! -d $pair/serial ]]; then run_arm "$group" "$batch" "$trace" serial "$pair" "$cohort"; fi
+    run_arm "$group" "$batch" "$trace" fused "$pair" "$cohort"
+    "$PYTHON" -B "$workers/large_batch_placement.py" compare "$pair/serial/thp.json" "$pair/fused/thp.json"
+    for arm in serial fused; do
+        grep -E '^(CHECK|TIMING|SAVED) ' "$pair/$arm/worker.log" | tee -a "$out/summary.txt" >&3
+        rm -f -- "$pair/$arm/worker.log" "$pair/$arm/cpu.log"
+    done
+}
+
+for group in "${groups[@]}"; do
+    trace=$(bash "$helpers/peer_g2_input.sh" "$work" "$group")
+    if (( fixed )); then
+        mkdir -p "$out/g$group"
+        "$PYTHON" -B "$workers/large_batch_input.py" "$trace" "$group" "$out/g$group/donors"
+    fi
+    for batch in "${batches[@]}"; do
+        cohorts=1
+        if (( fixed )); then
+            archive=
+            if (( batch < 16 )); then
+                cohorts=$((16 / batch))
+            elif (( batch > 16 )); then
+                archive=$fixed_archive
             fi
         fi
-        if [[ ! -d $pair/serial ]]; then run_arm "$group" "$batch" "$trace" serial "$pair"; fi
-        run_arm "$group" "$batch" "$trace" fused "$pair"
-        "$PYTHON" -B "$workers/large_batch_placement.py" compare "$pair/serial/thp.json" "$pair/fused/thp.json"
-        for arm in serial fused; do
-            grep -E '^(CHECK|TIMING|SAVED) ' "$pair/$arm/worker.log" | tee -a "$out/summary.txt" >&3
-            rm -f -- "$pair/$arm/worker.log" "$pair/$arm/cpu.log"
+        for ((cohort=0; cohort<cohorts; cohort++)); do
+            pair="$out/g$group/bs$batch"
+            if (( cohorts > 1 )); then pair="$pair/cohort$cohort"; fi
+            run_pair "$group" "$batch" "$trace" "$cohort" "$pair"
         done
+        if (( fixed && batch == 16 )); then
+            for block in 1 2; do
+                d="$out/pr30/block$block/g$group"
+                mkdir -p "$d"
+                published=${PEER_PR30_PUBLISHED_ARCHIVE:-$work/peer-baseline/pr30-feature-live-main-ten.aYyvMS}
+                thp="$published/block$block/g$group/paced/thp.json"
+                if [[ -f $thp ]] && cmp -s "$published/host.txt" "$out/host.txt" &&
+                    cmp -s "$published/physical_npu.txt" "$out/physical_npu.txt" &&
+                    cmp -s "$published/machine_id.txt" "$out/machine_id.txt"; then
+                    read -r node adapter < <("$PYTHON" -B "$workers/large_batch_placement.py" get "$thp")
+                    set_cpu_placement "$node" "$adapter" published
+                fi
+                echo "CASE_BEGIN G$group BS16 PR30_PROTOCOL block=$block" >&3
+                run_arm "$group" 16 "$trace" candidate "$d"
+                set_cpu_placement "$planned_node" "$planned_adapter"
+            done
+        fi
     done
+    if (( fixed )); then rm -rf -- "$out/g$group/donors"; fi
 done
-if [[ -n $archive ]]; then
+if (( fixed )); then
+    "$PYTHON" -B "$workers/fixed_q4_summary.py" "$out" --batches "${batches[@]}" --groups "${groups[@]}" | tee -a "$out/summary.txt" >&3
+    target_rc=0
+    if (( ${#batches[@]} == 9 && ${#groups[@]} == 5 )); then
+        "$PYTHON" -B "$workers/fixed_bs16_report.py" "$out" | tee -a "$out/summary.txt" >&3 || target_rc=$?
+        if (( target_rc != 0 && target_rc != 3 )); then exit "$target_rc"; fi
+    fi
+fi
+if [[ -n $archive && $fixed == 0 ]]; then
     "$PYTHON" -B - "$out" <<'PY' | tee -a "$out/summary.txt" >&3
 from pathlib import Path
 from statistics import mean
@@ -244,4 +331,9 @@ rm -rf -- "$host_tools"
 # The per-arm JSON and placement records contain the measurement. Setup and
 # import transcripts in this new output directory are only needed on failure.
 rm -f -- "$out"/{run,venv,pybind11,lidu-import,build-lidu,build-cpu}.log
+if (( fixed )); then
+    echo "REPLAY_COMPLETE cells=$((${#groups[@]} * ${#batches[@]})) RESULT_ROOT=$out" >&3
+    trap - EXIT
+    exit "$target_rc"
+fi
 echo "REPLAY_COMPLETE pairs=20 RESULT_ROOT=$out" >&3

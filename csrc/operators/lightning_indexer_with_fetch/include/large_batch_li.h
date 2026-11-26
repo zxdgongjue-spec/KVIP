@@ -16,6 +16,19 @@ LARGE_LI_DEVICE constexpr uint32_t CeilDiv(uint32_t x, uint32_t n) {
     return x / n + uint32_t(x % n != 0);
 }
 
+// LI2 writes 1 to the query's own readiness line. After the final window a
+// producer may publish the exact number of compact IDs (including zero).
+constexpr uint32_t kStagedBase = 2;
+constexpr uint32_t kTopK = 2048;
+LARGE_LI_DEVICE constexpr bool HasStagedMisses(uint32_t marker) {
+    return marker >= kStagedBase && marker <= kStagedBase + kTopK;
+}
+
+LARGE_LI_DEVICE constexpr bool CanStagePublishedMisses(uint32_t valid, uint32_t scan, uint64_t source,
+                                                       uint32_t cursor, uint16_t cutoff) {
+    return valid && valid <= scan && scan <= 131072 && source && cutoff && cursor >= scan;
+}
+
 // The terminal follows exactly the contiguous extent published by this row's
 // producers. Each query's causal bound still masks the last partial tile.
 template <class Shape, class Ends>
@@ -90,6 +103,14 @@ LARGE_LI_DEVICE constexpr uint32_t SuffixInWindow(Slice span, uint32_t resident,
     }
     return uint32_t(uint64_t(span.end - resident) * quota / total -
                     uint64_t(span.begin - resident) * quota / total);
+}
+
+// A window of L >= 4 tiles retains owner work: its proportional suffix
+// is <= ceil(L/2) and its later-window adjustment is <= floor(L/16).
+// This once-per-row check lets the cube prime the next window without
+// recalculating either boundary or suffix. Short rows keep on-demand credit.
+LARGE_LI_DEVICE constexpr bool CanOverlapBanks(uint32_t tiles, uint32_t quota, uint32_t rounds) {
+    return rounds >= 2 && tiles >= 4 * (rounds - 1) && quota <= tiles / 2;
 }
 
 // Give a shared helper a small extra suffix after the initial cold window.

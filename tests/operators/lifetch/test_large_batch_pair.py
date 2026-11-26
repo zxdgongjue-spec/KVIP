@@ -4,12 +4,14 @@
 from pathlib import Path
 from types import SimpleNamespace
 import sys
+from tempfile import TemporaryDirectory
 import unittest
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "support"))
-from large_batch_input import BATCHES, FrozenRound, expand, input_digest
+from large_batch_input import BATCHES, FrozenRound, expand, input_digest, load, save_source
+from fixed_bs16_report import BATCHES as FIXED_BATCHES, PUBLISHED_EVENT_PER_CALL, combined_pass
 from large_batch_pair import check_scores, large_account, last_row_windows, li_intervals, stage_sample, tail_team_intervals, verify_abc, verify_assignments
 from workloads import ReplayPagePlan, ReplayRound
 
@@ -43,6 +45,24 @@ def fixture():
 
 
 class LargeBatchReplay(unittest.TestCase):
+    def test_packed_and_single_event_gates_are_independent(self):
+        cells = [dict(group=g, batch=b, serial_graph_us=100, fused_graph_us=80)
+                 for g in PUBLISHED_EVENT_PER_CALL for b in FIXED_BATCHES]
+        packed = [dict(group=g, context_matched=True, new_packed_us=[110, 90], published_packed_us=[99, 101])
+                  for g in PUBLISHED_EVENT_PER_CALL]
+        self.assertEqual(combined_pass(cells, packed), (45, 5))
+        cells[0]['fused_graph_us'] = 80.01
+        packed[0]['context_matched'] = False
+        packed[-1]['new_packed_us'] = [115, 90]
+        self.assertEqual(combined_pass(cells, packed), (44, 3))
+        with self.assertRaises(ValueError):
+            combined_pass(cells[:-1] + cells[:1], packed)
+        with self.assertRaises(ValueError):
+            combined_pass(cells, packed[:-1] + packed[:1])
+        cells[0]['serial_graph_us'] = float('nan')
+        with self.assertRaises(ValueError):
+            combined_pass(cells, packed)
+
     def test_last_row_window_clock_partition(self):
         stamps = np.zeros((20, 4, 4), dtype=np.uint64)
         stamps[:, :, 2:] = (100, 200)
@@ -87,6 +107,62 @@ class LargeBatchReplay(unittest.TestCase):
             self.assertEqual(input_digest(data, pages, donors), input_digest(clone, pages, donors))
             clone.captured_hot_valid[0] += 1
             self.assertNotEqual(input_digest(data, pages, donors), input_digest(clone, pages, donors))
+
+    def test_fixed_small_batches_cover_all_donors_once(self):
+        for batch in (1, 2, 4, 8, 16):
+            cohorts = 16 // batch
+            observed = []
+            for i in range(cohorts):
+                data, donors = expand(fixture(), batch, cohort=i)
+                self.assertEqual(len(set(donors)), batch)
+                np.testing.assert_array_equal(data.logical_keys.ravel(), donors)
+                self.assertEqual(ReplayPagePlan(FrozenRound(data, [])).geometry["batch"], batch)
+                observed.extend(donors)
+            self.assertEqual(sorted(observed), list(range(16)))
+            with self.assertRaises(ValueError):
+                expand(fixture(), batch, cohort=cohorts)
+
+    def test_prepared_bank_preserves_operand_and_page_fingerprint(self):
+        from workloads import CaptureReference
+        source = fixture()
+        ref = CaptureReference(0, 1, 101, 10, Path("example"), (("a", 1), ("b", 2)))
+        with TemporaryDirectory() as d:
+            bank = Path(d) / "donors"
+            trace = Path(d) / "source"
+            save_source(bank, trace, 10, 1, source, [ref])
+            for b, cohort in ((1, 14), (8, 1), (16, 0), (32, 0)):
+                stream, donors = load(trace, 10, 1, b, cohort, bank)
+                raw, expected_rows = expand(source, b, cohort)
+                self.assertEqual(donors, expected_rows)
+                self.assertEqual(stream.rounds, ((ref,),))
+                self.assertEqual(input_digest(raw, ReplayPagePlan(FrozenRound(raw, [ref])), donors),
+                                 input_digest(stream.inputs, ReplayPagePlan(stream), donors))
+            with self.assertRaises(ValueError):
+                load(trace, 2, 1, 8, 0, bank)
+
+    def test_small_batch_kernel_accounting(self):
+        marker = dict(name="sample", ph="X", ts=90, dur=60)
+        for bs in (1, 2, 4, 8, 16):
+            names = ("v9_li_kernel", "v9_li_kernel_1", "v9_li_kernel_2") if bs == 16 else (
+                "v9_li_fixed_hot", "v9_li_kernel_1", "v9_li_fixed_cold")
+            events = [marker]
+            for i, name in enumerate((*names, "v9_parallel_terminal")):
+                events.append(dict(name=name + "_1", ph="X", cat="kernel", ts=100 + i * 7, dur=i + 1))
+            stages = stage_sample(large_account(events, "sample", 30, batch=bs), True)
+            self.assertEqual((stages["LI1"], stages["LI2"], stages["LI3"], stages["LI"], stages["tail"]),
+                             (1, 2, 3, 6, 4))
+            if bs == 16:
+                for missing in (2, 3):
+                    with self.assertRaisesRegex(ValueError, "expected three"):
+                        large_account(events[:missing] + events[missing+1:], "sample", 30, batch=bs)
+                invalid = list(events)
+                invalid[2] = dict(invalid[2], name="v9_li_kernel_16_1_1")
+                with self.assertRaisesRegex(ValueError, "wrong PR30 LI2"):
+                    large_account(invalid, "sample", 30, batch=bs)
+            else:
+                events[1] = dict(events[1], name="v9_li_kernel")
+                with self.assertRaisesRegex(ValueError, "Unattributed"):
+                    large_account(events, "sample", 30, batch=bs)
 
     def test_merged_li_scope_and_median_inputs(self):
         scope = dict(name="measured", ph="X", ts=100, dur=28)

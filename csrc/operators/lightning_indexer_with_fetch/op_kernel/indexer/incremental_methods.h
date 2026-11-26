@@ -146,6 +146,16 @@ __aicore__ inline GM_ADDR WindowTopkPrefix() {
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     return reinterpret_cast<GM_ADDR>(ctx->incremental)+runtimeShape_.batch*512;
 }
+#if KVIP_LARGE_BATCH_LI || KVIP_PARALLEL_TERMINAL
+__aicore__ inline void LoadPublishedLargeIds(uint32_t query) {
+    constexpr uint32_t prefixBytes = 4 * 2048 * 6 + 1024;
+    auto row = WindowTopkPrefix() + uint64_t(query / 4) * prefixBytes;
+    GlobalTensor<uint32_t> ids;
+    ids.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(row + 4 * 2048 * 2) + (query % 4) * 2048);
+    DataCopy(indicesOutLocal_, ids, 2048);
+}
+#endif
+
 // Included in QLIVector. Use the existing merge/output/TopK scratch buffers.
 // Raw scores and predicates die before TopK reuses its scratch. ID maps
 // follow the LI trunk geometry; optional next-Q input uses only spare LI UB.
