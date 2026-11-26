@@ -73,9 +73,9 @@ public:
                                 __gm__ uint8_t *actualSeqLengthsK, __gm__ uint8_t *blockTable,
                                 __gm__ uint8_t *sparseIndices,
                                 __gm__ uint8_t *workspace, const QLITilingData *__restrict tiling, TPipe *tPipe,
-                                uint32_t seqParts = 2);
+                                uint32_t seqParts = 2, bool serviceOnly = false);
     __aicore__ inline void Process();
-    template <SequenceLiPhase Phase, bool WaitColdPeers = true>
+    template <SequenceLiPhase Phase, bool WaitColdPeers = true, bool SeparateService = false>
     __aicore__ inline void ProcessSequenceSplit(uint32_t parts = 2, GM_ADDR coldGmReady = nullptr);
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
     template <bool OwnWindow = false>
@@ -474,7 +474,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
                                               __gm__ uint8_t *blockTable,
                                               __gm__ uint8_t *sparseIndices, __gm__ uint8_t *workspace,
                                               const QLITilingData *__restrict tiling, TPipe *tPipe,
-                                              uint32_t seqParts)
+                                              uint32_t seqParts, bool serviceOnly)
 {
     if ASCEND_IS_AIV {
         tmpBlockIdx = GetBlockIdx();  // vec:0-47
@@ -489,7 +489,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::Init(__gm__ uint8_t *q
 
     // 获取分核信息
     if (sequenceSplit_) {
-        splitCoreInfo.bN2Start = aiCoreIdx / seqParts;
+        splitCoreInfo.bN2Start = serviceOnly ? 0 : aiCoreIdx / seqParts;
         splitCoreInfo.bN2End = splitCoreInfo.bN2Start;
         splitCoreInfo.s2End = constInfo.kSeqSize / constInfo.s2BaseSize - 1;
     } else {
@@ -725,10 +725,14 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
         info.reuseQuery = newQuery && tile == begin;
 #endif
 #if KVIP_STAGE_TRACE
-        // First and last tile preserve pipeline transitions without turning
-        // the full history scan into a trace of every individual submission.
+        // BS2/W4 includes the first three tiles to cover both ping-pong
+        // banks and the next credit request at the window boundary.
         kvip_trace::ScanSample pipeSample;
-        if (stageTrace_ && (tile == begin || tile + 1 == end)) {
+        uint32_t leadingSamples = 1;
+        if (traceKernel_ == kvip_trace::Cold && runtimeShape_.batch == 2 && runtimeShape_.rounds == 4) {
+            leadingSamples = 3;
+        }
+        if (stageTrace_ && (tile - begin < leadingSamples || tile + 1 == end)) {
             uint32_t firstQ = kvip_trace::kAllQueries;
             if ASCEND_IS_AIV { firstQ = (tmpBlockIdx % 2) * 2; }
             const uint32_t traceKernel = traceKernel_ == kvip_trace::Threshold || traceKernel_ == kvip_trace::Cold
@@ -804,7 +808,7 @@ __aicore__ inline bool QuantLightningIndexerKernel<QLIT>::ScoreRecent(
 }
 
 template <typename QLIT>
-template <SequenceLiPhase Phase, bool WaitColdPeers>
+template <SequenceLiPhase Phase, bool WaitColdPeers, bool SeparateService>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(
     uint32_t parts, [[maybe_unused]] GM_ADDR coldGmReady)
 {
@@ -928,7 +932,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(
                 KVIP_TRACE_BEGIN(progressScope, stageTrace_, Cold, ColdProgressPrepare, 0, batch);
                 vectorService.PrepareRotationProgress();
                 KVIP_TRACE_END(progressScope);
-                if (serviceLeader && serviceEpoch == 0) {
+                if (!SeparateService && serviceLeader && serviceEpoch == 0) {
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
                     if constexpr (Phase == SequenceLiPhase::PrecomputedCold) {
                         if (coldGmReady) {
@@ -989,7 +993,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(
                         tiles.begin, tiles.end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
                 }
                 if ASCEND_IS_AIV {
-                    if (serviceLeader && serviceEpoch == epoch) {
+                    if (!SeparateService && serviceLeader && serviceEpoch == epoch) {
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
                         if (parts > 2) {
                             if constexpr (WaitColdPeers) {

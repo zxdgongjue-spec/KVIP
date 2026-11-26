@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 from types import SimpleNamespace
 
+from lifetch_cold_trace_comparison import summarize_scopes
 from run_mr25_handoff import KVAF, ROOT, bench_arguments, collect, git, read, save
 from run_mr28_baseline_msprof import capture_route
 from run_mr28_dedicated_service import write_summary
@@ -35,6 +36,8 @@ BS2_TRACE_BASELINES = {
     'both': ('windows_w2', 'cold'),
 }
 BS2_TRACE_PREFIX = {'windows_w2': 'same_window_', 'cold': 'same_parts_w4_'}
+BS2_SERVICE_ARMS = {2: ('cold', 'cold_separate')}
+BS2_WAIT_SCOPES = {180: 'aic_credit_wait_sample', 151: 'service_predecessor_wait', 224: 'service_driver_wait'}
 MAIN = 'df8ad2598e70e4b5e266b15028ab26c601a2bdf2'
 DIRECTION1_MODES = {1: 'cold', 2: 'cold', 4: 'cold', 8: 'windows', 16: 'windows', 32: 'windows'}
 DIRECTION1_MISSES = (5, 10, 15, 20, 25, 30)
@@ -53,6 +56,8 @@ def balanced_arms(batch):
 
 
 def study_arms(args):
+    if args.bs2_p4_service:
+        return BS2_SERVICE_ARMS
     if args.bs2_trace_pair:
         return {2: (*BS2_TRACE_BASELINES[args.bs2_trace_pair], 'cold_w2')}
     if args.cold_window_matrix:
@@ -114,12 +119,13 @@ def plan(args, kvaf):
                            measurement_kind=measurement, mode=mode, requested_windows=requested, effective_windows=effective,
                            hot_score_parts=2, hot_score_aic=2 * physical, hot_score_aiv=4 * physical,
                            service_aics=service_aics, cold_score_parts=parts, cold_score_groups=physical * parts,
+                           separate_service_aivs=2 * service_aics * effective if mode == 'cold_separate' else 0,
                            service_owner_groups=2 * physical, service_group_slots=service_aics * effective,
                            max_requests_per_service_aiv=(physical + 2 * service_aics - 1) // (2 * service_aics),
                            arguments=arguments, kernels=CHECKED_KERNELS[f'small_{mode}'])
 
 
-def trace_arm(output, case, config, profiler):
+def trace_arm(output, case, config, profiler, *, compare_service=False):
     args = SimpleNamespace(batch=case['batch'], miss_percent=case['miss_percent'])
     case_output = output / f'bs{case["batch"]}' / case['mode']
     case_output.mkdir(parents=True)
@@ -136,8 +142,9 @@ def trace_arm(output, case, config, profiler):
         bodies = [stage for stage in report['stages']
                   if stage['kernel_entry'] == cold_entry and stage['phase_id'] == 1]
         groups = case['cold_score_groups']
-        if [(body['logical_aic_lanes'], body['logical_aiv_lanes']) for body in bodies] != [(groups, 2 * groups)]:
-            raise ValueError(f'{cold_entry} trace does not show the planned {groups} MIX groups')
+        aiv_lanes = 2 * groups + case['separate_service_aivs']
+        if [(body['logical_aic_lanes'], body['logical_aiv_lanes']) for body in bodies] != [(groups, aiv_lanes)]:
+            raise ValueError(f'{cold_entry} trace does not show the planned {groups} AIC and {aiv_lanes} AIV')
         manifest['status'] = 'PASS'
         row = dict(
             variant=case['mode'], batch=case['batch'], accepted=True, windows=report['windows'],
@@ -154,6 +161,22 @@ def trace_arm(output, case, config, profiler):
         fields = COLD_GM_STAGE_FIELDS.get(f"small_{case['mode']}", STAGES)
         for field, interval in zip(fields, capture['intervals'], strict=True):
             row[f'marked_{field}'] = interval['duration_us']
+        if compare_service:
+            scopes = summarize_scopes(capture['source'], cold_entry, report['windows'],
+                                      scopes=BS2_WAIT_SCOPES, sampled={180})
+            if [scope['events'] for scope in scopes if scope['window'] is None] != [
+                96, 6, 6 if case['separate_service_aivs'] else 0
+            ]:
+                raise ValueError('Unexpected AIC credit or Service wait scope coverage')
+            waits = case_output / 'bs2_service_waits.json'
+            save(waits, scopes)
+            row['service_waits_report'] = str(waits)
+            row['prefetch_by_window'] = [sum(req['prefetch_by_window'][window] for req in report['requests'])
+                                         for window in range(report['windows'])]
+            for scope in scopes:
+                if scope['window'] is None:
+                    row[f"{scope['scope']}_max_lane_us"] = scope['max_lane_union_us']
+                    row[f"{scope['scope']}_longest_us"] = scope['max_event_us']
         return row
     except BaseException:
         manifest['status'] = 'FAILED'
@@ -294,6 +317,8 @@ def main():
                        help='keep Hot P2; sweep Cold parts at W2 for BS1 and W2/W4 for BS2/BS8')
     route.add_argument('--bs2-trace-pair', choices=BS2_TRACE_BASELINES,
                        help='capture BS2 msprof pairs: P2/P4 at W2, W4/W2 at P4, or both')
+    route.add_argument('--bs2-p4-service', action='store_true',
+                       help='compare rotating and separate Service with static BS2 Cold P4/W4')
     parser.add_argument('--repeats', type=int, default=1, help='repeat the matrix with the same bridge and independent workers')
     parser.add_argument('--trace', action='store_true', help='capture one checked msprof replay per arm')
     parser.add_argument('--dry-run', action='store_true')
@@ -338,6 +363,7 @@ def main():
                     full32=args.full32, window_sweep=args.window_sweep, balanced=args.balanced,
                     cold_window_matrix=args.cold_window_matrix,
                     bs2_trace_pair=args.bs2_trace_pair,
+                    bs2_p4_service=args.bs2_p4_service,
                     granularity_study=args.granularity_study, repeats=args.repeats,
                     scopes=dict(queries=4, history=131072, resident=16384,
                                 miss_percent=sorted({case['miss_percent'] for case in cases + unsupported}),
@@ -374,13 +400,15 @@ def main():
             print(f"Round {repeat}/{args.repeats}, BS{case['batch']} miss{miss:g} "
                   f"{case['mode']} P{case['cold_score_parts']}/W{case['effective_windows']} "
                   f"({case['cold_score_groups']} Cold MIX groups)", flush=True)
-            row = trace_arm(run_dir, case, config, profiler) if args.trace else perf_arm(run_dir, case, config)
+            row = (trace_arm(run_dir, case, config, profiler, compare_service=args.bs2_p4_service)
+                   if args.trace else perf_arm(run_dir, case, config))
             row.update(repeat=repeat, miss_percent=miss, physical_batch=case['physical_batch'],
                        waves=case['waves'],
                        hot_score_parts=case['hot_score_parts'], hot_score_aic=case['hot_score_aic'],
                        hot_score_aiv=case['hot_score_aiv'],
                        measurement_kind=case['measurement_kind'], cold_score_groups=case['cold_score_groups'],
                        cold_score_aic=case['cold_score_groups'], cold_score_aiv=2 * case['cold_score_groups'],
+                       separate_service_aiv=case['separate_service_aivs'],
                        service_group_slots=case['service_group_slots'],
                        service_owner_groups=case['service_owner_groups'],
                        max_requests_per_service_aiv=case['max_requests_per_service_aiv'])
@@ -398,13 +426,22 @@ def main():
             parts = case['cold_score_parts']
             if (args.balanced or args.cold_window_matrix) and parts == 2:
                 window_bases[window_pair] = row
-            if row['variant'] == 'p2':
+            if row['variant'] == ('cold' if args.bs2_p4_service else 'p2'):
                 bases[pair] = row
             else:
                 before = bases[pair]
                 if (args.granularity_study or args.cold_window_matrix) and row['variant'] == 'cold':
                     p4_arms[pair] = row
                 compare_arms(before, row, trace=args.trace)
+                if args.bs2_p4_service:
+                    if args.trace:
+                        for stage in ('marked_cold_service_us', 'native_first_kernel_to_terminal_us',
+                                      *(f'{name}_max_lane_us' for name in BS2_WAIT_SCOPES.values()),
+                                      *(f'{name}_longest_us' for name in BS2_WAIT_SCOPES.values())):
+                            row[f"{stage.removesuffix('_us')}_delta_us"] = row[stage] - before[stage]
+                    else:
+                        print(f"Separate Service KV ready: {before['kv_ready_us']:.2f} -> "
+                              f"{row['kv_ready_us']:.2f} µs ({row['raw_kv_ready_ratio']:.4f}x)", flush=True)
                 if row['variant'] == 'cold_p8':
                     compare_arms(p4_arms[pair], row, trace=args.trace, prefix='vs_p4_')
                 if ((args.balanced and row['variant'] in FULL32_MODES)

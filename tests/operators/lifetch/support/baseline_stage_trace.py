@@ -65,8 +65,11 @@ DYNAMIC_KERNELS = {
 }
 SMALL_COLD_KERNELS = {**COLD_P4_KERNELS,
                       22: (KERNELS[22][0], 'v9_li_kernel_cold_ready_partitioned')}
+SMALL_COLD_SEPARATE_KERNELS = {**SMALL_COLD_KERNELS,
+                               22: ('Cold P4 + separate Service', 'v9_li_kernel_cold_separate_service')}
 ROUTE_KERNELS = {'p2': KERNELS, 'cold_p4': COLD_P4_KERNELS,
                  'small_cold': SMALL_COLD_KERNELS, 'small_topk': KERNELS,
+                 'small_cold_separate': SMALL_COLD_SEPARATE_KERNELS,
                  'dedicated': DEDICATED_KERNELS, 'static_ready': STATIC_READY_KERNELS,
                  'dynamic': DYNAMIC_KERNELS,
                  **{route: UNIFIED_KERNELS for route in UNIFIED_ROUTES}}
@@ -170,7 +173,8 @@ PHASES.update({phase: name for phase, (_, _, name) in PIPE_SCOPES.items()})
 NO_TILE, NO_QUERY, SERVICE_LANE = (1 << 20) - 1, 15, 14
 PIPE_SEMANTICS = ('Instrumented source scopes bracket instruction issue and existing fences. '
                   'Lane counters count overlapping scopes per logical lane, with no PMU sampling. '
-                  'Score scan scopes sample the first and last tile of each active half-window. '
+                  'Score scan scopes sample the first and last tile of each fragment. '
+                  'BS2 W4 Cold samples its first three and last tiles. '
                   'Core IDs are the raw device core-group '
                   'values observed alongside logical block and subblock IDs.')
 # Stages that must appear on this P2/W4 route. Get submission may be
@@ -239,6 +243,7 @@ class StageBuffer:
             'p2': 'kvip_parallel_tail_profile_forward',
             'cold_p4': 'kvip_parallel_tail_cold_partitioned_profile_forward',
             'small_cold': 'kvip_small_batch_cold_profile_forward',
+            'small_cold_separate': 'kvip_small_batch_cold_separate_profile_forward',
             'small_topk': 'kvip_small_batch_topk_profile_forward',
             'dedicated': 'kvip_parallel_tail_dedicated_service_profile_forward',
             'static_ready': 'kvip_parallel_tail_static_ready_service_profile_forward',
@@ -348,7 +353,7 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
             raise ValueError(f'Missing required pipe scopes: {missing_pipe}')
     if require_handoff_scopes:
         expected = dict(REQUIRED_HANDOFF)
-        if cold_route in ('cold_p4', 'small_cold', 'dedicated', 'static_ready', 'dynamic'):
+        if cold_route in ('cold_p4', 'small_cold', 'small_cold_separate', 'dedicated', 'static_ready', 'dynamic'):
             expected[21] = expected[21] | {COLD_PROGRESS_RESET}
         if cold_route in ('dedicated', 'static_ready'):
             expected[22] = expected[22] | {231}
@@ -380,6 +385,7 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
     small_cold_groups = batch * (cold_parts if cold_route == 'small_cold' else 4)
     small_cold_lanes = set(range(2 * small_cold_groups)) | set(range(64, 64 + small_cold_groups))
     cold_lanes = {'cold_p4': p4_lanes, 'small_cold': small_cold_lanes, 'small_topk': four_aiv | two_aic,
+                  'small_cold_separate': p4_lanes | set(range(16, 24)),
                   'dedicated': four_aiv | set(range(64, 88)),
                   'static_ready': four_aiv | set(range(64, 88)),
                   'dynamic': four_aiv | two_aic,
@@ -396,7 +402,24 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
         raise ValueError('A source scope has no corresponding kernel body on its lane')
     dedicated_scopes = {DEDICATED_DRIVER_WAIT, DEDICATED_READY_SNAPSHOT}
     dedicated_events = [event for event in events if event['phase'] in dedicated_scopes]
-    if cold_route in ('dedicated', 'static_ready', 'dynamic'):
+    if cold_route == 'small_cold_separate':
+        if batch != 2 or cold_parts != 4:
+            raise ValueError('Separate partitioned Service trace requires BS2 P4/W4')
+        services = [(event['lane'], event['iteration'], event['detail']) for event in events
+                    if event['kernel'] == 22 and event['phase'] == 150]
+        expected_services = [(16 + 2 * window + lane, window, lane) for window in range(4) for lane in range(2)]
+        expected_waits = expected_services[2:]
+        waits = [(event['lane'], event['iteration'], event['detail']) for event in dedicated_events
+                 if event['kernel'] == 22 and event['phase'] == DEDICATED_DRIVER_WAIT]
+        predecessors = [(event['lane'], event['iteration'], event['detail']) for event in events
+                        if event['kernel'] == 22 and event['phase'] == 151]
+        if (sorted(services) != expected_services or sorted(waits) != expected_waits
+                or sorted(predecessors) != expected_waits
+                or len(dedicated_events) != len(expected_waits)
+                or any(event['kernel'] == 22 and event['phase'] == 22 and event['lane'] >= 16
+                       for event in events)):
+            raise ValueError('Separate Service trace must use spare AIVs with one job per window and lane')
+    elif cold_route in ('dedicated', 'static_ready', 'dynamic'):
         if batch != 16:
             raise ValueError('Dedicated Service source trace requires BS16')
         driver_coverage = {(event['lane'], event['iteration']) for event in dedicated_events
@@ -672,7 +695,7 @@ def render(events, counter_mhz, *, cold_route='p2'):
                     (20, 191): 'Full-history Score reduction SIMD VF',
                     (20, 192): 'Full-history Score writeback issue',
                     (22, 22): 'AIV precomputed Cold tile scan'} if cold_route in UNIFIED_ROUTES else {}
-    if cold_route in ('dedicated', 'static_ready'):
+    if cold_route in ('dedicated', 'static_ready', 'small_cold_separate'):
         scope_labels[22, 150] = 'Dedicated Service'
     elif cold_route == 'dynamic':
         scope_labels[22, 150] = 'Service on assigned AIV'
@@ -937,6 +960,9 @@ def write_capture(directory, raw, counter_mhz, state, library, config, soc, mspr
                       cold_score_worker_pool=31, service_worker_pool=64)
     elif cold_route in UNIFIED_ROUTES:
         report['route'] = f'Full Score P{score_parts} + Cold T2 + four-AIV Terminal'
+    elif cold_route == 'small_cold_separate':
+        report.update(route='Hot P2 + Cold P4 with separate Service', cold_score_aic=8,
+                      cold_score_aiv=16, cold_service_aiv=8)
     small_mode = getattr(config, 'small_batch_mode', None)
     if small_mode is not None:
         from small_batch import trace_evidence

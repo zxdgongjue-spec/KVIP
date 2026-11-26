@@ -9,6 +9,7 @@ import numpy as np
 SUPPORTED_BATCHES = {
     'p2': (1, 2, 4, 8, 16),
     'cold': (1, 2, 4, 8),
+    'cold_separate': (2,),
     'cold_w2': (2,),
     'cold_p8': (1,),
     'cold_full': (1, 2, 8),
@@ -21,13 +22,15 @@ SUPPORTED_BATCHES = {
 }
 MODES = ('p2', 'cold', 'windows', 'topk', 'get')
 FULL32_MODES = {'cold_full', 'cold_full_w3', 'cold_full_w2'}
-PARTITIONED_MODES = FULL32_MODES | {'cold', 'cold_w2', 'cold_p8'}
+PARTITIONED_MODES = FULL32_MODES | {'cold', 'cold_separate', 'cold_w2', 'cold_p8'}
 WINDOW_OVERRIDES = {'windows': 3, 'windows_w2': 2, 'cold_w2': 2, 'cold_full_w3': 3, 'cold_full_w2': 2}
 TRACE_ROUTES = dict(p2='p2', **dict.fromkeys(PARTITIONED_MODES, 'small_cold'),
                     windows='p2', windows_w2='p2', topk='small_topk', get='p2')
+TRACE_ROUTES['cold_separate'] = 'small_cold_separate'
 KERNELS = ('v9_li_kernel', 'v9_li_kernel_1', 'v9_li_kernel_2', 'v9_parallel_terminal')
 COLD_KERNELS = (KERNELS[0], 'v9_li_kernel_threshold_cold_partitioned',
                 'v9_li_kernel_cold_ready_partitioned', KERNELS[3])
+COLD_SEPARATE_KERNELS = (*COLD_KERNELS[:2], 'v9_li_kernel_cold_separate_service', COLD_KERNELS[-1])
 TOPK_KERNELS = (KERNELS[0], 'v9_li_kernel_resident_topk_high', *KERNELS[1:])
 GET_BALANCE_FLAG = 2
 
@@ -35,7 +38,7 @@ GET_BALANCE_FLAG = 2
 def cold_score_parts(mode, batch):
     if mode in FULL32_MODES:
         return 32 // batch
-    return {'cold': 4, 'cold_w2': 4, 'cold_p8': 8}.get(mode, 2)
+    return {'cold': 4, 'cold_separate': 4, 'cold_w2': 4, 'cold_p8': 8}.get(mode, 2)
 
 
 def bind(state, mode):

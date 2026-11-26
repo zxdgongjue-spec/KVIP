@@ -45,12 +45,12 @@ def union_us(intervals):
     return duration
 
 
-def summarize_scopes(document, cold_kernel, windows):
+def summarize_scopes(document, cold_kernel, windows, *, scopes=SCOPES, sampled=SAMPLED):
     scope_events = defaultdict(list)
     for event in document['traceEvents']:
         args = event.get('args', {})
         phase = args.get('phase_id')
-        if event.get('ph') != 'X' or phase not in SCOPES or args.get('kernel_entry') != cold_kernel:
+        if event.get('ph') != 'X' or phase not in scopes or args.get('kernel_entry') != cold_kernel:
             continue
         window = args.get('window_epoch')
         start, duration = event['ts'], event['dur']
@@ -62,14 +62,14 @@ def summarize_scopes(document, cold_kernel, windows):
 
     rows = []
     for window in (None, *range(windows)):
-        for phase, name in SCOPES.items():
+        for phase, name in scopes.items():
             records = scope_events.get((window, phase), ())
             lanes = defaultdict(list)
             for lane, start, stop in records:
                 lanes[lane].append((start, stop))
             durations = [stop - start for _, start, stop in records]
             rows.append(dict(
-                window=window, phase_id=phase, scope=name, sampled=phase in SAMPLED,
+                window=window, phase_id=phase, scope=name, sampled=phase in sampled,
                 events=len(records), lanes=len(lanes),
                 event_median_us=median(durations) if durations else None,
                 max_event_us=max(durations, default=0.0),

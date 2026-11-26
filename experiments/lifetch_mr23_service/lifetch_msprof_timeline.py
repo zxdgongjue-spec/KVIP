@@ -45,13 +45,16 @@ PHASES_DYNAMIC = (
 )
 SMALL_COLD_PHASES = (*PHASES_COLD_P4[:2],
                      ('COLD_SERVICE', 'v9_li_kernel_cold_ready_partitioned', PHASES[2][2]), PHASES[3])
+SMALL_COLD_SEPARATE_PHASES = (*PHASES_COLD_P4[:2],
+    ('COLD_SERVICE', 'v9_li_kernel_cold_separate_service', 'Cold P4 + separate Service'), PHASES[3])
 RESIDENT_HIGH = ('RESIDENT_HIGH', 'v9_li_kernel_resident_topk_high', 'Resident high-byte histogram T2')
 SMALL_TOPK_PHASES = (PHASES[0], RESIDENT_HIGH, *PHASES[1:])
 READY_SERVICE_ROUTES = ('static_ready', 'dynamic')
 ROUTE_PHASES = {'p2': PHASES, 'cold_p4': PHASES_COLD_P4,
                 'full_p2': PHASES_UNIFIED, 'full_uniform': PHASES_UNIFIED,
                 'dedicated': PHASES_DEDICATED, 'static_ready': PHASES_STATIC_READY,
-                'dynamic': PHASES_DYNAMIC, 'small_cold': SMALL_COLD_PHASES, 'small_topk': SMALL_TOPK_PHASES}
+                'dynamic': PHASES_DYNAMIC, 'small_cold': SMALL_COLD_PHASES, 'small_topk': SMALL_TOPK_PHASES,
+                'small_cold_separate': SMALL_COLD_SEPARATE_PHASES}
 MARKERS = {f'KVIP_LIFETCH_{stage}_{side}' for stage, _, _ in SMALL_TOPK_PHASES for side in ('BEGIN', 'END')}
 KERNELS = {kernel for phases in ROUTE_PHASES.values() for _, kernel, _ in phases}
 COMPUTE_TYPES = {'AI_CORE', 'AI_VECTOR_CORE', 'MIX_AIC', 'MIX_AIV', 'AIV_SQE', 'FUSION'}

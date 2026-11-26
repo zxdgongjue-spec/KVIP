@@ -82,6 +82,28 @@ def test_trace_has_measured_lane_and_stage_envelopes():
     assert any(entry['pid'] == 1 and entry['tid'] == 64 for entry in spans)
 
 
+def test_bs2_separate_service_has_one_spare_aiv_for_each_window_and_lane():
+    events = [event for event in decode(sample_buffer(batch=2, cold_parts=4))
+              if event['phase'] not in (WAIT_PARTITIONED_HALF, 150, 151)]
+    body = next(event for event in events if event['kernel'] == 22 and event['phase'] == 1)
+    for window in range(4):
+        for lane in range(2):
+            block = 16 + 2 * window + lane
+            slot = dict(body, lane=block, block=block, iteration=window, detail=lane)
+            events.extend([dict(slot, phase=1), dict(slot, phase=150)])
+            if window:
+                events.extend([dict(slot, phase=source_trace.DEDICATED_DRIVER_WAIT), dict(slot, phase=151)])
+    route = dict(batch=2, cold_route='small_cold_separate', cold_parts=4)
+    verify_route(events, **route)
+    moved = [dict(event, lane=0, block=0) if event['phase'] == 150 and event['lane'] == 16 else event
+             for event in events]
+    with pytest.raises(ValueError, match='spare AIVs'):
+        verify_route(moved, **route)
+    missing_wait = [event for event in events if not (event['phase'] == 151 and event['lane'] == 19)]
+    with pytest.raises(ValueError, match='spare AIVs'):
+        verify_route(missing_wait, **route)
+
+
 def test_handoff_counts_cold_cursor_reset_on_the_threshold_source_clock():
     events = decode(sample_buffer())
     template = next(e for e in events if e['kernel'] == 21 and e['lane'] == 0)

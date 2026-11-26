@@ -75,8 +75,9 @@ public:
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     }
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
-    __aicore__ inline void BindPartitionedCold(GM_ADDR compute, uint32_t parts) {
+    __aicore__ inline void BindPartitionedCold(GM_ADDR compute, uint32_t parts, bool separateService = false) {
         coldParts_ = parts;
+        separateColdService_ = separateService;
         const uint32_t physical = blockId_ / 2;
         const uint32_t part = physical % parts;
         rotationCore_ = (physical / parts) * 2 + part / (parts / 2);
@@ -96,6 +97,30 @@ public:
     __aicore__ inline void RunDynamicService(uint32_t row, uint32_t epoch, uint32_t half) {
         dedicatedLane_ = row;
         AllocEventID();
+        RotateFetch(epoch, half);
+        FreeEventID();
+    }
+
+    __aicore__ inline void RunPartitionedWindowService(uint32_t slot, uint32_t half) {
+        const uint32_t epoch = slot / runtimeShape_.serviceLanes;
+        const uint32_t lane = slot % runtimeShape_.serviceLanes;
+        dedicatedLane_ = lane;
+        rotationCore_ = rotating::ServiceCore(runtimeShape_.batch, runtimeShape_.splitQ,
+            runtimeShape_.serviceAics, epoch, lane / 2);
+        AllocEventID();
+        if (epoch) {
+            KVIP_TRACE_BEGIN(driverWait, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+                Cold, DedicatedDriverWait, epoch, lane);
+            const uint32_t part = (rotationCore_ % 2) * (coldParts_ / 2);
+            const auto tiles = kvip_cold_score::Split(runtimeShape_.history, runtimeShape_.resident,
+                half, epoch, part, coldParts_);
+            const uint32_t end = tiles.end * kvip_cold_score::kTileTokens;
+            const uint32_t firstQuery = (rotationCore_ / 2) * SIM_Q + (lane % 2) * 2;
+            // Match the original rotating driver's two local Q rows.
+            for (uint32_t q = firstQuery; q < firstQuery + 2; ++q) {
+                while (ReadColdCursor(q, part) < end) {}
+            }
+        }
         RotateFetch(epoch, half);
         FreeEventID();
     }
@@ -414,6 +439,7 @@ private:
     }
     GM_ADDR coldProgress_ = nullptr;
     uint32_t coldParts_ = 0;
+    bool separateColdService_ = false;
     uint32_t rotationCore_ = 0;
     GlobalTensor<uint32_t> coldProgressGm_;
     GM_ADDR dedicatedProgress_ = nullptr;
@@ -1091,6 +1117,9 @@ __aicore__ inline void QLIVector<QLIT>::PublishColdTile(const QLICommon::RunInfo
         } else if (coldParts_) {
             // MTE3 has already queued this tile's predicates.
             // Each physical part has an exclusive cache line per query.
+            // A separate Service lane may observe the final cursor as soon
+            // as it is visible, so release the score and predicates first.
+            if (separateColdService_ && publishShardEnd) PipeBarrier<PIPE_MTE3>();
             publish.dstStride = coldParts_ * kvip_cold_score::kProgressBytes - publish.blockLen;
             DataCopyPad(coldProgressGm_[kvip_cold_score::ProgressOffset(queryRow, progressShard, coldParts_)],
                 rotationProgress_[(info.s2Idx % 64) * 16], publish);

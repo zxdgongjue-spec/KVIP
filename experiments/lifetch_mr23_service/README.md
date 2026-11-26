@@ -852,3 +852,34 @@ Open `lifetch_business_trace.json` for per-core scopes and
 In the root `summary.csv`, the P4/W2 row reports marked stage deltas
 against P2/W2 under `same_window_*` and against P4/W4 under
 `same_parts_w4_*`. These are traced kernel measurements.
+
+### BS2 P4/W4 with separate Service AIVs
+
+Run both arms with the same Hot P2, eight Cold P4 Score groups, W4
+and prefetch settings. The separate arm launches four extra MIX groups.
+Their AICs return immediately. Eight extra AIVs each own one original
+`(window, lane)` job. After the original driver's two Score cursors
+reach its fragment end, the AIV runs the existing rotating Service with
+the same logical owner, predecessor and prefetch policy. W0 starts from
+the resident publication. Score producers continue to the next window.
+The separate arm fences MTE3 before each fragment's final cursor write.
+Candidate scoring can advance sooner, so actual prefetch counts may differ.
+
+```bash
+runner=experiments/lifetch_mr23_service/run_bs2_p4_service_a5.sh
+bash "$runner" --dry-run
+bash "$runner" --warmup 2 --iterations 5
+# Optional separate invocations
+bash "$runner" --perf-only --warmup 2 --iterations 5
+bash "$runner" --trace-only
+```
+
+The default run prints separate output directories for the graph and
+the checked msprof replays. In the graph summary, compare
+`kv_ready_us` and the early/final Get counts. In the trace summary,
+compare the sampled AIC credit wait, the Service predecessor wait and
+the wait for the original Score driver. The two traced arms sample the
+first three tiles and the final tile of each Cold fragment. Each wait
+metric includes the largest union of matching spans on one logical lane
+and the longest individual span. Per-window figures are in
+`bs2_service_waits.json` next to each timeline.

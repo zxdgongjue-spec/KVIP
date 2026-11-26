@@ -31,7 +31,8 @@ __aicore__ inline bool HasUniformLengths(const rotating::RuntimeShape& shape, GM
     return true;
 }
 
-template <SequenceLiPhase Phase, bool ExternalBody = false, bool OwnWindow = false, bool WaitColdPeers = true>
+template <SequenceLiPhase Phase, bool ExternalBody = false, bool OwnWindow = false, bool WaitColdPeers = true,
+          bool SeparateService = false>
 __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, [[maybe_unused]] uint32_t job = 0,
     GM_ADDR coldGmReady = nullptr) {
     using namespace AscendC; using namespace QLICommon;
@@ -54,6 +55,20 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, [[maybe_unuse
     if constexpr (Phase == SequenceLiPhase::DedicatedCold) {
         if ASCEND_IS_AIC {
             if (GetBlockIdx() >= kvip_dedicated_cold::kProducerGroups) return;
+        }
+    }
+#endif
+    bool serviceOnly = false;
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    uint32_t serviceSlot = 0;
+    if constexpr (SeparateService) {
+        constexpr uint32_t kScoreGroups = 8;
+        if ASCEND_IS_AIV {
+            const uint32_t block = GetBlockIdx();
+            serviceOnly = block >= 2 * kScoreGroups;
+            if (serviceOnly) serviceSlot = block - 2 * kScoreGroups;
+        } else {
+            if (GetBlockIdx() >= kScoreGroups) return;
         }
     }
 #endif
@@ -85,14 +100,14 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, [[maybe_unuse
         2048,shape.liCores,128,shape.history/128,0,16384,128,shape.resident,
         splitSequence ? 0U : shape.splitQ,shape.aicCount};
     if ASCEND_IS_AIV { op.vectorService.SetStreamingWorkspace(P(15)); }
-    op.Init(P(0),P(1),P(2),P(3),P(4),P(5),P(6),P(7),P(9),P(12),&tiling,&pipe,parts);
+    op.Init(P(0),P(1),P(2),P(3),P(4),P(5),P(6),P(7),P(9),P(12),&tiling,&pipe,parts,serviceOnly);
     if ASCEND_IS_AIV {
         KVIP_TRACE_RECORD(bindingScope, stageTrace, traceKernel, kvip_trace::LiWorkspaceBind, 0, 0);
         op.vectorService.SetPrefixStorage(P(13));
         op.vectorService.SetRotationContext(P(14));
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
         if constexpr (Phase == SequenceLiPhase::Cold) {
-            if (parts > 2) op.vectorService.BindPartitionedCold(P(12), parts);
+            if (parts > 2) op.vectorService.BindPartitionedCold(P(12), parts, SeparateService);
         } else if constexpr (Phase == SequenceLiPhase::DedicatedCold || Phase == SequenceLiPhase::DynamicScore ||
             Phase == SequenceLiPhase::DynamicService) {
             op.vectorService.BindDedicatedCold(P(12));
@@ -116,6 +131,17 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, [[maybe_unuse
         if (splitSequence) op.template ProcessSequenceSplit<Phase>(parts);
         else op.Process();
     } else {
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+        if constexpr (SeparateService) {
+            if (serviceOnly) {
+                if ASCEND_IS_AIV {
+                    op.vectorService.RunPartitionedWindowService(serviceSlot, rotating::SequenceHalfWindow(shape));
+                }
+            } else {
+                op.template ProcessSequenceSplit<Phase, WaitColdPeers, true>(parts, coldGmReady);
+            }
+        } else
+#endif
         op.template ProcessSequenceSplit<Phase, WaitColdPeers>(parts, coldGmReady);
     }
     KVIP_TRACE_RECORD(teardownScope, stageTrace, traceKernel, kvip_trace::LiPipeDestroy, 0, 0);
@@ -267,6 +293,13 @@ extern "C" __global__ __aicore__ void v9_li_kernel_cold_ready_partitioned(GM_ADD
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     RunLi<SequenceLiPhase::Cold, false, false, false>(bindings, parts);
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_li_kernel_cold_separate_service(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__) && !V9_UBMEM
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    RunLi<SequenceLiPhase::Cold, false, false, false, true>(bindings, 4);
 #endif
 }
 
