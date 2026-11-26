@@ -13,7 +13,7 @@ from run_mr25_handoff import KVAF, ROOT, bench_arguments, collect, git, read, sa
 from run_mr28_baseline_msprof import capture_route
 from run_mr28_dedicated_service import write_summary
 from kvip.operators.lifetch.geometry import li_geometry
-from small_batch import FULL32_MODES, MODES, SUPPORTED_BATCHES, TRACE_ROUTES, WINDOW_OVERRIDES, cold_score_parts
+from small_batch import FULL32_MODES, MODES, RETIRED_MODES, SUPPORTED_BATCHES, TRACE_ROUTES, WINDOW_OVERRIDES, cold_score_parts
 from terminal_handoff import CHECKED_KERNELS, COLD_GM_STAGE_FIELDS, STAGES
 from workloads import configuration
 
@@ -28,7 +28,7 @@ DIRECTION1_MISSES = (5, 10, 15, 20, 25, 30)
 NATIVE_BATCH_LIMIT = 16
 
 
-def balanced_arms(batch):
+def balanced_arms(batch, retired_study=False):
     # P4+ preserves the two native leader positions per request, even at 32 MIX.
     service_groups = (batch + 1) // 2
     owner_groups = 2 * batch
@@ -36,11 +36,18 @@ def balanced_arms(batch):
     for windows, pair in ((3, ('windows', 'cold_full_w3')), (2, ('windows_w2', 'cold_full_w2'))):
         if windows < min(4, owner_groups) and windows * service_groups <= owner_groups:
             arms.extend(pair)
+    if retired_study:
+        arms_with_pickup = []
+        for mode in arms:
+            arms_with_pickup.append(mode)
+            if mode in FULL32_MODES:
+                arms_with_pickup.append(mode.replace('cold_full', 'cold_full_retired'))
+        return tuple(arms_with_pickup)
     return tuple(arms)
 
 
 def plan(args, kvaf):
-    study = FULL32_ARMS if args.full32 or args.balanced else WINDOW_ARMS if args.window_sweep else (
+    study = FULL32_ARMS if args.full32 or args.balanced or args.retired_study else WINDOW_ARMS if args.window_sweep else (
         GRANULARITY_ARMS if args.granularity_study else None)
     default_batches = (DIRECTION1_MODES if args.direction1_matrix else
                        study or FOLLOW_UP_ARMS)
@@ -54,14 +61,14 @@ def plan(args, kvaf):
             continue
         if args.direction1_matrix:
             modes = ('p2', DIRECTION1_MODES[batch])
-        elif args.balanced:
-            modes = balanced_arms(batch)
+        elif args.balanced or args.retired_study:
+            modes = balanced_arms(batch, args.retired_study)
         elif study:
             modes = study[batch]
         else:
             modes = FOLLOW_UP_ARMS[batch] if args.follow_up else MODES
         service_aics = li_geometry(physical, intermediate_fetches=4, aic_count=32)['service_aics_per_window']
-        if args.balanced:
+        if args.balanced or args.retired_study:
             service_aics = (physical + 1) // 2
         iterations = 1 if args.trace else args.iterations
         for miss in misses:
@@ -193,7 +200,7 @@ def trace_compare(before, after, *, prefix=''):
                               for req in candidate),
     )
     after.update({f'{prefix}{key}': value for key, value in comparison.items()})
-    if after['variant'] in (FULL32_MODES | {'topk', 'cold_p8'}) and not comparison['resident_seed_match']:
+    if after['variant'] in (FULL32_MODES | RETIRED_MODES | {'topk', 'cold_p8'}) and not comparison['resident_seed_match']:
         raise ValueError(f"Resident Top2048 seed differs from {before['variant']}")
 
 
@@ -245,6 +252,8 @@ def main():
                        help='compare native P2 W4/W3/W2 for BS2 and BS8 with fixed Service lanes')
     route.add_argument('--balanced', action='store_true',
                        help='compare P2 and Cold 32/BS across every feasible W2/W3/W4 at one request per Service AIV')
+    route.add_argument('--retired-study', action='store_true',
+                       help='compare P2, full32 rotation and retired AIV Service at each matched geometry')
     parser.add_argument('--repeats', type=int, default=1, help='repeat the matrix with the same bridge and independent workers')
     parser.add_argument('--trace', action='store_true', help='capture one checked msprof replay per arm')
     parser.add_argument('--dry-run', action='store_true')
@@ -252,8 +261,8 @@ def main():
     parser.add_argument('--iterations', type=int, default=5)
     parser.add_argument('--timeout-seconds', type=int, default=1800)
     args = parser.parse_args()
-    if args.granularity_study or args.full32 or args.window_sweep or args.balanced:
-        study = FULL32_ARMS if args.full32 or args.balanced else WINDOW_ARMS if args.window_sweep else GRANULARITY_ARMS
+    if args.granularity_study or args.full32 or args.window_sweep or args.balanced or args.retired_study:
+        study = FULL32_ARMS if args.full32 or args.balanced or args.retired_study else WINDOW_ARMS if args.window_sweep else GRANULARITY_ARMS
         if args.group_bs32 or any(batch not in study for batch in args.batch or ()):
             parser.error(f'This study supports only native BS values {tuple(study)}')
     elif not args.direction1_matrix and (args.miss_percent or args.group_bs32
@@ -280,7 +289,7 @@ def main():
                     kvaf_commit=KVAF, measurement='marked_msprof' if args.trace else 'graph_event',
                     follow_up=args.follow_up, direction1_matrix=args.direction1_matrix,
                     full32=args.full32, window_sweep=args.window_sweep, balanced=args.balanced,
-                    granularity_study=args.granularity_study, repeats=args.repeats,
+                    granularity_study=args.granularity_study, retired_study=args.retired_study, repeats=args.repeats,
                     scopes=dict(queries=4, history=131072, resident=16384,
                                 miss_percent=sorted({case['miss_percent'] for case in cases + unsupported}),
                                 aic=32, aiv=64, prefetch_limit=512, per_window_limit=128, rank_start=1024),
@@ -298,7 +307,7 @@ def main():
         raise FileNotFoundError('msprof is missing from the active CANN environment')
     output = Path(os.environ['KVIP_AB_OUTPUT']).resolve()
     print(f'Small batch A5 comparison: {output}', flush=True)
-    rows, bases, p4_arms, window_bases = list(unsupported), {}, {}, {}
+    rows, bases, p4_arms, window_bases, static_arms = list(unsupported), {}, {}, {}, {}
     manifest['status'] = 'RUNNING'
     try:
         for case in cases:
@@ -310,7 +319,7 @@ def main():
             repeat = case['repeat']
             run_dir = output / f'repeat-{repeat:02d}' if args.repeats > 1 else output
             miss = case['miss_percent']
-            if args.direction1_matrix or args.granularity_study or args.full32 or args.window_sweep or args.balanced:
+            if args.direction1_matrix or args.granularity_study or args.full32 or args.window_sweep or args.balanced or args.retired_study:
                 run_dir = run_dir / f'miss{miss:g}'
             print(f"Round {repeat}/{args.repeats}, BS{case['batch']} miss{miss:g} "
                   f"{case['mode']} P{case['cold_score_parts']}/W{case['effective_windows']} "
@@ -326,8 +335,10 @@ def main():
             rows.append(row)
             pair = (repeat, row['batch'], miss)
             window_pair = (*pair, case['effective_windows'])
-            if args.balanced and case['cold_score_parts'] == 2:
+            if (args.balanced or args.retired_study) and case['cold_score_parts'] == 2:
                 window_bases[window_pair] = row
+            if args.retired_study and row['variant'] in FULL32_MODES:
+                static_arms[window_pair] = row
             if row['variant'] == 'p2':
                 bases[pair] = row
             else:
@@ -347,13 +358,20 @@ def main():
                         p4 = p4_arms[pair]
                         compare_request_counts(p4, row, prefix='vs_p4_')
                         row['vs_p4_raw_kv_ready_delta_us'] = row['kv_ready_us'] - p4['kv_ready_us']
-                if args.balanced and row['variant'] in FULL32_MODES:
+                if (args.balanced or args.retired_study) and row['variant'] in FULL32_MODES | RETIRED_MODES:
                     same_window = window_bases[window_pair]
                     if args.trace:
                         trace_compare(same_window, row, prefix='same_window_')
                     else:
                         compare_request_counts(same_window, row, prefix='same_window_')
                         row['same_window_raw_kv_ready_delta_us'] = row['kv_ready_us'] - same_window['kv_ready_us']
+                if row['variant'] in RETIRED_MODES:
+                    static = static_arms[window_pair]
+                    if args.trace:
+                        trace_compare(static, row, prefix='same_window_static_')
+                    else:
+                        compare_request_counts(static, row, prefix='same_window_static_')
+                        row['same_window_static_raw_kv_ready_delta_us'] = row['kv_ready_us'] - static['kv_ready_us']
             summarize(output, rows)
         manifest['status'] = 'PASS'
         return 0

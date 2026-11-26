@@ -13,6 +13,9 @@ SUPPORTED_BATCHES = {
     'cold_full': (1, 2, 8),
     'cold_full_w3': (2, 8),
     'cold_full_w2': (2, 8),
+    'cold_full_retired': (1, 2, 8),
+    'cold_full_retired_w3': (2, 8),
+    'cold_full_retired_w2': (2, 8),
     'windows': (2, 4, 8, 16),
     'windows_w2': (2, 8),
     'topk': (1, 8),
@@ -20,19 +23,24 @@ SUPPORTED_BATCHES = {
 }
 MODES = ('p2', 'cold', 'windows', 'topk', 'get')
 FULL32_MODES = {'cold_full', 'cold_full_w3', 'cold_full_w2'}
-PARTITIONED_MODES = FULL32_MODES | {'cold', 'cold_p8'}
-WINDOW_OVERRIDES = {'windows': 3, 'windows_w2': 2, 'cold_full_w3': 3, 'cold_full_w2': 2}
-TRACE_ROUTES = dict(p2='p2', **dict.fromkeys(PARTITIONED_MODES, 'small_cold'),
+RETIRED_MODES = {'cold_full_retired', 'cold_full_retired_w3', 'cold_full_retired_w2'}
+PARTITIONED_MODES = FULL32_MODES | RETIRED_MODES | {'cold', 'cold_p8'}
+WINDOW_OVERRIDES = {'windows': 3, 'windows_w2': 2, 'cold_full_w3': 3, 'cold_full_w2': 2,
+                    'cold_full_retired_w3': 3, 'cold_full_retired_w2': 2}
+TRACE_ROUTES = dict(p2='p2', **dict.fromkeys(PARTITIONED_MODES - RETIRED_MODES, 'small_cold'),
+                    **dict.fromkeys(RETIRED_MODES, 'small_retired'),
                     windows='p2', windows_w2='p2', topk='small_topk', get='p2')
 KERNELS = ('v9_li_kernel', 'v9_li_kernel_1', 'v9_li_kernel_2', 'v9_parallel_terminal')
 COLD_KERNELS = (KERNELS[0], 'v9_li_kernel_threshold_cold_partitioned',
                 'v9_li_kernel_cold_ready_partitioned', KERNELS[3])
+RETIRED_KERNELS = (KERNELS[0], 'v9_li_kernel_threshold_retired_service',
+                   'v9_li_kernel_cold_retired_service', KERNELS[3])
 TOPK_KERNELS = (KERNELS[0], 'v9_li_kernel_resident_topk_high', *KERNELS[1:])
 GET_BALANCE_FLAG = 2
 
 
 def cold_score_parts(mode, batch):
-    if mode in FULL32_MODES:
+    if mode in FULL32_MODES | RETIRED_MODES:
         return 32 // batch
     return {'cold': 4, 'cold_p8': 8}.get(mode, 2)
 
@@ -54,15 +62,20 @@ def bind(state, mode):
 
     library = state.rotating.library
     parts = 2
-    symbol_mode = 'cold_full' if mode in FULL32_MODES else mode
+    retired = mode in RETIRED_MODES
+    symbol_mode = 'cold_full' if mode in FULL32_MODES | RETIRED_MODES else mode
     if mode in PARTITIONED_MODES:
         choose = getattr(library, f'kvip_small_batch_{symbol_mode}_parts')
         choose.argtypes, choose.restype = [ctypes.c_void_p], ctypes.c_uint32
         parts = choose(forward.shape_pointer)
         expected = cold_score_parts(mode, state.batch)
         required = shape.batch * 4 * (shape.history * 2 + 64 * parts)
+        alignment = 64
+        if retired:
+            alignment = 128
+            required += (32 + shape.rounds * shape.serviceLanes) * alignment
         if (parts != expected or state.workspace.compute.nbytes < required
-                or state.workspace.compute.data_ptr() % 64):
+                or state.workspace.compute.data_ptr() % alignment):
             raise ValueError(f'Cold P{expected} geometry or classified-progress capacity is unsupported')
     elif mode == 'topk':
         forward.resident_high_table = state.torch.empty(
@@ -75,7 +88,8 @@ def bind(state, mode):
         forward.set_options()
 
     if mode in PARTITIONED_MODES or mode == 'topk':
-        launch = getattr(library, f'kvip_small_batch_{symbol_mode}_forward')
+        launch_mode = 'cold_retired' if retired else symbol_mode
+        launch = getattr(library, f'kvip_small_batch_{launch_mode}_forward')
         launch.argtypes, launch.restype = [ctypes.c_void_p] * 4, ctypes.c_uint32
         forward.terminal_function = launch
     return parts
@@ -124,10 +138,12 @@ def capture_resident_seed(state, stream, mode):
     launches = [(KERNELS[0], li_groups)]
     if mode == 'topk':
         launches.append((TOPK_KERNELS[1], state.batch * 8))
-    launches.append((COLD_KERNELS[1] if mode in PARTITIONED_MODES else KERNELS[1], li_groups))
+    threshold = (RETIRED_KERNELS[1] if mode in RETIRED_MODES else
+                 COLD_KERNELS[1] if mode in PARTITIONED_MODES else KERNELS[1])
+    launches.append((threshold, li_groups))
     for symbol, blocks in launches:
         launch = getattr(state.rotating.library, f'aclrtlaunch_{symbol}')
-        extra = [cold_score_parts(mode, state.batch)] if symbol == COLD_KERNELS[1] else []
+        extra = [cold_score_parts(mode, state.batch)] if symbol in (COLD_KERNELS[1], RETIRED_KERNELS[1]) else []
         launch.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p] + [ctypes.c_uint32] * len(extra)
         launch.restype = ctypes.c_uint32
         status = launch(blocks, stream.npu_stream, forward.bindings.data_ptr(), *extra)

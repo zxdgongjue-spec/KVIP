@@ -29,12 +29,13 @@ COLD_GM_KERNELS = {
     'cold_gm_pipeline': ('v9_li_kernel_hot_cold_gm', 'v9_li_kernel_cold_gm_batch',
                          'v9_parallel_terminal'),
 }
-from small_batch import COLD_KERNELS as SMALL_COLD_KERNELS, FULL32_MODES, TOPK_KERNELS as SMALL_TOPK_KERNELS
+from small_batch import COLD_KERNELS as SMALL_COLD_KERNELS, FULL32_MODES, RETIRED_KERNELS, RETIRED_MODES, TOPK_KERNELS as SMALL_TOPK_KERNELS
 
 CHECKED_KERNELS = {**P2_W1_KERNELS, **COLD_GM_KERNELS,
                    **{f'small_{mode}': P2_W1_KERNELS['p2'] for mode in ('p2', 'windows', 'windows_w2', 'get')},
                    'small_cold': SMALL_COLD_KERNELS, 'small_cold_p8': SMALL_COLD_KERNELS,
                    **{f'small_{mode}': SMALL_COLD_KERNELS for mode in FULL32_MODES},
+                   **{f'small_{mode}': RETIRED_KERNELS for mode in RETIRED_MODES},
                    'small_topk': SMALL_TOPK_KERNELS}
 COLD_GM_STAGE_FIELDS['small_topk'] = (STAGES[0], 'resident_histogram_us', *STAGES[1:])
 DYNAMIC_MAILBOX_BYTES = 192 * 128

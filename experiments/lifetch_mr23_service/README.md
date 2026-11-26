@@ -799,3 +799,28 @@ Read `summary.csv` for checked graph Event latency, phase times, and
 early/final Get counts. `raw_kv_ready_delta_us` uses native-window P2;
 `same_window_raw_kv_ready_delta_us` uses P2 at the candidate's window
 count. A trace run validates the actual Cold MIX counts independently.
+
+### Full32 with Service picked up by retired Score AIVs
+
+The study compares P2, the fixed Full32 rotation and the retired-worker
+variant at each of the seven balanced BS/window geometries above. The last
+two arms use exactly the same 32 Score groups and W0 rotation. After each
+MIX drains its final credits, one AIV can claim a later Service window
+whose original driver has published the required scores and whose previous
+window has published its state. Score fragments retain their static owners.
+
+Run timing first with optional msprof capture on the same fixture:
+
+```bash
+bash experiments/lifetch_mr23_service/run_full32_dynamic_a5.sh --dry-run
+bash experiments/lifetch_mr23_service/run_full32_dynamic_a5.sh --warmup 1 --iterations 5
+```
+
+Use `--perf-only` to stop after the numeric comparison, or `--batch 2` to
+restrict both phases. The default runner generates marked traces only after
+all timing arms pass KV/Index validation. Compare
+`same_window_static_raw_kv_ready_delta_us` and
+`same_window_static_get_count_comparison` against the same-window Full32
+arm. The marked replay reports physical pickup AIVs, per-window prefetch
+tokens, and the final Get tokens. Prefetch can differ when Service samples
+the live frontier at a different time.

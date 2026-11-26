@@ -75,8 +75,8 @@ public:
                                 __gm__ uint8_t *workspace, const QLITilingData *__restrict tiling, TPipe *tPipe,
                                 uint32_t seqParts = 2);
     __aicore__ inline void Process();
-    template <SequenceLiPhase Phase, bool WaitColdPeers = true>
-    __aicore__ inline void ProcessSequenceSplit(uint32_t parts = 2, GM_ADDR coldGmReady = nullptr);
+    template <SequenceLiPhase Phase, bool WaitColdPeers = true, bool RetireService = false>
+    __aicore__ inline void ProcessSequenceSplit(uint32_t parts = 2, GM_ADDR coldGmReady = nullptr, GM_ADDR retireScratch = nullptr);
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
     template <bool OwnWindow = false>
     __aicore__ inline void ProcessDedicatedCold(GM_ADDR compute);
@@ -804,9 +804,9 @@ __aicore__ inline bool QuantLightningIndexerKernel<QLIT>::ScoreRecent(
 }
 
 template <typename QLIT>
-template <SequenceLiPhase Phase, bool WaitColdPeers>
+template <SequenceLiPhase Phase, bool WaitColdPeers, bool RetireService>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(
-    uint32_t parts, [[maybe_unused]] GM_ADDR coldGmReady)
+    uint32_t parts, [[maybe_unused]] GM_ADDR coldGmReady, [[maybe_unused]] GM_ADDR retireScratch)
 {
     uint32_t batch = splitCoreInfo.bN2Start;
     uint32_t shard = aiCoreIdx % parts;
@@ -989,7 +989,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(
                         tiles.begin, tiles.end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
                 }
                 if ASCEND_IS_AIV {
-                    if (serviceLeader && serviceEpoch == epoch) {
+                    if (!RetireService && serviceLeader && serviceEpoch == epoch) {
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
                         if (parts > 2) {
                             if constexpr (WaitColdPeers) {
@@ -1015,6 +1015,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(
             vectorService.FreeEventID();
 #endif
             KVIP_TRACE_END(eventDrain);
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+            if constexpr (RetireService) {
+                vectorService.RunRetiredService(retireScratch, aiCoreIdx, rotating::SequenceHalfWindow(runtimeShape_));
+            }
+#endif
         } else {
             matmulService.FreeEventID();
             KVIP_TRACE_END(eventDrain);
@@ -1032,6 +1037,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(
                     QLICommon::ConstInfo::CROSS_VC_EVENT + peer);
                 CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
                     QLICommon::ConstInfo::CROSS_VC_EVENT + peer + 1);
+            }
+            if constexpr (RetireService) {
+                KVIP_TRACE_END(cubeTailScope);
+                PipeBarrier<PIPE_ALL>();
+                kvip_retired_service::Store(kvip_retired_service::Word(retireScratch, aiCoreIdx), 1);
             }
 #endif
         }

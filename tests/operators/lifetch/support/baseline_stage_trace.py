@@ -65,7 +65,12 @@ DYNAMIC_KERNELS = {
 }
 SMALL_COLD_KERNELS = {**COLD_P4_KERNELS,
                       22: (KERNELS[22][0], 'v9_li_kernel_cold_ready_partitioned')}
-ROUTE_KERNELS = {'p2': KERNELS, 'cold_p4': COLD_P4_KERNELS,
+SMALL_RETIRED_KERNELS = {
+    **SMALL_COLD_KERNELS,
+    21: (KERNELS[21][0], 'v9_li_kernel_threshold_retired_service'),
+    22: ('Cold Score + retired AIV Service', 'v9_li_kernel_cold_retired_service'),
+}
+ROUTE_KERNELS = {'p2': KERNELS, 'cold_p4': COLD_P4_KERNELS, 'small_retired': SMALL_RETIRED_KERNELS,
                  'small_cold': SMALL_COLD_KERNELS, 'small_topk': KERNELS,
                  'dedicated': DEDICATED_KERNELS, 'static_ready': STATIC_READY_KERNELS,
                  'dynamic': DYNAMIC_KERNELS,
@@ -239,6 +244,7 @@ class StageBuffer:
             'p2': 'kvip_parallel_tail_profile_forward',
             'cold_p4': 'kvip_parallel_tail_cold_partitioned_profile_forward',
             'small_cold': 'kvip_small_batch_cold_profile_forward',
+            'small_retired': 'kvip_small_batch_cold_retired_profile_forward',
             'small_topk': 'kvip_small_batch_topk_profile_forward',
             'dedicated': 'kvip_parallel_tail_dedicated_service_profile_forward',
             'static_ready': 'kvip_parallel_tail_static_ready_service_profile_forward',
@@ -348,10 +354,12 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
             raise ValueError(f'Missing required pipe scopes: {missing_pipe}')
     if require_handoff_scopes:
         expected = dict(REQUIRED_HANDOFF)
-        if cold_route in ('cold_p4', 'small_cold', 'dedicated', 'static_ready', 'dynamic'):
+        if cold_route in ('cold_p4', 'small_cold', 'small_retired', 'dedicated', 'static_ready', 'dynamic'):
             expected[21] = expected[21] | {COLD_PROGRESS_RESET}
         if cold_route in ('dedicated', 'static_ready'):
             expected[22] = expected[22] | {231}
+        if cold_route == 'small_retired':
+            expected[22] = expected[22] | {DYNAMIC_SERVICE_JOB}
         if cold_route == 'dynamic':
             # The dynamic job scope wraps role-local initialization and drain.
             expected[22] = {228, DYNAMIC_SCORE_JOB, DYNAMIC_SERVICE_JOB}
@@ -375,11 +383,12 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
     four_aiv = set(range(4 * batch))
     two_aic = set(range(64, 64 + 2 * batch))
     p4_lanes = set(range(8 * batch)) | set(range(64, 64 + 4 * batch))
-    if cold_route == 'small_cold' and (cold_parts not in (4, 8, 16, 32) or batch * cold_parts > 32):
+    if cold_route in ('small_cold', 'small_retired') and (cold_parts not in (4, 8, 16, 32) or batch * cold_parts > 32):
         raise ValueError(f'Unsupported small-batch Cold trace part count {cold_parts}')
-    small_cold_groups = batch * (cold_parts if cold_route == 'small_cold' else 4)
+    small_cold_groups = batch * (cold_parts if cold_route in ('small_cold', 'small_retired') else 4)
     small_cold_lanes = set(range(2 * small_cold_groups)) | set(range(64, 64 + small_cold_groups))
-    cold_lanes = {'cold_p4': p4_lanes, 'small_cold': small_cold_lanes, 'small_topk': four_aiv | two_aic,
+    cold_lanes = {'cold_p4': p4_lanes, 'small_cold': small_cold_lanes,
+                  'small_retired': small_cold_lanes, 'small_topk': four_aiv | two_aic,
                   'dedicated': four_aiv | set(range(64, 88)),
                   'static_ready': four_aiv | set(range(64, 88)),
                   'dynamic': four_aiv | two_aic,
@@ -478,6 +487,30 @@ def verify_dynamic_jobs(events):
         if event['begin'] < ready:
             raise ValueError(f'Service {(row, window)} started before its data dependencies')
     return {key: event['lane'] for key, event in services.items()}
+
+def verify_retired_jobs(events, windows, service_lanes):
+    """Check unique logical-window pickup after the physical MIX tail drain."""
+    tails = {event['lane']: event['end'] for event in events
+             if event['kernel'] == 22 and event['phase'] == 27}
+    expected = {(epoch, lane) for epoch in range(1, windows) for lane in range(service_lanes)}
+    jobs = {}
+    for event in events:
+        if event['phase'] != DYNAMIC_SERVICE_JOB:
+            continue
+        logical, epoch, _ = dynamic_job(event['detail'])
+        worker = event['lane']
+        retired_at = tails.get(64 + worker // 2)
+        key = epoch, logical
+        if (key in jobs or key not in expected or event['kernel'] != 22
+                or worker >= 64 or worker % 2 or epoch != event['iteration']
+                or retired_at is None or event['begin'] < retired_at):
+            raise ValueError(f'Invalid retired AIV Service assignment at {key} on worker {worker}')
+        jobs[key] = worker
+    if set(jobs) != expected:
+        raise ValueError('Incomplete retired AIV Service assignments')
+    return [dict(epoch=epoch, service_lane=lane, worker_aiv=worker)
+            for (epoch, lane), worker in sorted(jobs.items())]
+
 
 def source_lane_counts(spans):
     """Count distinct logical lanes, even when their source scopes overlap."""
@@ -927,6 +960,9 @@ def write_capture(directory, raw, counter_mhz, state, library, config, soc, mspr
                 raise ValueError(f'Cold comparison phase {PHASES[phase]} must cover all three Cold windows')
     document, stages = render(events, counter_mhz, cold_route=cold_route)
     report = replay_evidence(state, library, config, soc)
+    if cold_route == 'small_retired':
+        shape = state.rotating.runtime_shape
+        report['retired_service_jobs'] = verify_retired_jobs(events, shape.rounds, shape.serviceLanes)
     if cold_route == 'cold_p4':
         report['route'] = 'Hot P2 + Cold P4 + four-AIV Terminal'
     elif cold_route in ('dedicated', 'static_ready'):
