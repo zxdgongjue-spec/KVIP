@@ -4,7 +4,8 @@
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
 #if defined(__CCE_AICORE__)
 #include "context.h"
-#include "indexer/resident_topk_high.h"
+#include "indexer/resident_topk_layout.h"
+#include "indexer/topk_high_histogram.h"
 #endif
 
 extern "C" __global__ __aicore__ void v9_li_kernel_resident_topk_high(GM_ADDR bindings)
