@@ -215,6 +215,7 @@ def test_terminal_queues_are_disjoint_and_rebind_output():
     ("v9_li_kernel_0", "v9_li_kernel_threshold_cold_partitioned_0", "v9_li_kernel_cold_partitioned_0"),
     ("v9_li_kernel_hot_partitioned", "v9_li_kernel_threshold_cold_partitioned", "v9_li_kernel_cold_partitioned"),
     ("v9_li_kernel_score_t2_0", "v9_li_kernel_1_1", "v9_li_kernel_cold_t2_2"),
+    ("v9_li_kernel_0", "v9_li_kernel_threshold_retired_service_0", "v9_li_kernel_cold_retired_service_0"),
 ])
 def test_parallel_terminal_same_graph_accounting(hot_kernel, threshold_kernel, cold_kernel):
     from diagnostics import account, decode_terminal_timeline
