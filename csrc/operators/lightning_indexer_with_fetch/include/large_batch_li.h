@@ -127,8 +127,9 @@ LARGE_LI_DEVICE constexpr uint32_t MiddleSuffix(uint32_t resident, uint32_t tota
     const Slice span = Window(resident, resident + total, 4, original);
     const uint32_t suffix = LaterSuffix(span, resident, total, quota, rows, original);
     if (original != 2 || !suffix) return suffix;
-    const uint32_t length = span.end - span.begin;
-    const uint32_t early = uint32_t(uint64_t(length / 2) * suffix / length);
+    // The earlier half has floor(length/2) tiles; the later half takes the
+    // odd tile. Divide the suffix the same way, without a device division.
+    const uint32_t early = suffix / 2;
     return epoch == 2 ? early : suffix - early;
 }
 
