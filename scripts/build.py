@@ -115,19 +115,30 @@ def main():
         NANOVLLM_A5_OPS_PYTHON=sys.executable,
     )
     if not args.skip_kvaf_build:
-        for target in ("cpu", "npu"):
-            call(
-                [
-                    "bash",
-                    dependency / "build.sh",
-                    target,
-                    "--jobs",
-                    args.jobs,
-                    *(["--without-aicpu"] if target == "npu" and not args.with_aicpu else []),
-                ],
-                cwd=dependency,
-                env=env,
-            )
+        call(["bash", dependency / "build.sh", "cpu", "--jobs", args.jobs], cwd=dependency, env=env)
+        # Deployment builds do not need KVAF's host model tests. The pinned
+        # script hardcodes BUILD_TESTING, so override that CMake argument only.
+        npu_build = """
+cmake() {
+    local -a args=()
+    local arg
+    for arg in "$@"; do
+        if [[ "$arg" == -DBUILD_TESTING=ON ]]; then arg=-DBUILD_TESTING=OFF; fi
+        args+=("$arg")
+    done
+    command cmake "${args[@]}"
+}
+export -f cmake
+exec bash "$@"
+"""
+        call(
+            [
+                "bash", "-c", npu_build, "kvaf-npu-build",
+                dependency / "build.sh", "npu", "--jobs", args.jobs,
+                *([] if args.with_aicpu else ["--without-aicpu"]),
+            ],
+            cwd=dependency, env=env,
+        )
     for kind in ("get", "put"):
         kernel = build_dir / "bin" / f"kvaf_execute_batch_{kind}_kernels.o"
         if not kernel.is_file():
