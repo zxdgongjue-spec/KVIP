@@ -1,6 +1,7 @@
 #include "stage_trace.h"
 #include "prefetch.h"
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+#include "retired_service.h"
 #include "window_frontier.h"
 #include "window_overlap_probe.h"
 #endif
@@ -118,6 +119,44 @@ public:
         KVIP_TRACE_BEGIN(eventDrain, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
             Cold, LiEventsDrain, 0, lane);
         FreeEventID();
+    }
+
+    __aicore__ inline void RunRetiredService(GM_ADDR scratch, uint32_t group, uint32_t half) {
+        using namespace kvip_retired_service;
+        // Only one of the two retired vector peers enters the worker pool.
+        if (blockId_ % 2 != 0) return;
+        while (!Load(Word(scratch, group))) {}
+
+        auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+        auto events = reinterpret_cast<__gm__ rotating::Event*>(ctx->events);
+        const uint32_t lanes = runtimeShape_.serviceLanes;
+        auto claimResult = incrementalOld_.template ReinterpretCast<uint32_t>();
+        while (true) {
+            bool pending = false;
+            for (uint32_t i = 0; i < lanes; ++i) {
+                const uint32_t lane = (group + i) % lanes;
+                for (uint32_t epoch = 1; epoch < runtimeShape_.rounds; ++epoch) {
+                    if (EventComplete(events + epoch * lanes + lane)) continue;
+                    pending = true;
+                    auto flag = Word(scratch, kGroups + epoch * lanes + lane);
+                    if (!EventComplete(events + (epoch - 1) * lanes + lane) || Load(flag) ||
+                        !RetiredDriverReady(epoch, lane, half)) break;
+                    Simt::VF_CALL<Claim>(Simt::Dim3{32, 1, 1}, flag,
+                        reinterpret_cast<__ubuf__ uint32_t*>(claimResult.GetPhyAddr()));
+                    SetFlag<HardEvent::V_S>(EVENT_ID5);
+                    WaitFlag<HardEvent::V_S>(EVENT_ID5);
+                    if (!claimResult.GetValue(0)) {
+                        KVIP_TRACE_BEGIN(pickup, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+                            Cold, DynamicServiceJob, epoch, (lane << 4) | (epoch << 2));
+                        RunDynamicService(lane, epoch, half);
+                        PipeBarrier<PIPE_ALL>();
+                        KVIP_TRACE_END(pickup);
+                    }
+                    break;
+                }
+            }
+            if (!pending) return;
+        }
     }
 
     __aicore__ inline void DrainColdPublication() {
@@ -401,6 +440,18 @@ private:
             reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ uint32_t*>(cursor)),
             kvip_cold_score::kProgressBytes);
         return *cursor;
+    }
+
+    __aicore__ inline bool RetiredDriverReady(uint32_t epoch, uint32_t lane, uint32_t half) const {
+        const uint32_t driver = rotating::ServiceCore(runtimeShape_.batch, runtimeShape_.splitQ,
+            runtimeShape_.serviceAics, epoch, lane / 2);
+        const uint32_t row = driver / 2;
+        const uint32_t part = (driver % 2) * (coldParts_ / 2);
+        const auto range = kvip_cold_score::Split(runtimeShape_.history, runtimeShape_.resident,
+            half, epoch, part, coldParts_);
+        const uint32_t end = range.end * kvip_cold_score::kTileTokens;
+        const uint32_t query = row * SIM_Q + (lane % 2) * 2;
+        return ReadColdCursor(query, part) >= end && ReadColdCursor(query + 1, part) >= end;
     }
 
     __aicore__ inline uint64_t PartitionedColdReady(uint32_t query, uint32_t half) const {
