@@ -394,3 +394,21 @@ def test_msprof_cleans_up_acquired_resources_before_returning_errors(tmp_path, f
         with scoped_msprof(fake_profiler(calls, failed=failed), tmp_path, device_id=5):
             calls.append(('replay',))
     assert [call[0] for call in calls] == expected
+
+
+def test_retired_service_requires_unique_windows_after_paired_aic_tail():
+    tail = dict(kernel=22, phase=27, lane=67, end=100)
+    first = dict(kernel=22, phase=source_trace.DYNAMIC_SERVICE_JOB, lane=6,
+                 iteration=1, detail=1 << 2, begin=101)
+    second = {**first, 'detail': (1 << 4) | (1 << 2)}
+    events = [tail, first, second]
+    assert source_trace.verify_retired_jobs(events, 2, 2) == [
+        dict(epoch=1, service_lane=0, worker_aiv=6),
+        dict(epoch=1, service_lane=1, worker_aiv=6),
+    ]
+    with pytest.raises(ValueError, match='Invalid retired AIV Service assignment'):
+        source_trace.verify_retired_jobs([*events, second], 2, 2)
+    with pytest.raises(ValueError, match='Invalid retired AIV Service assignment'):
+        source_trace.verify_retired_jobs([tail, {**first, 'begin': 99}, second], 2, 2)
+    with pytest.raises(ValueError, match='Incomplete retired AIV Service assignments'):
+        source_trace.verify_retired_jobs([tail, first], 2, 2)

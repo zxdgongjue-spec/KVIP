@@ -14,7 +14,8 @@ from run_mr28_baseline_msprof import capture_route
 from run_mr28_dedicated_service import write_summary
 from kvip.operators.lifetch.geometry import li_geometry
 from small_batch import (
-    FULL32_MODES, MODES, PARTITIONED_MODES, SUPPORTED_BATCHES, TRACE_ROUTES, WINDOW_OVERRIDES, cold_score_parts,
+    FULL32_MODES, MODES, PARTITIONED_MODES, RETIRED_MODES, SUPPORTED_BATCHES, TRACE_ROUTES,
+    WINDOW_OVERRIDES, WINDOW_SCOPE_PHASES, cold_score_parts,
 )
 from terminal_handoff import CHECKED_KERNELS, COLD_GM_STAGE_FIELDS, STAGES
 from workloads import configuration
@@ -28,6 +29,24 @@ COLD_WINDOW_ARMS = {
     1: ('p2', 'cold', 'cold_p8', 'cold_full'),
     2: ('p2', 'cold', 'cold_full', 'windows_w2', 'cold_w2', 'cold_full_w2'),
     8: ('p2', 'cold_full', 'windows_w2', 'cold_full_w2'),
+}
+WINDOW_PROBES = {
+    'bs1-p8': (1, ('cold_p8', 'cold_p8_bulk')),
+    'bs2-w3': (2, ('windows', 'windows_early')),
+}
+RETIRED_CANDIDATES = {
+    (1, 4, 2): ('cold', 'cold_retired_p4'),
+    (1, 8, 2): ('cold_p8', 'cold_retired_p8'),
+    (1, 32, 2): ('cold_full', 'cold_full_retired'),
+    (2, 4, 2): ('cold_w2', 'cold_retired_p4_w2'),
+    (2, 4, 4): ('cold', 'cold_retired_p4'),
+    (2, 16, 2): ('cold_full_w2', 'cold_full_retired_w2'),
+    (2, 16, 4): ('cold_full', 'cold_full_retired'),
+    (8, 4, 2): ('cold_full_w2', 'cold_full_retired_w2'),
+    (8, 4, 4): ('cold_full', 'cold_full_retired'),
+}
+FULL32_RETIRED_ARMS = {
+    'cold_full': 'cold_full_retired', 'cold_full_w3': 'cold_full_retired_w3', 'cold_full_w2': 'cold_full_retired_w2',
 }
 MAIN = 'df8ad2598e70e4b5e266b15028ab26c601a2bdf2'
 DIRECTION1_MODES = {1: 'cold', 2: 'cold', 4: 'cold', 8: 'windows', 16: 'windows', 32: 'windows'}
@@ -46,10 +65,26 @@ def balanced_arms(batch):
     return tuple(arms)
 
 
+def parse_retired_candidate(value):
+    try:
+        geometry = tuple(map(int, value.split(':')))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError('Use BS:P:W, for example 1:8:2') from error
+    if geometry not in RETIRED_CANDIDATES:
+        supported = ', '.join(':'.join(map(str, key)) for key in RETIRED_CANDIDATES)
+        raise argparse.ArgumentTypeError(f'Unsupported retired candidate {value}; choose from {supported}')
+    return geometry
+
+
 def study_arms(args):
     if args.cold_window_matrix:
         return COLD_WINDOW_ARMS
-    if args.full32 or args.balanced:
+    if args.window_probe:
+        batch, arms = WINDOW_PROBES[args.window_probe]
+        return {batch: arms}
+    if args.retired_candidate:
+        return {batch: () for batch, _, _ in args.retired_candidate}
+    if args.full32 or args.balanced or args.retired_study:
         return FULL32_ARMS
     if args.window_sweep:
         return WINDOW_ARMS
@@ -71,22 +106,30 @@ def plan(args, kvaf):
             continue
         if args.direction1_matrix:
             modes = ('p2', DIRECTION1_MODES[batch])
-        elif args.balanced:
+        elif args.balanced or args.retired_study:
             modes = balanced_arms(batch)
+            if args.retired_study:
+                modes += tuple(FULL32_RETIRED_ARMS[mode] for mode in modes if mode in FULL32_MODES)
         elif study:
             modes = study[batch]
         else:
             modes = FOLLOW_UP_ARMS[batch] if args.follow_up else MODES
         service_aics = li_geometry(physical, intermediate_fetches=4, aic_count=32)['service_aics_per_window']
-        if args.balanced:
+        if args.balanced or args.retired_study:
             service_aics = (physical + 1) // 2
         iterations = 1 if args.trace else args.iterations
+        batch_arms = [(mode, None) for mode in modes]
+        if args.retired_candidate:
+            batch_arms = [(mode, candidate) for candidate in dict.fromkeys(args.retired_candidate)
+                          if candidate[0] == batch for mode in RETIRED_CANDIDATES[candidate]]
         for miss in misses:
-            for mode in modes:
+            for mode, retired_candidate in batch_arms:
                 if mode not in selected or physical not in SUPPORTED_BATCHES[mode]:
                     continue
                 requested = WINDOW_OVERRIDES.get(mode, 4)
-                if args.cold_window_matrix and batch == 1:
+                if retired_candidate:
+                    requested = retired_candidate[2]
+                elif batch == 1 and (args.cold_window_matrix or args.window_probe):
                     requested = 2
                 geometry = li_geometry(physical, intermediate_fetches=requested, aic_count=32,
                                        service_aics=service_aics)
@@ -102,13 +145,57 @@ def plan(args, kvaf):
                 arguments.extend(('--prefetch-window-limit', '128'))
                 measurement = 'serial_bs16x2_graph_event' if waves > 1 else 'native'
                 parts = cold_score_parts(mode, physical)
+                if retired_candidate and retired_candidate != (physical, parts, effective):
+                    raise ValueError(f'Retired candidate {retired_candidate} did not resolve to the requested geometry')
                 yield dict(batch=batch, physical_batch=physical, waves=waves, miss_percent=miss,
                            measurement_kind=measurement, mode=mode, requested_windows=requested, effective_windows=effective,
                            hot_score_parts=2, hot_score_aic=2 * physical, hot_score_aiv=4 * physical,
                            service_aics=service_aics, cold_score_parts=parts, cold_score_groups=physical * parts,
                            service_owner_groups=2 * physical, service_group_slots=service_aics * effective,
                            max_requests_per_service_aiv=(physical + 2 * service_aics - 1) // (2 * service_aics),
+                           retired_candidate=retired_candidate, window_probe=args.window_probe,
                            arguments=arguments, kernels=CHECKED_KERNELS[f'small_{mode}'])
+
+
+def window_scopes(source, batch, windows):
+    scopes = {}
+    for event in source['traceEvents']:
+        args = event.get('args', {})
+        phase = args.get('phase_id')
+        if (event.get('ph') != 'X' or args.get('kernel_id') != 22 or args.get('core_type') != 'AIV'
+                or phase not in WINDOW_SCOPE_PHASES):
+            continue
+        window, lane = args['window_epoch'], args['service_lane']
+        if lane not in range(batch) or window not in range(windows):
+            continue
+        name = WINDOW_SCOPE_PHASES[phase]
+        key = (window, lane, name)
+        if key in scopes:
+            raise ValueError(f'Duplicate scope {key}')
+        scopes[key] = dict(window=window, request=lane, scope=name, source_us=event['dur'],
+                           begin_tick=args['begin_tick'], end_tick=args['end_tick'])
+    return scopes
+
+
+def checked_window_scopes(case, report, source):
+    probe = case['window_probe']
+    if not probe:
+        return {}
+    batch, windows = case['batch'], report['windows']
+    scopes = window_scopes(source, batch, windows)
+    names = [(w, b, 'window_ready') for w in range(windows) for b in range(batch)]
+    names += [(w, b, 'previous_wait') for w in range(1, windows) for b in range(batch)]
+    if case['mode'] != 'windows_early' and any(key[2] == 'early_header_enqueue' for key in scopes):
+        raise ValueError('Unexpected read-ahead in the control or cursor probe')
+    if probe == 'bs1-p8':
+        names += [(w, 0, 'p8_cursor') for w in range(windows)]
+        if case['mode'] == 'cold_p8_bulk':
+            names += [(w, 0, 'bulk_cursor_mte2') for w in range(windows)]
+        elif any(key[2] == 'bulk_cursor_mte2' for key in scopes):
+            raise ValueError('Bulk cursor scope appeared in the scalar control')
+    if any(key not in scopes for key in names):
+        raise ValueError('Incomplete window probe source-scope coverage')
+    return scopes
 
 
 def trace_arm(output, case, config, profiler):
@@ -130,6 +217,7 @@ def trace_arm(output, case, config, profiler):
         groups = case['cold_score_groups']
         if [(body['logical_aic_lanes'], body['logical_aiv_lanes']) for body in bodies] != [(groups, 2 * groups)]:
             raise ValueError(f'{cold_entry} trace does not show the planned {groups} MIX groups')
+        scopes = checked_window_scopes(case, report, capture['source'])
         manifest['status'] = 'PASS'
         row = dict(
             variant=case['mode'], batch=case['batch'], accepted=True, windows=report['windows'],
@@ -143,6 +231,12 @@ def trace_arm(output, case, config, profiler):
             final_get_requests_per_call=report['total_final_get'],
             total_get_requests_per_call=report['total_prefetch'] + report['total_final_get'],
         )
+        if case['window_probe']:
+            row.update(window_scopes=list(scopes.values()), native_stages=capture['intervals'],
+                       early_header_enqueues=sum(key[2] == 'early_header_enqueue' for key in scopes),
+                       window_scope_count=len(scopes))
+        if case['mode'] in RETIRED_MODES:
+            row['retired_service_jobs'] = len(report['retired_service_jobs'])
         fields = COLD_GM_STAGE_FIELDS.get(f"small_{case['mode']}", STAGES)
         for field, interval in zip(fields, capture['intervals'], strict=True):
             row[f'marked_{field}'] = interval['duration_us']
@@ -212,9 +306,29 @@ def trace_compare(before, after, *, prefix=''):
         requests_balanced=sum(max(req['final_posted_counts']) < max(req['final_original_owner_counts'])
                               for req in candidate),
     )
+    key = 'prefetch_tokens_in_submit_order_by_window'
+    if all(key in request for request in base + candidate):
+        comparison['same_window_prefetch_post_order'] = all(
+            left[key] == right[key] for left, right in zip(base, candidate))
     after.update({f'{prefix}{key}': value for key, value in comparison.items()})
-    if after['variant'] in (PARTITIONED_MODES | {'topk'}) and not comparison['resident_seed_match']:
+    if (after['variant'] in (PARTITIONED_MODES | {'topk', 'windows_early'})
+            and not comparison['resident_seed_match']):
         raise ValueError(f"Resident Top2048 seed differs from {before['variant']}")
+
+
+def write_window_probe_comparison(output, before, after):
+    base = {(s['window'], s['request'], s['scope']): s for s in before['window_scopes']}
+    deltas = []
+    for scope in after['window_scopes']:
+        key = (scope['window'], scope['request'], scope['scope'])
+        if key in base:
+            old = base[key]['source_us']
+            deltas.append(dict(window=key[0], request=key[1], scope=key[2],
+                               base_us=old, optimized_us=scope['source_us'], delta_us=scope['source_us'] - old))
+    save(output / 'window_probe_comparison.json', {
+        'control': before, 'experiment': after, 'source_scope_deltas': deltas,
+        'source_scopes_unit': 'calibrated device microseconds',
+    })
 
 
 def compare_request_counts(before, after, *, prefix=''):
@@ -223,7 +337,7 @@ def compare_request_counts(before, after, *, prefix=''):
 
     base, candidate = keyed(before), keyed(after)
     if base.keys() != candidate.keys():
-        raise ValueError('Measured request and invocation coverage differs from P2')
+        raise ValueError(f"Measured request and invocation coverage differs from {before['variant']}")
     keys = ('prefetch_requests', 'final_get_requests', 'total_get_requests')
     matches = {key: all(base[i][key] == candidate[i][key] for i in base) for key in keys}
     after[f'{prefix}get_count_comparison'] = ('same_early_and_final_counts' if all(matches.values())
@@ -236,8 +350,12 @@ def compare_request_counts(before, after, *, prefix=''):
 
 
 def compare_arms(before, after, *, trace, prefix=''):
+    if any(after[key] != before[key] for key in ('fixture_sha256', 'library_sha256')):
+        raise ValueError('Pair used different fixture or bridge')
     if trace:
         trace_compare(before, after, prefix=prefix)
+        after[f'{prefix}marked_chain_delta_us'] = (
+            after['native_first_kernel_to_terminal_us'] - before['native_first_kernel_to_terminal_us'])
     else:
         compare_request_counts(before, after, prefix=prefix)
         after[f'{prefix}raw_kv_ready_delta_us'] = after['kv_ready_us'] - before['kv_ready_us']
@@ -245,7 +363,7 @@ def compare_arms(before, after, *, trace, prefix=''):
 
 def summarize(output, rows):
     summary = [{key: value for key, value in row.items()
-                if key not in ('requests', 'per_call_requests')} for row in rows]
+                if key not in ('requests', 'per_call_requests', 'window_scopes', 'native_stages')} for row in rows]
     write_summary(output, summary)
     grouped = [row for row in summary if row.get('measurement_kind') == 'serial_bs16x2_graph_event']
     if grouped:
@@ -275,6 +393,11 @@ def main():
                        help='compare P2 and Cold 32/BS across every feasible W2/W3/W4 at one request per Service AIV')
     route.add_argument('--cold-window-matrix', action='store_true',
                        help='keep Hot P2; sweep Cold parts at W2 for BS1 and W2/W4 for BS2/BS8')
+    route.add_argument('--retired-study', action='store_true',
+                       help='compare P2, full32 rotation and retired Service at legacy matched geometries')
+    route.add_argument('--retired-candidate', type=parse_retired_candidate, action='append', metavar='BS:P:W',
+                       help='compare static and retired Service at a selected sweep geometry; repeat for more')
+    route.add_argument('--window-probe', choices=WINDOW_PROBES, help='run a fixed-geometry A/B pair')
     parser.add_argument('--repeats', type=int, default=1, help='repeat the matrix with the same bridge and independent workers')
     parser.add_argument('--trace', action='store_true', help='capture one checked msprof replay per arm')
     parser.add_argument('--dry-run', action='store_true')
@@ -282,6 +405,10 @@ def main():
     parser.add_argument('--iterations', type=int, default=5)
     parser.add_argument('--timeout-seconds', type=int, default=1800)
     args = parser.parse_args()
+    if (args.retired_candidate or args.window_probe) and (args.batch or args.group_bs32):
+        parser.error('Candidate and probe routes select their own batches and windows')
+    if args.window_probe and args.miss_percent:
+        parser.error('--window-probe uses miss 10%')
     study = study_arms(args)
     if study:
         if args.group_bs32 or any(batch not in study for batch in args.batch or ()):
@@ -316,7 +443,8 @@ def main():
                     follow_up=args.follow_up, direction1_matrix=args.direction1_matrix,
                     full32=args.full32, window_sweep=args.window_sweep, balanced=args.balanced,
                     cold_window_matrix=args.cold_window_matrix,
-                    granularity_study=args.granularity_study, repeats=args.repeats,
+                    granularity_study=args.granularity_study, retired_study=args.retired_study,
+                    retired_candidates=args.retired_candidate, window_probe=args.window_probe, repeats=args.repeats,
                     scopes=dict(queries=4, history=131072, resident=16384,
                                 miss_percent=sorted({case['miss_percent'] for case in cases + unsupported}),
                                 aic=32, aiv=64, prefetch_limit=512, per_window_limit=128, rank_start=1024),
@@ -334,7 +462,8 @@ def main():
         raise FileNotFoundError('msprof is missing from the active CANN environment')
     output = Path(os.environ['KVIP_AB_OUTPUT']).resolve()
     print(f'Small batch A5 comparison: {output}', flush=True)
-    rows, bases, p4_arms, window_bases, w4_arms = list(unsupported), {}, {}, {}, {}
+    rows = list(unsupported)
+    bases, p4_arms, window_bases, w4_arms, static_arms = {}, {}, {}, {}, {}
     manifest['status'] = 'RUNNING'
     try:
         for case in cases:
@@ -348,6 +477,9 @@ def main():
             miss = case['miss_percent']
             if args.direction1_matrix or study:
                 run_dir = run_dir / f'miss{miss:g}'
+            if case['retired_candidate']:
+                batch, parts, windows = case['retired_candidate']
+                run_dir /= f'bs{batch}-p{parts}-w{windows}'
             print(f"Round {repeat}/{args.repeats}, BS{case['batch']} miss{miss:g} "
                   f"{case['mode']} P{case['cold_score_parts']}/W{case['effective_windows']} "
                   f"({case['cold_score_groups']} Cold MIX groups)", flush=True)
@@ -365,22 +497,39 @@ def main():
             pair = (repeat, row['batch'], miss)
             window_pair = (*pair, case['effective_windows'])
             parts = case['cold_score_parts']
-            if (args.balanced or args.cold_window_matrix) and parts == 2:
+            if (args.balanced or args.cold_window_matrix or args.retired_study) and parts == 2:
                 window_bases[window_pair] = row
-            if row['variant'] == 'p2':
-                bases[pair] = row
-            else:
-                before = bases[pair]
-                if any(row[key] != before[key] for key in ('fixture_sha256', 'library_sha256')):
-                    raise ValueError('Pair used different fixture or bridge')
-                if (args.granularity_study or args.cold_window_matrix) and row['variant'] == 'cold':
-                    p4_arms[pair] = row
-                compare_arms(before, row, trace=args.trace)
-                if row['variant'] == 'cold_p8':
-                    compare_arms(p4_arms[pair], row, trace=args.trace, prefix='vs_p4_')
-                if ((args.balanced and row['variant'] in FULL32_MODES)
-                        or (args.cold_window_matrix and parts > 2)):
-                    compare_arms(window_bases[window_pair], row, trace=args.trace, prefix='same_window_')
+            if args.retired_candidate or args.retired_study:
+                static_pair = (*window_pair, parts)
+                if row['variant'] in RETIRED_MODES:
+                    before = static_arms[static_pair]
+                    if any(row.get(key) != before.get(key) for key in ('windows', 'service_lanes', 'cold_score_parts')):
+                        raise ValueError('Retired Service comparison used different geometry')
+                    compare_arms(before, row, trace=args.trace, prefix='same_window_static_')
+                elif parts > 2:
+                    static_arms[static_pair] = row
+            if args.window_probe:
+                control = WINDOW_PROBES[args.window_probe][1][0]
+                if row['variant'] == control:
+                    bases[pair] = row
+                else:
+                    before = bases[pair]
+                    compare_arms(before, row, trace=args.trace)
+                    if args.trace:
+                        write_window_probe_comparison(run_dir, before, row)
+            elif not args.retired_candidate:
+                if row['variant'] == 'p2':
+                    bases[pair] = row
+                else:
+                    before = bases[pair]
+                    if (args.granularity_study or args.cold_window_matrix) and row['variant'] == 'cold':
+                        p4_arms[pair] = row
+                    compare_arms(before, row, trace=args.trace)
+                    if row['variant'] == 'cold_p8':
+                        compare_arms(p4_arms[pair], row, trace=args.trace, prefix='vs_p4_')
+                    if (((args.balanced or args.retired_study) and parts > 2)
+                            or (args.cold_window_matrix and parts > 2)):
+                        compare_arms(window_bases[window_pair], row, trace=args.trace, prefix='same_window_')
             if args.cold_window_matrix and row['batch'] != 1:
                 parts_pair = (*pair, parts)
                 if case['effective_windows'] == 4:

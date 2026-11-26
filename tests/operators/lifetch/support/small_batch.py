@@ -11,31 +11,71 @@ SUPPORTED_BATCHES = {
     'cold': (1, 2, 4, 8),
     'cold_w2': (2,),
     'cold_p8': (1,),
+    'cold_p8_bulk': (1,),
+    'cold_retired_p4': (1, 2),
+    'cold_retired_p4_w2': (2,),
+    'cold_retired_p8': (1,),
     'cold_full': (1, 2, 8),
     'cold_full_w3': (2, 8),
     'cold_full_w2': (2, 8),
+    'cold_full_retired': (1, 2, 8),
+    'cold_full_retired_w3': (2, 8),
+    'cold_full_retired_w2': (2, 8),
     'windows': (2, 4, 8, 16),
     'windows_w2': (2, 8),
+    'windows_early': (2,),
     'topk': (1, 8),
     'get': (1, 8),
 }
 MODES = ('p2', 'cold', 'windows', 'topk', 'get')
 FULL32_MODES = {'cold_full', 'cold_full_w3', 'cold_full_w2'}
-PARTITIONED_MODES = FULL32_MODES | {'cold', 'cold_w2', 'cold_p8'}
-WINDOW_OVERRIDES = {'windows': 3, 'windows_w2': 2, 'cold_w2': 2, 'cold_full_w3': 3, 'cold_full_w2': 2}
-TRACE_ROUTES = dict(p2='p2', **dict.fromkeys(PARTITIONED_MODES, 'small_cold'),
-                    windows='p2', windows_w2='p2', topk='small_topk', get='p2')
+FULL32_RETIRED_MODES = {'cold_full_retired', 'cold_full_retired_w3', 'cold_full_retired_w2'}
+INTERMEDIATE_RETIRED_MODES = {'cold_retired_p4': 'cold', 'cold_retired_p4_w2': 'cold', 'cold_retired_p8': 'cold_p8'}
+RETIRED_MODES = FULL32_RETIRED_MODES | INTERMEDIATE_RETIRED_MODES.keys()
+PARTITIONED_MODES = FULL32_MODES | RETIRED_MODES | {'cold', 'cold_w2', 'cold_p8', 'cold_p8_bulk'}
+WINDOW_OVERRIDES = {
+    'windows': 3, 'windows_w2': 2, 'windows_early': 3, 'cold_w2': 2,
+    'cold_full_w3': 3, 'cold_full_w2': 2, 'cold_full_retired_w3': 3, 'cold_full_retired_w2': 2,
+    'cold_retired_p4_w2': 2,
+}
+WINDOW_SCOPE_PHASES = {
+    151: 'previous_wait', 243: 'window_ready', 246: 'p8_cursor', 247: 'early_header_enqueue', 250: 'bulk_cursor_mte2',
+}
+TRACE_ROUTES = dict(p2='p2', **dict.fromkeys(PARTITIONED_MODES - RETIRED_MODES, 'small_cold'),
+                    **dict.fromkeys(RETIRED_MODES, 'small_retired'),
+                    windows='p2', windows_w2='p2', windows_early='p2', topk='small_topk', get='p2')
 KERNELS = ('v9_li_kernel', 'v9_li_kernel_1', 'v9_li_kernel_2', 'v9_parallel_terminal')
 COLD_KERNELS = (KERNELS[0], 'v9_li_kernel_threshold_cold_partitioned',
                 'v9_li_kernel_cold_ready_partitioned', KERNELS[3])
+RETIRED_KERNELS = (KERNELS[0], 'v9_li_kernel_threshold_retired_service',
+                   'v9_li_kernel_cold_retired_service', KERNELS[3])
 TOPK_KERNELS = (KERNELS[0], 'v9_li_kernel_resident_topk_high', *KERNELS[1:])
 GET_BALANCE_FLAG = 2
+WINDOW_PROBE_OPTION_OFFSET = 224
+WINDOW_READY_LINE_BYTES = 128
+
+
+def cold_selector_mode(mode):
+    if mode in FULL32_MODES | FULL32_RETIRED_MODES:
+        return 'cold_full'
+    if mode == 'cold_p8_bulk':
+        return 'cold_p8'
+    return INTERMEDIATE_RETIRED_MODES.get(mode, mode.removesuffix('_w2'))
+
+
+def cold_launch_mode(mode):
+    if mode in FULL32_RETIRED_MODES:
+        return 'cold_retired'
+    if mode in INTERMEDIATE_RETIRED_MODES:
+        return mode.removesuffix('_w2')
+    return cold_selector_mode(mode)
 
 
 def cold_score_parts(mode, batch):
-    if mode in FULL32_MODES:
+    selector = cold_selector_mode(mode)
+    if selector == 'cold_full':
         return 32 // batch
-    return {'cold': 4, 'cold_w2': 4, 'cold_p8': 8}.get(mode, 2)
+    return {'cold': 4, 'cold_p8': 8}.get(selector, 2)
 
 
 def bind(state, mode):
@@ -55,15 +95,18 @@ def bind(state, mode):
 
     library = state.rotating.library
     parts = 2
-    symbol_mode = 'cold_full' if mode in FULL32_MODES else mode.removesuffix('_w2')
     if mode in PARTITIONED_MODES:
-        choose = getattr(library, f'kvip_small_batch_{symbol_mode}_parts')
+        choose = getattr(library, f'kvip_small_batch_{cold_selector_mode(mode)}_parts')
         choose.argtypes, choose.restype = [ctypes.c_void_p], ctypes.c_uint32
         parts = choose(forward.shape_pointer)
         expected = cold_score_parts(mode, state.batch)
         required = shape.batch * 4 * (shape.history * 2 + 64 * parts)
+        alignment = 64
+        if mode in RETIRED_MODES:
+            alignment = 128
+            required += (32 + shape.rounds * shape.serviceLanes) * alignment
         if (parts != expected or state.workspace.compute.nbytes < required
-                or state.workspace.compute.data_ptr() % 64):
+                or state.workspace.compute.data_ptr() % alignment):
             raise ValueError(f'Cold P{expected} geometry or classified-progress capacity is unsupported')
     elif mode == 'topk':
         forward.resident_high_table = state.torch.empty(
@@ -75,8 +118,21 @@ def bind(state, mode):
         forward.balance_final_get = True
         forward.set_options()
 
+    if mode in ('cold_p8_bulk', 'windows_early'):
+        option = 1
+        if mode == 'windows_early':
+            forward.window_header_ready = state.torch.zeros(
+                (shape.rounds * shape.serviceLanes, WINDOW_READY_LINE_BYTES),
+                dtype=state.torch.uint8, device=state.device)
+            option = forward.window_header_ready.data_ptr()
+            if option % WINDOW_READY_LINE_BYTES:
+                raise ValueError('The read-ahead flags require aligned GM lines')
+        encoded = np.asarray([option], dtype='<u8').view('u1')
+        start = WINDOW_PROBE_OPTION_OFFSET
+        forward.workspace[start:start + encoded.nbytes].copy_(state.torch.from_numpy(encoded))
+
     if mode in PARTITIONED_MODES or mode == 'topk':
-        launch = getattr(library, f'kvip_small_batch_{symbol_mode}_forward')
+        launch = getattr(library, f'kvip_small_batch_{cold_launch_mode(mode)}_forward')
         launch.argtypes, launch.restype = [ctypes.c_void_p] * 4, ctypes.c_uint32
         forward.terminal_function = launch
     return parts
@@ -102,6 +158,9 @@ def trace_evidence(state, report):
         if np.any(logical < 0) or np.any(logical >= cold_history):
             raise ValueError(f'Request {b}: invalid logical source mapping')
         offsets = np.cumsum([0, *req['prefetch_by_window']])
+        if report.get('small_batch_mode') in ('cold_p8', 'cold_p8_bulk', 'windows', 'windows_early'):
+            req['prefetch_tokens_in_submit_order_by_window'] = [
+                logical[a:z].tolist() for a, z in zip(offsets, offsets[1:])]
         req['prefetch_tokens_by_window'] = [sorted(logical[a:z].tolist()) for a, z in zip(offsets, offsets[1:])]
         req['final_get_tokens'] = sorted(logical[early:].tolist())
         req['final_get_slots'] = [[int(token), int(slot)] for token, slot in zip(logical[early:], targets[early:])]
@@ -125,10 +184,12 @@ def capture_resident_seed(state, stream, mode):
     launches = [(KERNELS[0], li_groups)]
     if mode == 'topk':
         launches.append((TOPK_KERNELS[1], state.batch * 8))
-    launches.append((COLD_KERNELS[1] if mode in PARTITIONED_MODES else KERNELS[1], li_groups))
+    threshold = (RETIRED_KERNELS[1] if mode in RETIRED_MODES else
+                 COLD_KERNELS[1] if mode in PARTITIONED_MODES else KERNELS[1])
+    launches.append((threshold, li_groups))
     for symbol, blocks in launches:
         launch = getattr(state.rotating.library, f'aclrtlaunch_{symbol}')
-        extra = [cold_score_parts(mode, state.batch)] if symbol == COLD_KERNELS[1] else []
+        extra = [cold_score_parts(mode, state.batch)] if symbol in (COLD_KERNELS[1], RETIRED_KERNELS[1]) else []
         launch.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p] + [ctypes.c_uint32] * len(extra)
         launch.restype = ctypes.c_uint32
         status = launch(blocks, stream.npu_stream, forward.bindings.data_ptr(), *extra)

@@ -51,7 +51,11 @@ READY_SERVICE_ROUTES = ('static_ready', 'dynamic')
 ROUTE_PHASES = {'p2': PHASES, 'cold_p4': PHASES_COLD_P4,
                 'full_p2': PHASES_UNIFIED, 'full_uniform': PHASES_UNIFIED,
                 'dedicated': PHASES_DEDICATED, 'static_ready': PHASES_STATIC_READY,
-                'dynamic': PHASES_DYNAMIC, 'small_cold': SMALL_COLD_PHASES, 'small_topk': SMALL_TOPK_PHASES}
+                'dynamic': PHASES_DYNAMIC, 'small_cold': SMALL_COLD_PHASES, 'small_topk': SMALL_TOPK_PHASES,
+                'small_retired': (PHASES[0],
+                                  ('THRESHOLD', 'v9_li_kernel_threshold_retired_service', PHASES[1][2]),
+                                  ('COLD_SERVICE', 'v9_li_kernel_cold_retired_service', 'Cold Score + retired AIV Service'),
+                                  PHASES[3])}
 MARKERS = {f'KVIP_LIFETCH_{stage}_{side}' for stage, _, _ in SMALL_TOPK_PHASES for side in ('BEGIN', 'END')}
 KERNELS = {kernel for phases in ROUTE_PHASES.values() for _, kernel, _ in phases}
 COMPUTE_TYPES = {'AI_CORE', 'AI_VECTOR_CORE', 'MIX_AIC', 'MIX_AIV', 'AIV_SQE', 'FUSION'}

@@ -65,7 +65,12 @@ DYNAMIC_KERNELS = {
 }
 SMALL_COLD_KERNELS = {**COLD_P4_KERNELS,
                       22: (KERNELS[22][0], 'v9_li_kernel_cold_ready_partitioned')}
-ROUTE_KERNELS = {'p2': KERNELS, 'cold_p4': COLD_P4_KERNELS,
+SMALL_RETIRED_KERNELS = {
+    **SMALL_COLD_KERNELS,
+    21: (KERNELS[21][0], 'v9_li_kernel_threshold_retired_service'),
+    22: ('Cold Score + retired AIV Service', 'v9_li_kernel_cold_retired_service'),
+}
+ROUTE_KERNELS = {'p2': KERNELS, 'cold_p4': COLD_P4_KERNELS, 'small_retired': SMALL_RETIRED_KERNELS,
                  'small_cold': SMALL_COLD_KERNELS, 'small_topk': KERNELS,
                  'dedicated': DEDICATED_KERNELS, 'static_ready': STATIC_READY_KERNELS,
                  'dynamic': DYNAMIC_KERNELS,
@@ -120,6 +125,9 @@ PHASES = {
     243: 'Stage window state and ready cursors',
     244: 'Drain and publish window state',
     245: 'Prepare LI per-query run info',
+    246: 'P8 cursor read and ready-prefix fold',
+    247: 'Enqueue next-window Top2048 header read',
+    250: 'P8 bulk cursor GM to UB with fence',
     DYNAMIC_SCORE_JOB: 'Dynamically assigned Score fragment',
     DYNAMIC_SERVICE_JOB: 'Dynamically assigned Service window',
 }
@@ -226,7 +234,7 @@ def scoped_msprof(prof, output, device_id):
 class StageBuffer:
     """Attach a private trace buffer only for one already-bound native call."""
 
-    def __init__(self, state, *, cold_route='p2', cold_parts=4):
+    def __init__(self, state, *, cold_route='p2', small_mode=None):
         self.forward = state.forward
         library = self.forward.rotating.library
         probe = getattr(library, 'kvip_stage_trace_supported', None)
@@ -239,6 +247,7 @@ class StageBuffer:
             'p2': 'kvip_parallel_tail_profile_forward',
             'cold_p4': 'kvip_parallel_tail_cold_partitioned_profile_forward',
             'small_cold': 'kvip_small_batch_cold_profile_forward',
+            'small_retired': 'kvip_small_batch_cold_retired_profile_forward',
             'small_topk': 'kvip_small_batch_topk_profile_forward',
             'dedicated': 'kvip_parallel_tail_dedicated_service_profile_forward',
             'static_ready': 'kvip_parallel_tail_static_ready_service_profile_forward',
@@ -246,10 +255,10 @@ class StageBuffer:
             'full_p2': 'kvip_parallel_tail_unified_p2_profile_forward',
             'full_uniform': 'kvip_parallel_tail_unified_partitioned_profile_forward',
         }[cold_route]
-        if cold_route == 'small_cold' and cold_parts == 8:
-            profile_symbol = 'kvip_small_batch_cold_p8_profile_forward'
-        if cold_route == 'small_cold' and cold_parts in (16, 32):
-            profile_symbol = 'kvip_small_batch_cold_full_profile_forward'
+        if small_mode is not None and cold_route in ('small_cold', 'small_retired'):
+            from small_batch import cold_launch_mode
+
+            profile_symbol = f'kvip_small_batch_{cold_launch_mode(small_mode)}_profile_forward'
         self.profile_forward = getattr(library, profile_symbol)
         self.profile_forward.argtypes = [ctypes.c_void_p] * 4
         self.profile_forward.restype = ctypes.c_uint32
@@ -348,10 +357,12 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
             raise ValueError(f'Missing required pipe scopes: {missing_pipe}')
     if require_handoff_scopes:
         expected = dict(REQUIRED_HANDOFF)
-        if cold_route in ('cold_p4', 'small_cold', 'dedicated', 'static_ready', 'dynamic'):
+        if cold_route in ('cold_p4', 'small_cold', 'small_retired', 'dedicated', 'static_ready', 'dynamic'):
             expected[21] = expected[21] | {COLD_PROGRESS_RESET}
         if cold_route in ('dedicated', 'static_ready'):
             expected[22] = expected[22] | {231}
+        if cold_route == 'small_retired':
+            expected[22] = expected[22] | {DYNAMIC_SERVICE_JOB}
         if cold_route == 'dynamic':
             # The dynamic job scope wraps role-local initialization and drain.
             expected[22] = {228, DYNAMIC_SCORE_JOB, DYNAMIC_SERVICE_JOB}
@@ -375,11 +386,12 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
     four_aiv = set(range(4 * batch))
     two_aic = set(range(64, 64 + 2 * batch))
     p4_lanes = set(range(8 * batch)) | set(range(64, 64 + 4 * batch))
-    if cold_route == 'small_cold' and (cold_parts not in (4, 8, 16, 32) or batch * cold_parts > 32):
+    if cold_route in ('small_cold', 'small_retired') and (cold_parts not in (4, 8, 16, 32) or batch * cold_parts > 32):
         raise ValueError(f'Unsupported small-batch Cold trace part count {cold_parts}')
-    small_cold_groups = batch * (cold_parts if cold_route == 'small_cold' else 4)
+    small_cold_groups = batch * (cold_parts if cold_route in ('small_cold', 'small_retired') else 4)
     small_cold_lanes = set(range(2 * small_cold_groups)) | set(range(64, 64 + small_cold_groups))
-    cold_lanes = {'cold_p4': p4_lanes, 'small_cold': small_cold_lanes, 'small_topk': four_aiv | two_aic,
+    cold_lanes = {'cold_p4': p4_lanes, 'small_cold': small_cold_lanes,
+                  'small_retired': small_cold_lanes, 'small_topk': four_aiv | two_aic,
                   'dedicated': four_aiv | set(range(64, 88)),
                   'static_ready': four_aiv | set(range(64, 88)),
                   'dynamic': four_aiv | two_aic,
@@ -478,6 +490,31 @@ def verify_dynamic_jobs(events):
         if event['begin'] < ready:
             raise ValueError(f'Service {(row, window)} started before its data dependencies')
     return {key: event['lane'] for key, event in services.items()}
+
+
+def verify_retired_jobs(events, windows, service_lanes):
+    """Check unique logical-window pickup after the physical MIX tail drain."""
+    tails = {event['lane']: event['end'] for event in events
+             if event['kernel'] == 22 and event['phase'] == 27}
+    expected = {(epoch, lane) for epoch in range(1, windows) for lane in range(service_lanes)}
+    jobs = {}
+    for event in events:
+        if event['phase'] != DYNAMIC_SERVICE_JOB:
+            continue
+        logical, epoch, _ = dynamic_job(event['detail'])
+        worker = event['lane']
+        retired_at = tails.get(64 + worker // 2)
+        key = epoch, logical
+        if (key in jobs or key not in expected or event['kernel'] != 22
+                or worker >= 64 or worker % 2 or epoch != event['iteration']
+                or retired_at is None or event['begin'] < retired_at):
+            raise ValueError(f'Invalid retired AIV Service assignment at {key} on worker {worker}')
+        jobs[key] = worker
+    if set(jobs) != expected:
+        raise ValueError('Incomplete retired AIV Service assignments')
+    return [dict(epoch=epoch, service_lane=lane, worker_aiv=worker)
+            for (epoch, lane), worker in sorted(jobs.items())]
+
 
 def source_lane_counts(spans):
     """Count distinct logical lanes, even when their source scopes overlap."""
@@ -704,12 +741,12 @@ def render(events, counter_mhz, *, cold_route='p2'):
         recorded_lane_spans[lane].append((begin, end))
         kernel = event['kernel']
         kernel_stage, entry = kernels[kernel]
-        args = dict(kernel_entry=entry, phase_id=phase, block=event['block'], subblock=event['subblock'],
+        args = dict(kernel_id=kernel, kernel_entry=entry, phase_id=phase, block=event['block'], subblock=event['subblock'],
                     core_type=core_type, raw_core_id=event['core'], raw_core_id_hex=hex(event['core']),
                     iteration=event['iteration'], detail=event['detail'], begin_tick=begin, end_tick=end)
         window_epoch = None
         category = kernel_stage
-        if kernel in (20, 22) and (phase in (21, 22, 25, *range(150, 156), 243, 244,
+        if kernel in (20, 22) and (phase in (21, 22, 25, *range(150, 156), 243, 244, 246, 247, 250,
                                              DEDICATED_DRIVER_WAIT, DEDICATED_READY_SNAPSHOT, 230, 231,
                                              DYNAMIC_SCORE_JOB, DYNAMIC_SERVICE_JOB)
                                    or phase in PIPE_SCOPES):
@@ -744,7 +781,7 @@ def render(events, counter_mhz, *, cold_route='p2'):
             args.update(request_row=event['detail'] >> 24, query=(event['detail'] >> 20) & NO_QUERY)
         elif phase in (21, 22, 152, 153, 230, 231):
             args['request_row'] = event['detail']
-        elif phase in (25, 150, 151, 243, 244, DEDICATED_DRIVER_WAIT):
+        elif phase in (25, 150, 151, 243, 244, 246, 247, 250, DEDICATED_DRIVER_WAIT):
             args['service_lane'] = event['detail']
         elif phase == 154:
             args['request_or_service_lane'] = event['detail']
@@ -927,6 +964,10 @@ def write_capture(directory, raw, counter_mhz, state, library, config, soc, mspr
                 raise ValueError(f'Cold comparison phase {PHASES[phase]} must cover all three Cold windows')
     document, stages = render(events, counter_mhz, cold_route=cold_route)
     report = replay_evidence(state, library, config, soc)
+    if cold_route == 'small_retired':
+        shape = state.rotating.runtime_shape
+        report.update(route=f'Hot P2 + Cold P{cold_parts} with retired AIV Service + four-AIV Terminal',
+                      retired_service_jobs=verify_retired_jobs(events, shape.rounds, shape.serviceLanes))
     if cold_route == 'cold_p4':
         report['route'] = 'Hot P2 + Cold P4 + four-AIV Terminal'
     elif cold_route in ('dedicated', 'static_ready'):

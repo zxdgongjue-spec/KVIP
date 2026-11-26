@@ -139,6 +139,8 @@ extern "C" uint32_t aclrtlaunch_v9_li_kernel_hot_partitioned(uint32_t,void*,void
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_threshold_cold_partitioned(uint32_t,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_partitioned(uint32_t,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_ready_partitioned(uint32_t,void*,void*,uint32_t);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_threshold_retired_service(uint32_t,void*,void*,uint32_t);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_retired_service(uint32_t,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_resident_topk_high(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_score_t2(uint32_t,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_t2(uint32_t,void*,void*);
@@ -181,7 +183,7 @@ static uint32_t LaunchTailStage(void* stream, ParallelTailStage stage, Launch la
 template<bool Profile = false>
 static uint32_t LaunchParallelTail(void* bindings,void* terminal,
     void* stream,const rotating::RuntimeShape* shape,uint32_t hotParts,uint32_t coldParts=2,bool earlyW1=false,
-    bool readyCold=false,bool residentHigh=false) {
+    bool readyCold=false,bool residentHigh=false,bool retiredService=false) {
     if(!bindings || !terminal || !stream || !kvip_parallel_tail_supported(shape))return 100000;
     uint32_t result;
 #if KVIP_HOT_SCORE_PARTITION
@@ -204,9 +206,14 @@ static uint32_t LaunchParallelTail(void* bindings,void* terminal,
         });
     } else if(coldParts>2){
         if(!result)result=LaunchTailStage<Profile>(stream,ParallelTailStage::Threshold,[&] {
-            return aclrtlaunch_v9_li_kernel_threshold_cold_partitioned(shape->liCores,stream,bindings,coldParts);
+            return retiredService
+                ? aclrtlaunch_v9_li_kernel_threshold_retired_service(shape->liCores,stream,bindings,coldParts)
+                : aclrtlaunch_v9_li_kernel_threshold_cold_partitioned(shape->liCores,stream,bindings,coldParts);
         });
         if(!result)result=LaunchTailStage<Profile>(stream,ParallelTailStage::ColdService,[&] {
+            if (retiredService) {
+                return aclrtlaunch_v9_li_kernel_cold_retired_service(shape->batch*coldParts,stream,bindings,coldParts);
+            }
             return readyCold
                 ? aclrtlaunch_v9_li_kernel_cold_ready_partitioned(shape->batch*coldParts,stream,bindings,coldParts)
                 : aclrtlaunch_v9_li_kernel_cold_partitioned(shape->batch*coldParts,stream,bindings,coldParts);
@@ -418,12 +425,15 @@ extern "C" uint32_t kvip_small_batch_cold_full_parts(const rotating::RuntimeShap
     return kvip_cold_score::CompleteWindows(shape->history, shape->resident, half, shape->rounds, parts) ? parts : 0;
 }
 
-template<bool Profile>
+template<bool Profile, bool RetiredService = false>
 static uint32_t LaunchSmallBatchColdFull(void* bindings, void* terminal, void* stream,
                                         const rotating::RuntimeShape* shape) {
     const auto parts = kvip_small_batch_cold_full_parts(shape);
     if (!parts) return 100000;
-    return LaunchParallelTail<Profile>(bindings, terminal, stream, shape, 2, parts, false, true);
+    if constexpr (RetiredService) {
+        if (shape->serviceLanes < shape->batch || shape->serviceLanes > shape->batch + 1) return 100000;
+    }
+    return LaunchParallelTail<Profile>(bindings, terminal, stream, shape, 2, parts, false, true, false, RetiredService);
 }
 
 template<bool Profile>
@@ -432,6 +442,15 @@ static uint32_t LaunchSmallBatchColdP8(void* bindings, void* terminal, void* str
     const auto parts = kvip_small_batch_cold_p8_parts(shape);
     if (!parts) return 100000;
     return LaunchParallelTail<Profile>(bindings, terminal, stream, shape, 2, parts, false, true);
+}
+
+template<bool Profile, uint32_t Parts>
+static uint32_t LaunchSmallBatchColdRetired(void* bindings, void* terminal, void* stream,
+                                            const rotating::RuntimeShape* shape) {
+    const auto supported = Parts == 4 ? kvip_small_batch_cold_parts(shape) : kvip_small_batch_cold_p8_parts(shape);
+    if (supported != Parts || shape->serviceLanes < shape->batch ||
+        shape->serviceLanes > shape->batch + 1) return 100000;
+    return LaunchParallelTail<Profile>(bindings, terminal, stream, shape, 2, Parts, false, true, false, true);
 }
 
 template<bool Profile>
@@ -457,6 +476,21 @@ extern "C" uint32_t kvip_small_batch_cold_full_forward(void* bindings, void* ter
     return LaunchSmallBatchColdFull<false>(bindings, terminal, stream, shape);
 }
 
+extern "C" uint32_t kvip_small_batch_cold_retired_forward(void* bindings, void* terminal, void* stream,
+                                                          const rotating::RuntimeShape* shape) {
+    return LaunchSmallBatchColdFull<false, true>(bindings, terminal, stream, shape);
+}
+
+extern "C" uint32_t kvip_small_batch_cold_retired_p4_forward(
+    void* bindings, void* terminal, void* stream, const rotating::RuntimeShape* shape) {
+    return LaunchSmallBatchColdRetired<false, 4>(bindings, terminal, stream, shape);
+}
+
+extern "C" uint32_t kvip_small_batch_cold_retired_p8_forward(
+    void* bindings, void* terminal, void* stream, const rotating::RuntimeShape* shape) {
+    return LaunchSmallBatchColdRetired<false, 8>(bindings, terminal, stream, shape);
+}
+
 extern "C" uint32_t kvip_small_batch_topk_forward(void* bindings,void* terminal,void* stream,
     const rotating::RuntimeShape* shape) {
     return LaunchSmallBatchTopK<false>(bindings,terminal,stream,shape);
@@ -476,6 +510,21 @@ extern "C" uint32_t kvip_small_batch_cold_p8_profile_forward(void* bindings, voi
 extern "C" uint32_t kvip_small_batch_cold_full_profile_forward(void* bindings, void* terminal, void* stream,
                                                                const rotating::RuntimeShape* shape) {
     return LaunchSmallBatchColdFull<true>(bindings, terminal, stream, shape);
+}
+
+extern "C" uint32_t kvip_small_batch_cold_retired_profile_forward(void* bindings, void* terminal, void* stream,
+                                                                  const rotating::RuntimeShape* shape) {
+    return LaunchSmallBatchColdFull<true, true>(bindings, terminal, stream, shape);
+}
+
+extern "C" uint32_t kvip_small_batch_cold_retired_p4_profile_forward(
+    void* bindings, void* terminal, void* stream, const rotating::RuntimeShape* shape) {
+    return LaunchSmallBatchColdRetired<true, 4>(bindings, terminal, stream, shape);
+}
+
+extern "C" uint32_t kvip_small_batch_cold_retired_p8_profile_forward(
+    void* bindings, void* terminal, void* stream, const rotating::RuntimeShape* shape) {
+    return LaunchSmallBatchColdRetired<true, 8>(bindings, terminal, stream, shape);
 }
 
 extern "C" uint32_t kvip_small_batch_topk_profile_forward(void* bindings,void* terminal,void* stream,

@@ -4247,7 +4247,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             trace_route = small_batch.TRACE_ROUTES[small_mode] if small_mode is not None else cold_route or 'p2'
             if small_mode is not None:
                 cold_parts = small_cold_parts
-            trace = StageBuffer(state, cold_route=trace_route, cold_parts=cold_parts)
+            trace = StageBuffer(state, cold_route=trace_route, small_mode=small_mode)
             replay_stage(f'calibrating device counter and warming up unmarked {cold_route or "p2"}')
             pending = True
             counter_mhz = state.forward.calibrate_counter_mhz()

@@ -31,7 +31,7 @@ __aicore__ inline bool HasUniformLengths(const rotating::RuntimeShape& shape, GM
     return true;
 }
 
-template <SequenceLiPhase Phase, bool ExternalBody = false, bool OwnWindow = false, bool WaitColdPeers = true>
+template <SequenceLiPhase Phase, bool ExternalBody = false, bool OwnWindow = false, bool WaitColdPeers = true, bool RetireService = false>
 __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, [[maybe_unused]] uint32_t job = 0,
     GM_ADDR coldGmReady = nullptr) {
     using namespace AscendC; using namespace QLICommon;
@@ -116,7 +116,13 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, [[maybe_unuse
         if (splitSequence) op.template ProcessSequenceSplit<Phase>(parts);
         else op.Process();
     } else {
-        op.template ProcessSequenceSplit<Phase, WaitColdPeers>(parts, coldGmReady);
+        GM_ADDR retireScratch = nullptr;
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+        if constexpr (RetireService) {
+            retireScratch = kvip_retired_service::Scratch(P(12), shape.batch, shape.history, parts);
+        }
+#endif
+        op.template ProcessSequenceSplit<Phase, WaitColdPeers, RetireService>(parts, coldGmReady, retireScratch);
     }
     KVIP_TRACE_RECORD(teardownScope, stageTrace, traceKernel, kvip_trace::LiPipeDestroy, 0, 0);
     pipe.Destroy();
@@ -271,6 +277,31 @@ extern "C" __global__ __aicore__ void v9_li_kernel_cold_ready_partitioned(GM_ADD
 }
 
 #if !V9_UBMEM
+extern "C" __global__ __aicore__ void v9_li_kernel_threshold_retired_service(GM_ADDR bindings, uint32_t parts) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    if ASCEND_IS_AIV {
+        using namespace kvip_retired_service;
+        const auto args = reinterpret_cast<__gm__ const uint64_t*>(bindings);
+        const auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(args[14]));
+        auto scratch = Scratch(reinterpret_cast<GM_ADDR>(args[12]), shape.batch, shape.history, parts);
+        const uint32_t lines = kGroups + shape.rounds * shape.serviceLanes;
+        for (uint32_t line = AscendC::GetBlockIdx(); line < lines; line += shape.batch * 4) {
+            Store(Word(scratch, line), 0);
+        }
+        ResetPartitionedColdProgress(bindings, parts);
+        RunLi<SequenceLiPhase::Threshold>(bindings);
+    }
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_li_kernel_cold_retired_service(GM_ADDR bindings, uint32_t parts) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    RunLi<SequenceLiPhase::Cold, false, false, false, true>(bindings, parts);
+#endif
+}
+
 extern "C" __global__ __aicore__ void v9_li_kernel_threshold_dedicated_service(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
@@ -446,7 +477,28 @@ extern "C" __global__ __aicore__ void v9_li_kernel_cold_gm_batch(GM_ADDR binding
 extern "C" __global__ __aicore__ void v9_li_kernel_1(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-    if ASCEND_IS_AIV { RunLi<SequenceLiPhase::Threshold>(bindings); }
+    if ASCEND_IS_AIV {
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+        using namespace AscendC;
+        if (GetBlockIdx() == 0) {
+            const auto args = reinterpret_cast<__gm__ const uint64_t*>(bindings);
+            auto ready = kvip_window_probe::Ready(kvip_window_probe::Option(reinterpret_cast<GM_ADDR>(args[15])));
+            if (ready) {
+                const auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(args[14]));
+                if (kvip_window_probe::EarlyShape(shape)) {
+                    // Threshold completes before Cold on every graph replay.
+                    for (uint32_t i = 0; i < shape.rounds * shape.serviceLanes; ++i) {
+                        auto flag = ready + i * kvip_window_probe::kReadyWords;
+                        *flag = 0;
+                        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flag),
+                            kvip_window_probe::kReadyBytes);
+                    }
+                }
+            }
+        }
+#endif
+        RunLi<SequenceLiPhase::Threshold>(bindings);
+    }
 #endif
 }
 

@@ -632,6 +632,16 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
 }
 __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half,uint32_t lane) {
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+    GlobalTensor<uint64_t> metadata;
+    metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(rotating::TopKHeader(ctx)));
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    const bool p8Row = runtimeShape_.batch == 1 && lane == 0 && coldParts_ == 8;
+    const bool earlyShape = lane < runtimeShape_.batch && !coldParts_ && !dedicatedProgress_ &&
+        kvip_window_probe::EarlyShape(runtimeShape_);
+    const auto option = p8Row || earlyShape ? kvip_window_probe::Option(streamingWorkspace_) : 0;
+    auto topkReady = earlyShape ? kvip_window_probe::Ready(option) : nullptr;
+    bool headerIssued = false;
+#endif
     // The predecessor wait is part of the optional window service and can
     // delay the producer. Capture it separately from incremental computation.
     bool trace=streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U);
@@ -645,7 +655,24 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half,uint32_t lane)
         KVIP_TRACE_BEGIN(predecessorScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
             Cold, ServicePredecessor, epoch, lane);
         auto previous=reinterpret_cast<__gm__ volatile rotating::Event*>(ctx->events)+(epoch-1)*runtimeShape_.serviceLanes+lane;
-        do {kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ rotating::Event*>(previous)),64);}while(!previous->complete);
+        auto previousBytes = reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ rotating::Event*>(previous));
+        do {
+            kvaf_device::CleanCacheLines(previousBytes,64);
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+            if (topkReady && !headerIssued && !previous->complete) {
+                const uint32_t index = (epoch - 1) * runtimeShape_.serviceLanes + lane;
+                auto flag = topkReady + index * kvip_window_probe::kReadyWords;
+                kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flag),64);
+                if (*reinterpret_cast<__gm__ volatile uint32_t*>(flag)) {
+                    KVIP_TRACE_BEGIN(preloadScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+                        Cold, EarlyTopKHeaderEnqueue, epoch, lane);
+                    // Live cursors, row admissions and WQE still use complete.
+                    DataCopy(incrementalMetadata_,metadata[lane*64],64);
+                    headerIssued = true;
+                }
+            }
+#endif
+        } while(!previous->complete);
     }
     KVIP_TRACE_BEGIN(windowScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_), Cold, LiWindow, epoch, lane);
     KVIP_TRACE_BEGIN(readyScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_), Cold, WindowReadyLoad, epoch, lane);
@@ -669,11 +696,14 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half,uint32_t lane)
     for(uint32_t b=lane,i=0;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes,++i)
         DataCopy(incrementalOld_[256+i*16],rowsSource[b*256],16);
     }
-    GlobalTensor<uint64_t> metadata;
-    metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(rotating::TopKHeader(ctx)));
     if(incrementalMetadataActive_) {
-        for(uint32_t b=lane,i=0;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes,i+=64)
-            DataCopy(incrementalMetadata_[i],metadata[b*64],64);
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+        if (!headerIssued)
+#endif
+        {
+            for(uint32_t b=lane,i=0;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes,i+=64)
+                DataCopy(incrementalMetadata_[i],metadata[b*64],64);
+        }
         SetFlag<HardEvent::MTE2_S>(EVENT_ID5);WaitFlag<HardEvent::MTE2_S>(EVENT_ID5);
     }
     uint32_t ownedQueries=lane<runtimeShape_.batch?((runtimeShape_.batch-1-lane)/runtimeShape_.serviceLanes+1)*4:0;
@@ -688,9 +718,29 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half,uint32_t lane)
                     incrementalMetadata_.SetValue(index * 16 + 4, DedicatedColdReady(b * 4 + q, epoch, half));
             }
         } else if (coldParts_) {
-            for (uint32_t b = lane, index = 0; b < runtimeShape_.batch; b += runtimeShape_.serviceLanes) {
-                for (uint32_t q = 0; q < 4; ++q, ++index)
-                    incrementalMetadata_.SetValue(index * 16 + 4, PartitionedColdReady(b * 4 + q, half));
+            KVIP_TRACE_BEGIN(cursorScope, p8Row ? KVIP_TRACE_WORKSPACE(streamingWorkspace_) : 0,
+                Cold, WindowCursorLoad, epoch, lane);
+            if (p8Row && option == kvip_window_probe::kBulk) {
+                constexpr uint32_t kParts = 8;
+                constexpr uint32_t kWords = kvip_cold_score::kQueries * kParts * kvip_cold_score::kProgressWords;
+                // This old-ID scratch is separate from row metadata at [256,272).
+                auto snapshot = incrementalOld_[512];
+                KVIP_TRACE_BEGIN(copyScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+                    Cold, BulkCursorMte2, epoch, lane);
+                DataCopy(snapshot, coldProgressGm_, kWords);
+                SetFlag<HardEvent::MTE2_S>(EVENT_ID5);WaitFlag<HardEvent::MTE2_S>(EVENT_ID5);
+                KVIP_TRACE_END(copyScope);
+                for (uint32_t q = 0; q < kvip_cold_score::kQueries; ++q) {
+                    uint32_t cursors[kParts];
+                    for (uint32_t part = 0; part < kParts; ++part)
+                        cursors[part] = snapshot.GetValue(kvip_cold_score::ProgressOffset(q, part, kParts));
+                    incrementalMetadata_.SetValue(q * 16 + 4, FoldPartitionedColdReady(cursors, half));
+                }
+            } else {
+                for (uint32_t b = lane, index = 0; b < runtimeShape_.batch; b += runtimeShape_.serviceLanes) {
+                    for (uint32_t q = 0; q < 4; ++q, ++index)
+                        incrementalMetadata_.SetValue(index * 16 + 4, PartitionedColdReady(b * 4 + q, half));
+                }
             }
         } else
 #endif
@@ -791,6 +841,14 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half,uint32_t lane)
             DataCopy(metadata[b*64],incrementalMetadata_[i],64);
         SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
         incrementalMetadataActive_=false;
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+        if (topkReady && epoch + 1 < runtimeShape_.rounds) {
+            const uint32_t index = epoch * runtimeShape_.serviceLanes + lane;
+            auto flag = topkReady + index * kvip_window_probe::kReadyWords;
+            *flag = 1;
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flag),64);
+        }
+#endif
     }
     exportWindowCold_=false;
     // The producer's progress lookup table shares the TopK score buffer.

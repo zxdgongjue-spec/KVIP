@@ -832,3 +832,58 @@ with the same effective W. `same_parts_w4_*` compares W2 against W4 at the
 same P. Read these deltas with the early and final Get counts. The trace
 run records resident seed hashes and WQE token sets alongside the
 native kernel and business timelines.
+
+## a5-24 同口径三阶段实验
+
+基于主仓 P2 `df8ad259`。固定 Q4、32 heads、128K history、16K resident、miss 10%、seed 43、32 AIC／64 AIV。沿用 resident 阈值、rank 起点 1024、每请求预算 512、逐窗上限 128、逐 Q Top2048、去重和 Terminal 补取。Hot 始终 P2。P 是每请求 Cold MIX 分片数，W 是有效窗口数。
+
+| 阶段 | BS | 最小对照 | 运行数 |
+| --- | --- | --- | ---: |
+| P/W 扫描 | 1 | W2 × P2/P4/P8/P32 | 4 |
+| P/W 扫描 | 2 | W2/W4 × P2/P4/P16 | 6 |
+| P/W 扫描 | 8 | W2/W4 × P2/P4 | 4 |
+| 退休 AIV | 1/2/8 | 每个 BS 取最佳 P > 2 的几何，固定轮值对比退休 AIV 动态领取 | 6 |
+| MR33 游标批读 | 1 | P8/W2，标量游标读对比 2 KiB MTE2 批读 | 2 |
+| MR33 header 提前搬运 | 2 | P2/W3，原生搬运对比提前搬运 512 B | 2 |
+
+主仓对照 BS1 用 P2/W2，BS2/8 用 P2/W4。筛选同时显示包含 P2 的最快几何以及可运行退休 AIV 的最快几何。在多轮时按每格 KV ready 的中位数排序。阶段二重跑同几何静态对照。MR33 两臂分别沿用自己的同几何对照。每个同轮控制组使用同一桥接库，保持阈值与预取策略；改变 W 或分数可见时点后，实际发出的预取与 Get 工作量可能有差异。
+
+### a5-24 宿主机
+
+```bash
+repo=/home/w00568585/vLLM-DSA/third_party/KVIP-mr32
+git -C "$repo" fetch origin refs/heads/codex/lifetch-unified-matrix-a5
+git -C "$repo" switch --detach FETCH_HEAD
+docker exec -it kvip-mr32-a5 bash
+```
+
+依赖源若尚未准备，在宿主机设置 `KVIP_KVAF_ROOT` 为共享 KVAF 路径，用 Python ≥3.12 执行同一入口的 `--prepare-deps`。容器中的 `--build-deps` 复用现有源码。如果 KVIP LIDU 和钉定在 `813f1750` 的 KVAF 已编译，直接计时。
+
+### A5 容器内
+
+`KVIP_A5_DEVICE` 使用容器可见编号。若 Python 3.12 不是默认解释器，先设置 `KVIP_PYTHON` 指向镜像中包含 torch、torch_npu 和 acl 的解释器。
+
+```bash
+export KVIP_A5_DEVICE=0
+export KVIP_KVAF_ROOT=/home/w00568585/vLLM-DSA/third_party/KVAF-unified-813f1750
+export KVIP_AB_OUTPUT=/home/w00568585/vLLM-DSA/results/lifetch-unified-matrix
+runner=/workspace/vllm-dsa/third_party/KVIP-mr32/experiments/lifetch_mr23_service/run_unified_a5.sh
+
+# 仅在依赖尚未编译时执行
+# bash "$runner" --build-deps
+
+bash "$runner" --sweep --warmup 2 --iterations 5
+# 将此值设为上一条命令打印的 Summary 文件
+sweep_csv=/完整的扫描输出目录/summary.csv
+bash "$runner" --retired --sweep-summary "$sweep_csv" --warmup 2 --iterations 5
+bash "$runner" --service-probes --warmup 2 --iterations 5
+```
+
+计时后用同一 P/W 及夹具生成标记的 trace。
+
+```bash
+bash "$runner" --retired --sweep-summary "$sweep_csv" --trace --warmup 0
+bash "$runner" --service-probes --trace --warmup 0
+```
+
+读取各次 `Run output` 下的 `manifest.json`、`summary.csv` 和各臂目录中的 `lifetch_business_trace.json`、`lifetch_msprof_trace.json`。性能以不带标记的 KV ready 图事件为准。动态收益看 `same_window_static_*`，并核对同一请求的预取、最终 Get 和总请求数。不同计数时保留观测值并用逐窗 token 核对差异。同计数的 trace 可继续对照首末门铃、Service 等待和 Terminal。使用 `--dry-run` 可离线查看阶段一、示例阶段二及两个 MR33 对照。
