@@ -4384,6 +4384,8 @@ class StreamingForward(LIFetchForward):
         self.set_options(deferred_fetch=enabled)
 
     def set_options(self, *, diagnostics=False, deferred_fetch=False):
+        if diagnostics and getattr(getattr(self, "terminal_function", None), "timing_only", False):
+            raise ValueError("Attach the shared-final trace image before enabling diagnostics")
         super().set_options(diagnostics=diagnostics, deferred_fetch=deferred_fetch)
         self.diagnostics_enabled = diagnostics
 

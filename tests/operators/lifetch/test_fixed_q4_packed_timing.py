@@ -147,6 +147,10 @@ def test_shared_final_timing_image_cannot_be_used_for_trace():
         launch.window_policy = "shared-final"
         launch.trace_only = trace
         attach(state, launch)
+        if not trace:
+            from execution import StreamingForward
+            with pytest.raises(ValueError, match="before enabling diagnostics"):
+                StreamingForward.set_options(state.forward, diagnostics=True)
         state.forward.diagnostics_enabled = trace
         assert state.forward.terminal_function(1, 2, 3, 4) == 6
         state.forward.diagnostics_enabled = not trace

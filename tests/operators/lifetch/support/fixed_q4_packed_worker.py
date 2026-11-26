@@ -106,7 +106,6 @@ def measure_packed(ex, proofs, serial, torch, states, sequence, config, director
         inputs = sequence.inputs
         state.reset()
         mhz = state.forward.calibrate_counter_mhz()
-        state.forward.set_diagnostics(True)
         state.forward.times.zero_()
         state.forward.events_src.fill_(-1)
         state.forward.events_dst.fill_(-1)
@@ -130,8 +129,10 @@ def measure_packed(ex, proofs, serial, torch, states, sequence, config, director
             proofs.update(diagnostic_cold_symbol=expected_li23 + "_trace",
                           diagnostic_cold_build_fingerprint=trace_launch.source_fingerprint)
         try:
+            state.forward.set_diagnostics(True)
             state.forward()
             stream.synchronize()
+            state.forward.set_diagnostics(False)
         except BaseException as error:
             ex.NativeFetchSession.quarantine("window_density_completion_uncertain", error)
             raise
@@ -163,7 +164,6 @@ def measure_packed(ex, proofs, serial, torch, states, sequence, config, director
         if sum(e["posted_tokens"] for e in density["epochs"]) != traffic["prefetch"]:
             raise ValueError("Doorbells disagree with the independent row GET counters")
         proofs["window_density"] = density
-        state.forward.set_diagnostics(False)
     return result
 
 

@@ -87,5 +87,6 @@ def attach(state, launch):
             raise ValueError("Select the dedicated shared-final cold image matching the diagnostic flag")
         return launch(a, b, stream, shape, hot, tail)
 
+    forward.timing_only = launch.window_policy == "shared-final" and not launch.trace_only
     state.forward.terminal_function = forward
     state.large_window_launch = launch
