@@ -29,6 +29,9 @@ def window_use(events, src, physical_winners, prefetch_rows, clock_mhz):
         count = int(totals[row])
         if count < 0 or count > sources.shape[1]:
             raise ValueError("Prefetch count exceeds the request journal")
+        hot, first, midpoint, remainder, last = (int(n) for n in records[:, row, 10])
+        if max(hot, first, midpoint + remainder, last) > 256 or midpoint > 128 or count > 1024:
+            raise ValueError("Five-window replay exceeded the original request quota")
         prefix = sources[row, :count]
         if np.any(prefix < 0) or len(np.unique(prefix)) != count:
             raise ValueError("Prefetch contains invalid or duplicate physical sources")

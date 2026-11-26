@@ -31,3 +31,14 @@ def test_midpoint_reports_unique_wanted_prefetch_excluding_terminal_reads():
     records[2, 0, 12] = 0
     with pytest.raises(ValueError, match="doorbell"):
         window_use(records, src, winners, [4, 1], 2)
+
+
+@pytest.mark.parametrize("middle", [(129, 0), (128, 129), (0, 257)])
+def test_middle_windows_share_the_original_request_quota(middle):
+    records = np.zeros((5, 1, 16), dtype=np.uint64)
+    records[:, 0, 2] = np.arange(5, dtype=np.uint64) << 32
+    records[:, 0, 3] = 1
+    records[2:4, 0, 10] = middle
+    count = sum(middle)
+    with pytest.raises(ValueError, match="quota"):
+        window_use(records, np.arange(count)[None, :], np.zeros((1, 4, 2048)), [count], 1)
