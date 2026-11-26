@@ -132,6 +132,7 @@ def configuration(argv=None):
             command.add_argument('--group', type=int)
             command.add_argument('--round-range', type=round_range)
             command.add_argument('--prefetch-tokens', type=int, default=512)
+            command.add_argument('--prefetch-window-limit', type=int, help='URMA prefetch token cap per window')
             command.add_argument('--prefetch-rank-start', type=int, default=1024,
                                  help='URMA initial admission rank (1..2048); progresses to 2048 by per-Q coverage')
             command.add_argument('--intermediate-fetches', type=int, default=8)
@@ -185,9 +186,12 @@ def configuration(argv=None):
             parser.error('prefetch-rank-start must be in 1..2048')
         if args.transport != 'urma' and args.prefetch_rank_start != 1024:
             parser.error('prefetch-rank-start requires the URMA ranked prefetch path')
+        if args.prefetch_window_limit is not None and (
+                args.transport != 'urma' or not 1 <= args.prefetch_window_limit <= 480):
+            parser.error('prefetch-window-limit requires URMA and a cap in 1..480')
         if (args.warmup < 0 or args.iterations <= 0 or not 1 <= args.intermediate_fetches <= 32
                 or not 0 <= args.prefetch_tokens <= 2048
-                or args.prefetch_tokens % args.intermediate_fetches):
+                or (args.prefetch_window_limit is None and args.prefetch_tokens % args.intermediate_fetches)):
             parser.error('invalid timing or prefetch configuration')
     if args.mode == 'diagnose':
         if 'all' in args.stages and len(args.stages) != 1:

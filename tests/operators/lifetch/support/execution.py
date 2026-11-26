@@ -3266,7 +3266,8 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None):
+                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024,
+                 prefetch_window_limit=None, service_aics=0, lease=None):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3297,7 +3298,7 @@ class FusedReplayState:
             if not ubmem:
                 self.workspace.allocate_rotation(
                     torch, batch=self.batch, history=self.history, resident=self.resident,
-                    aics=aics, windows=windows, status_bytes=self.lease.sizes['status'])
+                    aics=aics, windows=windows, status_bytes=self.lease.sizes['status'], service_aics=service_aics)
             binding = dict(
                 query_ends=self.workspace.inputs.query_ends.view(self.batch, 4),
                 hot_valid=self.storage.hot_valid, row_owners=self.workspace.inputs.row_owners,
@@ -3318,7 +3319,7 @@ class FusedReplayState:
                     torch, library, self.workspace.arguments(self.storage), owner,
                     batch=self.batch, history=self.history, resident=self.resident,
                     intermediate_fetches=windows, prefetch_limit=prefetch_tokens,
-                    prefetch_rank_start=prefetch_rank_start,
+                    prefetch_rank_start=prefetch_rank_start, window_limit=prefetch_window_limit, service_aics=service_aics,
                     aic_count=aics, token_bytes=self.token_bytes, **binding)
             update_type = UbmemIndexUpdate if ubmem else DirectIndexUpdate
             self.update = update_type(
@@ -3825,6 +3826,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 checked_kernels = (
                     getattr(config, 'mr28_p2_w1_experiment', False)
                     or getattr(config, 'mr28_cold_gm_experiment', False)
+                    or getattr(config, 'small_batch_mode', None) is not None
                 )
                 handoff_samples.extend(terminal_stages(
                     measured, dynamic=getattr(config, 'mr28_dedicated_service', None) == 'dynamic',
@@ -4006,6 +4008,12 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     profile_replay = baseline_trace or instruction_replay
     msprof_output = getattr(config, 'msprof_output', None)
     cold_route = getattr(config, 'msprof_cold_route', None)
+    small_mode = getattr(config, 'small_batch_mode', None)
+    if small_mode is not None:
+        import small_batch
+
+        if not fused or config.transport != 'urma' or config.mode != 'bench' or config.input != 'synthetic':
+            raise ValueError('Small batch trials require the fused synthetic URMA benchmark')
     dedicated_routes = ('dedicated', 'static_ready', 'dynamic')
     ready_routes = ('static_ready', 'dynamic')
     partition_trial = hot_partition is not None or cold_partition is not None
@@ -4015,11 +4023,12 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         raise ValueError('The Score trial uses the dense synthetic URMA Terminal comparison')
     if sum((partition_trial, unified_score is not None, dedicated_service is not None)) > 1:
         raise ValueError('Windowed partition, unified Score and dedicated Service are separate trials')
+    profile_windows = (2, 3, 4) if baseline_trace and cold_route is None else (4,)
     if profile_replay and (not fused or handoff or score_trial or config.transport != 'urma'
                           or config.input != 'synthetic' or config.mode != 'bench'
                           or config.iterations != 1 or len(config.batches) != 1
-                          or config.intermediate_fetches != 4 or config.prefetch_tokens <= 0):
-        raise ValueError('Profiling requires one synthetic P2 URMA case with W4 and prefetch enabled')
+                          or config.intermediate_fetches not in profile_windows or config.prefetch_tokens <= 0):
+        raise ValueError(f'Profiling requires one synthetic URMA case with windows in {profile_windows} and prefetch enabled')
     if baseline_trace and (not msprof_output or instruction_replay):
         raise ValueError('Baseline stage trace requires an exclusive profile output')
     if cold_route is not None:
@@ -4044,6 +4053,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     soc = acl.get_soc_name()
     device_resources = query_device_resources(cann, config.device)
     aics = device_resources['effective_aic']
+    if small_mode is not None and (aics != 32 or device_resources['aiv'] != 64 or 'Ascend950' not in soc):
+        raise ValueError(f'Small batch trials require A5 with 32 AIC/64 AIV, got {device_resources} on {soc}')
     if (dedicated_service is not None or cold_route in dedicated_routes) and (
             aics != 32 or device_resources['aiv'] < 64 or 'Ascend950' not in soc):
         raise ValueError(f"BS16 Service comparison targets A5 with 32 MIX groups, got {soc} "
@@ -4104,9 +4115,10 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
 
                     replay_stage(f'loading marked {cold_route or "p2"} fusion bridge')
                     library = build_library(
-                        config.msprof_build_dir if cold_route is not None else directory / 'trace_build',
+                        getattr(config, 'msprof_build_dir', directory / 'trace_build'),
                         cann, headers, soc, local_counts=getattr(config, 'msprof_local_counts', False),
-                        hot_partition=cold_route is not None, stage_trace=True, ub_candidates=False, post_chunk=0,
+                        hot_partition=cold_route is not None or small_mode is not None,
+                        stage_trace=True, ub_candidates=False, post_chunk=0,
                     )
                 elif instruction_replay:
                     library = instruction_library
@@ -4115,7 +4127,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
 
                     library = build_library(config.handoff_build_dir, cann, headers, soc,
                                             local_counts=handoff == 'local_counts' or partition_trial,
-                                            hot_partition=score_trial, ub_candidates=ub_candidates,
+                                            hot_partition=score_trial or small_mode is not None, ub_candidates=ub_candidates,
                                             post_chunk=post_chunk,
                                             dedicated_drain_aiv1=getattr(config, 'mr28_dedicated_drain_aiv1', True))
                 else:
@@ -4135,7 +4147,11 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 torch, runtime, view, library, initial, pages, logical_addresses,
                 transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
-                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024))
+                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024),
+                prefetch_window_limit=getattr(config, "prefetch_window_limit", None),
+                service_aics=getattr(config, "small_batch_service_aics", 0))
+            if small_mode is not None:
+                small_batch.bind(state, small_mode)
             if profile_replay:
                 shape = state.rotating.runtime_shape
                 if (state.forward.terminal is None or shape.liCores != 2 * g['batch']
@@ -4223,11 +4239,21 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 expected_parts = 4 if cold_route == 'cold_p4' else 2
                 if cold_parts != expected_parts:
                     raise ValueError(f'Expected Cold P{expected_parts}, got P{cold_parts}')
-            trace = StageBuffer(state, cold_route=cold_route or 'p2')
+            trace_route = small_batch.TRACE_ROUTES[small_mode] if small_mode is not None else cold_route or 'p2'
+            if small_mode == 'cold':
+                cold_parts = 4
+            trace = StageBuffer(state, cold_route=trace_route)
             replay_stage(f'calibrating device counter and warming up unmarked {cold_route or "p2"}')
             pending = True
             counter_mhz = state.forward.calibrate_counter_mhz()
             pending = False
+            resident_seed_sha256 = None
+            if small_mode is not None:
+                replay_stage('capturing resident publication before Cold')
+                pending = True
+                state.reset()
+                resident_seed_sha256 = small_batch.capture_resident_seed(state, stream, small_mode)
+                pending = False
             for _ in range(config.warmup):
                 pending = True
                 state.reset()
@@ -4237,6 +4263,10 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             pending = True
             state.reset()
             trace.attach()
+            if small_mode is not None:
+                state.forward.set_diagnostics(True)
+                state.forward.events_src.fill_(-1)
+                state.forward.events_dst.fill_(-1)
             stream.synchronize()
             pending = False
             replay_stage(f'initialization and warmup finished; collecting only marked {cold_route or "p2"}')
@@ -4255,7 +4285,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             (directory / 'baseline_stage_trace.bin').write_bytes(raw)
             validate(initial)
             return write_capture(directory, raw, counter_mhz, state, library, config, soc, capture,
-                                 cold_parts=cold_parts, score_parts=score_parts)
+                                 cold_parts=cold_parts, score_parts=score_parts, trace_route=trace_route,
+                                 resident_seed_sha256=resident_seed_sha256)
         pending = True
         replay_stage('first eager forward and device completion')
         if dedicated_service is not None and getattr(config, 'mr28_staged_eager', False):
@@ -4284,7 +4315,11 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         torch, runtime, view, library, initial, pages, logical_addresses,
                         transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
-                        prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease)
+                        prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024),
+                        prefetch_window_limit=getattr(config, 'prefetch_window_limit', None),
+                        service_aics=getattr(config, "small_batch_service_aics", 0), lease=state.lease)
+                    if small_mode is not None:
+                        small_batch.bind(replica, small_mode)
                     replica.failure_directory = directory
                     if partition_trial:
                         if bind_score_partition(replica, hot=hot_partition, cold=cold_partition) != score_parts:
@@ -4312,11 +4347,15 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 result['handoff_route'] = dict(mode=handoff, library=str(library), soc=soc, effective_aic=aics,
                                               score_parts=2, score_blocks=shape.liCores, windows=shape.rounds,
                                               service_lanes=shape.serviceLanes, terminal_tasks=4 * g['batch'])
-                if score_trial or prefetch_trial:
+                if score_trial or prefetch_trial or small_mode is not None:
                     if not frontier_mode:
                         with Path(library).open('rb') as binary:
                             binary_sha = hashlib.file_digest(binary, 'sha256').hexdigest()
                     result['handoff_route'].update(library_sha256=binary_sha, local_counts=partition_trial)
+                if small_mode is not None:
+                    result['handoff_route'].update(available_aiv=device_resources['aiv'], small_batch_mode=small_mode,
+                                                   prefetch_window_limit=config.prefetch_window_limit,
+                                                   cold_score_parts=4 if small_mode == 'cold' else 2)
                 if prefetch_trial:
                     result['handoff_route'].update(service_ub_candidates=ub_candidates,
                                                    service_post_chunk=post_chunk)
@@ -4640,6 +4679,14 @@ class StreamingForward(LIFetchForward):
 
     def set_deferred_fetch(self, enabled):
         self.set_options(deferred_fetch=enabled)
+
+    def set_options(self, *, diagnostics=False, deferred_fetch=False):
+        super().set_options(diagnostics=diagnostics, deferred_fetch=deferred_fetch)
+        if getattr(self, 'balance_final_get', False):
+            from small_batch import GET_BALANCE_FLAG
+
+            value = np.asarray([GET_BALANCE_FLAG | int(diagnostics)], dtype='<u4').view('u1')
+            self.terminal.workspace[52:56].copy_(self.torch.from_numpy(value))
 
     def set_diagnostics(self, enabled):
         self.set_options(diagnostics=enabled)

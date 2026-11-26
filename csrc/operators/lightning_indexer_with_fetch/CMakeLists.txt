@@ -25,7 +25,11 @@ if(KVIP_OUTPUT_WORKER AND NOT KVIP_FUSE_QUERY_WORK)
   message(FATAL_ERROR "KVIP_OUTPUT_WORKER requires KVIP_FUSE_QUERY_WORK")
 endif()
 set(_base "${CMAKE_CURRENT_SOURCE_DIR}")
-ascendc_library(v9_kernel STATIC op_kernel/indexer.cpp op_kernel/lifecycle.cpp op_kernel/streaming.cpp)
+set(v9_sources op_kernel/indexer.cpp op_kernel/lifecycle.cpp op_kernel/streaming.cpp)
+if(KVIP_HOT_SCORE_PARTITION)
+  list(APPEND v9_sources op_kernel/resident_topk_high.cpp)
+endif()
+ascendc_library(v9_kernel STATIC ${v9_sources})
 ascendc_include_directories(v9_kernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel
   ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/indexer ${KVAF_INCLUDE}
   ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
@@ -59,6 +63,7 @@ ascendc_include_directories(parallel_terminal_kernel PRIVATE ${CMAKE_CURRENT_SOU
 ascendc_compile_options(parallel_terminal_kernel PRIVATE -DKVIP_PARALLEL_TERMINAL=1
   -DKVIP_STAGE_TRACE=$<BOOL:${KVIP_STAGE_TRACE}>
   -DKVIP_WINDOW_FRONTIER=$<BOOL:${KVIP_HOT_SCORE_PARTITION}>
+  -DKVIP_SMALL_BATCH_GET=$<BOOL:${KVIP_HOT_SCORE_PARTITION}>
   -O2 -g --cce-auto-sync=off -mllvm -user-reserved-ub-size=223232
   -DV9_USER_UB_BYTES=223232 -DV9_BATCH_POST=2 -DSIM_Q=4 -DSIM_CAPTURE_HITS=1
   -DV9_SIMULATION=0 -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WORKER=1 -DROTATION_PUBLISH_TILES=1)

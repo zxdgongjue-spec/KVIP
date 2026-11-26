@@ -926,7 +926,7 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
             r"v9_li_kernel_(?:(?:hot|cold|threshold_cold)_partitioned|"
             r"(?:score|cold)_t2|(?:threshold|cold)_dedicated_service|hot_ready_service|"
             r"cold_static_ready_service|dynamic_service|(?:threshold|cold)_p2_w1|"
-            r"hot_cold_gm|cold_gm_batch)(?:_\d+)*", n
+            r"hot_cold_gm|cold_gm_batch|cold_ready_partitioned|resident_topk_high)(?:_\d+)*", n
         ):
             n = kernels["li"]
         cat = (event.get("cat") or "").lower()

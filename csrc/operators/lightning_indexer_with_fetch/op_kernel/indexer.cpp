@@ -27,7 +27,7 @@ __aicore__ inline bool HasUniformLengths(const rotating::RuntimeShape& shape, GM
     return true;
 }
 
-template <SequenceLiPhase Phase, bool ExternalBody = false, bool OwnWindow = false>
+template <SequenceLiPhase Phase, bool ExternalBody = false, bool OwnWindow = false, bool WaitColdPeers = true>
 __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, [[maybe_unused]] uint32_t job = 0,
     GM_ADDR coldGmReady = nullptr) {
     using namespace AscendC; using namespace QLICommon;
@@ -112,7 +112,7 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, [[maybe_unuse
         if (splitSequence) op.template ProcessSequenceSplit<Phase>(parts);
         else op.Process();
     } else {
-        op.template ProcessSequenceSplit<Phase>(parts, coldGmReady);
+        op.template ProcessSequenceSplit<Phase, WaitColdPeers>(parts, coldGmReady);
     }
     KVIP_TRACE_RECORD(teardownScope, stageTrace, traceKernel, kvip_trace::LiPipeDestroy, 0, 0);
     pipe.Destroy();
@@ -256,6 +256,13 @@ extern "C" __global__ __aicore__ void v9_li_kernel_cold_partitioned(GM_ADDR bind
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     RunLi<SequenceLiPhase::Cold>(bindings, parts);
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_li_kernel_cold_ready_partitioned(GM_ADDR bindings, uint32_t parts) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    RunLi<SequenceLiPhase::Cold, false, false, false>(bindings, parts);
 #endif
 }
 

@@ -43,12 +43,16 @@ PHASES_DYNAMIC = (
     ('COLD_SERVICE', 'v9_li_kernel_dynamic_service', 'Resident Top2048 + dynamic Cold Score and Service'),
     PHASES[3],
 )
+SMALL_COLD_PHASES = (*PHASES_COLD_P4[:2],
+                     ('COLD_SERVICE', 'v9_li_kernel_cold_ready_partitioned', PHASES[2][2]), PHASES[3])
+RESIDENT_HIGH = ('RESIDENT_HIGH', 'v9_li_kernel_resident_topk_high', 'Resident high-byte histogram T2')
+SMALL_TOPK_PHASES = (PHASES[0], RESIDENT_HIGH, *PHASES[1:])
 READY_SERVICE_ROUTES = ('static_ready', 'dynamic')
 ROUTE_PHASES = {'p2': PHASES, 'cold_p4': PHASES_COLD_P4,
                 'full_p2': PHASES_UNIFIED, 'full_uniform': PHASES_UNIFIED,
                 'dedicated': PHASES_DEDICATED, 'static_ready': PHASES_STATIC_READY,
-                'dynamic': PHASES_DYNAMIC}
-MARKERS = {f'KVIP_LIFETCH_{stage}_{side}' for stage, _, _ in PHASES for side in ('BEGIN', 'END')}
+                'dynamic': PHASES_DYNAMIC, 'small_cold': SMALL_COLD_PHASES, 'small_topk': SMALL_TOPK_PHASES}
+MARKERS = {f'KVIP_LIFETCH_{stage}_{side}' for stage, _, _ in SMALL_TOPK_PHASES for side in ('BEGIN', 'END')}
 KERNELS = {kernel for phases in ROUTE_PHASES.values() for _, kernel, _ in phases}
 COMPUTE_TYPES = {'AI_CORE', 'AI_VECTOR_CORE', 'MIX_AIC', 'MIX_AIV', 'AIV_SQE', 'FUSION'}
 DEPENDENCIES = (
@@ -185,7 +189,11 @@ def device_handoffs(vendor, intervals):
             device_tasks.append((name, args, interval, event.get('ph') == 'X'))
 
     result = []
-    dependencies = (DEPENDENCIES[0], DEPENDENCIES[2]) if len(intervals) == 3 else DEPENDENCIES
+    dependencies = DEPENDENCIES
+    if len(intervals) == 3:
+        dependencies = (DEPENDENCIES[0], DEPENDENCIES[2])
+    elif len(intervals) == 5:
+        dependencies = (DEPENDENCIES[0], 'Resident merges the two high-byte histograms per query', *DEPENDENCIES[1:])
     for left, right, dependency in zip(intervals, intervals[1:], dependencies):
         stream = left['stream']
         if stream != right['stream']:
@@ -269,7 +277,8 @@ def publish_business_views(output, vendor, source, intervals, save, *, cold_rout
                if isinstance(event, dict) and event.get('ph') == 'X'
                and isinstance(event.get('args'), dict) and event['args'].get('marked_lanes')}
     expected_kernels = {kernel for _, kernel, _ in ROUTE_PHASES[cold_route]}
-    if kernels != expected_kernels or {interval['kernel'] for interval in intervals} != expected_kernels:
+    source_kernels = expected_kernels - {RESIDENT_HIGH[1]} if cold_route == 'small_topk' else expected_kernels
+    if kernels != source_kernels or {interval['kernel'] for interval in intervals} != expected_kernels:
         raise ValueError('Source timeline is missing one or more fusion stages')
     # Keep source cycles and the CANN clock as measured. No cross-clock shifts
     # are necessary to view all of the detailed business stages together.

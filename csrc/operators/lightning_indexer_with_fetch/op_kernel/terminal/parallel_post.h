@@ -1,4 +1,9 @@
 #pragma once
+constexpr uint32_t kFinalGetCountsOffset=25*32;
+constexpr uint32_t kFinalGetQueueUnavailable=0x80000000U;
+constexpr uint32_t kFinalGetLargestCountOffset=15;
+constexpr uint32_t kFinalGetCountSumOffset=16;
+
 // The original window's exact UB bitmap, partitioned by Q ownership.
 // Same terminal slot/record operations, with request-local pointers resolved once.
 __simt_callee__ inline void PrepareDirect(
@@ -17,7 +22,7 @@ __simt_callee__ inline void PrepareDirect(
 
 __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PackUniqueLocal(
  __ubuf__ uint32_t* input,uint32_t width,uint32_t n0,uint32_t n1,uint32_t n2,uint32_t n3,uint32_t q,
- __gm__ uint32_t* mapping,__ubuf__ uint32_t* ids,__ubuf__ uint32_t* counter,__ubuf__ uint32_t* bits,__gm__ rotating::Row* row,__gm__ uint64_t* addresses,__ubuf__ uint32_t* lo,__ubuf__ uint32_t* hi,uint32_t resident,__ubuf__ uint32_t* slots,__gm__ uint32_t* lru,uint32_t slotCapacity,bool preclaimed,bool capacityProbe,__gm__ uint32_t* headers,uint32_t priorSlots,__gm__ uint32_t* changes,__gm__ uint32_t* changeSlots,uint64_t tailRange,uint32_t tailCapacity,__gm__ uint32_t* boundTemplate,__gm__ KvafExecuteBatchGetKernelArgs* qArgs,__ubuf__ uint32_t* fullIds,__ubuf__ uint32_t* outputSlots,__ubuf__ uint32_t* error,__gm__ uint64_t* logical,__gm__ uint32_t* flags,uint32_t generation,uint32_t history,__gm__ uint32_t* selected,uint32_t outputBase,__gm__ uint64_t* update,uint32_t batch,uint32_t query){
+ __gm__ uint32_t* mapping,__ubuf__ uint32_t* ids,__ubuf__ uint32_t* counter,__ubuf__ uint32_t* bits,__gm__ rotating::Row* row,__gm__ uint64_t* addresses,__ubuf__ uint32_t* lo,__ubuf__ uint32_t* hi,uint32_t resident,__ubuf__ uint32_t* slots,__gm__ uint32_t* lru,uint32_t slotCapacity,bool preclaimed,bool capacityProbe,__gm__ uint32_t* headers,uint32_t priorSlots,__gm__ uint32_t* changes,__gm__ uint32_t* changeSlots,uint64_t tailRange,uint32_t tailCapacity,__gm__ uint32_t* boundTemplate,__gm__ KvafExecuteBatchGetKernelArgs* qArgs,__ubuf__ uint32_t* fullIds,__ubuf__ uint32_t* outputSlots,__ubuf__ uint32_t* error,__gm__ uint64_t* logical,__gm__ uint32_t* flags,uint32_t generation,uint32_t history,__gm__ uint32_t* selected,uint32_t outputBase,__gm__ uint64_t* update,uint32_t batch,uint32_t query,bool balanceFinalGet){
  uint32_t tailBegin=uint32_t(tailRange),tailEnd=uint32_t(tailRange>>32);
  uint32_t counts[4]={n0,n1,n2,n3},tid=threadIdx.x,lane=tid%32;
  if(tid>=2 && tid<9 && tid!=5)counter[tid]=0; // The original block barrier publishes all control words.
@@ -81,7 +86,20 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PackUniqueLocal(
   }
   asc_threadfence();
   uint32_t finished;do{bool done=lane>=2 || *reinterpret_cast<__ubuf__ volatile uint32_t*>(counter+3+lane)==1;finished=asc_ballot(done);}while(finished!=UINT32_MAX);
-  if(!lane){asc_stcg(flags+24*32+q,generation);asc_threadfence();}
+  if(!lane){
+   if(balanceFinalGet){
+    // The lease owns each SQ through completion of the previous replay.
+    // Accept redistribution only if every SQ can hold a full Q's entries.
+    auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(asc_ldcg(&qArgs->queue_state));
+    const uint32_t limit=terminal_runtime::kTop;
+    const bool ready=asc_ldcg(boundTemplate+17)>limit && count<=limit &&
+        asc_ldcg(&queue->sq_producer_index)<=UINT64_MAX-limit && asc_ldcg(&queue->last_error)==0;
+    asc_stcg(flags+kFinalGetCountsOffset+q,ready?count:kFinalGetQueueUnavailable);
+    asc_threadfence();
+   }
+   asc_stcg(flags+24*32+q,generation);
+   asc_threadfence();
+  }
  }else if(tid<96){
   uint32_t ready;do{bool done=*reinterpret_cast<__ubuf__ volatile uint32_t*>(counter+2)==1;ready=asc_ballot(done);}while(ready!=UINT32_MAX);
   asc_threadfence_block();
@@ -123,12 +141,45 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void PackUniqueLocal(
  Emit(fullIds,outputSlots,error,mapping,lru,logical,history,resident,history-512,256,512,nullptr,nullptr,flags,generation,q+1);
  if(tid<32){uint32_t ready;
   do{ready=asc_ballot(lane>=4 || asc_ldcg(flags+24*32+lane)>=generation);}while(ready!=UINT32_MAX);
-  if(!lane)counter[13]=asc_ldcg(&row->slots);
+  if(!lane){
+   counter[13]=asc_ldcg(&row->slots);
+   if(balanceFinalGet){
+    uint32_t largest=0,accepted=0;
+    for(uint32_t other=0;other<terminal_runtime::kQueries;++other){
+     uint32_t count=asc_ldcg(flags+kFinalGetCountsOffset+other);
+     if(count==kFinalGetQueueUnavailable){
+      accepted=kFinalGetQueueUnavailable;
+      break;
+     }
+     accepted+=count;
+     if(count>largest)largest=count;
+    }
+    counter[kFinalGetLargestCountOffset]=largest;
+    counter[kFinalGetCountSumOffset]=accepted;
+   }
+  }
  }
 
 
 
 }
+
+// All Qs have published their owned ordinal ranges before this gather. Index
+// waits for every Q to enter its update after WQE commit before changing any
+// source addresses or retiring the assignment records.
+__simt_vf__ __aicore__ LAUNCH_BOUND(256) inline void GatherFinalGetDescriptors(
+ __gm__ uint32_t* changes,__gm__ uint32_t* changeSlots,__gm__ uint64_t* addresses,
+ uint32_t count,uint32_t outputBase,__ubuf__ uint32_t* low,__ubuf__ uint32_t* high,
+ __ubuf__ uint32_t* slots){
+ for(uint32_t i=threadIdx.x;i<count;i+=256){
+  uint32_t token=asc_ldcg(changes+i);
+  uint64_t source=asc_ldcg(addresses+token);
+  low[i]=uint32_t(source);
+  high[i]=uint32_t(source>>32);
+  slots[i]=outputBase+asc_ldcg(changeSlots+i);
+ }
+}
+
 // Payload precedes release publication; readers bypass scalar cache.
 // One full warp; no inter-warp state or payload reads. Callers publish separately.
 __simt_vf__ __aicore__ LAUNCH_BOUND(32) inline void WaitFour(

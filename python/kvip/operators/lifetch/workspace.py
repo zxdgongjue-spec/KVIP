@@ -59,7 +59,7 @@ class LIFetchWorkspace:
     def _make_inputs(self, torch, batch, device, **kwargs):
         return QueryInputs(torch, batch, device, **kwargs)
 
-    def allocate_rotation(self, torch, *, batch, history, resident, aics, windows, status_bytes=1216):
+    def allocate_rotation(self, torch, *, batch, history, resident, aics, windows, status_bytes=1216, service_aics=0):
         """Reserve reusable resolver work memory before HBM profiling.
 
         Groups execute serially on the same stream. Their ABI bindings point
@@ -68,7 +68,7 @@ class LIFetchWorkspace:
         if self.scratch:
             raise RuntimeError("Rotation workspace already allocated")
         geometry = tiling_geometry
-        shape = geometry.li_geometry(batch, "auto", windows, aics)
+        shape = geometry.li_geometry(batch, "auto", windows, aics, service_aics)
         final = geometry.final_aivs(batch, "auto", aics)
         spec = rotation_spec(
             batch,

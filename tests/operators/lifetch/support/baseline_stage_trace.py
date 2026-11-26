@@ -63,7 +63,10 @@ DYNAMIC_KERNELS = {
     21: (KERNELS[21][0], 'v9_li_kernel_dynamic_service'),
     22: ('Dynamic Cold Score and Service', 'v9_li_kernel_dynamic_service'),
 }
+SMALL_COLD_KERNELS = {**COLD_P4_KERNELS,
+                      22: (KERNELS[22][0], 'v9_li_kernel_cold_ready_partitioned')}
 ROUTE_KERNELS = {'p2': KERNELS, 'cold_p4': COLD_P4_KERNELS,
+                 'small_cold': SMALL_COLD_KERNELS, 'small_topk': KERNELS,
                  'dedicated': DEDICATED_KERNELS, 'static_ready': STATIC_READY_KERNELS,
                  'dynamic': DYNAMIC_KERNELS,
                  **{route: UNIFIED_KERNELS for route in UNIFIED_ROUTES}}
@@ -235,6 +238,8 @@ class StageBuffer:
         profile_symbol = {
             'p2': 'kvip_parallel_tail_profile_forward',
             'cold_p4': 'kvip_parallel_tail_cold_partitioned_profile_forward',
+            'small_cold': 'kvip_small_batch_cold_profile_forward',
+            'small_topk': 'kvip_small_batch_topk_profile_forward',
             'dedicated': 'kvip_parallel_tail_dedicated_service_profile_forward',
             'static_ready': 'kvip_parallel_tail_static_ready_service_profile_forward',
             'dynamic': 'kvip_parallel_tail_dynamic_service_profile_forward',
@@ -339,7 +344,7 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
             raise ValueError(f'Missing required pipe scopes: {missing_pipe}')
     if require_handoff_scopes:
         expected = dict(REQUIRED_HANDOFF)
-        if cold_route in ('cold_p4', 'dedicated', 'static_ready', 'dynamic'):
+        if cold_route in ('cold_p4', 'small_cold', 'dedicated', 'static_ready', 'dynamic'):
             expected[21] = expected[21] | {COLD_PROGRESS_RESET}
         if cold_route in ('dedicated', 'static_ready'):
             expected[22] = expected[22] | {231}
@@ -365,7 +370,8 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
         raise ValueError('Cold T2 must only trace AIV work')
     four_aiv = set(range(4 * batch))
     two_aic = set(range(64, 64 + 2 * batch))
-    cold_lanes = {'cold_p4': set(range(8 * batch)) | set(range(64, 64 + 4 * batch)),
+    p4_lanes = set(range(8 * batch)) | set(range(64, 64 + 4 * batch))
+    cold_lanes = {'cold_p4': p4_lanes, 'small_cold': p4_lanes, 'small_topk': four_aiv | two_aic,
                   'dedicated': four_aiv | set(range(64, 88)),
                   'static_ready': four_aiv | set(range(64, 88)),
                   'dynamic': four_aiv | two_aic,
@@ -849,9 +855,16 @@ def render(events, counter_mhz, *, cold_route='p2'):
 
 
 def replay_evidence(state, library, config, soc):
+    from kvip.operators.lifetch.geometry import prefetch_budget
+
     windows = state.rotating.runtime_shape.rounds
+    _, window_limit = prefetch_budget(config.prefetch_tokens, getattr(config, 'prefetch_window_limit', None),
+                                      config.intermediate_fetches)
     requests = request_counts(state.rotating.rows.cpu().numpy(), state.rotating.final_posts.cpu().numpy(),
                               windows, config.prefetch_tokens)
+    if getattr(config, 'prefetch_window_limit', None) is not None:
+        if any(count > window_limit for row in requests for count in row['prefetch_by_window']):
+            raise ValueError('Observed prefetch exceeds the configured window cap')
     fixture = Path(state.initial.source_paths[0])
     with Path(library).open('rb') as binary:
         library_sha256 = hashlib.file_digest(binary, 'sha256').hexdigest()
@@ -860,6 +873,7 @@ def replay_evidence(state, library, config, soc):
         aics=32, geometry=state.initial.geometry, miss_percent=config.miss_percent,
         warmup=config.warmup, windows=windows, requested_windows=config.intermediate_fetches,
         prefetch_tokens=config.prefetch_tokens, prefetch_rank_start=config.prefetch_rank_start,
+        prefetch_window_limit=window_limit,
         total_prefetch=sum(req['prefetch_requests'] for req in requests),
         total_final_get=sum(req['final_get_requests'] for req in requests),
         requests=requests, fixture_sha256=fixture_hash(fixture), library_sha256=library_sha256,
@@ -884,12 +898,19 @@ def write_instruction_replay(directory, state, library, config, soc):
 
 
 def write_capture(directory, raw, counter_mhz, state, library, config, soc, msprof_capture, *,
-                  cold_parts=2, score_parts=2):
+                  cold_parts=2, score_parts=2, trace_route=None, resident_seed_sha256=None):
     comparison_route = getattr(config, 'msprof_cold_route', None)
-    cold_route = comparison_route or 'p2'
+    cold_route = trace_route or comparison_route or 'p2'
     events = decode(raw)
     verify_route(events, state.batch, require_pipe_scopes=True, require_handoff_scopes=True,
                  cold_route=cold_route, score_parts=score_parts)
+    if comparison_route is None and getattr(config, 'prefetch_window_limit', None) is not None:
+        shape = state.rotating.runtime_shape
+        expected_service = {(epoch, lane) for epoch in range(shape.rounds) for lane in range(shape.serviceLanes)}
+        observed = [(event['iteration'], event['detail']) for event in events
+                    if event['kernel'] == 22 and event['phase'] == 150]
+        if set(observed) != expected_service or len(observed) != len(expected_service):
+            raise ValueError('Service trace does not cover each effective window and lane exactly once')
     if comparison_route:
         cold_phases = (22, 151) if cold_route in UNIFIED_ROUTES else (21, 22, 151, 192)
         for phase in cold_phases:
@@ -908,6 +929,13 @@ def write_capture(directory, raw, counter_mhz, state, library, config, soc, mspr
                       cold_score_worker_pool=31, service_worker_pool=64)
     elif cold_route in UNIFIED_ROUTES:
         report['route'] = f'Full Score P{score_parts} + Cold T2 + four-AIV Terminal'
+    small_mode = getattr(config, 'small_batch_mode', None)
+    if small_mode is not None:
+        from small_batch import trace_evidence
+
+        report['small_batch_mode'] = small_mode
+        report['resident_seed_sha256'] = resident_seed_sha256
+        trace_evidence(state, report)
     phases = {event['phase'] for event in events}
     if ((report['total_prefetch'] and not {153, 154, 168, 204, 205}.issubset(phases))
             or (report['total_final_get'] and not {164, 165, 167, 215, 217}.issubset(phases))):

@@ -75,7 +75,7 @@ public:
                                 __gm__ uint8_t *workspace, const QLITilingData *__restrict tiling, TPipe *tPipe,
                                 uint32_t seqParts = 2);
     __aicore__ inline void Process();
-    template <SequenceLiPhase Phase>
+    template <SequenceLiPhase Phase, bool WaitColdPeers = true>
     __aicore__ inline void ProcessSequenceSplit(uint32_t parts = 2, GM_ADDR coldGmReady = nullptr);
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
     template <bool OwnWindow = false>
@@ -804,7 +804,7 @@ __aicore__ inline bool QuantLightningIndexerKernel<QLIT>::ScoreRecent(
 }
 
 template <typename QLIT>
-template <SequenceLiPhase Phase>
+template <SequenceLiPhase Phase, bool WaitColdPeers>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(
     uint32_t parts, [[maybe_unused]] GM_ADDR coldGmReady)
 {
@@ -991,7 +991,15 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(
                 if ASCEND_IS_AIV {
                     if (serviceLeader && serviceEpoch == epoch) {
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
-                        if (parts > 2) vectorService.WaitPartitionedHalf(batch, shard, epoch, halfTokens);
+                        if (parts > 2) {
+                            if constexpr (WaitColdPeers) {
+                                vectorService.WaitPartitionedHalf(batch, shard, epoch, halfTokens);
+                            } else {
+                                // Capture any prefix already visible, after
+                                // this driver's own bitmap and cursor writes.
+                                vectorService.DrainColdPublication();
+                            }
+                        }
 #endif
                         vectorService.RotateFetch(epoch, halfTokens);
                     }
@@ -1015,7 +1023,10 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(
             CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT);
             CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT + 1);
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
-            if constexpr (Phase == SequenceLiPhase::W1Score || Phase == SequenceLiPhase::ColdRawScore) {
+            if constexpr (Phase == SequenceLiPhase::W1Score || Phase == SequenceLiPhase::ColdRawScore ||
+                (Phase == SequenceLiPhase::Cold && !WaitColdPeers)) {
+                // Each FIXP bank reads credit from both vector peers on
+                // every tile. Retire both peers' final credits before replay.
                 constexpr uint32_t peer = QLICommon::ConstInfo::AIV0_AIV1_OFFSET;
                 CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
                     QLICommon::ConstInfo::CROSS_VC_EVENT + peer);

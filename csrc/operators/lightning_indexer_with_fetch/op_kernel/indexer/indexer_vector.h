@@ -36,6 +36,9 @@
 #include "recent_seed.h"
 #include "incremental_vector_helpers.h"
 #include "window_fast_vector.h"
+#if KVIP_HOT_SCORE_PARTITION && KVIP_STREAMING_LI
+#include "resident_topk_high.h"
+#endif
 #endif
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
 #include "../../../common/lifetch/dedicated_cold_schedule.h"
@@ -113,12 +116,15 @@ public:
         FreeEventID();
     }
 
+    __aicore__ inline void DrainColdPublication() {
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    }
+
     __aicore__ inline void WaitPartitionedHalf(uint32_t batch, uint32_t part, uint32_t epoch, uint32_t half) {
         KVIP_TRACE_BEGIN(partitionWaitScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
             Cold, ColdPartitionWait, epoch, kvip_trace::PipeDetail(batch, (blockId_ % 2) * 2, part));
-        // The leader's own Q files have finished publishing before polling helpers.
-        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        DrainColdPublication();
         const uint32_t beginQ = batch * 4 + (blockId_ % 2) * 2;
         const uint32_t endPart = part + coldParts_ / 2;
         for (uint32_t p = part + 1; p < endPart; ++p) {
@@ -1475,7 +1481,25 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
                 BeginFinalMetadata(streamingQuery);
 #endif
                 KVIP_TRACE_BEGIN(hotTopkScope, residentTrace, Threshold, ThresholdTopKVf, 0, residentDetail);
-                topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, validS2LenAlign, 0, 1, prefixActive_);
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM && KVIP_STREAMING_LI
+                bool usedShardedHistogram = false;
+                if constexpr (std::is_same_v<SCORE_T, uint16_t>) {
+                    if (prefixActive_ && streamingTopkOnly_ && !recentMerged &&
+                        (runtimeShape_.batch == 1 || runtimeShape_.batch == 8) &&
+                        runtimeShape_.history == kvip_resident_topk::kHistory &&
+                        runtimeShape_.indexHeads == 32 && runtimeShape_.resident == kvip_resident_topk::kResident &&
+                        validS2Len == kvip_resident_topk::kResident && topkCount_ == kvip_resident_topk::kTopK) {
+                        const auto table = kvip_resident_topk::HighTable(streamingWorkspace_);
+                        if (table) {
+                            kvip_resident_topk::Finish(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_,
+                                topkSharedTmpLocal_, table, streamingQuery);
+                            usedShardedHistogram = true;
+                        }
+                    }
+                }
+                if (!usedShardedHistogram)
+#endif
+                    topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, validS2LenAlign, 0, 1, prefixActive_);
                 KVIP_TRACE_END(hotTopkScope);
 #if !V9_UBMEM && KVIP_STREAMING_LI
                 if (recentMerged) {

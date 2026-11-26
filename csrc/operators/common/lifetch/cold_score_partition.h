@@ -15,6 +15,7 @@ constexpr uint32_t kProgressWords = 16;
 constexpr uint32_t kProgressBytes = kProgressWords * sizeof(uint32_t);
 constexpr uint32_t kQueries = 4;
 constexpr uint32_t kMaxParts = 32;
+constexpr uint32_t kReadyParts = 4;
 using TileRange = kvip_hot_score::TileRange;
 
 KVIP_COLD_SCORE_DEVICE inline uint64_t ScoreBytes(uint32_t batch, uint32_t history) {
@@ -55,22 +56,35 @@ KVIP_COLD_SCORE_DEVICE inline uint32_t Prefix(const uint32_t* cursors, uint32_t 
     return ready;
 }
 
-// The experimental path uses dense page-aligned windows and even subdivisions.
-// Every part must have a final tile, so its normal MIX credit drain remains valid.
-inline uint32_t Parts(uint32_t batch, uint32_t history, uint32_t resident, uint32_t half,
-    uint32_t rounds, uint32_t aics) {
-    if (!batch || aics > kMaxParts || rounds < 2 || rounds > 4 ||
-        !half || history <= resident || history % 256 || resident % 256 || half % 256)
-        return 0;
-    const uint32_t parts = (aics / batch) & ~1U;
-    if (parts < 2) return 0;
+inline bool CompleteWindows(uint32_t history, uint32_t resident, uint32_t half,
+    uint32_t rounds, uint32_t parts) {
+    if (rounds < 2 || rounds > 4 || !half || history <= resident ||
+        history % 256 || resident % 256 || half % 256 || parts < 2 || parts % 2)
+        return false;
+    // Each producer needs a nonempty range in every window, including its
+    // final tile so both AIVs retire their local score pipeline.
     for (uint32_t epoch = 1; epoch < rounds; ++epoch) {
         for (uint32_t part = 0; part < parts; ++part) {
             const auto tiles = Split(history, resident, half, epoch, part, parts);
-            if (tiles.begin >= tiles.end) return 0;
+            if (tiles.begin >= tiles.end) return false;
         }
     }
-    return parts;
+    return true;
+}
+
+inline uint32_t Parts(uint32_t batch, uint32_t history, uint32_t resident, uint32_t half,
+    uint32_t rounds, uint32_t aics) {
+    if (!batch || aics > kMaxParts) return 0;
+    const uint32_t parts = (aics / batch) & ~1U;
+    return CompleteWindows(history, resident, half, rounds, parts) ? parts : 0;
+}
+
+inline uint32_t ReadyParts(uint32_t batch, uint32_t history, uint32_t resident, uint32_t half,
+    uint32_t rounds, uint32_t aics) {
+    if ((batch != 1 && batch != 8) || aics > kMaxParts || aics < batch * kReadyParts ||
+        !CompleteWindows(history, resident, half, rounds, kReadyParts))
+        return 2;
+    return kReadyParts;
 }
 }
 

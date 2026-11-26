@@ -588,3 +588,72 @@ frontiers, each request's per-window prefetch and final Get token
 multisets, or per-Q final Get counts. The script exits nonzero on a
 mismatch and preserves the raw KV-ready result in `summary.csv`.
 The graph Event includes the experiment's capture and replay overhead.
+
+## Small-batch single-change A5 comparison
+
+Use the native P2 route from main d6cfd392 as the reference inside the same
+experimental build. Each arm runs BS1 or BS8, Q4, history 131072, resident
+16384, miss 10%, G32, seed 43, rank start 1024, and 32 AIC / 64 AIV.
+Each keeps the original threshold-triggered prefetch with total budget 512
+and window cap 128. The four experiments have exclusive switches.
+
+| Arm | Scope | BS1 | BS8 |
+| --- | --- | --- | --- |
+| p2 | Native Hot, Threshold, Cold with rotating Service, and Terminal | W2 | W4 |
+| cold | Subdivide each native Cold half into two, publish classified progress, and let the existing Service observe contiguous ready prefixes | P4 / W2 | P4 / W4 |
+| windows | Native Score and Service, with one fewer window and the same Service AIV count | P2 already uses W2 | P2 / W3 |
+| topk | Shard resident high-byte histogram across two AIVs and use the same per-Q cutoff, gather and output logic | T2 / W2 | T2 / W4 |
+| get | Rebalance existing unique Final Get descriptors across four exclusive queues per request after placement, when it reduces the peak | W2 | W4 |
+
+BS8 W3 keeps eight Service AIV per window and changes the token caps to
+16384, 73728 and 131072. Its per-request sum of window budgets is at most
+384. BS1 W1 would leave the P2 sequence-split route. Cold P4 adds four
+producer AIVs on BS1 and 32 on BS8 relative to P2. P4 keeps the native
+Service order and uses live classified prefixes. Its speculative fetch
+workload can vary with scoreboard progress. Resident T2 adds one helper
+launch and keeps the rolling and final Top2048 paths. Final Get leaves
+prefetched entries and assigned destination slots in place.
+
+In the existing shared worktree on the networked host, prepare dependencies
+only if needed. Inside the container, build them once using the matching CANN
+and Torch environments.
+
+```bash
+# Host, only for dependency preparation
+bash experiments/lifetch_mr23_service/run_small_batch_a5.sh --prepare-deps
+
+# Container, only when dependencies are unbuilt
+bash experiments/lifetch_mr23_service/run_small_batch_a5.sh --build-deps
+```
+
+Run graph Event timings and checked trace captures separately.
+
+```bash
+export KVIP_A5_DEVICE=0
+bash experiments/lifetch_mr23_service/run_small_batch_a5.sh --warmup 1 --iterations 5
+bash experiments/lifetch_mr23_service/run_small_batch_a5.sh --trace --warmup 0
+```
+
+Either invocation accepts repeatable `--batch 1|8` and
+`--variant cold|windows|topk|get|p2`. P2 is included for each selected
+batch. Omitting both selectors runs nine arms. To run the first priority
+only, pass `--variant cold --variant windows`. Reuse the printed output
+folders; the timing and trace commands run workers sequentially. Each
+invocation stops at the first failed arm and retains completed reports.
+Use `--dry-run` to validate the matrix without A5 dependencies.
+
+- Graph Event timings use normal graph replay and retain each arm's
+  checked phase times and per-call/request Get counters. The summary has
+  raw ratios and a separate ratio for equal per-request prefetch and
+  Final Get counts. Counts alone do not establish identical token IDs.
+- Marked traces include diagnostic capture overhead and each arm writes
+  lifetch_msprof_trace.json, lifetch_business_trace.json, lifetch_handoff_report.json
+  and its checked stage report. The extra Resident histogram is labeled
+  in the native timeline. The separate pre-Cold resident replay compares
+  scores, ordered IDs and the thresholds the Cold consumer reads.
+- Trace summaries compare per-request/window prefetch identities, final
+  Get identities and actual per-Q queue loads. Logical assignments are
+  captured before Index retirement. The diagnostic checks queue ordinal
+  coverage and validates Top2048, KV and Index after device completion.
+  Compare WQE generation and Final CQ on the critical path together with
+  the number of requests whose peak per-queue load actually fell.
