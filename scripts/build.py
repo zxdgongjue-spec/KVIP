@@ -56,6 +56,7 @@ def prepare_dependency(root, transport):
     if head != REVISION:
         raise RuntimeError(f"Expected KVAF main revision {REVISION}, found {head}")
     patches = [
+        (ROOT / "scripts/patches/kvaf-ddr-create-timeout.patch", ()),
         (ROOT / "scripts/patches/kvaf-main-fused-device.patch", ()),
     ]
     lease_fix = ROOT / "scripts/patches/kvaf-prepared-get-lease.patch"

@@ -1,0 +1,17 @@
+--- a/runtime/peer/execution_protocol.cc
++++ b/runtime/peer/execution_protocol.cc
+@@ -238,9 +238,11 @@
+   for (auto* a = list; a; a = a->ai_next) {
+     fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+     if (fd < 0) continue;
+-    timeval timeout{30, 0};
+-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
++    // DDR creation can synchronously fault in a large CPU memory pool.
++    const timeval receive_timeout{request.op == Op::CreateRegion ? 300 : 30, 0};
++    const timeval send_timeout{30, 0};
++    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout, sizeof(receive_timeout));
++    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
+     if (connect(fd, a->ai_addr, a->ai_addrlen) == 0) break;
+     close(fd);
+     fd = -1;
