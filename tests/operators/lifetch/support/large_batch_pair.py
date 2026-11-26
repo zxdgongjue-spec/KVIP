@@ -46,7 +46,7 @@ def check_scores(inputs, selected, serial):
 KERNEL_SUFFIX = r"(?:(?:_[0-9]+)|(?:_mix_ai[cv])|(?:_ai[cv]))*"
 
 
-def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False):
+def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False, expected_li23=None):
     """Read raw, scope-relative CANN records, including both sides of MIX tasks."""
     from decimal import Decimal
 
@@ -64,6 +64,12 @@ def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False):
             "fetch": ("kvafexecutebatchgetaivkernelv2", "kvafexecutebatchgetaivkernelv3"),
         }
     )
+    if expected_li23 is not None:
+        if not fused or batch not in (20, 24, 28, 32):
+            raise ValueError("An experimental cold kernel requires a large fused batch")
+        if expected_li23 == "v9_li_large_bs32_split_role" and batch != 32:
+            raise ValueError("Split-role requires BS32")
+        names["LI23"] = (expected_li23,)
     if batch == 16 and fused:
         names = {"pr30_li": ("v9_li_kernel",), "tail": ("v9_parallel_terminal", "v9_parallel_terminal_fixed")}
     elif fused and batch < 16:
@@ -276,6 +282,25 @@ def mutable_snapshots(state, fused):
     return [(target, target.clone()) for target in mutable_buffers(state, fused)]
 
 
+def window_traffic(counters, counts, grants=()):
+    """Validate the device row totals and the per-epoch grant before reporting a policy."""
+    prefetch, first_window = counters[:, 0], counters[:, 7]
+    if np.any(prefetch < 0) or np.any(prefetch > 2048):
+        raise ValueError("Prefetch exceeded the per-request reservation")
+    if np.any(first_window < 0) or np.any(first_window > prefetch):
+        raise ValueError("First-window GET count exceeds the row's total")
+    traffic = dict(prefetch=int(prefetch.sum()), final=int(counts.sum()),
+                   first_prefetch=int(first_window.sum()), first_nonempty_rows=int(np.count_nonzero(first_window)))
+    if grants:
+        epochs = counters[:, 7:]
+        if (epochs.shape[1] != len(grants) or np.any(epochs < 0) or np.any(epochs > grants)
+                or np.any(prefetch > sum(grants)) or not np.array_equal(epochs.sum(axis=1), prefetch)):
+            raise ValueError("Window grants do not match the observed per-row GET counts")
+        traffic.update(posted_per_window=epochs.sum(axis=0).tolist(), largest_row_per_window=epochs.max(axis=0).tolist(),
+                       row_window_prefetch=epochs.tolist(), row_query_final=counts.tolist())
+    return traffic
+
+
 def read_selected(state, inputs, fused):
     """Verify public IDs and the Index slots used by each Q, outside its event."""
     batch = state.batch
@@ -290,26 +315,13 @@ def read_selected(state, inputs, fused):
         validate_terminal_receipts(counts, status, terminal.queue_views)
         # Row.requests and Row.epochCount[0] are maintained even without profiling.
         # Read both after the measured graph, independently of diagnostic timestamps.
-        two_cold = getattr(state, "two_cold_windows", False)
-        counters = state.rotating.rows[:, 9:(19 if two_cold else 17)].cpu().numpy()
-        prefetch = counters[:, 0]
-        first_window = counters[:, 7]
-        if np.any(prefetch < 0) or np.any(prefetch > 2048):
-            raise ValueError("Prefetch exceeded the per-request reservation")
-        if np.any(first_window < 0) or np.any(first_window > prefetch):
-            raise ValueError("First-window GET count exceeds the row's total")
-        traffic = dict(prefetch=int(prefetch.sum()), final=int(counts.sum()),
-                       first_prefetch=int(first_window.sum()), first_nonempty_rows=int(np.count_nonzero(first_window)))
-        if two_cold:
-            grants = np.array([256, 384, 384])
-            epochs = counters[:, 7:10]
-            if (np.any(epochs < 0) or np.any(epochs > grants) or np.any(prefetch > 1024)
-                    or not np.array_equal(epochs.sum(axis=1), prefetch)):
-                raise ValueError("Three-window grants do not match the observed per-row GET counts")
-            traffic["posted_per_window"] = epochs.sum(axis=0).tolist()
-            traffic["largest_row_per_window"] = epochs.max(axis=0).tolist()
-            traffic["row_window_prefetch"] = epochs.tolist()
-            traffic["row_query_final"] = counts.tolist()
+        launch = getattr(state, "large_window_launch", None)
+        grants = ()
+        if launch:
+            from large_two_cold import WINDOW_GRANTS
+            grants = WINDOW_GRANTS[launch.window_policy]
+        counters = state.rotating.rows[:, 9:16 + max(1, len(grants))].cpu().numpy()
+        traffic = window_traffic(counters, counts, grants)
         raw = state.workspace.topk.cpu().numpy().reshape(shape)
         unpack = state.workspace.inputs.unpack_indices.cpu().numpy().reshape(-1)
         if np.any(raw < 0) or np.any(raw >= state.history) or not np.array_equal(np.sort(unpack), np.arange(batch * 4)):
@@ -715,9 +727,16 @@ def run(args):
         serial = np.load(path, mmap_mode="r", allow_pickle=False)
         if serial.shape != (CALLS, args.batch, 4, 2048):
             raise ValueError("Strong serial output shape mismatch")
-    two_cold = getattr(args, "large_two_cold", False)
-    if two_cold and (not args.packed_ten or not args.compare_packed_candidate or not fused or args.batch not in (20,24,28,32)):
-        raise ValueError("The three-window experiment requires a fresh packed BS20/24/28/32 fused candidate")
+    policy = args.large_window_policy
+    if policy and (not args.packed_ten or not args.compare_packed_candidate or not fused
+                   or args.batch not in (20, 24, 28, 32)):
+        raise ValueError(f"{policy} requires a fresh packed BS20/24/28/32 fused candidate")
+    if policy == "split-role":
+        # Frozen 128K inputs carry Q4 lookahead in 256-aligned physical storage.
+        # For all five captures each row ends on the same 128-token score tile.
+        if (args.batch != 32 or inputs.geometry["history"] != 131328
+                or np.unique((inputs.query_ends[:, -1] + 127) // 128).size != 1):
+            raise ValueError("Split-role requires a fixed-length BS32 Q4 128K capture")
     cfg = configuration(
         [
             "bench" if args.packed_ten else "diagnose",
@@ -742,7 +761,7 @@ def run(args):
             "--prefetch-tokens",
             "1024",
             "--intermediate-fetches",
-            "3" if two_cold else "4",
+            "3" if policy == "two-cold" else "4",
             "--warmup",
             str(WARMUP),
             "--iterations",
@@ -760,17 +779,19 @@ def run(args):
     else:
         benchmark = partial(measured_replays, ex, proofs, serial)
     result = ex.run_path(cfg, args.output / "path", sequence, pages, fused=fused, measure=benchmark,
-                         large_two_cold=two_cold)
+                         large_window_policy=policy)
     workers = (32 if args.batch > 16 else 40) if fused else 2
     if result["correctness"] != "PASS" or result["failures"] or result["runtime_workers"] != workers:
         raise ValueError(f"{args.arm}: production replay failed or used incorrect worker count")
     if args.packed_ten:
-        if two_cold:
-            proofs["window_grants_per_row"] = [256, 384, 384]
+        if policy:
+            from large_two_cold import WINDOW_GRANTS
+            grants = WINDOW_GRANTS[policy]
+            proofs["window_grants_per_row"] = list(grants)
             proofs["row_prefetch_limit"] = 1024
             means = np.mean([item["posted_per_window"] for item in proofs["traffic"]], axis=0)
             peaks = np.max([item["largest_row_per_window"] for item in proofs["traffic"]], axis=0)
-            print(f"WINDOWS G{args.group} BS{args.batch} grants=256/384/384 row_limit=1024 "
+            print(f"WINDOWS G{args.group} BS{args.batch} grants={'/'.join(map(str, grants))} row_limit=1024 policy={policy} "
                   f"posted_per_call_mean={'/'.join(f'{value:.1f}' for value in means)} "
                   f"peak_row={'/'.join(str(value) for value in peaks)}")
         save_packed(args, identity, inputs, proofs, workers, scratch_existed)
@@ -918,8 +939,11 @@ def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arm", choices=("serial", "fused"), required=True)
-    parser.add_argument("--large-two-cold", action="store_true",
-                        help="One seed and two cold windows, fixed BS20/24/28/32")
+    windows = parser.add_mutually_exclusive_group()
+    windows.add_argument("--large-two-cold", dest="large_window_policy", action="store_const", const="two-cold",
+                         help="Measure the isolated three-window large-batch cold kernel")
+    windows.add_argument("--large-window-policy", choices=("two-cold", "split-role"),
+                         help="Measure the selected large-batch cold kernel in the packed candidate")
     parser.add_argument("--window-density", action="store_true", help="Collect post timestamps in one separate large-BS call")
     parser.add_argument("--compare-packed-candidate", action="store_true", help="Use the original strong serial selection for a modified fusion kernel")
     parser.add_argument("--packed-ten", action="store_true", help="Capture and time ten independent states in one graph")

@@ -5,8 +5,11 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent / "support"))
 from fixed_q4_packed_timing import packed_account
+from large_batch_pair import window_traffic
 
 
 def fixture(names):
@@ -54,6 +57,39 @@ class PackedAttribution(unittest.TestCase):
                 self.assertAlmostEqual(sum(means[k] for k in ("LI", "tail", "inter_kernel_gap",
                                                               "between_calls", "event_edges")), means["graph"])
                 self.assertAlmostEqual(means["between_calls"] + means["event_edges"], means["event_minus_span"])
+
+    def test_each_request_obeys_the_selected_window_grants(self):
+        for grants in ((256, 384, 384), (256, 256, 256, 256)):
+            with self.subTest(grants=grants):
+                rows = np.zeros((2, 7 + len(grants)), dtype=np.int32)
+                rows[0, 7:] = grants
+                rows[0, 0] = sum(grants)
+                counts = np.zeros((2, 4), dtype=np.int32)
+                self.assertEqual(window_traffic(rows, counts, grants)["posted_per_window"], list(grants))
+                rows[0, 7] -= 1
+                with self.assertRaisesRegex(ValueError, "observed per-row"):
+                    window_traffic(rows, counts, grants)
+                rows[0, 8] += 1
+                with self.assertRaisesRegex(ValueError, "observed per-row"):
+                    window_traffic(rows, counts, grants)
+
+    def test_experimental_cold_receipt_checks_all_ten_calls(self):
+        symbol = "v9_li_large_bs32_split_role"
+        names = ["v9_li_large_hot", symbol, "v9_parallel_terminal_large"]
+        events = fixture(names)
+        result = packed_account(events, "scope", 1000, fused=True, batch=32, expected_li23=symbol)
+        self.assertEqual(result["calls"], 10)
+        # One regular launch among nine experimental ones must fail attribution.
+        next(e for e in events if e["name"].startswith(symbol))["name"] = "v9_li_large_threshold_cold"
+        with self.assertRaisesRegex(ValueError, "Unattributed"):
+            packed_account(events, "scope", 1000, fused=True, batch=32, expected_li23=symbol)
+        for batch in (1, 2, 4, 8, 16):
+            with self.subTest(batch=batch), self.assertRaisesRegex(ValueError, "large fused batch"):
+                packed_account(events, "scope", 1000, fused=True, batch=batch, expected_li23=symbol)
+
+        for batch in (20, 24, 28):
+            with self.subTest(batch=batch), self.assertRaisesRegex(ValueError, "requires BS32"):
+                packed_account(events, "scope", 1000, fused=True, batch=batch, expected_li23=symbol)
 
     def test_stage_p50_uses_the_ten_observed_spans(self):
         events = fixture(["v9_li_large_hot", "v9_li_large_threshold_cold", "v9_parallel_terminal_large"])

@@ -14,6 +14,10 @@ large_cold_windows=${PEER_LARGE_COLD_WINDOWS:-2}
 if [[ $large_cold_windows != 2 && $large_cold_windows != 3 ]]; then
     echo "PEER_LARGE_COLD_WINDOWS must be 2 or 3" >&2; exit 2
 fi
+bs32_li=${PEER_BS32_LI:-}
+if [[ -n $bs32_li && $bs32_li != split-role ]]; then
+    echo "Unknown PEER_BS32_LI=$bs32_li" >&2; exit 2
+fi
 batches=(20 24 28 32)
 groups=(10 4 17 7 2)
 if (( $# )); then
@@ -50,6 +54,12 @@ if (( $# )); then
         exit 2
     fi
 fi
+if [[ -n $bs32_li ]]; then
+    if (( !packed_candidate )); then echo "$bs32_li requires --packed-aiv" >&2; exit 2; fi
+    if [[ ! -s $root/csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer_large_dualrole.cpp ]]; then
+        echo "Missing BS32 split-role device implementation" >&2; exit 2
+    fi
+fi
 peer_physical_npu=4
 if (( fixed )); then
     peer_physical_npu=${PEER_PHYSICAL_NPU:-${ASCEND_RT_VISIBLE_DEVICES:-4}}
@@ -70,6 +80,7 @@ prefix=largebs-q4
 if (( fixed )); then prefix=fixed-q4; fi
 if [[ -n $packed_archive ]]; then prefix=fixed-q4-packed; fi
 if (( packed_candidate )); then prefix="fixed-q4-aiv-${large_cold_windows}cold"; fi
+if [[ -n $bs32_li ]]; then prefix="$prefix-bs32-$bs32_li"; fi
 if [[ -n $packed_archive && -n ${PEER_PACKED_RESUME:-} ]]; then
     out=$(cd "$PEER_PACKED_RESUME" && pwd)
     [[ $out == "$area/$prefix."* && $(<"$out/packed_source.txt") == "$packed_archive" &&
@@ -179,7 +190,12 @@ if [[ -n $packed_archive ]]; then
         "$PYTHON" -B "$workers/fixed_q4_packed_report.py" verify-source "$out" "$packed_archive" "$root"
     fi
     if (( packed_candidate && large_cold_windows == 2 )); then
-        echo 'WINDOW_SCHEDULE BS20/24/28/32 first=256 cold=384,384 row_limit=1024' >&3
+        large_batches=20/24/28/32
+        if [[ -n $bs32_li ]]; then large_batches=20/24/28; fi
+        echo "WINDOW_SCHEDULE BS$large_batches first=256 cold=384,384 row_limit=1024" >&3
+    fi
+    if [[ -n $bs32_li ]]; then
+        echo 'WINDOW_SCHEDULE BS32 policy=split-role first=256 cold=256,256,256 row_limit=1024' >&3
     fi
     echo "CONFIG packed_calls=10 blocks=2 groups=${groups[*]} batches=${batches[*]} physical_NPU=$peer_physical_npu archive=$packed_archive" >&3
 elif (( fixed )); then
@@ -270,7 +286,11 @@ run_arm() (
         args+=(--packed-ten --serial-result "$packed_oracle")
         if (( packed_candidate )); then args+=(--compare-packed-candidate); fi
         if (( packed_candidate && batch == 32 )) && [[ ${pair##*/} == block1 ]]; then args+=(--window-density); fi
-        if (( packed_candidate && batch > 16 && large_cold_windows == 2 )); then args+=(--large-two-cold); fi
+        if (( packed_candidate && batch == 32 )) && [[ $bs32_li == split-role ]]; then
+            args+=(--large-window-policy split-role)
+        elif (( packed_candidate && batch > 16 && large_cold_windows == 2 )); then
+            args+=(--large-two-cold)
+        fi
     elif [[ $arm == fused ]]; then
         if [[ -n $archive ]]; then
             args+=(--serial-result "$archive/g$group/bs$batch/serial" --compare-archived-pair)
@@ -355,7 +375,10 @@ run_packed_cohort() {
             if (( packed_candidate && batch == 32 && block == 1 )); then
                 grep ' WINDOW_DIAG ' "$result/worker.log" | tee -a "$out/summary.txt" >&3
             fi
-            if (( packed_candidate && batch > 16 && large_cold_windows == 2 )); then grep '^WINDOWS ' "$result/worker.log" | tee -a "$out/summary.txt" >&3; fi
+            if (( packed_candidate && batch > 16 && large_cold_windows == 2 )) ||
+                { (( packed_candidate && batch == 32 )) && [[ $bs32_li == split-role ]]; }; then
+                grep '^WINDOWS ' "$result/worker.log" | tee -a "$out/summary.txt" >&3
+            fi
             "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref" "$result/thp.json"
             touch "$result/placement_verified"
         done

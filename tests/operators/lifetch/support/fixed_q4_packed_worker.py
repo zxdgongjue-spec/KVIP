@@ -76,8 +76,18 @@ def measure_packed(ex, proofs, serial, torch, states, sequence, config, director
         raise ValueError("Expected a single frozen round, four graph warmups and ten independent measured states")
     frozen = FrozenPackedRound(states, sequence.inputs, serial, fused)
 
+    launch = getattr(states[0], "large_window_launch", None)
+    expected_li23 = None
+    if launch:
+        from large_two_cold import COLD_SYMBOL
+        if any(getattr(state, "large_window_launch", None) is not launch for state in states):
+            raise ValueError("The packed graph contains different experimental kernels")
+        expected_li23 = COLD_SYMBOL[launch.window_policy]
+        proofs.update(large_window_policy=launch.window_policy, measured_cold_symbol=expected_li23,
+                      cold_build_fingerprint=launch.source_fingerprint)
+
     def profile(*args, **kwargs):
-        result = profile_fixed_graph_batch(*args, batch=states[0].batch, **kwargs)
+        result = profile_fixed_graph_batch(*args, batch=states[0].batch, expected_li23=expected_li23, **kwargs)
         proofs.update(result["packed"])
         return result
 
@@ -104,11 +114,22 @@ def measure_packed(ex, proofs, serial, torch, states, sequence, config, director
         stream = torch.npu.current_stream(state.device)
         stream.synchronize()
         sibling_checks = score_spans = None
-        trace_args = getattr(state, "two_cold_build_args", None)
+        trace_args = getattr(state, "large_window_build_args", None)
+        if launch and launch.window_policy == "split-role":
+            # Its sole window worker publishes the normal epoch events. The old
+            # two-lane sibling-wait fields have no equivalent in this schedule.
+            trace_args = None
+            proofs.update(diagnostic_cold_symbol=expected_li23,
+                          diagnostic_cold_build_fingerprint=launch.source_fingerprint)
         original_launch = state.forward.terminal_function
         if trace_args:
             from large_two_cold import build, attach
-            attach(state, build(*trace_args, trace_sibling=True))
+            trace_launch = build(*trace_args, trace_sibling=True)
+            if trace_launch.source_fingerprint == launch.source_fingerprint:
+                raise ValueError("The timing and diagnostic cold builds must be separate")
+            attach(state, trace_launch)
+            proofs.update(diagnostic_cold_symbol=expected_li23 + "_trace",
+                          diagnostic_cold_build_fingerprint=trace_launch.source_fingerprint)
         try:
             state.forward()
             stream.synchronize()
@@ -117,6 +138,8 @@ def measure_packed(ex, proofs, serial, torch, states, sequence, config, director
             raise
         finally:
             state.forward.terminal_function = original_launch
+            if trace_args:
+                state.large_window_launch = launch
         state.check_completion()
         ids, traffic = read_selected(state, inputs, True)
         check_scores(inputs, ids, serial[0])
