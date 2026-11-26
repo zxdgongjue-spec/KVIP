@@ -55,7 +55,11 @@ __aicore__ inline void QuantLightningIndexerKernel<T>::ProcessLargeScore(uint32_
         matmulService.FreeEventID();
         // Balance both return credits of both vector lanes, including an
         // untouched ping/pong bank on a one-tile job, before the next job.
+#if KVIP_BS32_SCORE_WINDOW_ROLES
+        for (uint32_t v = 0; v < 1; ++v) {
+#else
         for (uint32_t v = 0; v < 2; ++v) {
+#endif
             CrossCoreWaitFlag<Flags::QLI_SYNC_MODE4, PIPE_FIX>(Flags::CROSS_VC_EVENT +
                                                                v * Flags::AIV0_AIV1_OFFSET);
             CrossCoreWaitFlag<Flags::QLI_SYNC_MODE4, PIPE_FIX>(Flags::CROSS_VC_EVENT +
@@ -64,7 +68,9 @@ __aicore__ inline void QuantLightningIndexerKernel<T>::ProcessLargeScore(uint32_
         // These flags, separate from both score buffers, acknowledge both
         // credits. A fast V cannot prime a still-set credit for the next job.
         CrossCoreSetFlag<Flags::QLI_SYNC_MODE4, PIPE_FIX>(acknowledged);
+#if !KVIP_BS32_SCORE_WINDOW_ROLES
         CrossCoreSetFlag<Flags::QLI_SYNC_MODE4, PIPE_FIX>(acknowledged + Flags::AIV0_AIV1_OFFSET);
+#endif
     }
     PipeBarrier<PIPE_ALL>();
 }
@@ -381,6 +387,9 @@ __aicore__ inline void FinishPair(const Inputs& input, const RowPlan& plan, Inde
     vec.PostWindow(epoch, 0);
 }
 
+#if KVIP_BS32_SCORE_WINDOW_ROLES
+#include "indexer/large_bs_split_owner.h"
+#else
 __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint32_t planCount) {
     JoinThreshold(input, plan.row);
     TPipe pipe;
@@ -474,9 +483,11 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint3
         }
     }
 }
+#endif
 } // namespace
 #endif
 
+#if !KVIP_BS32_SCORE_WINDOW_ROLES
 extern "C" __global__ __aicore__ void v9_li_large_hot(GM_ADDR bindings, GM_ADDR terminal) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
@@ -526,3 +537,4 @@ extern "C" __global__ __aicore__ void v9_li_large_threshold_cold(GM_ADDR binding
     }
 #endif
 }
+#endif

@@ -1,0 +1,15 @@
+// Isolated device entry. The regular hot and terminal launches keep their original images.
+#define KVIP_BS32_SCORE_WINDOW_ROLES 1
+#define QLIKernel QLIKernelBS32SplitRole
+#include "indexer_large.cpp"
+
+extern "C" __global__ __aicore__ void v9_li_large_bs32_split_role(GM_ADDR bindings, GM_ADDR terminal) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    Inputs input(bindings, terminal);
+    const uint32_t row = input.core;
+    Threshold(input, row, false);
+    auto plan = RowCost<true>(input, row);
+    ColdOwner(input, plan);
+#endif
+}

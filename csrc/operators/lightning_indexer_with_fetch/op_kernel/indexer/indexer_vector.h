@@ -201,7 +201,11 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query, uint32_t scanHis
         GlobalTensor<uint16_t> thresholds;
         thresholds.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(
             prefixOutput_ + batch * rowBytes + count * 6));
+#if KVIP_BS32_SCORE_WINDOW_ROLES
+        DataCopy(prefixThreshold_, thresholds[0], 512);
+#else
         DataCopy(prefixThreshold_, thresholds[(blockId_ % 2) * 256], 256);
+#endif
         SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
         WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
     }
@@ -516,6 +520,30 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe, bool topkOnly)
 #if KVIP_STREAMING_LI
     streamingTopkOnly_ = topkOnly;
 #endif
+#if KVIP_BS32_SCORE_WINDOW_ROLES
+    if (!topkOnly && !(blockId_ % 2)) {
+        // V0 holds both Q pairs, while V1 owns the workspace for ranking and posting.
+        pipe->InitBuffer(resMm1Buf_, 2 * constInfo_.mBaseSize * s2BaseSize_ * sizeof(QK_T));
+        resMm1UB_ = resMm1Buf_.Get<QK_T>();
+        pipe->InitBuffer(prefixThresholdBuf_, 1024);
+        prefixThreshold_ = prefixThresholdBuf_.Get<uint16_t>();
+        pipe->InitBuffer(classifyBuf_, 2048);
+        classifyUB_ = classifyBuf_.Get<uint16_t>();
+        pipe->InitBuffer(weightBuf_, 2 * s1BaseSize_ * UB_BANK_DEPTH_STRIDE);
+        weightUB_ = weightBuf_.Get<W_T>();
+        pipe->InitBuffer(weightFloatBuf_, 2 * s1BaseSize_ * UB_BANK_DEPTH_STRIDE);
+        weightFloatUB_ = weightFloatBuf_.Get<float>();
+        pipe->InitBuffer(kScaleBuf_, 2 * s2BaseSize_ * QLICommon::KScaleTiles * sizeof(SCALE_T));
+        kScaleUB_ = kScaleBuf_.Get<SCALE_T>();
+        pipe->InitBuffer(qScaleBuf_, 2 * s1BaseSize_ * UB_BANK_DEPTH_STRIDE);
+        qScaleUB_ = qScaleBuf_.Get<SCALE_T>();
+        pipe->InitBuffer(outBuf_, 2 * s1BaseSize_ * s2BaseSize_ * sizeof(SCORE_T));
+        vec1OutUB_ = outBuf_.Get<SCORE_T>();
+
+        Duplicate(kScaleUB_, static_cast<SCALE_T>(0), 2 * s2BaseSize_ * QLICommon::KScaleTiles);
+        return;
+    }
+#endif
     if (!topkOnly) {
         // Fixpipe writes to the start of UB on its paired AIVs.
         pipe->InitBuffer(resMm1Buf_, 2 * CeilDiv(constInfo_.mBaseSize, 2) * s2BaseSize_ * sizeof(QK_T));
@@ -752,8 +780,13 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     int64_t curS1Idx = info.gS1Idx * s1BaseSize_;
     int64_t curS2Idx = info.s2Idx * s2BaseSize_;
     int64_t curS1ProcNum = curS1Idx + s1BaseSize_ > info.actS1Size ? info.actS1Size % s1BaseSize_ : s1BaseSize_;
+#if KVIP_BS32_SCORE_WINDOW_ROLES
+    int64_t curAivS1Idx = curS1Idx;
+    int64_t curAivS1ProcNum = curS1ProcNum;
+#else
     int64_t curAivS1Idx = curS1Idx + (blockId_ % 2) * CeilDiv(curS1ProcNum, 2);
     int64_t curAivS1ProcNum = (blockId_ % 2 == 0) ? CeilDiv(curS1ProcNum, 2) : curS1ProcNum / 2;
+#endif
     if (curAivS1ProcNum == 0) {
         CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_CV_EVENT + pingpong);  // V核等C核计算完mm1，mm1Res已搬运到UB
         CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   // V核处理完，通知C核可以把mm1Res搬运到UB
@@ -815,13 +848,34 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     auto qScaleBase = qScaleUB_[qScalepingpong * (UB_BANK_STRIDE / sizeof(SCALE_T))];
     auto kScaleBase = kScaleUB_[kScalepingpong * QLICommon::KScaleTiles * s2BaseSize_ + ((info.s2Idx - info.s2Start) % QLICommon::KScaleTiles) * s2BaseSize_];
     auto qkBase = resMm1UB_[pingpong * (UB_BANK_STRIDE / sizeof(float))];
+#if KVIP_BS32_SCORE_WINDOW_ROLES
+    auto qkVLstride = (UB_BANK_DEPTH_STRIDE / sizeof(float)) * constInfo_.mBaseSize;
+#else
     auto qkVLstride = (UB_BANK_DEPTH_STRIDE / sizeof(float)) / 2 * constInfo_.mBaseSize;
+#endif
 
 #if !V9_UBMEM
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {
 #else
     if (curS2Idx >= runtimeShape_.resident) {
 #endif
+#if KVIP_BS32_SCORE_WINDOW_ROLES
+        constexpr uint32_t scoreStride = UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T);
+        constexpr uint32_t fp32Stride = UB_BANK_DEPTH_STRIDE / sizeof(float);
+        constexpr uint32_t weightStride = UB_BANK_DEPTH_STRIDE / sizeof(W_T);
+        constexpr uint32_t scaleStride = UB_BANK_DEPTH_STRIDE / sizeof(SCALE_T);
+        auto thresholds = reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_.GetPhyAddr());
+        auto classified = reinterpret_cast<__ubuf__ uint16_t*>(classifyUB_.GetPhyAddr());
+        for (uint32_t pair = 0; pair < 4; pair += 2) {
+            vector1::BatchClassifyScore(
+                outBase[pair * scoreStride], scoreStride,
+                qkBase[pair * gSize_ * fp32Stride], qkVLstride,
+                static_cast<uint32_t>(gSize_ * fp32Stride),
+                weightBase[pair * weightStride], weightStride, weightFloatBase,
+                kScaleBase, static_cast<uint32_t>(0), qScaleBase[pair * scaleStride], scaleStride,
+                gSize_, 2, thresholds + pair * 128, classified + pingpong * 512 + pair * 128);
+        }
+#else
     vector1::BatchClassifyScore(outBase, UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T),
                                         qkBase, qkVLstride, (uint32_t)(gSize_ * UB_BANK_DEPTH_STRIDE / sizeof(float)),
                                         weightBase, UB_BANK_DEPTH_STRIDE / sizeof(W_T), weightFloatBase,
@@ -830,6 +884,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                                         gSize_, curAivS1ProcNum,
         (__ubuf__ uint16_t *)prefixThreshold_.GetPhyAddr() + (curAivS1Idx % 2) * 128,
         (__ubuf__ uint16_t *)classifyUB_.GetPhyAddr() + pingpong * 256);
+#endif
     } else {
     vector1::BatchMulWeightAndReduceSum(outBase, UB_BANK_DEPTH_STRIDE / sizeof(SCORE_T),
                                         qkBase, qkVLstride, (uint32_t)(gSize_ * UB_BANK_DEPTH_STRIDE / sizeof(float)),
@@ -879,7 +934,11 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         hitCopy.srcStride = 7; // classifyUB query stride is 256 bytes.
         hitCopy.dstStride = runtimeShape_.history / 4 - 32;
         DataCopyPad(outputHits[(info.bIdx * SIM_Q + curAivS1Idx) * (runtimeShape_.history / 4) + curS2Idx / 4],
+#if KVIP_BS32_SCORE_WINDOW_ROLES
+                    classifyUB_[pingpong * 512].template ReinterpretCast<uint8_t>(), hitCopy);
+#else
                     classifyUB_[pingpong * 256].template ReinterpretCast<uint8_t>(), hitCopy);
+#endif
     }
 #endif
 
