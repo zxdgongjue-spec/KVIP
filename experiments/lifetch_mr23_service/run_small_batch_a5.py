@@ -14,7 +14,7 @@ from run_mr28_baseline_msprof import capture_route
 from run_mr28_dedicated_service import write_summary
 from kvip.operators.lifetch.geometry import li_geometry
 from small_batch import (
-    ADAPTIVE_ROUTES, FULL32_MODES, MODES, PARTITIONED_MODES, SUPPORTED_BATCHES, TRACE_ROUTES,
+    ADAPTIVE_ROUTES, FULL32_MODES, MODES, PARTITIONED_MODES, SUPPORTED_BATCHES, TRACE_ROUTES, WINDOW_Q_WORKERS,
     cold_score_parts, selected_windows,
 )
 from terminal_handoff import CHECKED_KERNELS, COLD_GM_STAGE_FIELDS, STAGES
@@ -63,6 +63,8 @@ def balanced_arms(batch):
 
 
 def study_arms(args):
+    if args.bs2_window_q:
+        return {2: tuple(WINDOW_Q_WORKERS)}
     if args.adaptive_pw:
         return ADAPTIVE_ARMS
     if args.window_probe:
@@ -129,7 +131,7 @@ def plan(args, kvaf):
                            service_aics=service_aics, cold_score_parts=parts, cold_score_groups=physical * parts,
                            service_owner_groups=2 * physical, service_group_slots=service_aics * effective,
                            max_requests_per_service_aiv=(physical + 2 * service_aics - 1) // (2 * service_aics),
-                           window_probe=args.window_probe,
+                           window_probe=args.window_probe, bs2_window_q=args.bs2_window_q,
                            arguments=arguments, kernels=CHECKED_KERNELS[f'small_{mode}'])
 
 
@@ -199,6 +201,12 @@ def trace_arm(output, case, config, profiler):
         if case.get('window_probe'):
             counts, row['window_scopes'] = window_probe_scopes(capture['source'], case)
             row.update({f'{name}_scopes': count for name, count in counts.items()})
+        if case.get('bs2_window_q'):
+            from window_q_trace import analyze_window_q
+
+            metrics, scopes = analyze_window_q(capture['source'], WINDOW_Q_WORKERS[case['mode']])
+            row.update(metrics)
+            save(case_output / 'window_q_report.json', dict(metrics=metrics, scopes=scopes, requests=report['requests']))
         return row
     except BaseException:
         manifest['status'] = 'FAILED'
@@ -342,6 +350,8 @@ def main():
                        help='keep Hot P2; sweep Cold parts at W2 for BS1 and W2/W4 for BS2/BS8')
     route.add_argument('--bs2-trace-pair', choices=BS2_TRACE_BASELINES,
                        help='capture BS2 msprof pairs: P2/P4 at W2, W4/W2 at P4, or both')
+    route.add_argument('--bs2-window-q', action='store_true',
+                       help='compare W1 serial Q4, Q2+Q2 and four Q1 at BS2 P4/W2, miss 10%')
     route.add_argument('--adaptive-pw', action='store_true',
                        help='compare native P2, fixed best P/W and adaptive P/W with retired AIV Service')
     route.add_argument('--window-probe', choices=WINDOW_PROBES,
@@ -355,6 +365,8 @@ def main():
     args = parser.parse_args()
     if args.bs2_trace_pair:
         args.trace = True
+    if args.bs2_window_q and any(miss != 10 for miss in args.miss_percent or ()):
+        parser.error('--bs2-window-q uses the BS2 miss 10% fixture')
     study = study_arms(args)
     if study:
         if args.group_bs32 or any(batch not in study for batch in args.batch or ()):
@@ -390,6 +402,7 @@ def main():
                     full32=args.full32, window_sweep=args.window_sweep, balanced=args.balanced,
                     cold_window_matrix=args.cold_window_matrix,
                     bs2_trace_pair=args.bs2_trace_pair,
+                    bs2_window_q=args.bs2_window_q,
                     adaptive_pw=args.adaptive_pw, window_probe=args.window_probe,
                     granularity_study=args.granularity_study, repeats=args.repeats,
                     scopes=dict(queries=4, history=131072, resident=16384,
@@ -461,6 +474,20 @@ def main():
                         save(run_dir / 'window_probe_comparison.json', dict(control=before, experiment=row))
                     else:
                         compare_arms(before, row, trace=False)
+                summarize(output, rows)
+                continue
+            if args.bs2_window_q:
+                row['w1_topk_workers_per_request'] = WINDOW_Q_WORKERS[row['variant']]
+                if row['variant'] == 'cold_w2':
+                    focused_baselines[pair] = row
+                else:
+                    before = focused_baselines[pair]
+                    if args.trace:
+                        compare_stage_trace(before, row, 'vs_serial_q4_')
+                        for metric in ('w1_after_last_aiv_score_scan_us', 'w1_max_owner_service_us'):
+                            row[f"vs_serial_q4_{metric.removesuffix('_us')}_delta_us"] = row[metric] - before[metric]
+                    else:
+                        compare_arms(before, row, trace=False, prefix='vs_serial_q4_')
                 summarize(output, rows)
                 continue
             window_pair = (*pair, case['effective_windows'])

@@ -128,6 +128,9 @@ PHASES = {
     246: 'P8 cursor read and ready-prefix fold',
     247: 'Enqueue next-window Top2048 header read',
     250: 'P8 bulk cursor GM to UB',
+    251: 'Snapshot W1 TopK ready bounds',
+    252: 'Join W1 TopK workers',
+    253: 'W1 TopK worker query slice',
     DYNAMIC_SCORE_JOB: 'Dynamically assigned Score fragment',
     DYNAMIC_SERVICE_JOB: 'Dynamically assigned Service window',
 }
@@ -745,7 +748,7 @@ def render(events, counter_mhz, *, cold_route='p2'):
                     iteration=event['iteration'], detail=event['detail'], begin_tick=begin, end_tick=end)
         window_epoch = None
         category = kernel_stage
-        if kernel in (20, 22) and (phase in (21, 22, 25, *range(150, 156), 243, 244, 246, 247, 250,
+        if kernel in (20, 22) and (phase in (21, 22, 25, *range(150, 156), 243, 244, 246, 247, 250, 251, 252, 253,
                                              DEDICATED_DRIVER_WAIT, DEDICATED_READY_SNAPSHOT, 230, 231,
                                              DYNAMIC_SCORE_JOB, DYNAMIC_SERVICE_JOB)
                                    or phase in PIPE_SCOPES):
@@ -774,11 +777,11 @@ def render(events, counter_mhz, *, cold_route='p2'):
             args.update(request_row=row, window_epoch=window, job_ticket=event['detail'] >> 8)
             if phase == DYNAMIC_SCORE_JOB:
                 args['fragment'] = fragment
-        elif phase in (23, 155, 245, DEDICATED_READY_SNAPSHOT, COLD_PROGRESS_RESET) or kernel == 23:
+        elif phase in (23, 155, 245, 253, DEDICATED_READY_SNAPSHOT, COLD_PROGRESS_RESET) or kernel == 23:
             args.update(request_row=event['detail'] // 4, query=event['detail'] % 4)
         elif phase == 242:
             args.update(request_row=event['detail'] >> 24, query=(event['detail'] >> 20) & NO_QUERY)
-        elif phase in (21, 22, 152, 153, 230, 231):
+        elif phase in (21, 22, 152, 153, 230, 231, 251, 252):
             args['request_row'] = event['detail']
         elif phase in (25, 150, 151, 243, 244, 246, 247, 250, DEDICATED_DRIVER_WAIT):
             args['service_lane'] = event['detail']

@@ -885,3 +885,30 @@ enqueue events means the read-ahead opportunity did not arise in that
 replay. For dynamic Service, `baseline_stage_report.json` includes each
 logical window/lane, the worker AIV that claimed it, and verifies that
 the worker's MIX group had drained.
+
+### BS2 P4/W2 W1 Top2048 scheduling
+
+`--bs2-window-q` runs the same checked A5 fixture for three arms at BS2,
+Q4, 128K history, 16K resident and miss 10%. All arms share one bridge per
+measurement mode and keep Hot P2, Cold P4, W2, prefetch budgets 512/128,
+and W0 rotation. The W1 control (`cold_w2`) runs all four Q on each
+request's Service owner. `cold_w2_q2` uses two Score AIVs per request
+and `cold_w2_q1` uses four. Workers read the request owner's published
+ready bounds and publish separate per-Q results. The original request
+owner remains responsible for cross-Q deduplication and WQE submission.
+
+```bash
+bash "$runner" --bs2-window-q --dry-run
+bash "$runner" --bs2-window-q --warmup 2 --iterations 5
+bash "$runner" --bs2-window-q --trace
+```
+
+The timing run reports graph Event KV ready, phase times and Get counts
+in `summary.csv`. The trace run also writes `window_q_report.json` in
+each arm directory under `miss10/bs2`. It shows the per-Q worker slices,
+owner snapshot and join, WQE scopes, and the interval from the last AIV
+Score scan to the end of W1 Service. These source scopes use one clock
+and can overlap. The tagged msprof trace retains the original vendor
+clock. Use `vs_serial_q4_*` in the summary for paired deltas. Changes in
+worker timing can change the observed ready frontier and the split
+between prefetch and final Get, so inspect the Get evidence with timing.

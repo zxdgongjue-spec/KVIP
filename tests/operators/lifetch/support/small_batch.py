@@ -7,10 +7,11 @@ import hashlib
 import numpy as np
 
 ADAPTIVE_ROUTES = {1: 'cold_p8', 2: 'cold_w2', 8: 'cold_full_w2'}
+WINDOW_Q_WORKERS = {'cold_w2': 1, 'cold_w2_q2': 2, 'cold_w2_q1': 4}
 SUPPORTED_BATCHES = {
     'p2': (1, 2, 4, 8, 16),
     'cold': (1, 2, 4, 8),
-    'cold_w2': (2,),
+    **dict.fromkeys(WINDOW_Q_WORKERS, (2,)),
     'cold_p8': (1,),
     'cold_p8_bulk': (1,),
     'cold_full': (1, 2, 8),
@@ -25,9 +26,9 @@ SUPPORTED_BATCHES = {
 }
 MODES = ('p2', 'cold', 'windows', 'topk', 'get')
 FULL32_MODES = {'cold_full', 'cold_full_w3', 'cold_full_w2'}
-PARTITIONED_MODES = FULL32_MODES | {'cold', 'cold_w2', 'cold_p8', 'cold_p8_bulk', 'adaptive'}
+PARTITIONED_MODES = FULL32_MODES | WINDOW_Q_WORKERS.keys() | {'cold', 'cold_p8', 'cold_p8_bulk', 'adaptive'}
 WINDOW_OVERRIDES = {'windows': 3, 'windows_early': 3, 'windows_w2': 2,
-                    'cold_w2': 2, 'cold_full_w3': 3, 'cold_full_w2': 2}
+                    **dict.fromkeys(WINDOW_Q_WORKERS, 2), 'cold_full_w3': 3, 'cold_full_w2': 2}
 TRACE_ROUTES = dict(p2='p2', **dict.fromkeys(PARTITIONED_MODES, 'small_cold'),
                     windows='p2', windows_w2='p2', windows_early='p2', topk='small_topk', get='p2')
 TRACE_ROUTES['adaptive'] = 'small_retired'
@@ -40,6 +41,8 @@ TOPK_KERNELS = (KERNELS[0], 'v9_li_kernel_resident_topk_high', *KERNELS[1:])
 GET_BALANCE_FLAG = 2
 WINDOW_PROBE_OPTION_OFFSET = 224
 WINDOW_READY_LINE_BYTES = 128
+WINDOW_Q_OPTION_OFFSET = 232
+WINDOW_Q_SCRATCH_BYTES = 1280
 
 
 def selected_mode(mode, batch):
@@ -55,7 +58,9 @@ def cold_score_parts(mode, batch):
     mode = selected_mode(mode, batch)
     if mode in FULL32_MODES:
         return 32 // batch
-    return {'cold': 4, 'cold_w2': 4, 'cold_p8': 8, 'cold_p8_bulk': 8}.get(mode, 2)
+    if mode in WINDOW_Q_WORKERS or mode == 'cold':
+        return 4
+    return 8 if mode in ('cold_p8', 'cold_p8_bulk') else 2
 
 
 def bind(state, mode):
@@ -80,6 +85,8 @@ def bind(state, mode):
     symbol_mode = 'cold_full' if mode in FULL32_MODES else mode.removesuffix('_w2').removesuffix('_bulk')
     if retired:
         symbol_mode = 'cold_retired'
+    elif mode in WINDOW_Q_WORKERS:
+        symbol_mode = 'cold'
     if mode in PARTITIONED_MODES:
         choose = getattr(library, f'kvip_small_batch_{symbol_mode}_parts')
         choose.argtypes, choose.restype = [ctypes.c_void_p], ctypes.c_uint32
@@ -115,6 +122,16 @@ def bind(state, mode):
         value = np.asarray([option], dtype='<u8').view('u1')
         forward.workspace[WINDOW_PROBE_OPTION_OFFSET:WINDOW_PROBE_OPTION_OFFSET + 8].copy_(state.torch.from_numpy(value))
 
+    q_workers = WINDOW_Q_WORKERS.get(mode, 1)
+    if q_workers > 1:
+        forward.window_q_scratch = state.torch.zeros(
+            WINDOW_Q_SCRATCH_BYTES, dtype=state.torch.uint8, device=state.device)
+        address = forward.window_q_scratch.data_ptr()
+        if not address or address % WINDOW_READY_LINE_BYTES:
+            raise ValueError('The split-Q window requires aligned GM state')
+        value = np.asarray([address | q_workers], dtype='<u8').view('u1')
+        forward.workspace[WINDOW_Q_OPTION_OFFSET:WINDOW_Q_OPTION_OFFSET + 8].copy_(state.torch.from_numpy(value))
+
     if mode in PARTITIONED_MODES or mode == 'topk':
         launch = getattr(library, f'kvip_small_batch_{symbol_mode}_forward')
         launch.argtypes, launch.restype = [ctypes.c_void_p] * 4, ctypes.c_uint32
@@ -142,7 +159,7 @@ def trace_evidence(state, report):
         if np.any(logical < 0) or np.any(logical >= cold_history):
             raise ValueError(f'Request {b}: invalid logical source mapping')
         offsets = np.cumsum([0, *req['prefetch_by_window']])
-        if report.get('small_batch_mode') in ('cold_p8', 'cold_p8_bulk', 'windows', 'windows_early'):
+        if report.get('small_batch_mode') in WINDOW_Q_WORKERS.keys() | {'cold_p8', 'cold_p8_bulk', 'windows', 'windows_early'}:
             req['prefetch_tokens_in_submit_order_by_window'] = [
                 logical[a:z].tolist() for a, z in zip(offsets, offsets[1:])]
         req['prefetch_tokens_by_window'] = [sorted(logical[a:z].tolist()) for a, z in zip(offsets, offsets[1:])]
