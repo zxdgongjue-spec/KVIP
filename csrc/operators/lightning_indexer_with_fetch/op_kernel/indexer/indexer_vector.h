@@ -1,4 +1,8 @@
+#include "stage_trace.h"
 #include "prefetch.h"
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+#include "window_frontier.h"
+#endif
 #if KVIP_STREAMING_LI
 #include "pipeline_types.h"
 #include "staged_topk_classify.h"
@@ -35,6 +39,13 @@
 #if KVIP_URMA_WINDOW_LI
 #include "window_rank_pair.h"
 #endif
+#if KVIP_HOT_SCORE_PARTITION && KVIP_STREAMING_LI
+#include "resident_topk_high.h"
+#endif
+#endif
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+#include "../../../common/lifetch/dedicated_cold_schedule.h"
+#include "../../../common/lifetch/cold_score_partition.h"
 #endif
 
 namespace QLIKernel {
@@ -63,6 +74,72 @@ public:
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
     }
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    __aicore__ inline void BindPartitionedCold(GM_ADDR compute, uint32_t parts) {
+        coldParts_ = parts;
+        const uint32_t physical = blockId_ / 2;
+        const uint32_t part = physical % parts;
+        rotationCore_ = (physical / parts) * 2 + part / (parts / 2);
+        coldProgress_ = compute + kvip_cold_score::ScoreBytes(runtimeShape_.batch, runtimeShape_.history);
+        coldProgressGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(coldProgress_));
+    }
+
+    __aicore__ inline void BindDedicatedCold(GM_ADDR compute) {
+        dedicatedProgress_ = compute + kvip_cold_score::ScoreBytes(runtimeShape_.batch, runtimeShape_.history);
+        dedicatedProgressGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(dedicatedProgress_));
+    }
+
+    __aicore__ inline void SetDedicatedColdEpoch(uint32_t epoch) {
+        dedicatedEpoch_ = epoch;
+    }
+
+    __aicore__ inline void RunDynamicService(uint32_t row, uint32_t epoch, uint32_t half) {
+        dedicatedLane_ = row;
+        AllocEventID();
+        RotateFetch(epoch, half);
+        FreeEventID();
+    }
+
+    template <bool OwnWindow = false>
+    __aicore__ inline void RunDedicatedService(uint32_t lane, uint32_t half) {
+        dedicatedLane_ = lane;
+        KVIP_TRACE_BEGIN(eventInit, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+            Cold, LiEventsAcquire, 0, lane);
+        AllocEventID();
+        KVIP_TRACE_END(eventInit);
+        for (uint32_t epoch = 0; epoch < runtimeShape_.rounds; ++epoch) {
+            if (epoch) {
+                if constexpr (OwnWindow) WaitOwnWindow(lane, epoch, half);
+                else WaitDedicatedDriver(lane, epoch, half);
+            }
+            RotateFetch(epoch, half);
+        }
+        KVIP_TRACE_BEGIN(eventDrain, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+            Cold, LiEventsDrain, 0, lane);
+        FreeEventID();
+    }
+
+    __aicore__ inline void DrainColdPublication() {
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    }
+
+    __aicore__ inline void WaitPartitionedHalf(uint32_t batch, uint32_t part, uint32_t epoch, uint32_t half) {
+        KVIP_TRACE_BEGIN(partitionWaitScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+            Cold, ColdPartitionWait, epoch, kvip_trace::PipeDetail(batch, (blockId_ % 2) * 2, part));
+        DrainColdPublication();
+        const uint32_t beginQ = batch * 4 + (blockId_ % 2) * 2;
+        const uint32_t endPart = part + coldParts_ / 2;
+        for (uint32_t p = part + 1; p < endPart; ++p) {
+            const auto tile = kvip_cold_score::Split(runtimeShape_.history, runtimeShape_.resident, half,
+                epoch, p, coldParts_);
+            const uint32_t end = tile.end * kvip_cold_score::kTileTokens;
+            for (uint32_t query = beginQ; query < beginQ + 2; ++query) {
+                while (ReadColdCursor(query, p) < end) {}
+            }
+        }
+    }
+#endif
 #if KVIP_PARALLEL_TERMINAL
     __aicore__ inline LocalTensor<uint32_t> TerminalCompact() { return incrementalNew_.template ReinterpretCast<uint32_t>(); }
     __aicore__ inline LocalTensor<uint32_t> TerminalScratch() { return topkSharedTmpLocal_; }
@@ -106,23 +183,54 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
 #endif
     __aicore__ inline void RotateFetch(uint32_t epoch, uint32_t sequenceHalfWindow = 0) {
 #if !V9_UBMEM
-        AdvanceWindow(epoch,sequenceHalfWindow);
+        const uint32_t core = RotationCore();
+        const uint32_t serviceLane = ResolveServiceLane(core);
+#if KVIP_STAGE_TRACE
+        const uint64_t stageTrace = KVIP_TRACE_WORKSPACE(streamingWorkspace_);
+        KVIP_TRACE_BEGIN(serviceScope, stageTrace, Cold, ServiceBody, epoch, serviceLane);
+#endif
+#if KVIP_SERVICE_LOCAL_COUNTS
+        const bool stagedMetadata = AdvanceWindow(epoch, sequenceHalfWindow, serviceLane);
+        // The same lane owns this UB until Service returns. Keep the GM
+        // publication for later epochs and all existing ordering edges.
+        const __ubuf__ uint64_t* windowMetadata = stagedMetadata && sequenceHalfWindow
+            ? reinterpret_cast<const __ubuf__ uint64_t*>(incrementalMetadata_.GetPhyAddr()) : nullptr;
+#else
+        AdvanceWindow(epoch,sequenceHalfWindow,serviceLane);
+#endif
 #endif
         // Join this producer's hit publication. Other producers remain free.
         PipeBarrier<PIPE_ALL>();
 #if defined(V9_UBMEM) && V9_UBMEM
         rotating::Service(rotationContext_, epoch, blockId_ / 2, blockId_ % 2,
 #else
-        rotating::Service(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.splitQ,runtimeShape_.rounds,runtimeShape_.serviceAics,runtimeShape_.serviceLanes,runtimeShape_.tokenBytes,runtimeShape_.postThreads,runtimeShape_.postBank,runtimeShape_.batchedRows,runtimeShape_.scanTokens,rotationContext_, epoch, blockId_ / 2, blockId_ % 2,
+        rotating::Service(runtimeShape_.batch,runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,runtimeShape_.serviceLanes,runtimeShape_.tokenBytes,runtimeShape_.postThreads,runtimeShape_.postBank,runtimeShape_.batchedRows,runtimeShape_.scanTokens,rotationContext_, epoch, core, serviceLane,
 #endif
 #if !KVIP_STREAMING_LI
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow);
 #else
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow,
-            streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U));
+            streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U)
+#if !V9_UBMEM
+#if KVIP_SERVICE_LOCAL_COUNTS
+            , windowMetadata
+#else
+            , nullptr
+#endif
+#if KVIP_SERVICE_UB_CANDIDATES
+            , windowCandidatesActive_
+                ? reinterpret_cast<const __ubuf__ uint32_t*>(windowCandidates_.GetPhyAddr()) : nullptr
+#endif
+#endif
+#if KVIP_STAGE_TRACE && !V9_UBMEM
+            , stageTrace
+#endif
+        );
 #endif
     }
-    __aicore__ inline void LoadSequenceSplitThresholds(uint32_t batch) {
+    __aicore__ inline void LoadSequenceSplitThresholds(uint32_t batch, [[maybe_unused]] uint32_t epoch = 0) {
+        KVIP_TRACE_BEGIN(loadScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+            Cold, ColdThresholdRead, epoch, batch);
         constexpr uint32_t count = SIM_Q * 2048;
         constexpr uint32_t rowBytes = count * 6 + SIM_Q * 256;
         GlobalTensor<uint16_t> thresholds;
@@ -145,9 +253,13 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
     __aicore__ inline QLIVector(){};
     __aicore__ inline void ProcessVec1(const QLICommon::RunInfo &info, uint32_t progressShard = 0,
 #if !V9_UBMEM
-                                     bool publishShardEnd = false, bool scoreOnly = false);
+                                     bool publishShardEnd = false, bool scoreOnly = false KVIP_PIPE_PARAM_DEFAULT);
 #else
-                                     bool publishShardEnd = false);
+                                     bool publishShardEnd = false KVIP_PIPE_PARAM_DEFAULT);
+#endif
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    __aicore__ inline void ProcessPrecomputedVec1(const QLICommon::RunInfo &info,
+        uint32_t progressShard, bool publishShardEnd KVIP_PIPE_PARAM_DEFAULT);
 #endif
     __aicore__ inline void ProcessTopK(const QLICommon::RunInfo &info, uint32_t queryRow = SIM_Q);
     __aicore__ inline void SetPrefixStorage(GM_ADDR output) { prefixOutput_ = output; }
@@ -172,7 +284,11 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
                                               GlobalTensor<int32_t> blockTableGm);
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
     __aicore__ inline void AllocEventID();
-    __aicore__ inline void FreeEventID();
+    __aicore__ inline void FreeEventID(
+#if KVIP_STAGE_TRACE
+        uint64_t trace = 0, uint32_t traceKernel = 0
+#endif
+    );
 
 protected:
     GlobalTensor<SCORE_T> scoreGm;
@@ -200,6 +316,111 @@ protected:
     static constexpr uint32_t V_MTE2_EVENT3 = EVENT_ID5;
 
 private:
+    __aicore__ inline void PublishColdTile(const QLICommon::RunInfo &info, uint32_t query,
+        uint32_t queryCount, uint32_t progressShard, bool publishShardEnd);
+    __aicore__ inline uint32_t RotationCore() const {
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+        if (coldParts_) return rotationCore_;
+#endif
+        return blockId_ / 2;
+    }
+#if !V9_UBMEM
+    __aicore__ inline uint32_t ResolveServiceLane(uint32_t core) const {
+#if KVIP_HOT_SCORE_PARTITION
+        if (dedicatedLane_ != UINT32_MAX) return dedicatedLane_;
+#endif
+        return rotating::ServiceLane(runtimeShape_.batch, runtimeShape_.splitQ,
+            runtimeShape_.serviceAics, core, blockId_ % 2);
+    }
+#endif
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    __aicore__ inline uint32_t ReadDedicatedCursor(uint32_t query, uint32_t epoch, uint32_t fragment) const {
+        const auto offset = kvip_dedicated_cold::ProgressOffset(query, epoch, fragment);
+        auto cursor = reinterpret_cast<__gm__ volatile uint32_t*>(dedicatedProgress_) + offset;
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ uint32_t*>(cursor)),
+            kvip_dedicated_cold::kProgressWords * sizeof(uint32_t));
+        return *cursor;
+    }
+
+    __aicore__ inline uint64_t DedicatedColdReady(uint32_t query, uint32_t epoch, uint32_t half) const {
+        KVIP_TRACE_BEGIN(readyScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+            Cold, DedicatedReadySnapshot, epoch, query);
+        uint32_t ends[(kvip_dedicated_cold::kRounds - 1) * kvip_dedicated_cold::kFragments] = {};
+        for (uint32_t w = 1; w <= epoch; ++w) {
+            for (uint32_t fragment = 0; fragment < kvip_dedicated_cold::kFragments; ++fragment) {
+                ends[(w - 1) * kvip_dedicated_cold::kFragments + fragment] = ReadDedicatedCursor(query, w, fragment);
+            }
+        }
+        const uint32_t end0 = kvip_dedicated_cold::Prefix(runtimeShape_.history, runtimeShape_.resident, half, epoch, 0, ends);
+        const uint32_t end1 = kvip_dedicated_cold::Prefix(runtimeShape_.history, runtimeShape_.resident, half, epoch, 1, ends);
+        return uint64_t(end0) | (uint64_t(end1) << 32);
+    }
+
+    __aicore__ inline void WaitOwnWindow(uint32_t row, uint32_t epoch, uint32_t half) const {
+        KVIP_TRACE_BEGIN(scope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+            Cold, DedicatedDriverWait, epoch, row);
+        for (uint32_t fragment = 0; fragment < kvip_dedicated_cold::kFragments; ++fragment) {
+            const auto tiles = kvip_dedicated_cold::Fragment(runtimeShape_.history, runtimeShape_.resident,
+                half, epoch, fragment);
+            if (tiles.begin == tiles.end) continue;
+            const uint32_t end = tiles.end * kvip_dedicated_cold::kTileTokens;
+            for (uint32_t q = 0; q < SIM_Q; ++q) {
+                while (ReadDedicatedCursor(row * SIM_Q + q, epoch, fragment) < end) {}
+            }
+        }
+    }
+
+    __aicore__ inline void WaitDedicatedDriver(uint32_t lane, uint32_t epoch, uint32_t half) const {
+        // Preserve the native rotating driver's request, half and Q pair,
+        // even though the stable Service lane can act on a different request.
+        const uint32_t driver = rotating::ServiceCore(runtimeShape_.batch, runtimeShape_.splitQ,
+            runtimeShape_.serviceAics, epoch, lane / 2);
+        const uint32_t shard = driver % 2;
+        const uint32_t firstQuery = driver / 2 * 4 + (lane % 2) * 2;
+        const uint32_t endFragment = shard ? kvip_dedicated_cold::kFragments : 1;
+        KVIP_TRACE_BEGIN(driverScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+            Cold, DedicatedDriverWait, epoch, lane);
+        // The fragment ends are independent monotonic publications. The
+        // driver gate only needs this half, not the rest of the batch.
+        for (uint32_t fragment = shard; fragment < endFragment; ++fragment) {
+            const auto range = kvip_dedicated_cold::Fragment(runtimeShape_.history, runtimeShape_.resident,
+                half, epoch, fragment);
+            if (range.begin == range.end) continue;
+            const uint32_t limit = range.end * kvip_dedicated_cold::kTileTokens;
+            for (uint32_t query = firstQuery; query < firstQuery + 2; ++query) {
+                while (ReadDedicatedCursor(query, epoch, fragment) < limit) {}
+            }
+        }
+    }
+
+    __aicore__ inline uint32_t ReadColdCursor(uint32_t query, uint32_t part) const {
+        const uint64_t offset = kvip_cold_score::ProgressOffset(query, part, coldParts_);
+        auto cursor = reinterpret_cast<__gm__ volatile uint32_t*>(coldProgress_) + offset;
+        kvaf_device::CleanCacheLines(
+            reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ uint32_t*>(cursor)),
+            kvip_cold_score::kProgressBytes);
+        return *cursor;
+    }
+
+    __aicore__ inline uint64_t PartitionedColdReady(uint32_t query, uint32_t half) const {
+        uint32_t cursors[kvip_cold_score::kMaxParts];
+        for (uint32_t part = 0; part < coldParts_; ++part) cursors[part] = ReadColdCursor(query, part);
+        const uint32_t lastEpoch = runtimeShape_.rounds - 1;
+        const uint32_t end0 = kvip_cold_score::Prefix(cursors, runtimeShape_.history, runtimeShape_.resident,
+            half, lastEpoch, 0, coldParts_);
+        const uint32_t end1 = kvip_cold_score::Prefix(cursors, runtimeShape_.history, runtimeShape_.resident,
+            half, lastEpoch, 1, coldParts_);
+        return uint64_t(end0) | (uint64_t(end1) << 32);
+    }
+    GM_ADDR coldProgress_ = nullptr;
+    uint32_t coldParts_ = 0;
+    uint32_t rotationCore_ = 0;
+    GlobalTensor<uint32_t> coldProgressGm_;
+    GM_ADDR dedicatedProgress_ = nullptr;
+    uint32_t dedicatedLane_ = UINT32_MAX;
+    uint32_t dedicatedEpoch_ = 0;
+    GlobalTensor<uint32_t> dedicatedProgressGm_;
+#endif
     GM_ADDR rotationContext_ = nullptr;
 #if KVIP_STREAMING_LI
     GM_ADDR streamingWorkspace_ = nullptr;
@@ -262,8 +483,13 @@ private:
 #else
     __aicore__ inline void SaveResident(uint32_t query, uint32_t scoreRow, bool publishProgress) {
 #endif
+#if KVIP_STAGE_TRACE
+        const uint64_t residentTrace = KVIP_TRACE_WORKSPACE(streamingWorkspace_);
+        const uint32_t residentDetail = kvip_trace::PipeDetail(query / SIM_Q, query % SIM_Q);
+#endif
         auto src = (__local_mem__ uint16_t *)scoreOutLocal_.GetPhyAddr();
         auto dst = (__local_mem__ uint16_t *)prefixThreshold_.GetPhyAddr() + (query % 2) * 128;
+        KVIP_TRACE_BEGIN(reduceScope, residentTrace, Threshold, ResidentMinVf, 0, residentDetail);
         __VEC_SCOPE__ {
             MicroAPI::RegTensor<uint16_t> minimum, values, reduced;
             auto mask = MicroAPI::CreateMask<uint16_t, MicroAPI::MaskPattern::ALL>();
@@ -277,6 +503,8 @@ private:
         }
         SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
+        KVIP_TRACE_END(reduceScope);
+        KVIP_TRACE_BEGIN(prefixScope, residentTrace, Threshold, ThresholdOutputMte3, 0, residentDetail);
         constexpr uint32_t count = SIM_Q * 2048;
         constexpr uint32_t rowBytes = count * 6 + SIM_Q * 256;
         uint32_t batch = query / SIM_Q, q = query % SIM_Q;
@@ -289,6 +517,7 @@ private:
         DataCopy(indices[q * 2048], indicesOutLocal_.template ReinterpretCast<int32_t>(), 2048);
         DataCopy(thresholds[q * 128], prefixThreshold_[(query % 2) * 128], 128);
         PipeBarrier<PIPE_ALL>();
+        KVIP_TRACE_END(prefixScope);
         auto context = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
         if (context->lruSlots) {
             // TopK scratch is dead after the resident result is saved. Reuse
@@ -303,8 +532,11 @@ private:
             uint32_t validEnd = context->queryEnds ?
                 reinterpret_cast<__gm__ uint32_t*>(context->queryEnds)[query] : runtimeShape_.history;
             if (validEnd > runtimeShape_.resident) validEnd = runtimeShape_.resident;
+            KVIP_TRACE_BEGIN(victimScope, residentTrace, Threshold, ResidentVictimIdsMte2, 0, residentDetail);
             DataCopy(reservedChunk.template ReinterpretCast<uint32_t>(), victims, 2048);
             SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            KVIP_TRACE_END(victimScope);
+            KVIP_TRACE_BEGIN(classifyScope, residentTrace, Threshold, ResidentVictimClassifyVf, 0, residentDetail);
 #if !V9_UBMEM
             // One SIMT invocation covers both paths; zero selects GM only.
             Simt::VF_CALL<rotating::GatherVictimScoresUb>(Simt::Dim3{256,1,1},
@@ -328,6 +560,8 @@ private:
                 reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[(query % 2) * 128].GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint16_t*>(hitChunk.GetPhyAddr()), validEnd);
             SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            KVIP_TRACE_END(classifyScope);
+            KVIP_TRACE_BEGIN(hitScope, residentTrace, Threshold, ResidentHitBitmapMte3, 0, residentDetail);
             DataCopyExtParams copy;
             copy.blockCount = 16; copy.blockLen = 32;
             copy.srcStride = 7; copy.dstStride = 0;
@@ -336,6 +570,7 @@ private:
         }
 #if !V9_UBMEM
         // Private incremental TopK state, shared by all prefetch windows.
+        KVIP_TRACE_BEGIN(windowScope, residentTrace, Threshold, ResidentWindowSeed, 0, residentDetail);
         auto windowMeta=reinterpret_cast<__gm__ uint64_t*>(rotating::TopKHeader(context))+query*16;
         windowMeta[0]=reinterpret_cast<uint64_t>(scoreGm.GetPhyAddr())+uint64_t(scoreRow)*runtimeShape_.history*2;
         windowMeta[1]=uint64_t(runtimeShape_.resident)|(uint64_t(runtimeShape_.resident)<<32);windowMeta[2]=0;windowMeta[3]=0;
@@ -347,6 +582,7 @@ private:
         SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
         DataCopy(windowScores,scoreOutLocal_,2048);DataCopy(windowIds,indicesOutLocal_,2048);
         SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
+        KVIP_TRACE_END(windowScope);
 #endif
         if (publishProgress) {
             SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
@@ -488,6 +724,15 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe, bool topkOnly)
         uint32_t used=2*CeilDiv(constInfo_.mBaseSize,2)*s2BaseSize_*sizeof(QK_T)+1536+6*CeilDiv(s1BaseSize_,2)*UB_BANK_DEPTH_STRIDE+2*s2BaseSize_*QLICommon::KScaleTiles*sizeof(SCALE_T)+2*CeilDiv(s1BaseSize_,2)*s2BaseSize_*sizeof(SCORE_T)+(topkCountAlign256_+trunkLen_)*sizeof(SCORE_T)+(topkCountAlign256_+64)*4+topkCountAlign256_*sizeof(SCORE_T)+topkSharedTmpSize+trunkLen_*2+8192+1024;
         incrementalPipeline_=used+kIncrementalInputBytes<=223232;
         if(incrementalPipeline_){pipe->InitBuffer(incrementalInputBuf_,kIncrementalInputBytes);incrementalInput_=incrementalInputBuf_.Get<uint16_t>();}
+#if KVIP_SERVICE_UB_CANDIDATES
+        constexpr uint32_t candidateBytes = 4 * rotating::kWindowCandidatePitch * sizeof(uint32_t);
+        if (used + (incrementalPipeline_ ? kIncrementalInputBytes : 0) +
+                candidateBytes <= 223232) {
+            pipe->InitBuffer(windowCandidatesBuf_, candidateBytes);
+            windowCandidates_ = windowCandidatesBuf_.Get<uint32_t>();
+            windowCandidatesAllocated_ = true;
+        }
+#endif
     }
 #endif
     if (!topkOnly) Duplicate(kScaleUB_, static_cast<SCALE_T>(0), 2 * s2BaseSize_ * QLICommon::KScaleTiles);
@@ -555,12 +800,18 @@ __aicore__ inline void QLIVector<QLIT>::AllocEventID()
 }
 
 template <typename QLIT>
-__aicore__ inline void QLIVector<QLIT>::FreeEventID()
+__aicore__ inline void QLIVector<QLIT>::FreeEventID(
+#if KVIP_STAGE_TRACE
+    uint64_t trace, uint32_t traceKernel
+#endif
+)
 {
     WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + 0);
     WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + 1);
+    KVIP_TRACE_RECORD(scoreDrain, trace, traceKernel, kvip_trace::LiScoreOutputDrain, 0, 0);
     WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + 0);
     WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + 1);
+    KVIP_TRACE_END(scoreDrain);
     WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_QSCALE + 0);
     WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_QSCALE + 1);
 
@@ -650,9 +901,9 @@ __aicore__ inline void QLIVector<QLIT>::GetKeyScale(const QLICommon::RunInfo &ru
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &info, uint32_t progressShard,
 #if !V9_UBMEM
-                                                   bool publishShardEnd, bool scoreOnly)
+                                                   bool publishShardEnd, bool scoreOnly KVIP_PIPE_PARAM)
 #else
-                                                   bool publishShardEnd)
+                                                   bool publishShardEnd KVIP_PIPE_PARAM)
 #endif
 {
     auto pingpong = (info.loop % 2);
@@ -675,6 +926,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 #else
     if (info.isFirstS2InnerLoop) {
 #endif
+        KVIP_PIPE_SAMPLE(queryScope, pipeSample, AivQueryMte2);
         WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_QSCALE + qScalepingpong);
         //weightsGm --> weightUB_
         int64_t weightGmOffset = info.tensorWeightsOffset + curAivS1Idx * kHeadNum_ * gSize_;
@@ -701,6 +953,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     }
 
     if ((info.s2Idx - info.s2Start) % QLICommon::KScaleTiles == 0) {
+        KVIP_PIPE_SAMPLE(keyScope, pipeSample, AivKeyScaleMte2);
         WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + kScalepingpong);
         uint32_t getLen = QLICommon::KScaleTiles * s2BaseSize_ > (info.validS2Len - info.s2Idx * s2BaseSize_)
                                            ? info.validS2Len - info.s2Idx * s2BaseSize_
@@ -710,10 +963,14 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         SetFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_KSCALE + kScalepingpong);
         WaitFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_KSCALE + kScalepingpong);
     }
+    KVIP_PIPE_SAMPLE(bankScope, pipeSample, AivBankWait);
     WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+    KVIP_TRACE_END(bankScope);
 
     //CV同步
+    KVIP_PIPE_SAMPLE(cubeScope, pipeSample, AivCubeWait);
     CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_CV_EVENT + info.loop % 2);   //V核等C核计算完mm1，mm1Res已搬运到UB
+    KVIP_TRACE_END(cubeScope);
     LocalTensor<SCORE_T> outBase;
     if (std::is_same_v<SCORE_T, uint16_t>) {
         outBase = vec1OutUB_[pingpong * (UB_BANK_STRIDE / sizeof(uint16_t))];
@@ -727,6 +984,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     auto qkBase = resMm1UB_[pingpong * (UB_BANK_STRIDE / sizeof(float))];
     auto qkVLstride = (UB_BANK_DEPTH_STRIDE / sizeof(float)) / 2 * constInfo_.mBaseSize;
 
+    KVIP_PIPE_SAMPLE(vfScope, pipeSample, AivScoreVf);
 #if !V9_UBMEM
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {
 #else
@@ -748,6 +1006,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                                         qScaleBase, UB_BANK_DEPTH_STRIDE / sizeof(SCALE_T),
                                         gSize_, curAivS1ProcNum);
     }
+    KVIP_TRACE_END(vfScope);
 #if !V9_UBMEM
     if (info.LoadQuery()) {
 #else
@@ -773,32 +1032,38 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     copyOutParams.blockLen = s2BaseSize_ * sizeof(SCORE_T);
     copyOutParams.srcStride = (UB_BANK_DEPTH_STRIDE - copyOutParams.blockLen) / 32;
     copyOutParams.dstStride = (QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_) - s2BaseSize_) * sizeof(SCORE_T);
+    KVIP_PIPE_SAMPLE(storeScope, pipeSample, AivScoreMte3);
     DataCopyPad(scoreGm[vec1OutGmOffset], outBase, copyOutParams);
-#if SIM_CAPTURE_HITS
 #if !V9_UBMEM
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {
 #else
     if (curS2Idx >= runtimeShape_.resident) {
 #endif
-        constexpr uint32_t prefixBytes = SIM_Q * 2048 * 6 + SIM_Q * 256;
-        GlobalTensor<uint8_t> outputHits;
-        outputHits.SetGlobalBuffer((__gm__ uint8_t *)(prefixOutput_ + runtimeShape_.batch * prefixBytes));
-        DataCopyExtParams hitCopy;
-        hitCopy.blockCount = curAivS1ProcNum;
-        hitCopy.blockLen = 32;
-        hitCopy.srcStride = 7; // classifyUB query stride is 256 bytes.
-        hitCopy.dstStride = runtimeShape_.history / 4 - 32;
-        DataCopyPad(outputHits[(info.bIdx * SIM_Q + curAivS1Idx) * (runtimeShape_.history / 4) + curS2Idx / 4],
-                    classifyUB_[pingpong * 256].template ReinterpretCast<uint8_t>(), hitCopy);
+        PublishColdTile(info, curAivS1Idx, curAivS1ProcNum, progressShard, publishShardEnd);
     }
-#endif
+    SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+    KVIP_TRACE_END(storeScope);
+    CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB
+}
 
-#if !V9_UBMEM
-    if (!scoreOnly && curS2Idx >= runtimeShape_.resident && (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
-#else
-    if (curS2Idx >= runtimeShape_.resident && (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
+template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::PublishColdTile(const QLICommon::RunInfo &info, uint32_t query,
+    uint32_t queryCount, uint32_t progressShard, bool publishShardEnd) {
+    const uint32_t queryRow = info.bIdx * SIM_Q + query;
+#if SIM_CAPTURE_HITS
+    constexpr uint32_t prefixBytes = SIM_Q * 2048 * 6 + SIM_Q * 256;
+    GlobalTensor<uint8_t> outputHits;
+    outputHits.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(prefixOutput_ + runtimeShape_.batch * prefixBytes));
+    DataCopyExtParams hitCopy;
+    hitCopy.blockCount = queryCount;
+    hitCopy.blockLen = 32;
+    hitCopy.srcStride = 7; // classifyUB query stride is 256 bytes.
+    hitCopy.dstStride = runtimeShape_.history / 4 - 32;
+    DataCopyPad(outputHits[queryRow * (runtimeShape_.history / 4) + info.s2Idx * s2BaseSize_ / 4],
+        classifyUB_[(info.loop % 2) * 256].template ReinterpretCast<uint8_t>(), hitCopy);
 #endif
-        rotating::IsTrigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,info.s2Idx + 1))) {
+    if (publishShardEnd || (info.s2Idx + 1) % ROTATION_PUBLISH_TILES == 0 || info.isLastS2InnerLoop ||
+        rotating::IsTrigger(runtimeShape_.history, runtimeShape_.resident, runtimeShape_.rounds, info.s2Idx + 1)) {
         const uint32_t tableBase = (info.s2Idx / 64) * 64;
         if (tableBase != rotationProgressBase_) {
             SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
@@ -809,16 +1074,80 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
             rotationProgressBase_ = tableBase;
         }
         DataCopyExtParams publish;
-        publish.blockCount = curAivS1ProcNum; // Q2: one query/AIV; Q4: two
+        publish.blockCount = queryCount;
         publish.blockLen = 32;
         publish.srcStride = 0;
-        publish.dstStride = 96;
-        DataCopyPad(rotationProgressGm_[(info.bIdx * SIM_Q + curAivS1Idx) * 32 + progressShard * 16],
-            rotationProgress_[(info.s2Idx % 64) * 16], publish);
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+        if (dedicatedProgress_) {
+            constexpr uint32_t queryStride = (kvip_dedicated_cold::kRounds - 1) *
+                kvip_dedicated_cold::kFragments * kvip_dedicated_cold::kProgressWords * sizeof(uint32_t);
+            publish.dstStride = queryStride - publish.blockLen;
+            const uint32_t offset = kvip_dedicated_cold::ProgressOffset(queryRow, dedicatedEpoch_, progressShard);
+            // The two UB banks can post to the same GM cursor. Order those
+            // writes and make this tile's scores and predicates visible
+            // before a separate Service lane can observe its cursor.
+            PipeBarrier<PIPE_MTE3>();
+            DataCopyPad(dedicatedProgressGm_[offset], rotationProgress_[(info.s2Idx % 64) * 16], publish);
+        } else if (coldParts_) {
+            // MTE3 has already queued this tile's predicates.
+            // Each physical part has an exclusive cache line per query.
+            publish.dstStride = coldParts_ * kvip_cold_score::kProgressBytes - publish.blockLen;
+            DataCopyPad(coldProgressGm_[kvip_cold_score::ProgressOffset(queryRow, progressShard, coldParts_)],
+                rotationProgress_[(info.s2Idx % 64) * 16], publish);
+        } else
+#endif
+        {
+            publish.dstStride = 96;
+            DataCopyPad(rotationProgressGm_[queryRow * 32 + progressShard * 16],
+                rotationProgress_[(info.s2Idx % 64) * 16], publish);
+        }
     }
-    SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
-    CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB
 }
+
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::ProcessPrecomputedVec1(const QLICommon::RunInfo &info,
+    uint32_t progressShard, bool publishShardEnd KVIP_PIPE_PARAM) {
+    const uint32_t pingpong = info.loop % 2;
+    const uint32_t query = (blockId_ % 2) * 2;
+    auto scoresLocal = vec1OutUB_[pingpong * (UB_BANK_STRIDE / sizeof(uint16_t))];
+    KVIP_PIPE_SAMPLE(bankScope, pipeSample, ColdT2BankWait);
+    WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+    // MTE3_V orders the vector pipe. The V_MTE2 handoff makes that
+    // wait and the preceding vector reads visible before MTE2 reuses UB.
+    SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+    WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+    KVIP_TRACE_END(bankScope);
+    const uint32_t scoreBytes = s2BaseSize_ * sizeof(SCORE_T);
+    DataCopyExtParams copy{2, scoreBytes, (runtimeShape_.history - s2BaseSize_) * uint32_t(sizeof(SCORE_T)),
+        (UB_BANK_DEPTH_STRIDE - scoreBytes) / 32, 0};
+    DataCopyPadExtParams<SCORE_T> pad{false, 0, 0, 0};
+    KVIP_PIPE_SAMPLE(loadScope, pipeSample, ColdT2ScoreMte2);
+    DataCopyPad(scoresLocal, scoreGm[query * runtimeShape_.history + info.s2Idx * s2BaseSize_], copy, pad);
+    SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    KVIP_TRACE_END(loadScope);
+    auto scores = reinterpret_cast<__ubuf__ uint16_t*>(scoresLocal.GetPhyAddr());
+    auto threshold = reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_.GetPhyAddr());
+    auto hits = reinterpret_cast<__ubuf__ uint16_t*>(classifyUB_.GetPhyAddr()) + pingpong * 256;
+    KVIP_PIPE_SAMPLE(classifyScope, pipeSample, ColdT2PredicateVf);
+    __VEC_SCOPE__ {
+        MicroAPI::RegTensor<uint16_t> values;
+        auto all = MicroAPI::CreateMask<uint16_t, MicroAPI::MaskPattern::ALL>();
+        for (uint16_t q = 0; q < 2; ++q) {
+            MicroAPI::LoadAlign(values, scores + q * (UB_BANK_DEPTH_STRIDE / sizeof(uint16_t)));
+            vector1::ClassifyScore(values, threshold + q * 128, hits + q * 128, all);
+        }
+    }
+    KVIP_TRACE_END(classifyScope);
+    KVIP_PIPE_SAMPLE(publishScope, pipeSample, ColdT2PublishMte3);
+    SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
+    WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
+    PublishColdTile(info, query, 2, progressShard, publishShardEnd);
+    SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+    KVIP_TRACE_END(publishScope);
+}
+#endif
 
 #if KVIP_STREAMING_LI
 template <typename QLIT>
@@ -1045,6 +1374,10 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
         streamingPrefetched_ = false;
 #endif
 
+#if KVIP_STAGE_TRACE
+        const uint64_t residentTrace = prefixActive_ ? KVIP_TRACE_WORKSPACE(streamingWorkspace_) : 0;
+        const uint32_t residentDetail = kvip_trace::PipeDetail(info.bIdx, rowIdx);
+#endif
         SCORE_T zero = 0;
         int32_t neg = -1;
         if (constInfo_.attenMaskFlag) {
@@ -1109,9 +1442,11 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
                 WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
                 copyInParams.blockLen = validS2Len * sizeof(SCORE_T); // byte
                 AscendC::DataCopyPadExtParams<SCORE_T> padParams{true, 0, 0, 0};
+                KVIP_TRACE_BEGIN(hotInputScope, residentTrace, Threshold, ThresholdInputMte2, 0, residentDetail);
                 AscendC::DataCopyPad(mrgValueLocal_, scoreGm[vecOffset * QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_)], copyInParams, padParams);
                 SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
                 WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+                KVIP_TRACE_END(hotInputScope);
 #if !V9_UBMEM && KVIP_STREAMING_LI
                 kvip_recent_index::Range joinedRecent{0, 0};
                 // The TopK input and scratch already reserve resident + K
@@ -1148,7 +1483,27 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
 #if KVIP_STREAMING_LI
                 BeginFinalMetadata(streamingQuery);
 #endif
-                topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, validS2LenAlign, 0, 1, prefixActive_);
+                KVIP_TRACE_BEGIN(hotTopkScope, residentTrace, Threshold, ThresholdTopKVf, 0, residentDetail);
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM && KVIP_STREAMING_LI
+                bool usedShardedHistogram = false;
+                if constexpr (std::is_same_v<SCORE_T, uint16_t>) {
+                    if (prefixActive_ && streamingTopkOnly_ && !recentMerged &&
+                        (runtimeShape_.batch == 1 || runtimeShape_.batch == 8) &&
+                        runtimeShape_.history == kvip_resident_topk::kHistory &&
+                        runtimeShape_.indexHeads == 32 && runtimeShape_.resident == kvip_resident_topk::kResident &&
+                        validS2Len == kvip_resident_topk::kResident && topkCount_ == kvip_resident_topk::kTopK) {
+                        const auto table = kvip_resident_topk::HighTable(streamingWorkspace_);
+                        if (table) {
+                            kvip_resident_topk::Finish(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_,
+                                topkSharedTmpLocal_, table, streamingQuery);
+                            usedShardedHistogram = true;
+                        }
+                    }
+                }
+                if (!usedShardedHistogram)
+#endif
+                    topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, validS2LenAlign, 0, 1, prefixActive_);
+                KVIP_TRACE_END(hotTopkScope);
 #if !V9_UBMEM && KVIP_STREAMING_LI
                 if (recentMerged) {
                     SetFlag<HardEvent::V_S>(EVENT_ID0); WaitFlag<HardEvent::V_S>(EVENT_ID0);

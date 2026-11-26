@@ -244,9 +244,14 @@ def run_config(path, shared_pool=None):
     config.kvaf_root = Path(config.kvaf_root).resolve()
     config.output = path.parent
     use_pool = config.mode in ('bench', 'diagnose')
+    instruction_replay = getattr(config, 'msprof_instruction_replay', False)
+    if instruction_replay and not (use_pool and config.input == 'synthetic'):
+        raise ValueError('Instruction collection requires the synthetic benchmark worker')
     if use_pool and config.input == 'synthetic' and shared_pool is None:
         pool = BenchPool(config)
         misses = config.miss_percent if isinstance(config.miss_percent, list) else [config.miss_percent]
+        if instruction_replay and (len(misses) != 1 or len(config.batches) != 1):
+            raise ValueError('Instruction collection requires one miss rate and one batch size')
         failed = 0
         try:
             for miss in misses:
@@ -412,8 +417,11 @@ def dispatch(config):
 
 def progress(run, stage):
     (run / "stage.log").write_text(stage + "\n")
-    if run.name.startswith('miss') and (run.parent / 'config.json').is_file():
-        (run.parent / 'stage.log').write_text(f'{run.name}: {stage}\n')
+    case = run if run.name.startswith('case-b') else None
+    miss_run = case.parent if case is not None else run
+    if miss_run.name.startswith('miss') and (miss_run.parent / 'config.json').is_file():
+        detail = f'{case.name}: {stage}' if case is not None else stage
+        (miss_run.parent / 'stage.log').write_text(f'{miss_run.name}: {detail}\n')
     print(stage, flush=True)
 
 
@@ -3258,7 +3266,8 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None):
+                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024,
+                 prefetch_window_limit=None, service_aics=0, lease=None):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3289,7 +3298,7 @@ class FusedReplayState:
             if not ubmem:
                 self.workspace.allocate_rotation(
                     torch, batch=self.batch, history=self.history, resident=self.resident,
-                    aics=aics, windows=windows, status_bytes=self.lease.sizes['status'])
+                    aics=aics, windows=windows, status_bytes=self.lease.sizes['status'], service_aics=service_aics)
             binding = dict(
                 query_ends=self.workspace.inputs.query_ends.view(self.batch, 4),
                 hot_valid=self.storage.hot_valid, row_owners=self.workspace.inputs.row_owners,
@@ -3310,7 +3319,7 @@ class FusedReplayState:
                     torch, library, self.workspace.arguments(self.storage), owner,
                     batch=self.batch, history=self.history, resident=self.resident,
                     intermediate_fetches=windows, prefetch_limit=prefetch_tokens,
-                    prefetch_rank_start=prefetch_rank_start,
+                    prefetch_rank_start=prefetch_rank_start, window_limit=prefetch_window_limit, service_aics=service_aics,
                     aic_count=aics, token_bytes=self.token_bytes, **binding)
             update_type = UbmemIndexUpdate if ubmem else DirectIndexUpdate
             self.update = update_type(
@@ -3703,6 +3712,13 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
     graph = torch.npu.NPUGraph()
     capture = torch.npu.Stream()
     checks = CorrectnessRecorder()
+    handoff = getattr(config, 'mr25_handoff', None)
+    handoff_samples, handoff_counts = [], []
+    frontier_mode = getattr(config, 'mr28_cold_frontier_mode', 0)
+    if frontier_mode:
+        import cold_frontier
+
+        frontier_invocations, frontier_issues = [], []
     pending = False
     def replay():
         nonlocal pending
@@ -3732,6 +3748,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
         pending = False
     resources = None
     try:
+        progress(directory.parent, 'REPLAY resetting graph inputs')
         for state in states:
             state.reset()
             if fused:
@@ -3742,6 +3759,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
         # capture nor measurement inherits a warmed cache from this setup.
         initial = next(iter(sequence))
         for i, state in enumerate(states):
+            progress(directory.parent, f'REPLAY pre-capture eager input {i + 1}/{len(states)}')
             pending = True
             state.forward()
             stream.synchronize()
@@ -3756,6 +3774,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             for state in states:
                 state.forward()
 
+        progress(directory.parent, 'REPLAY graph capture and capture-stream completion')
         with ExitStack() as scopes:
             pending = True
             if fused:
@@ -3782,6 +3801,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 for state in states:
                     state.prepare(inputs)
                 stream.synchronize()
+                progress(directory.parent, f'REPLAY graph warmup {warmup + 1}/{config.warmup}')
                 replay()
                 stream.synchronize()
                 validate_all(inputs, f'warmup{warmup}')
@@ -3796,11 +3816,40 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                     initial = algorithm_before(state.rotating)
                     initial['logical_ids'] = state.input_layout.copy()
                     before.append(initial)
+                if frontier_mode:
+                    cold_frontier.prepare_capture(state, frontier_mode)
             stream.synchronize()
             folder = directory / 'diagnose' / f'round-{inputs.source_round}'
+            progress(directory.parent, f'REPLAY profiled graph replay round {inputs.source_round}')
             measured = profile_graph_batch(torch, TrackedGraph(), calls=len(states), folder=folder,
                                            serial=not fused, transport=config.transport, stream=stream)
+            progress(directory.parent, f'REPLAY profiled graph completed round {inputs.source_round}; checking outputs')
             validate_all(inputs, 'measured')
+            if handoff:
+                from terminal_handoff import request_counts, terminal_stages
+
+                checked_kernels = (
+                    getattr(config, 'mr28_p2_w1_experiment', False)
+                    or getattr(config, 'mr28_cold_gm_experiment', False)
+                    or getattr(config, 'small_batch_mode', None) is not None
+                )
+                handoff_samples.extend(terminal_stages(
+                    measured, dynamic=getattr(config, 'mr28_dedicated_service', None) == 'dynamic',
+                    kernel_route=handoff if checked_kernels else None))
+                for index, state in enumerate(states):
+                    rotating = state.rotating
+                    rows = rotating.rows.cpu().numpy()
+                    records = request_counts(rows, rotating.final_posts.cpu().numpy(),
+                                             rotating.rounds, config.prefetch_tokens)
+                    handoff_counts.extend(dict(source_round=inputs.source_round, invocation=index, **record)
+                                          for record in records)
+                    if frontier_mode:
+                        try:
+                            frontier_invocations.append(cold_frontier.read_invocation(
+                                state, frontier_mode, inputs.source_round, index, rows, records))
+                        except ValueError as error:
+                            frontier_issues.append(dict(source_round=inputs.source_round, invocation=index,
+                                                        reason=str(error)))
             rounds[inputs.source_round] = measured['timing']
             samples = []
             for i, item in enumerate(measured['samples']):
@@ -3845,9 +3894,14 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 for i, state in enumerate(states):
                     sample = dict(round=i, source_round=inputs.source_round,
                                   streaming_cycles=state.forward.diagnostic_cycles())
+                    if getattr(config, 'mr28_cold_gm_experiment', False) and handoff != 'p2':
+                        from terminal_handoff import cold_gm_timeline
+
+                        sample['cold_gm_timeline'] = cold_gm_timeline(state, handoff, clock_mhz)
                     if getattr(state.forward, 'terminal', None) is not None:
                         sample['algorithm'] = algorithm_after(state.rotating, detail_before[i],
-                            admissions=state.forward.events_src.cpu().numpy())
+                            admissions=state.forward.events_src.cpu().numpy(),
+                            audit_posts=hasattr(config, 'service_post_chunk'))
                     if hasattr(state.rotating, 'rank_progress'):
                         records = state.rotating.rank_progress.cpu().tolist()
                         bounds = state.rotating.query_ends.cpu().tolist()
@@ -3900,11 +3954,20 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                        inter_kernel_gap_mean_us=sum(t['inter_kernel_gap_mean_us'] for t in rounds.values())/len(rounds),
                        overlap_mean_us=sum(t['overlap_mean_us'] for t in rounds.values())/len(rounds),
                        outside_invocations_mean_us=sum(t['outside_invocations_mean_us'] for t in rounds.values())/len(rounds))
-        return dict(rounds=rounds, all_rounds=overall, correctness=checks.status,
-                    failures=checks.failures, sequence_graph_sum=dict(
-                        mean_us=sum(t['mean_us'] for t in rounds.values()), samples=1))
+        result = dict(rounds=rounds, all_rounds=overall, correctness=checks.status,
+                      failures=checks.failures, sequence_graph_sum=dict(
+                          mean_us=sum(t['mean_us'] for t in rounds.values()), samples=1))
+        if handoff:
+            result.update(handoff_stage_samples=handoff_samples, pipeline_counts=handoff_counts)
+        if frontier_mode:
+            result['cold_frontier'] = dict(mode=frontier_mode, invocations=frontier_invocations, issues=frontier_issues)
+        return result
     except BaseException as error:
         if pending:
+            # Quarantine exits without unwinding. Preserve the full device
+            # diagnostic before the one-line transport status truncates it.
+            with contextlib.suppress(OSError):
+                (directory / 'graph_failure.log').write_text(traceback.format_exc())
             NativeFetchSession.quarantine('batched_replay_completion_uncertain', error)
         raise
     finally:
@@ -3930,14 +3993,85 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
     directory.mkdir(parents=True, exist_ok=True)
     initial = next(iter(sequence))
     build = config.kvaf_root / 'build-npu'
+    handoff = getattr(config, 'mr25_handoff', None)
+    hot_partition = getattr(config, 'mr25_hot_partition', None)
+    cold_partition = getattr(config, 'mr25_cold_partition', None)
+    unified_score = getattr(config, 'mr28_unified_score', None)
+    dedicated_service = getattr(config, 'mr28_dedicated_service', None)
+    p2_w1_experiment = getattr(config, 'mr28_p2_w1_experiment', False)
+    prefetch_trial = handoff in ('baseline', 'ub', 'batch') and hasattr(config, 'service_post_chunk')
+    ub_candidates = getattr(config, 'service_ub_candidates', False)
+    post_chunk = getattr(config, 'service_post_chunk', 0)
+    frontier_mode = getattr(config, 'mr28_cold_frontier_mode', 0)
+    if frontier_mode:
+        import cold_frontier
+
+        cold_frontier.check_config(config, sequence, handoff)
+
+    baseline_trace = getattr(config, 'msprof_baseline', False)
+    instruction_replay = getattr(config, 'msprof_instruction_replay', False)
+    profile_replay = baseline_trace or instruction_replay
+    msprof_output = getattr(config, 'msprof_output', None)
+    cold_route = getattr(config, 'msprof_cold_route', None)
+    small_mode = getattr(config, 'small_batch_mode', None)
+    if small_mode is not None:
+        import small_batch
+
+        if not fused or config.transport != 'urma' or config.mode != 'bench' or config.input != 'synthetic':
+            raise ValueError('Small batch trials require the fused synthetic URMA benchmark')
+    dedicated_routes = ('dedicated', 'static_ready', 'dynamic')
+    ready_routes = ('static_ready', 'dynamic')
+    partition_trial = hot_partition is not None or cold_partition is not None
+    score_trial = partition_trial or unified_score is not None or dedicated_service is not None
+    if score_trial and not (fused and handoff and config.transport == 'urma'
+                            and config.input == 'synthetic'):
+        raise ValueError('The Score trial uses the dense synthetic URMA Terminal comparison')
+    if sum((partition_trial, unified_score is not None, dedicated_service is not None)) > 1:
+        raise ValueError('Windowed partition, unified Score and dedicated Service are separate trials')
+    profile_windows = (2, 3, 4) if baseline_trace and cold_route is None else (4,)
+    if profile_replay and (not fused or handoff or score_trial or config.transport != 'urma'
+                          or config.input != 'synthetic' or config.mode != 'bench'
+                          or config.iterations != 1 or len(config.batches) != 1
+                          or config.intermediate_fetches not in profile_windows or config.prefetch_tokens <= 0):
+        raise ValueError(f'Profiling requires one synthetic URMA case with windows in {profile_windows} and prefetch enabled')
+    if baseline_trace and (not msprof_output or instruction_replay):
+        raise ValueError('Baseline stage trace requires an exclusive profile output')
+    if cold_route is not None:
+        if not baseline_trace or cold_route not in ('p2', 'cold_p4', 'full_p2', 'full_uniform', *dedicated_routes):
+            raise ValueError('Experimental profiling requires a marked fusion replay')
+        expected_batch = 16 if cold_route in dedicated_routes else 8
+        if (tuple(config.batches) != (expected_batch,) or config.history != 131072 or config.queries != 4
+                or config.resident != 16384 or config.index_heads != 32
+                or (cold_route != 'dedicated' and config.miss_percent != 10) or config.prefetch_tokens != 512
+                or config.prefetch_rank_start != 1024 or type(config.msprof_local_counts) is not bool
+                or (cold_route in ready_routes and config.msprof_local_counts)
+                or not config.msprof_build_dir):
+            raise ValueError(f'The {cold_route} trace requires its BS{expected_batch}/Q4/128K prefetch fixture')
+    if instruction_replay:
+        instruction_library = Path(getattr(config, 'msprof_instruction_library', '')).resolve()
+        if config.warmup or msprof_output or not instruction_library.is_file():
+            raise ValueError('Instruction collection requires a prebuilt bridge, zero warmup and no inner profiler')
     torch.npu.set_device(config.device)
     device = torch.device(f'npu:{config.device}')
     stream = torch.npu.current_stream(device)
     cann, headers = kvaf_build_paths(build)
     soc = acl.get_soc_name()
-    aics = query_device_resources(cann, config.device)['effective_aic']
-    _, registration, _ = _load_native_operators('c8_offload')
-    registration.require_a5_dsa_registration(('lidu_fused_batch_get_prepare_mtp_out',))
+    device_resources = query_device_resources(cann, config.device)
+    aics = device_resources['effective_aic']
+    if small_mode is not None and (aics != 32 or device_resources['aiv'] != 64 or 'Ascend950' not in soc):
+        raise ValueError(f'Small batch trials require A5 with 32 AIC/64 AIV, got {device_resources} on {soc}')
+    if (dedicated_service is not None or cold_route in dedicated_routes) and (
+            aics != 32 or device_resources['aiv'] < 64 or 'Ascend950' not in soc):
+        raise ValueError(f"BS16 Service comparison targets A5 with 32 MIX groups, got {soc} "
+                         f"with {aics} effective AICs and {device_resources['aiv']} AIVs")
+    if frontier_mode and device_resources['aiv'] != cold_frontier.GEOMETRY['aiv']:
+        raise ValueError('Cold frontier requires 64 available AIVs')
+    if profile_replay:
+        if aics != 32 or 'Ascend950' not in soc:
+            raise ValueError(f'Baseline stage trace targets A5 with 32 effective AICs; got {soc}, AICs={aics}')
+    else:
+        _, registration, _ = _load_native_operators('c8_offload')
+        registration.require_a5_dsa_registration(('lidu_fused_batch_get_prepare_mtp_out',))
     g = initial.geometry
     width = g['token_bytes']
     workers = 40 if fused and config.transport == 'urma' else 2
@@ -3981,16 +4115,73 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         logical_addresses = (page_addresses[:, :, None] + np.arange(128) * width).reshape(g['batch'], -1)
         if fused:
             if config.transport == 'urma':
-                (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers, soc=soc)
+                if baseline_trace:
+                    from terminal_handoff import build_library
+
+                    replay_stage(f'loading marked {cold_route or "p2"} fusion bridge')
+                    library = build_library(
+                        getattr(config, 'msprof_build_dir', directory / 'trace_build'),
+                        cann, headers, soc, local_counts=getattr(config, 'msprof_local_counts', False),
+                        hot_partition=cold_route is not None or small_mode is not None,
+                        stage_trace=True, ub_candidates=False, post_chunk=0,
+                    )
+                elif instruction_replay:
+                    library = instruction_library
+                elif handoff:
+                    from terminal_handoff import build_library
+
+                    library = build_library(config.handoff_build_dir, cann, headers, soc,
+                                            local_counts=handoff == 'local_counts' or partition_trial,
+                                            hot_partition=score_trial or small_mode is not None, ub_candidates=ub_candidates,
+                                            post_chunk=post_chunk,
+                                            dedicated_drain_aiv1=getattr(config, 'mr28_dedicated_drain_aiv1', True))
+                else:
+                    (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers, soc=soc)
             else:
                 shape = UbmemGeometry(g['batch'], g['history'], g['resident'], g['heads'], width,
                                       aics, config.intermediate_fetches, soc)
                 library = build_ubmem_library(cache_dir=build / 'lifetch_ubmem', cann=cann, shape=shape)
+            if frontier_mode:
+                with Path(library).open('rb') as binary:
+                    binary_sha = hashlib.file_digest(binary, 'sha256').hexdigest()
+                frontier_header = cold_frontier.header(config.mr28_cold_frontier_fixture_sha256, binary_sha,
+                                                       config.iterations)
+                frontier_tapes = (cold_frontier.load_tapes(config.mr28_cold_frontier_tape, frontier_header)
+                                  if frontier_mode == 2 else [None] * config.iterations)
             state = FusedReplayState(
                 torch, runtime, view, library, initial, pages, logical_addresses,
                 transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
-                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024))
+                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024),
+                prefetch_window_limit=getattr(config, "prefetch_window_limit", None),
+                service_aics=getattr(config, "small_batch_service_aics", 0))
+            if small_mode is not None:
+                small_cold_parts = small_batch.bind(state, small_mode)
+            if profile_replay:
+                shape = state.rotating.runtime_shape
+                if (state.forward.terminal is None or shape.liCores != 2 * g['batch']
+                        or shape.rounds != min(config.intermediate_fetches, shape.liCores)):
+                    raise RuntimeError('Profiling requires the P2 and four-AIV Terminal route')
+                if instruction_replay and hasattr(state.rotating.library, 'kvip_stage_trace_supported'):
+                    raise RuntimeError('Instruction collection requires the bridge with KVIP_STAGE_TRACE disabled')
+            if handoff:
+                shape = state.rotating.runtime_shape
+                if state.forward.terminal is None or shape.liCores != 2 * g['batch']:
+                    raise RuntimeError('MR25 handoff comparison requires the P2 sequence-split Terminal route')
+            if partition_trial:
+                from terminal_handoff import bind_score_partition
+
+                score_parts = bind_score_partition(state, hot=hot_partition, cold=cold_partition)
+            if unified_score is not None:
+                from terminal_handoff import bind_unified_score
+
+                unified_parts = bind_unified_score(state, unified_score)
+            if dedicated_service is not None:
+                from terminal_handoff import bind_dedicated_service
+
+                bind_dedicated_service(state, dedicated_service)
+            if frontier_mode:
+                cold_frontier.attach(state, frontier_mode, frontier_tapes[0])
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
@@ -4022,22 +4213,129 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 raise
             else:
                 pending = False
+        if instruction_replay:
+            from baseline_stage_trace import write_instruction_replay
+
+            replay_stage('submitting exactly one stock P2/Terminal for external instruction collection')
+            pending = True
+            state.forward()
+            stream.synchronize()
+            validate(initial)
+            return write_instruction_replay(directory, state, library, config, soc)
+        if baseline_trace:
+            from baseline_stage_trace import StageBuffer, scoped_msprof, write_capture
+
+            cold_parts = score_parts = 2
+            if cold_route in dedicated_routes:
+                from terminal_handoff import bind_dedicated_service
+
+                bind_dedicated_service(state, cold_route)
+            elif cold_route in ('full_p2', 'full_uniform'):
+                from terminal_handoff import bind_unified_score
+
+                score_parts = bind_unified_score(state, cold_route)
+                expected_parts = 4 if cold_route == 'full_uniform' else 2
+                if score_parts != expected_parts:
+                    raise ValueError(f'Expected full Score P{expected_parts}, got P{score_parts}')
+            elif cold_route is not None:
+                from terminal_handoff import bind_score_partition
+
+                _, cold_parts = bind_score_partition(state, hot=False, cold=cold_route == 'cold_p4')
+                expected_parts = 4 if cold_route == 'cold_p4' else 2
+                if cold_parts != expected_parts:
+                    raise ValueError(f'Expected Cold P{expected_parts}, got P{cold_parts}')
+            trace_route = small_batch.TRACE_ROUTES[small_mode] if small_mode is not None else cold_route or 'p2'
+            if small_mode is not None:
+                cold_parts = small_cold_parts
+            trace = StageBuffer(state, cold_route=trace_route, cold_parts=cold_parts)
+            replay_stage(f'calibrating device counter and warming up unmarked {cold_route or "p2"}')
+            pending = True
+            counter_mhz = state.forward.calibrate_counter_mhz()
+            pending = False
+            resident_seed_sha256 = None
+            if small_mode is not None:
+                replay_stage('capturing resident publication before Cold')
+                pending = True
+                state.reset()
+                resident_seed_sha256 = small_batch.capture_resident_seed(state, stream, small_mode)
+                pending = False
+            for _ in range(config.warmup):
+                pending = True
+                state.reset()
+                state.forward()
+                stream.synchronize()
+                validate(initial)
+            pending = True
+            state.reset()
+            trace.attach()
+            if small_mode is not None:
+                state.forward.set_diagnostics(True)
+                state.forward.events_src.fill_(-1)
+                state.forward.events_dst.fill_(-1)
+            stream.synchronize()
+            pending = False
+            replay_stage(f'initialization and warmup finished; collecting only marked {cold_route or "p2"}')
+            with scoped_msprof(acl.prof, msprof_output, config.device) as capture:
+                pending = True
+                try:
+                    trace.submit_marked(stream)
+                finally:
+                    try:
+                        stream.synchronize()
+                    except BaseException as error:
+                        NativeFetchSession.quarantine('profiled_replay_stream_completion_uncertain', error)
+            replay_stage('msprof stopped and finalized; validating Top2048, KV and Index')
+            trace.detach()
+            raw = trace.read()
+            (directory / 'baseline_stage_trace.bin').write_bytes(raw)
+            validate(initial)
+            return write_capture(directory, raw, counter_mhz, state, library, config, soc, capture,
+                                 cold_parts=cold_parts, score_parts=score_parts, trace_route=trace_route,
+                                 resident_seed_sha256=resident_seed_sha256)
         pending = True
         replay_stage('first eager forward and device completion')
-        state.forward()
-        stream.synchronize()
+        if dedicated_service is not None and getattr(config, 'mr28_staged_eager', False):
+            from terminal_handoff import run_staged_eager
+
+            try:
+                run_staged_eager(state, dedicated_service, replay_stage)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    (directory / 'eager_failure.log').write_text(traceback.format_exc())
+                raise
+        else:
+            state.forward()
+            stream.synchronize()
         replay_stage('first eager completed; correctness check')
         checks.check('eager', lambda: validate(initial))
+        if dedicated_service is not None:
+            if checks.failures:
+                raise AssertionError(f"First eager output mismatch: {checks.failures[0]['error']}")
+            replay_stage('first eager correctness PASS')
         if config.mode in ('bench', 'diagnose'):
             batch_states.append(state)
-            for _ in range(1, config.iterations):
+            for index in range(1, config.iterations):
                 if fused:
                     replica = FusedReplayState(
                         torch, runtime, view, library, initial, pages, logical_addresses,
                         transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
-                        prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease)
+                        prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024),
+                        prefetch_window_limit=getattr(config, 'prefetch_window_limit', None),
+                        service_aics=getattr(config, "small_batch_service_aics", 0), lease=state.lease)
+                    if small_mode is not None and small_batch.bind(replica, small_mode) != small_cold_parts:
+                        raise RuntimeError('Cold partition changed between small-batch graph invocations')
                     replica.failure_directory = directory
+                    if partition_trial:
+                        if bind_score_partition(replica, hot=hot_partition, cold=cold_partition) != score_parts:
+                            raise RuntimeError('Score partition changed between graph invocations')
+                    if unified_score is not None:
+                        if bind_unified_score(replica, unified_score) != unified_parts:
+                            raise RuntimeError('Unified Score partition changed between graph invocations')
+                    if dedicated_service is not None:
+                        bind_dedicated_service(replica, dedicated_service)
+                    if frontier_mode:
+                        cold_frontier.attach(replica, frontier_mode, frontier_tapes[index])
                 else:
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
                 batch_states.append(replica)
@@ -4049,6 +4347,54 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             result.update(transport=config.transport, path='fused' if fused else 'serial',
                           runtime_workers=shared_pool.workers if borrowed else workers, geometry=g,
                           input_paths=[str(ref.manifest_path) for refs in sequence.rounds for ref in refs])
+            if handoff:
+                # The rotating Service geometry still uses the P2 shape.
+                result['handoff_route'] = dict(mode=handoff, library=str(library), soc=soc, effective_aic=aics,
+                                              score_parts=2, score_blocks=shape.liCores, windows=shape.rounds,
+                                              service_lanes=shape.serviceLanes, terminal_tasks=4 * g['batch'])
+                if score_trial or prefetch_trial or small_mode is not None:
+                    if not frontier_mode:
+                        with Path(library).open('rb') as binary:
+                            binary_sha = hashlib.file_digest(binary, 'sha256').hexdigest()
+                    result['handoff_route'].update(library_sha256=binary_sha, local_counts=partition_trial)
+                if small_mode is not None:
+                    result['handoff_route'].update(available_aiv=device_resources['aiv'], small_batch_mode=small_mode,
+                                                   prefetch_window_limit=config.prefetch_window_limit,
+                                                   cold_score_parts=small_cold_parts,
+                                                   cold_score_blocks=small_cold_parts * g['batch'])
+                if prefetch_trial:
+                    result['handoff_route'].update(service_ub_candidates=ub_candidates,
+                                                   service_post_chunk=post_chunk)
+                if partition_trial:
+                    hot_parts, cold_parts = score_parts
+                    result['handoff_route'].update(hot_score_parts=hot_parts,
+                                                   hot_score_blocks=hot_parts * g['batch'],
+                                                   cold_score_parts=cold_parts,
+                                                   cold_score_blocks=cold_parts * g['batch'])
+                if unified_score is not None:
+                    result['handoff_route'].update(unified_score=unified_score != 'p2',
+                                                   producer_parts=unified_parts,
+                                                   producer_blocks=unified_parts * g['batch'])
+                if dedicated_service is not None:
+                    dedicated = dedicated_service in ('dedicated', 'static_ready')
+                    dynamic = dedicated_service == 'dynamic'
+                    score_groups = 24 if dedicated else shape.liCores - int(dynamic)
+                    result['handoff_route'].update(
+                        dedicated_service=dedicated, available_aiv=device_resources['aiv'],
+                        cold_mixed_groups=shape.liCores, cold_score_aic=score_groups,
+                        cold_score_aiv=2 * score_groups,
+                        cold_service_aiv=2 * shape.liCores if dynamic else shape.serviceLanes,
+                        scheduler_aic=int(dynamic), resident_aiv=g['batch'] * 4,
+                    )
+                if p2_w1_experiment:
+                    result['handoff_route'].update(w1_prescore=dedicated_service == 'p2_w1')
+                if getattr(config, 'mr28_cold_gm_experiment', False):
+                    result['handoff_route'].update(cold_score_writeback=dedicated_service != 'p2',
+                                                   cold_gm_row_consumer=dedicated_service == 'cold_gm_pipeline')
+            if frontier_mode:
+                evidence = result.pop('cold_frontier')
+                result['handoff_route']['cold_frontier_mode'] = frontier_mode
+                atomic_json(directory / cold_frontier.FILE_NAME, dict(header=frontier_header, **evidence))
             atomic_json(directory / 'path_result.json', result)
             return result
         state.reset()
@@ -4150,6 +4496,13 @@ def run_synthetic_batch(config, directory, *, shared_pool=None):
         prepare_compact_fixture(fixture, config.history, config.resident, config.miss_percent,
                                 config.index_heads, config.seed)
         pool.fixtures[key] = fixture
+    handoff = getattr(config, 'mr25_handoff', None)
+    if handoff:
+        from terminal_handoff import fixture_hash
+
+        fixture_sha256 = fixture_hash(fixture)
+        if getattr(config, 'mr28_cold_frontier_mode', 0):
+            config.mr28_cold_frontier_fixture_sha256 = fixture_sha256
     h, r, heads = config.history, config.resident, config.index_heads
     # The previous synthetic runner treats physical fixture rows as logical
     # tokens. Preserve that identity and the exact Q/Index/scale bit patterns.
@@ -4188,6 +4541,17 @@ def run_synthetic_batch(config, directory, *, shared_pool=None):
             from workloads import payload
             pages.token_payload = lambda row, ids: payload(row, np.asarray(ids))
             folder = directory / f'case-b{batch}'
+            if getattr(config, 'msprof_baseline', False) or getattr(config, 'msprof_instruction_replay', False):
+                run_path(config, folder, sequence, pages, fused=True, shared_pool=pool)
+                continue
+            if handoff:
+                result = run_path(config, folder / 'fused', sequence, pages, fused=True, shared_pool=pool)
+                atomic_json(folder / 'report.json', dict(batch=batch, miss_percent=config.miss_percent,
+                            input='synthetic', execution='COMPLETED', correctness=result['correctness'],
+                            fixture_sha256=fixture_sha256, route=result['handoff_route'],
+                            timing={'prototype_with_update': result['all_rounds']}))
+                failed |= result['correctness'] != 'PASS'
+                continue
             results = {}
             for name in ('serial', 'fused'):
                 results[name] = run_path(config, folder / name, sequence, pages,
@@ -4322,6 +4686,14 @@ class StreamingForward(LIFetchForward):
     def set_deferred_fetch(self, enabled):
         self.set_options(deferred_fetch=enabled)
 
+    def set_options(self, *, diagnostics=False, deferred_fetch=False):
+        super().set_options(diagnostics=diagnostics, deferred_fetch=deferred_fetch)
+        if getattr(self, 'balance_final_get', False):
+            from small_batch import GET_BALANCE_FLAG
+
+            value = np.asarray([GET_BALANCE_FLAG | int(diagnostics)], dtype='<u4').view('u1')
+            self.terminal.workspace[52:56].copy_(self.torch.from_numpy(value))
+
     def set_diagnostics(self, enabled):
         self.set_options(diagnostics=enabled)
 
@@ -4426,7 +4798,8 @@ class StreamingForward(LIFetchForward):
                     incremental_cycles=(int(event[14])-int(event[13])
                         if not ubmem and int(event[13]) and int(event[14]) >= int(event[13]) else None),
                     scan_cycles=int(event[5]), candidate_cycles=int(event[6]), post_cycles=int(event[7]),
-                    bitmap_bytes=int(event[8]), candidate_count=int(event[9]), posted_count=int(event[10])))
+                    bitmap_bytes=int(event[8]) if ubmem else int(event[8]) & 0xffffffff,
+                    candidate_count=int(event[9]), posted_count=int(event[10])))
             result[0]['prefetch_services'] = services
             first = events[:, 0 if ubmem else 11]
             last = events[:, 1 if ubmem else 12]

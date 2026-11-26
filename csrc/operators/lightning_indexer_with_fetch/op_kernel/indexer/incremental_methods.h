@@ -66,6 +66,24 @@ __aicore__ inline uint32_t WindowRank(__gm__ rotating::Context* ctx, uint32_t va
     covered = kvip_coverage::Covered(end0, end1, resident, valid, half, recent.begin, recent.end);
     return kvip_coverage::Rank(covered, initial, valid, ctx->prefetchRankStart ? uint32_t(ctx->prefetchRankStart) : 1024);
 }
+#if KVIP_STAGE_TRACE
+__aicore__ inline kvip_trace::ScanSample RankSample(uint32_t query) const {
+#if KVIP_PARALLEL_TERMINAL
+    const bool terminal = rankedEpoch_ == runtimeShape_.rounds;
+#else
+    constexpr bool terminal = false;
+#endif
+    return {exportWindowCold_ ? KVIP_TRACE_WORKSPACE(streamingWorkspace_) : 0,
+        terminal ? kvip_trace::Terminal : kvip_trace::Cold, terminal ? 0U : rankedEpoch_,
+        kvip_trace::PipeDetail(query / 4, query % 4)};
+}
+#endif
+#if KVIP_SERVICE_UB_CANDIDATES
+TBuf<TPosition::VECCALC> windowCandidatesBuf_;
+LocalTensor<uint32_t> windowCandidates_;
+bool windowCandidatesAllocated_ = false;
+bool windowCandidatesActive_ = false;
+#endif
 __aicore__ inline void ExportWindowCold(uint32_t query) {
     // Even a window with zero newly compacted scores exports the saved TopK.
     // Its output bank may still feed the preceding Q's asynchronous DMA.
@@ -103,9 +121,14 @@ __aicore__ inline void ExportWindowCold(uint32_t query) {
     bitmapLength=valid?valid:runtimeShape_.history;
     rankCut=windowRankCut_;
 #endif
+#if KVIP_STAGE_TRACE
+    const auto pipeSample = RankSample(query);
+#endif
+    KVIP_RANK_SAMPLE(selectScope, pipeSample, WindowTopKVf, TerminalTopKVf);
     uint32_t count=kvip_prefetch_rank::SelectBitmap(indicesOutLocal_,scoreOutLocal_,compact,
         topkSharedTmpLocal_[128],covered,bitmapLength,valid,rank,limit,rankTrace_?rankClocks:nullptr,minimum,
         windowCoveredEmpty_,rankCut);
+    KVIP_TRACE_END(selectScope);
     if(rankTrace_) {
         uint64_t delta[3]={rankClocks[1]-rankClocks[0],rankClocks[4]-rankClocks[1],1};
         for(uint32_t k=0;k<3;++k) {
@@ -127,6 +150,17 @@ __aicore__ inline void ExportWindowCold(uint32_t query) {
     if(count) {
         GlobalTensor<uint32_t> jobs;jobs.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048);
 #endif
+#if KVIP_SERVICE_UB_CANDIDATES
+        if (windowCandidatesActive_) {
+            // Keep the original per-Q candidates and their enumeration order.
+            // Only this AIV consumes the compact IDs, before leaving the window.
+            DataCopy(windowCandidates_[(query % 4) * rotating::kWindowCandidatePitch],
+                compact, (count + 7) / 8 * 8);
+            PipeBarrier<PIPE_V>();
+            return;
+        }
+#endif
+        KVIP_RANK_SAMPLE(outputScope, pipeSample, WindowOutputMte3, TerminalTopKMte3);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
         DataCopy(jobs,compact,(count+7)/8*8);
         if(mappedExport_){SetFlag<HardEvent::MTE3_V>(WINDOW_COLD_OUTPUT_EVENT);coldOutputPending_=true;}
@@ -226,7 +260,7 @@ __aicore__ inline bool MergeWindowRanks(uint32_t added, uint32_t base) {
     return true;
 }
 #endif
-__aicore__ inline void FlushIncremental(uint32_t count,uint32_t base,bool clearCandidates=true) {
+__aicore__ inline void FlushIncremental(uint32_t count,uint32_t base,bool clearCandidates=true KVIP_PIPE_PARAM_DEFAULT) {
     if(incrementalIdsPending_){WaitFlag<HardEvent::MTE2_V>(EVENT_ID7);incrementalIdsPending_=false;}
     mappedExport_=false;
     if(!count)return;
@@ -241,6 +275,7 @@ __aicore__ inline void FlushIncremental(uint32_t count,uint32_t base,bool clearC
     DataCopy(mrgValueLocal_,scoreOutLocal_,2048);
     DataCopy(incrementalOld_,indicesOutLocal_,2048);
     PipeBarrier<PIPE_V>();
+    KVIP_RANK_SAMPLE(topkScope, pipeSample, WindowTopKVf, TerminalTopKVf);
     topkOp_(mrgValueLocal_,indicesOutLocal_,scoreOutLocal_,2048+((count+255)/256)*256,0,1,true);
     PipeBarrier<PIPE_V>();
     // 32000-byte TopK scratch: 2048 old IDs plus at most 5952 added IDs.
@@ -257,6 +292,7 @@ __aicore__ inline void FlushIncremental(uint32_t count,uint32_t base,bool clearC
         reinterpret_cast<__ubuf__ uint16_t*>(incrementalNew_.GetPhyAddr()),base);
     }
     PipeBarrier<PIPE_V>();
+    KVIP_TRACE_END(topkScope);
     if(clearCandidates)Duplicate(mrgValueLocal_[2048],uint16_t(0),trunkLen_);
 }
 // Skipped windows do not own state. Follow them to the last real service.
@@ -312,6 +348,10 @@ __aicore__ inline void PreloadIncremental(uint32_t half) {
     mask.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(ctx->hits)+uint64_t(query)*runtimeShape_.history/8);
     static_assert(V_MTE2_EVENT3 != VEC1_V_MTE2_EVENT_QSCALE &&
                   V_MTE2_EVENT3 != VEC1_V_MTE2_EVENT_QSCALE + 1);
+#if KVIP_STAGE_TRACE
+    const auto pipeSample = RankSample(query);
+#endif
+    KVIP_RANK_SAMPLE(preloadScope, pipeSample, WindowInputMte2, TerminalInputMte2);
     // Q-scale bank 0 owns a primed V_MTE2 event 6 throughout this window.
     // Use the balanced scratch event: wait for this Q's reads, not that signal.
     SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
@@ -337,6 +377,9 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
     uint32_t ends[2]={end0,end1};
     rankEnd0_=prior[0];rankEnd1_=prior[1];
     if (!source) return;
+#if KVIP_STAGE_TRACE
+    const auto pipeSample = RankSample(query);
+#endif
     const uint32_t callsBefore=incrementalCalls_;
     mappedExport_=false;
     if (end0<=prior[0] && (!half || end1<=prior[1])) {
@@ -345,8 +388,11 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
             GlobalTensor<uint32_t> saved; saved.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(WindowTopkPrefix()+uint64_t(query/4)*prefixBytes+4*2048*2)+(query%4)*2048);
             GlobalTensor<uint16_t> savedScores;
             savedScores.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(WindowTopkPrefix()+uint64_t(query/4)*prefixBytes)+(query%4)*2048);
+            KVIP_RANK_SAMPLE(loadScope, pipeSample, WindowInputMte2, TerminalInputMte2);
             PipeBarrier<PIPE_ALL>();DataCopy(indicesOutLocal_,saved,2048);DataCopy(scoreOutLocal_,savedScores,2048);
-            SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);ExportWindowCold(query);
+            SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
+            KVIP_TRACE_END(loadScope);
+            ExportWindowCold(query);
         }
         return;
     }
@@ -366,6 +412,7 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
         PreloadIncremental(half);
         incrementalNextQuery_=nq;incrementalNextIndex_=ni;incrementalNextEnd0_=e0;incrementalNextEnd1_=e1;incrementalHasNext_=hn;
     }
+    KVIP_RANK_SAMPLE(savedScope, pipeSample, WindowInputMte2, TerminalInputMte2);
     bool staged=incrementalInputPending_ && incrementalInputQuery_==query;
     incrementalIdsPending_=staged;
     if(staged) {
@@ -380,6 +427,7 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
         DataCopy(scoreOutLocal_,stateScores,2048);DataCopy(indicesOutLocal_,stateIds,2048);
         SetFlag<HardEvent::MTE2_V>(EVENT_ID7);incrementalIdsPending_=true;
     }
+    KVIP_TRACE_END(savedScope);
     // Join state and first score tile together below; they use disjoint UB.
     auto rawLocal=topkSharedTmpLocal_.template ReinterpretCast<uint16_t>();
     const uint32_t rawCapacity=((topkOp_.GetSharedTmpBufferSize()-128)*4/9/128)*128;
@@ -388,6 +436,9 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
     auto scratchMask=maskLocal;
     auto countLocal=maskLocal[rawCapacity/8].template ReinterpretCast<uint32_t>();
     uint32_t packed=0,packBase=0;
+#if KVIP_STAGE_TRACE
+    bool rawRecorded = false;
+#endif
     const uint16_t cutoff=uint16_t(incrementalMetadataActive_?incrementalMetadata_.GetValue(mi+2):meta[2]);
     Duplicate(mrgValueLocal_[2048],uint16_t(0),trunkLen_);
     for (uint32_t base=Min(prior[0],half?prior[1]:prior[0]);base<Max(end0,half?end1:end0);) {
@@ -421,6 +472,12 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
             staged=false;
         } else {
             rawLocal=scratchRaw;maskLocal=scratchMask;
+#if KVIP_STAGE_TRACE
+        auto rawSample = pipeSample;
+        if (rawRecorded) rawSample.base = 0;
+        rawRecorded = true;
+#endif
+        KVIP_RANK_SAMPLE(rawScope, rawSample, WindowInputMte2, TerminalInputMte2);
         SetFlag<HardEvent::V_MTE2>(EVENT_ID5);WaitFlag<HardEvent::V_MTE2>(EVENT_ID5);
         DataCopy(rawLocal,raw[base],n);DataCopy(maskLocal,bitmap[base/8],n/8);
         SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
@@ -489,7 +546,7 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
             // Capacity is measured in compact candidates, not raw score tiles.
             // Reuse the demo's uint16 relative IDs across both sequence halves.
             if(packed && (packed+count>trunkLen_ || base+n-packBase>65536)) {
-                FlushIncremental(packed,packBase);packed=0;
+                FlushIncremental(packed,packBase,true KVIP_PIPE_ARG);packed=0;
                 // TopK reuses raw/mask scratch; reload only on a capacity flush.
                 SetFlag<HardEvent::V_MTE2>(EVENT_ID5);WaitFlag<HardEvent::V_MTE2>(EVENT_ID5);
                 DataCopy(rawLocal,raw[base],n);DataCopy(maskLocal,bitmap[base/8],n/8);
@@ -534,7 +591,7 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
         windowFloor_=cutoff;
     }
 #endif
-    FlushIncremental(packed,packBase,false);
+    FlushIncremental(packed,packBase,false KVIP_PIPE_ARG);
     PipeBarrier<PIPE_V>();
     // A nonzero cutoff already describes the unchanged TopK when this
     // window did not flush any candidates. Final TopK keeps its old path.
@@ -547,6 +604,7 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
     }
     rankEnd0_=prior[0];rankEnd1_=prior[1];
     if(exportWindowCold_)ExportWindowCold(query);
+    KVIP_RANK_SAMPLE(outputScope, pipeSample, WindowOutputMte3, TerminalTopKMte3);
     SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
     if(incrementalPipeline_ && incrementalMetadataActive_) {
         if(incrementalOutputPending_) {
@@ -563,6 +621,7 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
         DataCopy(stateScores,scoreOutLocal_,2048);DataCopy(stateIds,indicesOutLocal_,2048);
         SetFlag<HardEvent::MTE3_S>(EVENT_ID5);WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
     }
+    KVIP_TRACE_END(outputScope);
     if(incrementalMetadataActive_) {
         incrementalMetadata_.SetValue(mi+1,uint64_t(prior[0])|(uint64_t(prior[1])<<32));
         incrementalMetadata_.SetValue(mi+2,threshold);
@@ -571,10 +630,8 @@ __aicore__ inline void AdvanceIncremental(uint32_t query,uint32_t end0,uint32_t 
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
     }
 }
-__aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
+__aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half,uint32_t lane) {
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
-    uint32_t lane=rotating::ServiceLane(runtimeShape_.batch,runtimeShape_.splitQ,
-        runtimeShape_.serviceAics,blockId_/2,blockId_%2);
     // The predecessor wait is part of the optional window service and can
     // delay the producer. Capture it separately from incremental computation.
     bool trace=streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U);
@@ -585,17 +642,27 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     // Same predecessor dependency as original FastService, moved before the
     // added calculation so private per-lane state cannot have two writers.
     if(epoch) {
+        KVIP_TRACE_BEGIN(predecessorScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+            Cold, ServicePredecessor, epoch, lane);
         auto previous=reinterpret_cast<__gm__ volatile rotating::Event*>(ctx->events)+(epoch-1)*runtimeShape_.serviceLanes+lane;
         do {kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ rotating::Event*>(previous)),64);}while(!previous->complete);
     }
+    KVIP_TRACE_BEGIN(windowScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_), Cold, LiWindow, epoch, lane);
+    KVIP_TRACE_BEGIN(readyScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_), Cold, WindowReadyLoad, epoch, lane);
     uint64_t begin=trace?GetSystemCycle():0;
     exportWindowCold_=true;rankedEpoch_=epoch;rankTrace_=trace;
     incrementalCalls_=0;incrementalScanned_=0;incrementalCandidates_=0;
-    incrementalMetadataActive_=(runtimeShape_.batch+runtimeShape_.serviceLanes-1)/runtimeShape_.serviceLanes<=2;
+    const bool stagedMetadata=(runtimeShape_.batch+runtimeShape_.serviceLanes-1)/runtimeShape_.serviceLanes<=2;
+    incrementalMetadataActive_=stagedMetadata;
     if(incrementalMetadataActive_) {
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    if (!coldParts_ && !dedicatedProgress_)
+#endif
+    {
     GlobalTensor<uint32_t> progressSource;progressSource.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->progress));
     for(uint32_t b=lane,i=0;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes,i+=128)
         DataCopy(incrementalOld_[i],progressSource[b*128],128);
+    }
     // Stage the first 64 bytes of each row after progress. At most two rows
     // use words [256, 288), disjoint from progress words [0, 256).
     GlobalTensor<uint32_t> rowsSource;rowsSource.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rows));
@@ -614,11 +681,69 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     if(incrementalMetadataActive_) {
         if(ownedQueries>0)requests0=incrementalOld_.GetValue(256+9);
         if(ownedQueries>4)requests1=incrementalOld_.GetValue(256+16+9);
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+        if (dedicatedProgress_) {
+            for (uint32_t b = lane, index = 0; b < runtimeShape_.batch; b += runtimeShape_.serviceLanes) {
+                for (uint32_t q = 0; q < 4; ++q, ++index)
+                    incrementalMetadata_.SetValue(index * 16 + 4, DedicatedColdReady(b * 4 + q, epoch, half));
+            }
+        } else if (coldParts_) {
+            for (uint32_t b = lane, index = 0; b < runtimeShape_.batch; b += runtimeShape_.serviceLanes) {
+                for (uint32_t q = 0; q < 4; ++q, ++index)
+                    incrementalMetadata_.SetValue(index * 16 + 4, PartitionedColdReady(b * 4 + q, half));
+            }
+        } else
+#endif
+        {
         for(uint32_t i=0;i<ownedQueries;++i)
             incrementalMetadata_.SetValue(i*16+4,uint64_t(incrementalOld_.GetValue(i*32))|(uint64_t(incrementalOld_.GetValue(i*32+16))<<32));
+        }
     }
     uint32_t cap=half?rotating::SequenceWindowEnd(runtimeShape_.history,runtimeShape_.resident,half,epoch):
         rotating::Trigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,epoch)*128;
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    // The benchmark uses the native BS16 shape with one row per Service
+    // lane. Record the staged snapshot before TopK and next-Q preloading.
+    if (stagedMetadata && ownedQueries == kvip_window_frontier::kQueries) {
+        const auto mode = kvip_window_frontier::ActiveMode(streamingWorkspace_);
+        if (mode == kvip_window_frontier::Capture || mode == kvip_window_frontier::Replay) {
+            const auto table = kvip_window_frontier::Table(streamingWorkspace_);
+            const auto record = kvip_window_frontier::Row(table, runtimeShape_.batch, epoch, lane);
+            auto words = reinterpret_cast<__gm__ uint64_t*>(record);
+            if (mode == kvip_window_frontier::Replay) {
+                kvaf_device::CleanCacheLines(record, kvip_window_frontier::kRowBytes);
+            }
+            for (uint32_t q = 0; q < kvip_window_frontier::kQueries; ++q) {
+                const auto metadataIndex = q * 16 + 4;
+                if (mode == kvip_window_frontier::Capture) {
+                    words[q] = incrementalMetadata_.GetValue(metadataIndex);
+                } else {
+                    const auto saved = words[q];
+                    const auto observed = incrementalMetadata_.GetValue(metadataIndex);
+                    auto cursor = reinterpret_cast<__gm__ uint32_t*>(ctx->progress) + (lane * 4 + q) * 32;
+                    kvip_window_frontier::WaitClassified(cursor, observed, saved, cap);
+                    incrementalMetadata_.SetValue(metadataIndex, saved);
+                    words[kvip_window_frontier::kQueries + q] = incrementalMetadata_.GetValue(metadataIndex);
+                }
+            }
+            kvaf_device::CleanCacheLines(record, kvip_window_frontier::kRowBytes);
+        }
+    }
+#endif
+#if KVIP_SERVICE_UB_CANDIDATES
+    // Fall back for a sparse/not-yet-ready row. The GM path can legitimately
+    // retain a skipped Q's old count and IDs, which the private arena lacks.
+    windowCandidatesActive_ = windowCandidatesAllocated_ && half != 0
+        && ownedQueries == 4 && stagedMetadata && ctx->windowLimit <= 4 * rotating::kWindowCandidatePitch;
+    if (windowCandidatesActive_) {
+        for (uint32_t q = 0; q < 4; ++q) {
+            if (!incrementalMetadata_.GetValue(q * 16) ||
+                Min(uint32_t(incrementalMetadata_.GetValue(q * 16 + 4)), cap) < runtimeShape_.resident)
+                windowCandidatesActive_ = false;
+        }
+    }
+#endif
+    KVIP_TRACE_END(readyScope);
     for(uint32_t b=lane;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes) for(uint32_t q=0;q<4;++q) {
         // Init clears covered; the posting path records every admission in
         // requests. The predecessor fence makes the row and bitmap visible.
@@ -626,6 +751,10 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
         uint32_t progressIndex=(((b-lane)/runtimeShape_.serviceLanes)*4+q)*16+4;
         uint64_t ready;
         if(incrementalMetadataActive_)ready=incrementalMetadata_.GetValue(progressIndex);
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+        else if (dedicatedProgress_) ready = DedicatedColdReady(b * 4 + q, epoch, half);
+        else if (coldParts_) ready = PartitionedColdReady(b * 4 + q, half);
+#endif
         else {
             auto progress=reinterpret_cast<__gm__ volatile uint32_t*>(ctx->progress)+(b*4+q)*32;
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ uint32_t*>(progress)),128);
@@ -643,8 +772,11 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
             incrementalNextEnd0_=Min(uint32_t(nextReady),cap);
             incrementalNextEnd1_=half?Min(uint32_t(nextReady>>32),cap):0;
         }
+        KVIP_TRACE_BEGIN(queryScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
+            Cold, WindowQueryTopK, epoch, b * 4 + q);
         AdvanceIncremental(b*4+q,end0,end1,half);
     }
+    KVIP_TRACE_BEGIN(flushScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_), Cold, WindowStateFlush, epoch, lane);
     JoinColdOutput();
     if(incrementalInputPending_) {
         WaitFlag<HardEvent::MTE2_V>(EVENT_ID6);incrementalInputPending_=false;
@@ -663,14 +795,18 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     exportWindowCold_=false;
     // The producer's progress lookup table shares the TopK score buffer.
     // Rebuild it before LI resumes; otherwise score bytes become fake progress.
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+    if (!dedicatedProgress_)
+#endif
     PrepareRotationProgress();
+    KVIP_TRACE_END(flushScope);
     if(trace) {
         auto event=reinterpret_cast<__gm__ rotating::Event*>(ctx->events)+epoch*runtimeShape_.serviceLanes+lane;
         auto stamp=reinterpret_cast<__gm__ uint64_t*>(event->pad);
         stamp[2]=begin;stamp[3]=GetSystemCycle();stamp[4]=uint64_t(incrementalCalls_) | (uint64_t(incrementalScanned_)<<16) | (uint64_t(incrementalCandidates_)<<40);
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event),128);
     }
-    return true;
+    return stagedMetadata;
 }
 __aicore__ inline void FinalIncremental(uint32_t query,uint32_t valid) {
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);

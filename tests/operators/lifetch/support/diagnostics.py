@@ -504,13 +504,14 @@ def prefetch_tag_audit(ids, before, resident):
     return result
 
 
-def algorithm_after(rotating, before, *, admissions=None):
+def algorithm_after(rotating, before, *, admissions=None, audit_posts=False):
     shape = rotating.runtime_shape
     try:
         mapping = rotating.mapping.cpu().numpy()
+        rows = rotating.rows.cpu().numpy().view(np.uint32)
         if admissions is not None:
             mapping = np.full_like(mapping, -1)
-            counts = rotating.rows[:, 9].cpu().tolist()
+            counts = rows[:, 9].tolist()
             for b, count in enumerate(counts):
                 ids = np.asarray(admissions[b, :count], dtype=np.int64)
                 if not 0 <= count <= 2048 or np.any(ids < 0) or np.any(ids >= shape.history) or len(np.unique(ids)) != count:
@@ -519,9 +520,27 @@ def algorithm_after(rotating, before, *, admissions=None):
         result = algorithm_counts(
             mapping,
             rotating.arguments[9].cpu().numpy().view(np.int32).reshape(shape.batch, 4, 2048),
-            rotating.rows.cpu().numpy().view(np.uint32), rotating.final_posts.cpu().numpy(),
+            rows, rotating.final_posts.cpu().numpy(),
             shape.resident, rotating.rounds, token_bytes=shape.tokenBytes,
             admission_records=admissions is not None or not hasattr(rotating, "parallel_terminal"), **before)
+        if audit_posts:
+            # Terminal captures source tokens at their original SQ admission
+            # ordinals before the Index update retires the transfer records.
+            changes = rotating.change_count.cpu().tolist()
+            for b, request in enumerate(result['requests']):
+                early, final = request['prefetch'], request['final']
+                total = early + final
+                if (admissions is None or total != int(rows[b, 8]) or total != changes[b]
+                        or total > admissions.shape[1]):
+                    raise ValueError(f'Incomplete early/final transfer identity snapshot for request {b}')
+                positions = np.asarray(admissions[b, :total], dtype=np.int64)
+                if np.any(positions < 0) or np.any(positions >= shape.history):
+                    raise ValueError(f'Invalid source identity in transfer snapshot for request {b}')
+                ids = before['logical_ids'][b, positions].tolist()
+                early_ids, final_ids = set(ids[:early]), set(ids[early:])
+                request['posted_identity_audit'] = dict(
+                    early_duplicates=early - len(early_ids), final_duplicates=final - len(final_ids),
+                    early_final_overlap=len(early_ids & final_ids))
         if hasattr(rotating, 'window_topk_storage'):
             prefix_bytes = 4 * 2048 * 6 + 1024
             # The public prefix is immutable after SaveResident; the private
@@ -900,8 +919,16 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
     if any(e.get("name", "").lower().startswith("v9_early_fetch_kernel") for e in events):
         kernels["early_fetch"] = "v9_early_fetch_kernel"
     groups = {stage: [] for stage in kernels}
+    kernel_intervals = {stage: [] for stage in kernels}
     for event in events:
         n = event.get("name", "").lower()
+        if "li" in groups and re.fullmatch(
+            r"v9_li_kernel_(?:(?:hot|cold|threshold_cold)_partitioned|"
+            r"(?:score|cold)_t2|(?:threshold|cold)_dedicated_service|hot_ready_service|"
+            r"cold_static_ready_service|dynamic_service|(?:threshold|cold)_p2_w1|"
+            r"hot_cold_gm|cold_gm_batch|cold_ready_partitioned|resident_topk_high)(?:_\d+)*", n
+        ):
+            n = kernels["li"]
         cat = (event.get("cat") or "").lower()
         # CANN may omit cat. Accept exact kernel names with numeric dispatch
         # suffixes, while excluding launch APIs and explicitly tagged CPU ops.
@@ -920,6 +947,7 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
         if not start <= timestamp or finish > end:
             continue
         groups[stage].append((timestamp, finish))
+        kernel_intervals[stage].append((timestamp, finish, event["name"]))
     # Current URMA streaming starts with hot LI; older captures have Init.
     if fused_final and 'resolve_update' in groups and not groups.get('init'):
         groups.pop('init', None)
@@ -943,6 +971,7 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
         kernel_span_us=span,
         stages_us=durations,
         intervals_us=groups,
+        kernel_intervals=kernel_intervals,
         inter_kernel_gap_us=span - busy,
         boundary_residual_us=residual,
         note="Boundary residual includes event-to-kernel edges and clock measurement error; not proven CPU idle",
@@ -2191,7 +2220,7 @@ def terminal_diagnostics(stamps, rows, posts, events, destinations, service_lane
             if count:
                 if not 0 < t[15] <= t[4] <= t[24]:
                     raise ValueError('Missing terminal submission/CQ timestamps')
-                groups.append(dict(block=b*4+q, query=q+1, lane=b, entries=count,
+                groups.append(dict(block=b*4+q, query=q+1, lane=b, entries=count, slot_base=start,
                     bytes=count*token_bytes, first_cycles=t[15], last_cycles=t[24],
                     span_us=(t[24]-t[15])/clock_mhz))
         result.append(dict(batch=b, final_counts=counts))
@@ -2208,7 +2237,9 @@ def terminal_diagnostics(stamps, rows, posts, events, destinations, service_lane
             predecessor_wait_cycles=int(event[13])-int(event[4]) if event[4] and event[13] >= event[4] else None,
             incremental_cycles=int(event[14])-int(event[13]) if event[13] and event[14] >= event[13] else None,
             scan_cycles=int(event[5]), candidate_cycles=int(event[6]), post_cycles=int(event[7]),
-            bitmap_bytes=int(event[8]), candidate_count=int(event[9]), posted_count=int(event[10])))
+            bitmap_bytes=int(event[8]) & 0xffffffff, candidate_count=int(event[9]), posted_count=int(event[10]),
+            doorbells=(int(event[8]) >> 32) & 0xffff, ub_candidates=bool(int(event[8]) >> 48),
+            first_doorbell_cycles=int(event[11]), last_doorbell_cycles=int(event[12])))
     head['prefetch_services'] = services
 
     def scope(entries, begin, end, note):

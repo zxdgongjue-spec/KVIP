@@ -14,6 +14,7 @@ namespace kvaf_device { using ubmem_device::CleanCacheLines; constexpr uint32_t 
 #include "simt_api/device_warp_functions.h"
 #include "context.h"
 #include "indexer/ranked_candidates.h"
+#include "stage_trace.h"
 #include "../../common/lifetch/prefetch_budget.h"
 
 // Imported from direct_slots.h
@@ -130,7 +131,7 @@ __simd_vf__ inline void PrepareProgress(__ubuf__ uint32_t* table, uint32_t baseT
 #define V9_FETCH_PROFILE(...) if constexpr (captureIo) { __VA_ARGS__ }
 
 #include "kvaf_batch_get_device.h"
-#ifdef KVIP_KVAF_URMA_REGISTERED_BASE
+#if defined(KVIP_KVAF_URMA_REGISTERED_BASE) || KVIP_SERVICE_POST_CHUNK
 #include <stddef.h>
 #endif
 
@@ -264,7 +265,7 @@ __simd_vf__ inline void FinalBuild(uint32_t rt_tokenBytes,__ubuf__ uint32_t* rem
 }
 
 __aicore__ inline bool SubmitWqesAt(uint32_t rt_tokenBytes,uint64_t entityAddress,uint64_t queueAddress,uint64_t output,LocalTensor<uint32_t> slots,LocalTensor<uint32_t> words,
-    LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize,bool final,__gm__ Row* row) {
+    LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize,bool final,__gm__ Row* row KVIP_PIPE_PARAM_DEFAULT) {
     auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(queueAddress);
     // Intermediate service exclusively owns this queue; CQ draining starts
     // after LI completes. Keep its state on the DMA path, like the batch row.
@@ -307,13 +308,16 @@ __aicore__ inline bool SubmitWqesAt(uint32_t rt_tokenBytes,uint64_t entityAddres
     // 1024 WQEs, halving the dispatch/DMA fences for the usual final batch.
     for(uint32_t begin=0;begin<count;begin+=bankSize) {
         uint32_t n=count-begin<bankSize?count-begin:bankSize;
+        KVIP_PIPE_SAMPLE(buildScope, pipeSample, PrefetchBuildVf);
         FinalBuild(rt_tokenBytes,reinterpret_cast<__ubuf__ uint32_t*>(remoteLow.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(remoteHigh.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(slots.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(words.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),begin,n,count);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        KVIP_TRACE_END(buildScope);
         uint32_t start=uint32_t(head+begin)&(sqDepth-1),first=n<sqDepth-start?n:sqDepth-start;
+        KVIP_PIPE_SAMPLE(sqScope, pipeSample, PrefetchSqMte3);
         DataCopy(sq[start*16],words,first*16);
         if(first!=n)DataCopy(sq,words[first*16],(n-first)*16);
         SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
@@ -349,7 +353,7 @@ __aicore__ inline bool SubmitWqesAt(uint32_t rt_tokenBytes,uint64_t entityAddres
 }
 #if KVIP_PARALLEL_TERMINAL
 __aicore__ inline bool WriteReservedWqes(uint32_t rt_tokenBytes,uint64_t entityAddress,uint64_t queueAddress,uint64_t output,LocalTensor<uint32_t> slots,LocalTensor<uint32_t> words,
-    LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize,bool final,__gm__ Row* row,uint32_t offset,uint32_t total,__gm__ uint32_t* boundTemplate,uint64_t originalHead) {
+    LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize,bool final,__gm__ Row* row,uint32_t offset,uint32_t total,__gm__ uint32_t* boundTemplate,uint64_t originalHead KVIP_PIPE_PARAM_DEFAULT) {
     if(!count)return false;
     auto cfg64=cfg.ReinterpretCast<uint64_t>();uint64_t head=originalHead+offset;
 #ifdef KVIP_KVAF_URMA_REGISTERED_BASE
@@ -363,26 +367,32 @@ __aicore__ inline bool WriteReservedWqes(uint32_t rt_tokenBytes,uint64_t entityA
     // selected and locations are both dead: their contiguous 64KiB holds
     // 1024 WQEs, halving the dispatch/DMA fences for the usual final batch.
     if(count<=bankSize){
+        KVIP_PIPE_SAMPLE(buildScope, pipeSample, TerminalWqeVf);
         FinalBuild(rt_tokenBytes,reinterpret_cast<__ubuf__ uint32_t*>(remoteLow.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(remoteHigh.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(slots.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(words.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),0,count,total-offset);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        KVIP_TRACE_END(buildScope);
         uint32_t start=uint32_t(head)&(sqDepth-1),first=count<sqDepth-start?count:sqDepth-start;
+        KVIP_PIPE_SAMPLE(sqScope, pipeSample, TerminalSqMte3);
         DataCopy(sq[start*16],words,first*16);
         if(first!=count)DataCopy(sq,words[first*16],(count-first)*16);
         SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
     }else{
     for(uint32_t begin=0;begin<count;begin+=bankSize) {
         uint32_t n=count-begin<bankSize?count-begin:bankSize;
+        KVIP_PIPE_SAMPLE(buildScope, pipeSample, TerminalWqeVf);
         FinalBuild(rt_tokenBytes,reinterpret_cast<__ubuf__ uint32_t*>(remoteLow.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(remoteHigh.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(slots.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(words.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),begin,n,total-offset);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        KVIP_TRACE_END(buildScope);
         uint32_t start=uint32_t(head+begin)&(sqDepth-1),first=n<sqDepth-start?n:sqDepth-start;
+        KVIP_PIPE_SAMPLE(sqScope, pipeSample, TerminalSqMte3);
         DataCopy(sq[start*16],words,first*16);
         if(first!=n)DataCopy(sq,words[first*16],(n-first)*16);
         SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
@@ -497,6 +507,9 @@ namespace rotating {
 // Reserve the last 8KiB of the 32000-byte Q4 scratch for candidate IDs
 // when indicesOut holds the complete lane's batch rows.
 constexpr uint32_t kCandidateCapacity=2048;
+#if KVIP_SERVICE_UB_CANDIDATES
+constexpr uint32_t kWindowCandidatePitch = 32;
+#endif
 // V7's direct transport pattern: address lookup/slot assignment only for the
 // compact miss list. FinalBuild/SubmitWqes are shared with final completion.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
@@ -528,8 +541,11 @@ inline void PrepareCandidateWqes(uint32_t rt_resident,__ubuf__ uint32_t* ids,__u
 // One UB bit per token gives exact deduplication. Expand only newly inserted
 // compact IDs, never scan the history-sized set. Each warp reserves output once.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
-inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
+inline void UnionColdTopk(const __ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
     __ubuf__ uint32_t* ids,__ubuf__ uint32_t* cfg,uint32_t stride,
+#if KVIP_SERVICE_UB_CANDIDATES
+    uint32_t inputPitch,
+#endif
     uint32_t n0,uint32_t n1,uint32_t n2,uint32_t n3,uint32_t limit,uint32_t words,bool last,
     __gm__ uint32_t* mapping,__gm__ Context* ctx,uint32_t batch,uint32_t resident) {
     uint32_t tid=threadIdx.x,lane=tid%32;
@@ -537,7 +553,11 @@ inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
         uint32_t q=i/stride,j=i%stride,n=q==0?n0:q==1?n1:q==2?n2:n3;
         bool fresh=false;uint32_t token=0;
         if(j<n) {
+#if KVIP_SERVICE_UB_CANDIDATES
+            token=input[q*inputPitch+j];
+#else
             token=input[i];
+#endif
             // The predecessor service is joined before this window. Its map
             // is authoritative even when the exported eligibility is stale.
             // Never create a second Index exchange for an admitted source.
@@ -565,10 +585,18 @@ inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
 template<bool captureIo, bool predecessorChecked=false>
 __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,
-    uint32_t sequenceHalfWindow) {
+    uint32_t sequenceHalfWindow, const __ubuf__ uint64_t* windowMetadata = nullptr
+#if KVIP_SERVICE_UB_CANDIDATES
+    , const __ubuf__ uint32_t* windowCandidates = nullptr
+#endif
+#if KVIP_STAGE_TRACE
+    , uint64_t stageTrace = 0
+#endif
+) {
     uint64_t scanTicks=0,candidateTicks=0,postTicks=0,bitmapBytes=0,totalCandidates=0;
     uint64_t scanBegin=0,candidateBegin=0,postBegin=0,begin=0;
     uint64_t firstDoorbell=0,lastDoorbell=0;
+    uint32_t doorbells=0,ubCandidateRows=0;
     auto ctx=reinterpret_cast<__gm__ Context*>(pointer);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
     auto event=events+epoch*rt_serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(if constexpr (!predecessorChecked) event->waitBegin=GetSystemCycle();)
     if constexpr (!predecessorChecked) if(epoch) {
@@ -579,6 +607,13 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     auto work=flags.ReinterpretCast<uint32_t>();
     V9_FETCH_PROFILE(event->begin=GetSystemCycle();)
     uint64_t postedCount=0; // Business state: controls batched WQE submission.
+#if KVIP_SERVICE_POST_CHUNK
+    constexpr uint32_t cqDepthWord = offsetof(KvafBatchGetDirectUrmaEntity, cq_depth) / sizeof(uint32_t);
+    constexpr uint32_t errorWord = 24 + offsetof(KvafBatchGetQueueState, last_error) / sizeof(uint64_t);
+    constexpr uint32_t poisonWord = 24 + offsetof(KvafBatchGetQueueState, poisoned) / sizeof(uint64_t);
+    const bool splitGeometry = rt_batchedRows && rt_batch <= rt_serviceLanes && sequenceHalfWindow &&
+        rt_rounds == 4 && ctx->prefetchLimit == 512 && ctx->windowLimit == 128;
+#endif
 
     auto cfg=work[4096];
     auto rowStorage=ids;
@@ -614,15 +649,47 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         uint32_t available=requests<ctx->prefetchLimit?ctx->prefetchLimit-requests:0;
         if(available>ctx->windowLimit)available=ctx->windowLimit;
         V9_FETCH_PROFILE(scanBegin=GetSystemCycle();)
+        KVIP_TRACE_BEGIN(selectScope, stageTrace, Cold, ServiceSelect, epoch, b);
         // Counts occupy spare incremental metadata, exported alongside TopK.
-        GlobalTensor<uint32_t> metadata,compact;
-        metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(rotating::TopKHeader(ctx))+b*128);
+        GlobalTensor<uint32_t> compact;
         compact.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192);
-        DataCopy(cfg[128],metadata,128);
-        SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
         uint32_t counts[4],maxCount=0;
-        for(uint32_t q=0;q<4;++q){counts[q]=cfg.GetValue(128+q*32+6);if(counts[q]>maxCount)maxCount=counts[q];}
+#if KVIP_SERVICE_LOCAL_COUNTS
+        if (windowMetadata) {
+            // Lane-local rows use the same sixteen u64 words per query
+            // as the published metadata (count is the low half of word 3).
+            const auto rowMetadata = windowMetadata + (b / rt_serviceLanes) * 64;
+            for (uint32_t q = 0; q < 4; ++q) {
+                counts[q] = uint32_t(rowMetadata[q * 16 + 3]);
+                if (counts[q] > maxCount) maxCount = counts[q];
+            }
+        } else
+#endif
+        {
+            GlobalTensor<uint32_t> metadata;
+            metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(rotating::TopKHeader(ctx))+b*128);
+            DataCopy(cfg[128],metadata,128);
+            SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            for(uint32_t q=0;q<4;++q){counts[q]=cfg.GetValue(128+q*32+6);if(counts[q]>maxCount)maxCount=counts[q];}
+        }
         cfg.SetValue(40,0);
+#if KVIP_SERVICE_UB_CANDIDATES
+        if (windowCandidates && maxCount) {
+            const uint32_t width = (maxCount + 7) / 8 * 8;
+            Duplicate(scratch,uint32_t(0),rt_history/32);
+            SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
+            KVIP_TRACE_BEGIN(unionScope, stageTrace, Cold, ServiceUnionVf, epoch, kvip_trace::PipeDetail(b));
+            Simt::VF_CALL<UnionColdTopk>(Simt::Dim3{256,1,1},windowCandidates,
+                reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),width,kWindowCandidatePitch,
+                counts[0],counts[1],counts[2],counts[3],available,rt_history/32,true,
+                reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(b)*rt_history,ctx,b,rt_resident);
+            if(captureIo) ++ubCandidateRows;
+        } else
+#endif
+        {
         Duplicate(scratch,uint32_t(0),rt_history/32);
         auto input=scratch[rt_history/32];
         // Four 256-ID rows fit before the unchanged service output at 23808.
@@ -633,20 +700,28 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
             SetFlag<HardEvent::V_MTE2>(EVENT_ID5);WaitFlag<HardEvent::V_MTE2>(EVENT_ID5);
             DataCopyExtParams copy;copy.blockCount=4;copy.blockLen=width*4;copy.srcStride=(2048-width)*4;copy.dstStride=0;
             DataCopyPadExtParams<uint32_t> pad{false,0,0,0};
+            KVIP_TRACE_BEGIN(candidateMteScope, stageTrace, Cold, ServiceInputMte2, epoch, kvip_trace::PipeDetail(b));
             DataCopyPad(input,compact[start],copy,pad);
             SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
+            KVIP_TRACE_END(candidateMteScope);
             SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
             uint32_t n[4];for(uint32_t q=0;q<4;++q)n[q]=counts[q]>start?((counts[q]-start)<width?counts[q]-start:width):0;
+            KVIP_TRACE_BEGIN(unionScope, stageTrace, Cold, ServiceUnionVf, epoch, kvip_trace::PipeDetail(b));
             Simt::VF_CALL<UnionColdTopk>(Simt::Dim3{256,1,1},
                 reinterpret_cast<__ubuf__ uint32_t*>(input.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),width,n[0],n[1],n[2],n[3],available<kCandidateCapacity?available:kCandidateCapacity,rt_history/32,start+256>=maxCount,
+                reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),width,
+#if KVIP_SERVICE_UB_CANDIDATES
+                width,
+#endif
+                n[0],n[1],n[2],n[3],available<kCandidateCapacity?available:kCandidateCapacity,rt_history/32,start+256>=maxCount,
                 reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(b)*rt_history,ctx,b,rt_resident);
+        }
         }
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
         candidateCount=cfg.GetValue(40);if(candidateCount>kCandidateCapacity)candidateCount=kCandidateCapacity;
-
+        KVIP_TRACE_END(selectScope);
 
         V9_FETCH_PROFILE(scanTicks+=GetSystemCycle()-scanBegin;totalCandidates+=candidateCount;)
         V9_FETCH_PROFILE(candidateBegin=GetSystemCycle();postBegin=0;)
@@ -658,6 +733,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
             missing=candidateCount;count=missing<available?missing:available;
             V9_FETCH_PROFILE(candidateTicks+=GetSystemCycle()-candidateBegin;)
             if(count) {
+                KVIP_TRACE_BEGIN(prepareScope, stageTrace, Cold, PrefetchPrepare, epoch, b);
                 const auto& args=reinterpret_cast<__gm__ KvafExecuteBatchGetKernelArgs*>(ctx->args)[b*2];
                 const uint64_t entityAddress=args.channel_entity,queueAddress=args.queue_state;
                 uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
@@ -676,6 +752,22 @@ if (rt_batchedRows) {
                 queueGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(queueAddress));
                 DataCopy(postInput,entityGm,48);DataCopy(postInput[48],queueGm,16);
                 SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+#if KVIP_SERVICE_POST_CHUNK
+                // Validate before making this window's claims visible. A
+                // poisoned queue or insufficient credit cannot use grouped Post either.
+                const uint32_t sqDepth = postInput.GetValue(19);
+                const uint32_t cqDepth = postInput.GetValue(cqDepthWord);
+                const bool badQueue = !sqDepth || (sqDepth & (sqDepth - 1)) ||
+                    requests + count >= sqDepth || pending + 1 >= cqDepth ||
+                    state.GetValue(11) || post64.GetValue(errorWord) || post64.GetValue(poisonWord) ||
+                    post64.GetValue(25) > UINT64_MAX - count;
+                if (splitGeometry && badQueue) {
+                    state.SetValue(11, kvaf_device::kInvalidArgs);
+                    postInput.SetValue(64, 0);
+                    count = 0;
+                } else
+#endif
+                {
                 GlobalTensor<int32_t> admitted;
                 admitted.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(post64.GetValue(37)));
                 SetFlag<HardEvent::V_MTE3>(EVENT_ID5);WaitFlag<HardEvent::V_MTE3>(EVENT_ID5);
@@ -687,17 +779,26 @@ if (rt_batchedRows) {
                 DataCopy(jobs,ids,((count+7)/8)*8);
                 SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
                 slots+=count;requests+=count;
+                }
 } else {
                 {
+#if KVIP_STAGE_TRACE
+                    const kvip_trace::ScanSample pipeSample{stageTrace, kvip_trace::Cold,
+                        epoch, kvip_trace::PipeDetail(b)};
+#endif
+                    KVIP_PIPE_SAMPLE(candidateScope, pipeSample, PrefetchBuildVf);
                     Simt::VF_CALL<PrepareCandidateWqes>(Simt::Dim3{256,1,1},rt_resident,
                         reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
                         reinterpret_cast<__ubuf__ uint32_t*>(work[512].GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work[1024].GetPhyAddr()),
                         map,reinterpret_cast<__gm__ uint64_t*>(addresses),count,rt_resident+slots,ctx,b,reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddress(ctx->incremental,rt_batch,rt_history,b)));
                     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+                    KVIP_TRACE_END(candidateScope);
+                    KVIP_TRACE_END(prepareScope);
+                    KVIP_TRACE_BEGIN(submitScope, stageTrace, Cold, PrefetchSubmit, epoch, b);
                     if(captureIo && !firstDoorbell)firstDoorbell=GetSystemCycle();
-                    SubmitWqesAt(rt_tokenBytes,entityAddress,queueAddress,output,work[1024],scratch,work,work[512],cfg,count,256,false,nullptr);
+                    SubmitWqesAt(rt_tokenBytes,entityAddress,queueAddress,output,work[1024],scratch,work,work[512],cfg,count,256,false,nullptr KVIP_PIPE_ARG);
                     ++pending;
-                    if(captureIo)lastDoorbell=GetSystemCycle();
+                    if(captureIo){lastDoorbell=GetSystemCycle();++doorbells;}
                     slots+=count;requests+=count;
                 }
 }
@@ -725,38 +826,85 @@ if (rt_batchedRows) {
     }
 if (rt_batchedRows) {
     if(postedCount) {
+        KVIP_TRACE_BEGIN(batchSubmitScope, stageTrace, Cold, PrefetchSubmit, epoch, lane);
         V9_FETCH_PROFILE(begin=GetSystemCycle();)
         uint32_t maxCount=0;
         for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
             uint32_t n=cfg.GetValue(256+(b/rt_serviceLanes)*80+64);if(n>maxCount)maxCount=n;
         }
-        for(uint32_t start=0;start<maxCount;start+=rt_postBank) {
-            Simt::VF_CALL<BatchBuild<V9_BATCH_POST==1>>(Simt::Dim3{512,1,1},rt_batch,rt_history,rt_resident,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,ctx,epoch,lane,start,
+        uint32_t postBank = rt_postBank;
+#if KVIP_SERVICE_POST_CHUNK
+        static_assert(KVIP_SERVICE_POST_CHUNK == 64);
+        // Only split a single row on this lane. Check SQ and CQ credits in
+        // their own units, using all WQEs since the last replay's CQ join.
+        const bool chunked = splitGeometry && maxCount > KVIP_SERVICE_POST_CHUNK &&
+            rt_postBank > KVIP_SERVICE_POST_CHUNK;
+        if (chunked) postBank = KVIP_SERVICE_POST_CHUNK;
+#endif
+        for(uint32_t start=0;start<maxCount;start+=postBank) {
+            KVIP_TRACE_BEGIN(batchBuildScope, stageTrace, Cold, PrefetchBuildVf, epoch, kvip_trace::PipeDetail(lane, 14U));
+            Simt::VF_CALL<BatchBuild<V9_BATCH_POST==1>>(Simt::Dim3{512,1,1},rt_batch,rt_history,rt_resident,rt_serviceLanes,rt_tokenBytes,rt_postThreads,postBank,ctx,epoch,lane,start,
                 reinterpret_cast<__ubuf__ uint64_t*>(work[512].GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(cfg[256].GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()));
             SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
             SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            KVIP_TRACE_END(batchBuildScope);
             for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
                 uint32_t g=b/rt_serviceLanes;auto input=cfg[256+g*80];auto in64=input.ReinterpretCast<uint64_t>();
                 uint32_t count=input.GetValue(64);if(count<=start)continue;
-                uint32_t n=count-start;if(n>rt_postBank)n=rt_postBank;
+                uint32_t n=count-start;if(n>postBank)n=postBank;
                 uint32_t depth=input.GetValue(19),offset=uint32_t(in64.GetValue(25)+start)&(depth-1);
                 uint32_t first=n<depth-offset?n:depth-offset;
 #if V9_BATCH_POST == 2
-                FinalBuild(rt_tokenBytes,reinterpret_cast<__ubuf__ uint32_t*>(work[512+g*rt_postBank].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t*>(work[1024+g*rt_postBank].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t*>(work[1536+g*rt_postBank].GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t*>(scratch[g*rt_postBank*16].GetPhyAddr()),
+                KVIP_TRACE_BEGIN(rowBuildScope, stageTrace, Cold, PrefetchBuildVf, epoch, kvip_trace::PipeDetail(b));
+                FinalBuild(rt_tokenBytes,reinterpret_cast<__ubuf__ uint32_t*>(work[512+g*postBank].GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint32_t*>(work[1024+g*postBank].GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint32_t*>(work[1536+g*postBank].GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ uint32_t*>(scratch[g*postBank*16].GetPhyAddr()),
                     reinterpret_cast<__ubuf__ uint32_t*>(work[g*32].GetPhyAddr()),0,n,count-start);
                 SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+                KVIP_TRACE_END(rowBuildScope);
 #endif
+                KVIP_TRACE_BEGIN(rowSqScope, stageTrace, Cold, PrefetchSqMte3, epoch, kvip_trace::PipeDetail(b));
                 GlobalTensor<uint32_t> sq;sq.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(in64.GetValue(7)));
-                DataCopy(sq[offset*16],scratch[g*rt_postBank*16],first*16);
-                if(first<n)DataCopy(sq,scratch[(g*rt_postBank+first)*16],(n-first)*16);
+                DataCopy(sq[offset*16],scratch[g*postBank*16],first*16);
+                if(first<n)DataCopy(sq,scratch[(g*postBank+first)*16],(n-first)*16);
             }
             SetFlag<HardEvent::MTE3_V>(EVENT_ID0);WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+#if KVIP_SERVICE_POST_CHUNK
+            if (chunked && start + postBank < maxCount) {
+                // The logical window has already claimed all tokens. Expose
+                // just this SQ prefix. The final logical WQE still signals the
+                // sole CQE, so pending and all completion ownership stay put.
+                auto input = cfg[256];
+                auto in64 = input.ReinterpretCast<uint64_t>();
+                const uint64_t initialHead = in64.GetValue(25);
+#if !V9_SIMULATION
+                in64.SetValue(24,(uint64_t(1)<<32)|kvaf_device::kQueueMagic);
+#endif
+                const uint64_t head = initialHead + start + postBank;
+                in64.SetValue(25, head);
+                GlobalTensor<uint32_t> queue;
+                queue.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(in64.GetValue(36)));
+                SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+                DataCopy(queue,input[48],16);
+                SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+                const uint64_t db = in64.GetValue(8);
+                if(captureIo && !firstDoorbell)firstDoorbell=GetSystemCycle();
+#if V9_SIMULATION
+                *reinterpret_cast<__gm__ uint64_t*>(db)=head;
+                kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(db),64);
+#else
+                st_dev(uint32_t(head),reinterpret_cast<__gm__ uint32_t*>(db),0);
+#endif
+                if(captureIo){lastDoorbell=GetSystemCycle();++doorbells;}
+                // BatchBuild's owner/wrap calculations use the immutable PI.
+                in64.SetValue(25, initialHead);
+                SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
+            }
+#endif
         }
         for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
             auto input=cfg[256+(b/rt_serviceLanes)*80];auto in64=input.ReinterpretCast<uint64_t>();
@@ -774,19 +922,23 @@ if (rt_batchedRows) {
             auto input=cfg[256+(b/rt_serviceLanes)*80];if(!input.GetValue(64))continue;
             auto in64=input.ReinterpretCast<uint64_t>();uint64_t db=in64.GetValue(8),head=in64.GetValue(25);
             if(captureIo && !firstDoorbell)firstDoorbell=GetSystemCycle();
+            KVIP_TRACE_BEGIN(doorbellScope, stageTrace, Cold, PrefetchDoorbell, epoch, kvip_trace::PipeDetail(b));
 #if V9_SIMULATION
             *reinterpret_cast<__gm__ uint64_t*>(db)=head;
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(db),64);
 #else
             st_dev(uint32_t(head),reinterpret_cast<__gm__ uint32_t*>(db),0);
 #endif
-            if(captureIo)lastDoorbell=GetSystemCycle();
+            KVIP_TRACE_END(doorbellScope);
+            if(captureIo){lastDoorbell=GetSystemCycle();++doorbells;}
         }
         V9_FETCH_PROFILE(postTicks+=GetSystemCycle()-begin;)
     }
 }
     V9_FETCH_PROFILE(event->scanTicks=scanTicks;event->candidateTicks=candidateTicks;event->postTicks=postTicks;)
-    V9_FETCH_PROFILE(event->bitmapBytes=bitmapBytes;event->candidateCount=totalCandidates;event->postedCount=postedCount;)
+    // Keep the 128-byte Event ABI. Its diagnostic bitmap byte count uses
+    // the low 32 bits; the two upper halfwords track posts and UB rows.
+    V9_FETCH_PROFILE(event->bitmapBytes=bitmapBytes | (uint64_t(doorbells) << 32) | (uint64_t(ubCandidateRows) << 48);event->candidateCount=totalCandidates;event->postedCount=postedCount;)
     if(captureIo){auto stamp=reinterpret_cast<__gm__ uint64_t*>(event->pad);stamp[0]=firstDoorbell;stamp[1]=lastDoorbell;}
     V9_FETCH_PROFILE(event->end=GetSystemCycle();)event->complete=1;
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event),captureIo?sizeof(Event):64);
@@ -794,14 +946,36 @@ if (rt_batchedRows) {
 }
 
 namespace rotating {
-__aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_splitQ,uint32_t rt_rounds,uint32_t rt_serviceAics,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer, uint32_t epoch, uint32_t core,
+__aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer, uint32_t epoch, uint32_t core,
     uint32_t lane, LocalTensor<uint32_t> scratch, LocalTensor<uint16_t> flags,
-    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false) {
+    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false,
+    const __ubuf__ uint64_t* windowMetadata = nullptr
+#if KVIP_SERVICE_UB_CANDIDATES
+    , const __ubuf__ uint32_t* windowCandidates = nullptr
+#endif
+#if KVIP_STAGE_TRACE
+    , uint64_t stageTrace = 0
+#endif
+) {
     // RotateFetch calls AdvanceWindow first, which joins the same lane's
     // predecessor before touching incremental state. A second CQ-independent
     // poll here adds no ordering and delays the resumed score producer.
-    if(captureIo) FastService<true,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
-    else FastService<false,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
+    if(captureIo) FastService<true,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, lane, scratch, flags, indices, sequenceHalfWindow, windowMetadata
+#if KVIP_SERVICE_UB_CANDIDATES
+        , windowCandidates
+#endif
+#if KVIP_STAGE_TRACE
+        , stageTrace
+#endif
+    );
+    else FastService<false,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, lane, scratch, flags, indices, sequenceHalfWindow, windowMetadata
+#if KVIP_SERVICE_UB_CANDIDATES
+        , windowCandidates
+#endif
+#if KVIP_STAGE_TRACE
+        , stageTrace
+#endif
+    );
 }
 }
 
