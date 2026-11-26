@@ -80,7 +80,9 @@ public:
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
     template <bool OwnWindow = false>
     __aicore__ inline void ProcessDedicatedCold(GM_ADDR compute);
-    __aicore__ inline void ProcessDynamicScore(GM_ADDR compute, uint32_t row, uint32_t epoch, uint32_t fragment);
+    template<bool Partitioned = false>
+    __aicore__ inline void ProcessDynamicScore(
+        GM_ADDR compute, uint32_t row, uint32_t epoch, uint32_t fragment, uint32_t parts = 2);
 #endif
 
     // =================================类型定义区=================================
@@ -1147,26 +1149,47 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessDedicatedCold(G
     }
 }
 template <typename QLIT>
+template <bool Partitioned>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessDynamicScore(
-    GM_ADDR compute, uint32_t row, uint32_t epoch, uint32_t fragment)
+    GM_ADDR compute, uint32_t row, uint32_t epoch, uint32_t fragment, uint32_t parts)
 {
+    KVIP_TRACE_BEGIN(eventInit, Partitioned ? stageTrace_ : 0, Cold, LiEventsAcquire, epoch, row);
     if ASCEND_IS_AIV {
         vectorService.AllocEventID();
         CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT);
         CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + 1);
+        KVIP_TRACE_BEGIN(progressScope, Partitioned ? stageTrace_ : 0, Cold, ColdProgressPrepare, epoch, row);
         vectorService.PrepareRotationProgress();
-        vectorService.SetDedicatedColdEpoch(epoch);
+        KVIP_TRACE_END(progressScope);
+        if constexpr (!Partitioned) vectorService.SetDedicatedColdEpoch(epoch);
     } else {
         matmulService.AllocEventID();
     }
+    KVIP_TRACE_END(eventInit);
     BindDedicatedQuery(compute, row, epoch);
     uint32_t loop = 0, scaleLoop = 0;
     const uint32_t half = rotating::SequenceHalfWindow(runtimeShape_);
-    ScanDedicatedFragment(row, half, epoch, fragment, loop, scaleLoop, true, true);
+    if constexpr (Partitioned) {
+        const auto tiles = kvip_cold_score::Split(runtimeShape_.history, resident_, half, epoch, fragment, parts);
+#if KVIP_STAGE_TRACE
+        traceWindow_ = epoch;
+#endif
+        KVIP_TRACE_RECORD(scanScope, stageTrace_, kvip_trace::Cold, kvip_trace::ScanPhase(), epoch, row);
+        ScanSequenceHalf(tiles.begin, tiles.end, fragment, loop, scaleLoop, true, false, false, true);
+    } else {
+        ScanDedicatedFragment(row, half, epoch, fragment, loop, scaleLoop, true, true);
+    }
+    KVIP_TRACE_BEGIN(eventDrain, Partitioned ? stageTrace_ : 0, Cold, LiEventsDrain, epoch, row);
     if ASCEND_IS_AIV {
+#if KVIP_STAGE_TRACE
+        vectorService.FreeEventID(Partitioned ? stageTrace_ : 0, kvip_trace::Cold);
+#else
         vectorService.FreeEventID();
+#endif
+        KVIP_TRACE_END(eventDrain);
     } else {
         matmulService.FreeEventID();
+        KVIP_TRACE_END(eventDrain);
         KVIP_TRACE_BEGIN(cubeTail, stageTrace_, Cold, LiCubeWait, epoch, row);
         constexpr uint32_t bank = QLICommon::ConstInfo::CROSS_VC_EVENT;
         constexpr uint32_t peer = QLICommon::ConstInfo::AIV0_AIV1_OFFSET;

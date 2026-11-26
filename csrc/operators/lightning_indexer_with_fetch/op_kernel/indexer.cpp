@@ -17,6 +17,7 @@ struct QLITilingData {
 #include "../../lightning_indexer_with_fetch/op_kernel/indexer/indexer.h"
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
 #include "indexer/dynamic_mailbox.h"
+#include "indexer/partitioned_score_dispatch.h"
 #include "p2_w1_schedule.h"
 #endif
 namespace {
@@ -45,7 +46,7 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, [[maybe_unuse
         Phase == SequenceLiPhase::DynamicScore || Phase == SequenceLiPhase::DynamicService ||
         Phase == SequenceLiPhase::ColdRawScore;
     const uint64_t stageTrace = (parts == 2 || Phase == SequenceLiPhase::Cold ||
-        Phase == SequenceLiPhase::UnifiedScore)
+        Phase == SequenceLiPhase::DynamicScore || Phase == SequenceLiPhase::UnifiedScore)
         ? KVIP_TRACE_WORKSPACE(P(15)) : 0;
     constexpr uint32_t traceKernel = traceHotSlot ? kvip_trace::Hot :
         (Phase == SequenceLiPhase::Threshold || Phase == SequenceLiPhase::W1Score) ? kvip_trace::Threshold :
@@ -62,7 +63,7 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, [[maybe_unuse
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
     uint32_t serviceSlot = 0;
     if constexpr (SeparateService) {
-        constexpr uint32_t kScoreGroups = 8;
+        constexpr uint32_t kScoreGroups = kvip_partitioned_dispatch::kScoreGroups;
         if ASCEND_IS_AIV {
             const uint32_t block = GetBlockIdx();
             serviceOnly = block >= 2 * kScoreGroups;
@@ -106,7 +107,8 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, [[maybe_unuse
         op.vectorService.SetPrefixStorage(P(13));
         op.vectorService.SetRotationContext(P(14));
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
-        if constexpr (Phase == SequenceLiPhase::Cold) {
+        if constexpr (Phase == SequenceLiPhase::Cold ||
+            (Phase == SequenceLiPhase::DynamicScore && SeparateService)) {
             if (parts > 2) op.vectorService.BindPartitionedCold(P(12), parts, SeparateService);
         } else if constexpr (Phase == SequenceLiPhase::DedicatedCold || Phase == SequenceLiPhase::DynamicScore ||
             Phase == SequenceLiPhase::DynamicService) {
@@ -119,7 +121,8 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, [[maybe_unuse
     if constexpr (Phase == SequenceLiPhase::DedicatedCold) {
         op.template ProcessDedicatedCold<OwnWindow>(P(12));
     } else if constexpr (Phase == SequenceLiPhase::DynamicScore) {
-        op.ProcessDynamicScore(P(12), dynamic_li::Row(job), dynamic_li::Window(job), dynamic_li::Fragment(job));
+        op.template ProcessDynamicScore<SeparateService>(
+            P(12), dynamic_li::Row(job), dynamic_li::Window(job), dynamic_li::Fragment(job), parts);
     } else if constexpr (Phase == SequenceLiPhase::DynamicService) {
         if ASCEND_IS_AIV {
             op.vectorService.RunDynamicService(dynamic_li::Row(job), dynamic_li::Window(job),
@@ -253,6 +256,14 @@ __aicore__ inline dynamic_li::Mailbox DynamicMailbox(GM_ADDR bindings) {
         kvip_dedicated_cold::ProgressBytes()};
 }
 
+__aicore__ inline dynamic_li::Mailbox PartitionedScoreMailbox(GM_ADDR bindings) {
+    const auto args = reinterpret_cast<__gm__ const uint64_t*>(bindings);
+    const auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(args[14]));
+    constexpr uint32_t parts = kvip_partitioned_dispatch::kParts;
+    return {reinterpret_cast<GM_ADDR>(args[12]) + kvip_cold_score::ScoreBytes(shape.batch, shape.history) +
+        shape.batch * kvip_cold_score::kQueries * parts * kvip_cold_score::kProgressBytes};
+}
+
 #endif
 }
 #endif
@@ -300,6 +311,68 @@ extern "C" __global__ __aicore__ void v9_li_kernel_cold_separate_service(GM_ADDR
 #if defined(__CCE_AICORE__) && !V9_UBMEM
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     RunLi<SequenceLiPhase::Cold, false, false, false, true>(bindings, 4);
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_li_kernel_threshold_separate_dynamic(GM_ADDR bindings, uint32_t parts) {
+#if defined(__CCE_AICORE__) && !V9_UBMEM
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    if ASCEND_IS_AIV {
+        using namespace kvip_partitioned_dispatch;
+        auto bus = PartitionedScoreMailbox(bindings);
+        constexpr uint32_t thresholdAivs = kRows * kvip_cold_score::kQueries;
+        for (uint32_t line = AscendC::GetBlockIdx(); line < kLines; line += thresholdAivs) {
+            bus.Write(line, 0);
+        }
+        ResetPartitionedColdProgress(bindings, parts);
+        RunLi<SequenceLiPhase::Threshold>(bindings);
+    }
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_li_kernel_cold_separate_dynamic(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__) && !V9_UBMEM
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    using namespace kvip_partitioned_dispatch;
+    const uint32_t block = AscendC::GetBlockIdx();
+    auto bus = PartitionedScoreMailbox(bindings);
+    uint32_t group = block;
+    uint32_t ack = kAicAck + block;
+    if ASCEND_IS_AIV {
+        if (block >= kScoreAivs) {
+            RunLi<SequenceLiPhase::Cold, false, false, false, true>(bindings, kParts);
+            return;
+        }
+        group = block / 2;
+        ack = kAivAck + block;
+    } else {
+        // The first Service MIX has no Cube work in the static comparison.
+        if (block == kScoreGroups) {
+            Dispatcher dispatcher;
+            while (!dispatcher.Step(bus)) {}
+            for (uint32_t worker = 0; worker < kScoreGroups; ++worker) {
+                bus.SendScore(worker, dynamic_li::kStop);
+            }
+        }
+        if (block >= kScoreGroups) return;
+    }
+#if KVIP_STAGE_TRACE
+    const auto args = reinterpret_cast<__gm__ const uint64_t*>(bindings);
+    const uint64_t trace = KVIP_TRACE_WORKSPACE(reinterpret_cast<GM_ADDR>(args[15]));
+#endif
+    KVIP_TRACE_BEGIN(body, trace, Cold, KernelBody, 0, 0);
+    uint32_t seen = 0;
+    while (true) {
+        const uint32_t job = bus.Score(group);
+        if (job == dynamic_li::kStop) return;
+        if (job == seen) continue;
+        {
+            KVIP_TRACE_BEGIN(scope, trace, Cold, DynamicScoreJob, dynamic_li::Window(job), job);
+            RunLi<SequenceLiPhase::DynamicScore, true, false, false, true>(bindings, kParts, job);
+        }
+        bus.Write(ack, job);
+        seen = job;
+    }
 #endif
 }
 
