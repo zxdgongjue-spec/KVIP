@@ -2,10 +2,11 @@
 """Save one untimed stock LI reference for both candidates on a local capture."""
 import argparse
 import json
-import os
 from pathlib import Path
 
 import numpy as np
+
+from packed_device import physical_card
 
 from native_li_reference import check_positions, digest, get_reference, native_li
 from reporting import atomic_json
@@ -17,7 +18,7 @@ def load_oracle(directory, group):
     identity = source['identity']
     ends = np.asarray(source['effective_native_ends'])
     if (receipt['group'] != group or receipt['reference_kind'] != 'native-only'
-            or identity['visible'] != '4' or identity['operator'] != 'torch_npu.npu_quant_lightning_indexer'
+            or identity['visible'] != physical_card() or identity['operator'] != 'torch_npu.npu_quant_lightning_indexer'
             or ends.shape != (16, 4) or source['sparse_count'] != 2048):
         raise ValueError(f'G{group}: unexpected standalone native TopK reference')
     ids = np.load(directory / 'strong_serial.npy', allow_pickle=False)
@@ -32,8 +33,7 @@ def prepare(trace, group, directory):
     import torch_npu
     from workloads import ReplayPagePlan, ReplaySequence
 
-    if os.environ.get('ASCEND_RT_VISIBLE_DEVICES') != '4':
-        raise ValueError('Expected one visible physical NPU4')
+    physical_card(require_visible=True)
     device = torch.device('npu:0')
     torch.npu.set_device(device)
     sequence = ReplaySequence(trace, group, (1, 1))

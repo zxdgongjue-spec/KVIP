@@ -12,6 +12,8 @@ from time import perf_counter
 
 import numpy as np
 
+from packed_device import physical_card
+
 
 REVISION = '609fa26fd715f9409bbe74e1b2d3685c58dfb0cf'
 BATCH = 16
@@ -153,7 +155,7 @@ def worker(args):
     folder.mkdir(parents=True, exist_ok=False)
     atomic_json(folder / 'config.json', {**{k: str(v) if isinstance(v, Path) else v
                                            for k, v in vars(cfg).items()},
-                                       'physical_npu': 4, 'fused_only': True, 'production_root': str(main),
+                                       'physical_npu': int(physical_card(require_visible=True)), 'fused_only': True, 'production_root': str(main),
                                        'production_revision': args.revision})
     if history_cap:
         atomic_json(folder / 'capture_input.json', capture_receipt)
@@ -346,7 +348,7 @@ def worker(args):
         digest = hashlib.sha256(tail).hexdigest()
         if digest != '5054a60bd3822bd0790b781620f21cbfd9b8816f6d08684adc1f540a9f1083b4':
             raise ValueError(f'Loaded terminal code differs from B24 upstream: {digest} ({library})')
-        atomic_json(fused / 'ready_checks.json', dict(physical_npu=4, production_revision=args.revision,
+        atomic_json(fused / 'ready_checks.json', dict(physical_npu=int(physical_card()), production_revision=args.revision,
             terminal_text_sha256=digest, li_text_sha256=li_hashes,
             capture_operand_hashes=operand_hashes, loaded_library=str(library),
             library_sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
@@ -457,10 +459,10 @@ def main(args):
     from score_equivalence import save_checked
     from workloads import ReplaySequence
 
-    if (os.environ.get('ASCEND_RT_VISIBLE_DEVICES') != '4' or
-            subprocess.check_output(['git', '-C', args.main, 'rev-parse', 'HEAD'], text=True).strip() != args.revision or
+    physical_card(require_visible=True)
+    if (subprocess.check_output(['git', '-C', args.main, 'rev-parse', 'HEAD'], text=True).strip() != args.revision or
             subprocess.check_output(['git', '-C', args.main, 'status', '--porcelain', '-uno'], text=True).strip()):
-        raise ValueError('Expected clean pinned production mainline on physical NPU4')
+        raise ValueError('Expected clean pinned production checkout')
     # The reader and mainline have different modules named execution,
     # performance, correctness, etc. Keep the production process independent.
     subprocess.run([sys.executable, '-B', __file__, *sys.argv[1:], '--worker'], check=True)

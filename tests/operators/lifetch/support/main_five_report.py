@@ -8,6 +8,8 @@ from statistics import mean, median
 
 import numpy as np
 
+from packed_device import physical_card
+
 MAIN = '609fa26fd715f9409bbe74e1b2d3685c58dfb0cf'
 OWNER = '888db6b1603d22f4142bd2ccffe0518611856a31'
 GROUPS = (4, 10, 17, 7, 2)
@@ -119,7 +121,7 @@ def measured_parallel(root, group, arm, revision, owner, native, old_receipt, ar
         check_snapshot(group, INPUT_AND_RESULTS[group][0], archived_inputs, capture)
     if out['input_paths'] != inputs['source_paths'] or inputs['geometry'] != out['geometry']:
         raise ValueError(f'G{group}: output capture metadata mismatch')
-    expected = dict(group=group, transport='urma', input='real', device=0, physical_npu=4, warmup=4,
+    expected = dict(group=group, transport='urma', input='real', device=0, physical_npu=int(physical_card()), warmup=4,
                     iterations=expected_calls, intermediate_fetches=4, prefetch_tokens=1024, prefetch_rank_start=1024,
                     fused_only=True, production_revision=revision)
     differences = [name for name, value in expected.items() if config.get(name) != value]
@@ -130,7 +132,8 @@ def measured_parallel(root, group, arm, revision, owner, native, old_receipt, ar
         raise ValueError(f'G{group}: mainline device validation or transport setup failed')
     proof = read(folder / 'mainline_checks.json')
     expected_counts = (expected_calls, expected_calls * 16)
-    if (proof['production_revision'] != revision or proof['production_terminal'] is not True
+    if (proof['runtime']['visible'] != physical_card()
+            or proof['production_revision'] != revision or proof['production_terminal'] is not True
             or proof['profiled_terminal_kernel'] != 'v9_parallel_terminal'
             or (proof['measured_calls'], proof['measured_kv_index_rows']) != expected_counts
             or (proof['ordered_diagnostic_calls'], proof['ordered_diagnostic_rows']) != expected_counts):
