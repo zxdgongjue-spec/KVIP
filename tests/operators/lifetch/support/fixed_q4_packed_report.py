@@ -13,59 +13,115 @@ from reporting import atomic_json
 STAGES = ('graph', 'LI', 'tail')
 
 
-def verify_source(out, archive, repo):
+REFERENCE = '10442f1ffa314606c23f54b73e49ecfc372f1f9a'
+
+
+def verify_source(out, archive, repo, *, candidate=False):
     if field(archive, 'native') != NATIVE or not same_card(archive, out):
         raise ValueError(f'Input archive is from another operator, host or physical card: {archive}')
     for key in ('kvaf', 'kvaf_tree'):
         if not field(out, key) or field(out, key) != field(archive, key):
             raise ValueError(f'Archive and current {key} differ')
-    same_production(repo, NATIVE, 'HEAD')
+    same_production(repo, NATIVE, 'HEAD', candidate=candidate)
 
 
-def read_pair(pair, group, batch, cohort, root):
+def find_control(out, archive, repo, explicit):
+    verify_source(out, archive, repo, candidate=True)
+    wanted = {(g, b) for g in (10, 4, 17, 7, 2) for b in (1, 2, 4, 8, 16, 20, 24, 28, 32)}
+    choices = [Path(explicit)] if explicit else list(out.parent.glob('fixed-q4-packed.*'))
+    for ctl in sorted(choices, key=lambda path: path.stat().st_mtime_ns, reverse=True):
+        if (not (ctl / 'packed_summary.json').is_file() or field(ctl, 'native') != REFERENCE
+                or not same_card(ctl, out) or Path(field(ctl, 'packed_source')) != archive
+                or any(field(ctl, key) != field(out, key) for key in ('kvaf', 'kvaf_tree'))):
+            continue
+        summary = json.loads((ctl / 'packed_summary.json').read_text())
+        cells = summary.get('cells', [])
+        if (summary.get('protocol') == 'ten_independent_calls_one_device_event' and summary.get('blocks') == 2
+                and len(cells) == len(wanted) and {(r['group'], r['batch']) for r in cells} == wanted):
+            return ctl.resolve()
+    raise ValueError('No completed matching 45-cell ten-call baseline. Resume the original run to completion.')
+
+
+def read_arm(pair, group, batch, cohort, root, arm, *, traffic=False):
+    directory = pair / arm
+    row = json.loads((directory / 'packed_result.json').read_text())
+    identity = row['identity']
+    if (not (directory / 'placement_verified').is_file()
+            or row['arm'] != arm or row['calls'] != 10 or row['correctness'] != 'PASS'
+            or identity['group'] != group or identity['batch'] != batch
+            or identity['physical_npu'] != int(field(root, 'physical_npu'))
+            or identity['host'] != field(root, 'host') or identity['native'] != field(root, 'native')
+            or row['checked_queries'] != 40 * batch or row['checked_rows'] != 10 * batch
+            or (arm == 'serial' and row['get_workers'] != 2)):
+        raise ValueError(f'Incomplete or mismatched packed result: {directory}')
+    if batch <= 16 and identity['donor_rows'] != list(range(cohort, 16, 16 // batch)):
+        raise ValueError(f'Wrong source requests for {directory}')
+    times = {s: row['mean_us'][s] for s in ('LI', 'tail')}
+    times['graph'] = row['graph_mean_us']
+    if (not all(isfinite(v) and v > 0 for v in times.values()) or
+            not isclose(times['graph'] * 10, row['graph_event_us'], rel_tol=1e-8)):
+        raise ValueError(f'Invalid ten-call device event or stage measurements: {directory}')
+    if traffic:
+        calls = row['traffic']
+        if len(calls) != row['calls'] or any(type(c[k]) != int or c[k] < 0
+                                             for c in calls for k in ('prefetch', 'final')):
+            raise ValueError(f'Missing or invalid fused transfer counts: {directory}')
+        for key in ('prefetch', 'final'):
+            times[key] = mean(c[key] for c in calls)
+        if all('first_prefetch' in c and 'first_nonempty_rows' in c for c in calls):
+            times['first_prefetch'] = mean(c['first_prefetch'] for c in calls)
+            times['first_nonempty_rows'] = mean(c['first_nonempty_rows'] for c in calls)
+    # Each arm has already been checked against its own expected operator revision.
+    identity = {k: v for k, v in identity.items() if k != 'native'}
+    return times, (identity, placement(directory / 'thp.json'))
+
+
+def read_pair(pair, group, batch, cohort, root, control=None):
     rows = {}
     identities = []
-    for arm in ('serial', 'fused'):
-        directory = pair / arm
-        row = json.loads((directory / 'packed_result.json').read_text())
-        identity = row['identity']
-        if (not (directory / 'placement_verified').is_file()
-                or row['arm'] != arm or row['calls'] != 10 or row['correctness'] != 'PASS'
-                or identity['group'] != group or identity['batch'] != batch
-                or identity['physical_npu'] != int(field(root, 'physical_npu'))
-                or identity['host'] != field(root, 'host') or identity['native'] != field(root, 'native')
-                or row['checked_queries'] != 40 * batch or row['checked_rows'] != 10 * batch
-                or (arm == 'serial' and row['get_workers'] != 2)):
-            raise ValueError(f'Incomplete or mismatched packed result: {directory}')
-        if batch <= 16 and identity['donor_rows'] != list(range(cohort, 16, 16 // batch)):
-            raise ValueError(f'Wrong source requests for {directory}')
-        times = {s: row['mean_us'][s] for s in ('LI', 'tail')}
-        times['graph'] = row['graph_mean_us']
-        if (not all(isfinite(v) and v > 0 for v in times.values()) or
-                not isclose(times['graph'] * 10, row['graph_event_us'], rel_tol=1e-8)):
-            raise ValueError(f'Invalid ten-call device event or stage measurements: {directory}')
-        identities.append((identity, placement(directory / 'thp.json')))
-        rows[arm] = times
-    if identities[0] != identities[1]:
+    measurements = [('serial', 'serial', control or root), ('fused', 'fused', root)]
+    if control:
+        measurements.append(('previous_fused', 'fused', control))
+    for label, arm, source in measurements:
+        rows[label], ident = read_arm(source / pair.relative_to(root), group, batch, cohort, source, arm,
+                                     traffic=control is not None and arm == 'fused')
+        identities.append(ident)
+    if any(ident != identities[0] for ident in identities[1:]):
         raise ValueError(f'Serial and fused inputs, runtime or memory placement differ: {pair}')
     return rows
 
 
 def cell_summary(root, group, batch):
     cell = root / f'g{group}/bs{batch}'
+    reference = field(root, 'reference')
+    control = Path(reference) if reference else None
     observations = []
     cohort_count = max(1, 16 // batch)
     for cohort in range(cohort_count):
         directory = cell if cohort_count == 1 else cell / f'cohort{cohort}'
         for block in (1, 2):
-            observations.append(read_pair(directory / f'block{block}', group, batch, cohort, root))
+            observations.append(read_pair(directory / f'block{block}', group, batch, cohort, root, control))
     times = {arm: {s: mean(r[arm][s] for r in observations) for s in STAGES}
-             for arm in ('serial', 'fused')}
+             for arm in observations[0]}
     saved = {s: times['serial'][s] - times['fused'][s] for s in STAGES}
     gain = 100 * saved['graph'] / times['serial']['graph']
-    return dict(group=group, batch=batch, cohorts=cohort_count, blocks=2, calls_per_graph=10,
+    result = dict(group=group, batch=batch, cohorts=cohort_count, blocks=2, calls_per_graph=10,
                 mean_us=times, saved_us=saved, graph_gain_pct=gain,
                 reached_20pct=times['fused']['graph'] <= 0.8 * times['serial']['graph'])
+    if control:
+        delta = {k: times['previous_fused'][k] - times['fused'][k] for k in STAGES}
+        result['tokens_per_call'] = {arm: {key: mean(o[arm][key] for o in observations)
+                                           for key in ('prefetch', 'final')}
+                                     for arm in ('previous_fused', 'fused')}
+        if all('first_prefetch' in o['fused'] for o in observations):
+            result['first_window'] = {k: mean(o['fused'][k] for o in observations)
+                                      for k in ('first_prefetch', 'first_nonempty_rows')}
+        # Cohorts are nested outside the two blocks. Keep both block deltas visible.
+        result['graph_saved_vs_previous_by_block_us'] = [
+            mean(o['previous_fused']['graph'] - o['fused']['graph'] for o in observations[block::2])
+            for block in range(2)]
+        result.update(saved_vs_previous_us=delta, reached_15pct=gain >= 15, no_slowdown=delta['graph'] >= 0)
+    return result
 
 
 def report_cell(row):
@@ -76,6 +132,21 @@ def report_cell(row):
         print(f"G{row['group']} BS{row['batch']} {arm} graph_mean_us={values['graph']:.2f} "
               f"LI_mean_us={values['LI']:.2f} tail_mean_us={values['tail']:.2f}")
     saved = row['saved_us']
+    if 'saved_vs_previous_us' in row:
+        delta = row['saved_vs_previous_us']
+        old, new = (row['tokens_per_call'][arm] for arm in ('previous_fused', 'fused'))
+        b1, b2 = row['graph_saved_vs_previous_by_block_us']
+        first = row.get('first_window')
+        first_text = (f" first_window_GETs/active_rows={first['first_prefetch']:.1f}/"
+                      f"{first['first_nonempty_rows']:.1f}" if first else '')
+        print(f"G{row['group']} BS{row['batch']} saved_vs_serial_us={saved['graph']:+.2f} "
+              f"gain_vs_serial_pct={row['graph_gain_pct']:+.2f} target15={'PASS' if row['reached_15pct'] else 'MISS'} "
+              f"previous_minus_new_graph/LI/tail_us={delta['graph']:+.2f}/{delta['LI']:+.2f}/{delta['tail']:+.2f} "
+              f"no_slowdown={'PASS' if row['no_slowdown'] else 'MISS'} "
+              f"previous_minus_new_block1/block2_us={b1:+.2f}/{b2:+.2f} "
+              f"prefetch_old/new={old['prefetch']:.1f}/{new['prefetch']:.1f} "
+              f"final_old/new={old['final']:.1f}/{new['final']:.1f}{first_text}")
+        return
     print(f"G{row['group']} BS{row['batch']} serial_minus_fused graph_saved_us={saved['graph']:+.2f} "
           f"LI_saved_us={saved['LI']:+.2f} tail_saved_us={saved['tail']:+.2f} "
           f"graph_gain_pct={row['graph_gain_pct']:+.2f} target20={'PASS' if row['reached_20pct'] else 'MISS'}")
@@ -88,6 +159,11 @@ def main():
     source.add_argument('out', type=Path)
     source.add_argument('archive', type=Path)
     source.add_argument('repo', type=Path)
+    ctl = subs.add_parser('reference')
+    ctl.add_argument('out', type=Path)
+    ctl.add_argument('archive', type=Path)
+    ctl.add_argument('repo', type=Path)
+    ctl.add_argument('explicit')
     cell = subs.add_parser('cell')
     cell.add_argument('out', type=Path)
     cell.add_argument('group', type=int)
@@ -99,6 +175,8 @@ def main():
     args = parser.parse_args()
     if args.mode == 'verify-source':
         verify_source(args.out, args.archive, args.repo)
+    elif args.mode == 'reference':
+        print(find_control(args.out, args.archive, args.repo, args.explicit))
     elif args.mode == 'cell':
         report_cell(cell_summary(args.out, args.group, args.batch))
     else:
@@ -110,16 +188,41 @@ def main():
         old_path = archive / 'fixed_q4_acceptance.json'
         if 16 in args.batches and old_path.is_file():
             previous = json.loads(old_path.read_text())
-            prior = {p['group']: p['new_packed_us'] for p in previous.get('packed', [])
-                     if p.get('context_matched') and p.get('physical_npu') == 3}
+            prior = {p['group']: p for p in previous.get('packed', [])
+                     if p.get('context_matched') and p.get('physical_npu') == int(field(args.out, 'physical_npu'))}
             for cell in cells:
                 group = cell['group']
-                if cell['batch'] == 16 and group in prior and len(prior[group]) == 2:
-                    historical = mean(prior[group])
+                if cell['batch'] == 16 and group in prior and len(prior[group]['new_packed_us']) == 2:
+                    archived = prior[group]
+                    historical = mean(archived['new_packed_us'])
+                    refs = archived.get('reference_packed_us', [])
+                    if archived.get('reference_kind') == 'same_card_live' and len(refs) == 2 and all(
+                            isfinite(v) and v > 0 for v in refs):
+                        pr30 = mean(refs)
+                        delta = pr30 - cell['mean_us']['fused']['graph']
+                        cell['same_card_archived_pr30_mean_us'] = pr30
+                        cell['archived_pr30_minus_fused_us'] = delta
+                        print(f"G{group} BS16 same_card_archived_PR30_us={pr30:.2f} "
+                              f"PR30_minus_candidate_us={delta:+.2f}")
                     if isfinite(historical) and historical > 0:
                         cell['historical_bs16_candidate_us'] = historical
                         print(f"G{group} BS16 historical_candidate_mean_us={historical:.2f} "
                               f"fresh_candidate_mean_us={cell['mean_us']['fused']['graph']:.2f}")
+        if field(args.out, 'reference'):
+            hits = sum(c['reached_15pct'] for c in cells)
+            steady = sum(c['no_slowdown'] for c in cells)
+            both = sum(c['reached_15pct'] and c['no_slowdown'] for c in cells)
+            bs16 = [c for c in cells if c['batch'] == 16]
+            compared = [c['archived_pr30_minus_fused_us'] for c in bs16 if 'archived_pr30_minus_fused_us' in c]
+            parity = sum(v >= 0 for v in compared)
+            payload['acceptance'] = dict(cells=len(cells), both=both,
+                                         bs16=len(bs16), bs16_pr30_compared=len(compared), bs16_pr30_parity=parity,
+                                         all_pass=both == len(cells) and parity == len(bs16))
+            atomic_json(path, payload)
+            print(f'AIV_TARGET gain15={hits}/{len(cells)} no_slowdown={steady}/{len(cells)} '
+                  f'both={both}/{len(cells)} bs16_PR30_parity={parity}/{len(bs16)} '
+                  f'bs16_PR30_compared={len(compared)}/{len(bs16)} SUMMARY={path}')
+            return
         atomic_json(path, payload)
         print(f'PACKED_TARGET cells_at_20pct={passed}/{len(cells)} SUMMARY={path}')
 

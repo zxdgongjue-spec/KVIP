@@ -407,11 +407,18 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint3
         const auto span = large_li::Window(plan.start, plan.end, input.shape.rounds, epoch);
         const uint32_t suffix = large_li::LaterSuffix(span, plan.start, plan.tiles, plan.quota, planCount, epoch);
         const uint32_t cut = span.end - suffix;
+#if KVIP_TEST_SIBLING_TRACE
+        uint64_t scoreBegin = 0, scoreEnd = 0;
+        if ASCEND_IS_AIV { scoreBegin = GetSystemCycle(); }
+#endif
         if (span.begin < cut) {
             op.ProcessLargeScore(span.begin, cut, true, !thresholdLoaded, overlap);
             thresholdLoaded = true;
         }
         if ASCEND_IS_AIV {
+#if KVIP_TEST_SIBLING_TRACE
+            scoreEnd = GetSystemCycle();
+#endif
             // After ProcessLargeScore acknowledges BOTH old credits per lane,
             // the cube may fill the next two banks while these lanes rank the
             // current window and its single owner rings the doorbell.
@@ -423,7 +430,11 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint3
             }
             PublishProgress(input, plan.row, input.vecLane * 2, 2, span.end);
             op.vectorService.AllocEventID();
-            op.vectorService.AdvanceLargeWindowPair(plan.row, epoch, span.end * 128);
+            op.vectorService.AdvanceLargeWindowPair(plan.row, epoch, span.end * 128
+#if KVIP_TEST_SIBLING_TRACE
+                                                    , scoreBegin, scoreEnd
+#endif
+            );
             FinishPair(input, plan, op, epoch);
             op.vectorService.FreeEventID();
         }

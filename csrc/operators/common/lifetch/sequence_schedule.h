@@ -67,4 +67,18 @@ LIFETCH_SCHEDULE_DEVICE inline SequenceSlice SequenceSliceAt(uint32_t token, uin
     uint32_t index = (token - resident) / half;
     return {index % 2, resident + (index + 1) * half};
 }
+// A cursor is exclusive within its own alternating shard. A cursor may lag the
+// causal end while the entire outstanding interval belongs to the other shard.
+LIFETCH_SCHEDULE_DEVICE inline bool SequencePrefixCovers(uint64_t cursors, uint32_t resident,
+                                                        uint32_t half, uint32_t valid) {
+    const uint32_t ends[2] = {uint32_t(cursors), uint32_t(cursors >> 32)};
+    if (ends[0] >= valid && ends[1] >= valid) return true;
+    if (!half || ends[0] < resident || ends[1] < resident) return false;
+    for (uint32_t shard = 0; shard < 2; ++shard) {
+        if (ends[shard] >= valid) continue;
+        const auto next = SequenceSliceAt(ends[shard], resident, half);
+        if (next.shard == shard || next.end < valid) return false;
+    }
+    return true;
+}
 #undef LIFETCH_SCHEDULE_DEVICE

@@ -123,6 +123,7 @@ extern "C" uint32_t kvip_streaming_resolver_cores(){return pipeline_ab::kResolve
 extern "C" uint32_t kvip_streaming_flag_count(){return pipeline_ab::kFlagCount;}
 
 extern "C" uint32_t aclrtlaunch_v9_parallel_terminal(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_parallel_terminal_fixed(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_fixed_hot(uint32_t,void*,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_fixed_cold(uint32_t,void*,void*,void*);
 extern "C" uint32_t kvip_fixed_q4_score_groups(const rotating::RuntimeShape* shape) {
@@ -148,7 +149,7 @@ extern "C" uint32_t kvip_fixed_q4_small_forward(void* bindings, void* terminal,
     uint32_t result = aclrtlaunch_v9_li_fixed_hot(groups, stream, bindings, terminal);
     if (!result) result = aclrtlaunch_v9_li_kernel_1(shape->liCores, stream, bindings);
     if (!result) result = aclrtlaunch_v9_li_fixed_cold(groups, stream, bindings, terminal);
-    if (!result) result = aclrtlaunch_v9_parallel_terminal(shape->batch * 4, stream, terminal);
+    if (!result) result = aclrtlaunch_v9_parallel_terminal_fixed(shape->batch * 4, stream, terminal);
     return result;
 }
 extern "C" uint32_t kvip_parallel_tail_forward(void* bindings,void* terminal,
@@ -163,6 +164,12 @@ extern "C" uint32_t kvip_parallel_tail_forward(void* bindings,void* terminal,
     uint32_t result=aclrtlaunch_v9_li_kernel(shape->liCores,stream,bindings);
     if(!result)result=aclrtlaunch_v9_li_kernel_1(shape->liCores,stream,bindings);
     if(!result)result=aclrtlaunch_v9_li_kernel_2(shape->liCores,stream,bindings);
-    if(!result)result=aclrtlaunch_v9_parallel_terminal(shape->batch*4,stream,terminal);
+    if (!result) {
+        const bool fixed16 = shape->batch == 16 && shape->aicCount == 32 && shape->indexHeads == 32
+            && shape->resident == 16384 && (shape->history == 131072 || shape->history == 131328)
+            && shape->rounds == 4 && shape->tokenBytes == 656;
+        const auto launchTail = fixed16 ? aclrtlaunch_v9_parallel_terminal_fixed : aclrtlaunch_v9_parallel_terminal;
+        result = launchTail(shape->batch * 4, stream, terminal);
+    }
     return result;
 }

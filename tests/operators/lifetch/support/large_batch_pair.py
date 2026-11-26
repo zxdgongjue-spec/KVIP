@@ -56,7 +56,7 @@ def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False):
     base = Decimal(str(spans[0]["ts"]))
     duration = float(spans[0]["dur"])
     names = (
-        {"LI1": ("v9_li_large_hot",), "LI23": ("v9_li_large_threshold_cold",), "tail": ("v9_parallel_terminal_large",)}
+        {"LI1": ("v9_li_large_hot",), "LI23": ("v9_li_large_threshold_cold", "v9_li_large_two_cold"), "tail": ("v9_parallel_terminal_large",)}
         if fused
         else {
             "li": ("quantlightningindexer",),
@@ -65,10 +65,11 @@ def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False):
         }
     )
     if batch == 16 and fused:
-        names = {"pr30_li": ("v9_li_kernel",), "tail": ("v9_parallel_terminal",)}
+        names = {"pr30_li": ("v9_li_kernel",), "tail": ("v9_parallel_terminal", "v9_parallel_terminal_fixed")}
     elif fused and batch < 16:
         names = {"LI1": ("v9_li_fixed_hot",), "LI2": ("v9_li_kernel_1",),
-                 "LI3": ("v9_li_fixed_cold",), "tail": ("v9_parallel_terminal",)}
+                 "LI3": ("v9_li_fixed_cold",),
+                 "tail": ("v9_parallel_terminal", "v9_parallel_terminal_fixed")}
     names_re = {key: re.compile("(?:" + "|".join(aliases) + ")" + KERNEL_SUFFIX, re.I) for key, aliases in names.items()}
     stages = {key: [] for key in names}
     hardware_pids = {
@@ -287,10 +288,28 @@ def read_selected(state, inputs, fused):
 
         status = terminal.owner.core_status.cpu().numpy().view(np.uint64)
         validate_terminal_receipts(counts, status, terminal.queue_views)
-        prefetch = state.rotating.rows[:, 9].cpu().numpy()
+        # Row.requests and Row.epochCount[0] are maintained even without profiling.
+        # Read both after the measured graph, independently of diagnostic timestamps.
+        two_cold = getattr(state, "two_cold_windows", False)
+        counters = state.rotating.rows[:, 9:(19 if two_cold else 17)].cpu().numpy()
+        prefetch = counters[:, 0]
+        first_window = counters[:, 7]
         if np.any(prefetch < 0) or np.any(prefetch > 2048):
             raise ValueError("Prefetch exceeded the per-request reservation")
-        traffic = dict(prefetch=int(prefetch.sum()), final=int(counts.sum()))
+        if np.any(first_window < 0) or np.any(first_window > prefetch):
+            raise ValueError("First-window GET count exceeds the row's total")
+        traffic = dict(prefetch=int(prefetch.sum()), final=int(counts.sum()),
+                       first_prefetch=int(first_window.sum()), first_nonempty_rows=int(np.count_nonzero(first_window)))
+        if two_cold:
+            grants = np.array([256, 384, 384])
+            epochs = counters[:, 7:10]
+            if (np.any(epochs < 0) or np.any(epochs > grants) or np.any(prefetch > 1024)
+                    or not np.array_equal(epochs.sum(axis=1), prefetch)):
+                raise ValueError("Three-window grants do not match the observed per-row GET counts")
+            traffic["posted_per_window"] = epochs.sum(axis=0).tolist()
+            traffic["largest_row_per_window"] = epochs.max(axis=0).tolist()
+            traffic["row_window_prefetch"] = epochs.tolist()
+            traffic["row_query_final"] = counts.tolist()
         raw = state.workspace.topk.cpu().numpy().reshape(shape)
         unpack = state.workspace.inputs.unpack_indices.cpu().numpy().reshape(-1)
         if np.any(raw < 0) or np.any(raw >= state.history) or not np.array_equal(np.sort(unpack), np.arange(batch * 4)):
@@ -675,7 +694,7 @@ def run(args):
     previous = None
     if args.packed_ten:
         from fixed_q4_packed_archive import load_archived_oracle
-        serial = load_archived_oracle(args.serial_result, identity, repo)
+        serial = load_archived_oracle(args.serial_result, identity, repo, candidate=args.compare_packed_candidate)
     elif fused:
         base = identity
         if args.compare_archived_pair:
@@ -696,6 +715,9 @@ def run(args):
         serial = np.load(path, mmap_mode="r", allow_pickle=False)
         if serial.shape != (CALLS, args.batch, 4, 2048):
             raise ValueError("Strong serial output shape mismatch")
+    two_cold = getattr(args, "large_two_cold", False)
+    if two_cold and (not args.packed_ten or not args.compare_packed_candidate or not fused or args.batch not in (20,24,28,32)):
+        raise ValueError("The three-window experiment requires a fresh packed BS20/24/28/32 fused candidate")
     cfg = configuration(
         [
             "bench" if args.packed_ten else "diagnose",
@@ -720,7 +742,7 @@ def run(args):
             "--prefetch-tokens",
             "1024",
             "--intermediate-fetches",
-            "4",
+            "3" if two_cold else "4",
             "--warmup",
             str(WARMUP),
             "--iterations",
@@ -734,14 +756,23 @@ def run(args):
     scratch_existed = (args.output / "export_only_prof_dir").exists()
     if args.packed_ten:
         from fixed_q4_packed_worker import measure_packed, save_packed
-        benchmark = partial(measure_packed, ex, proofs, serial)
+        benchmark = partial(measure_packed, ex, proofs, serial, window_density=args.window_density)
     else:
         benchmark = partial(measured_replays, ex, proofs, serial)
-    result = ex.run_path(cfg, args.output / "path", sequence, pages, fused=fused, measure=benchmark)
+    result = ex.run_path(cfg, args.output / "path", sequence, pages, fused=fused, measure=benchmark,
+                         large_two_cold=two_cold)
     workers = (32 if args.batch > 16 else 40) if fused else 2
     if result["correctness"] != "PASS" or result["failures"] or result["runtime_workers"] != workers:
         raise ValueError(f"{args.arm}: production replay failed or used incorrect worker count")
     if args.packed_ten:
+        if two_cold:
+            proofs["window_grants_per_row"] = [256, 384, 384]
+            proofs["row_prefetch_limit"] = 1024
+            means = np.mean([item["posted_per_window"] for item in proofs["traffic"]], axis=0)
+            peaks = np.max([item["largest_row_per_window"] for item in proofs["traffic"]], axis=0)
+            print(f"WINDOWS G{args.group} BS{args.batch} grants=256/384/384 row_limit=1024 "
+                  f"posted_per_call_mean={'/'.join(f'{value:.1f}' for value in means)} "
+                  f"peak_row={'/'.join(str(value) for value in peaks)}")
         save_packed(args, identity, inputs, proofs, workers, scratch_existed)
         return
     values = proofs["samples"]
@@ -887,6 +918,10 @@ def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arm", choices=("serial", "fused"), required=True)
+    parser.add_argument("--large-two-cold", action="store_true",
+                        help="One seed and two cold windows, fixed BS20/24/28/32")
+    parser.add_argument("--window-density", action="store_true", help="Collect post timestamps in one separate large-BS call")
+    parser.add_argument("--compare-packed-candidate", action="store_true", help="Use the original strong serial selection for a modified fusion kernel")
     parser.add_argument("--packed-ten", action="store_true", help="Capture and time ten independent states in one graph")
     parser.add_argument("--trace", type=Path, required=True)
     parser.add_argument("--group", type=int, choices=GROUPS, required=True)

@@ -94,6 +94,13 @@ __aicore__ inline void ExportWindowCold(uint32_t query, uint32_t cutoff = 0) {
         ctx->incremental,runtimeShape_.batch,runtimeShape_.history,b));
     uint64_t rankClocks[5];
     uint32_t bitmapLength=runtimeShape_.history, limit=ctx->windowLimit/4, minimum=limit/2, rankCut=UINT32_MAX;
+#if defined(KVIP_EXPERIMENT_TWO_COLD)
+    // Four Qs share this row's first-window grant; later grants use windowLimit.
+    if (rankedEpoch_ == 0 && limit > 64) {
+        limit = 64;
+        minimum = 32;
+    }
+#endif
 #if KVIP_PARALLEL_TERMINAL
     if (rankedEpoch_==runtimeShape_.rounds) {
         // PackUncovered masks all IDs >= valid before consulting this row.
@@ -718,8 +725,8 @@ __aicore__ inline void FinalIncremental(uint32_t query,uint32_t valid,bool seque
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     if(runtimeShape_.rounds) {
         uint32_t lane=(query/4)%runtimeShape_.serviceLanes;
-        // Only the final consumer must join outstanding state; never spin in
-        // an optional intermediate window.
+        // Join the last published state before final selection. Intermediate
+        // window writers also wait for the preceding service on their lane.
         while(!PreviousServiceReady(runtimeShape_.rounds,lane)) {}
     }
     uint32_t scanEnd=runtimeShape_.history;

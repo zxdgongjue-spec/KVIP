@@ -1,0 +1,320 @@
+#pragma once
+#include "terminal_runtime_abi.h"
+#include "large_batch_li.h"
+#include "window_types.h"
+#if defined(__CCE_AICORE__)
+#include "shadow_exchange_parallel.h"
+using namespace pipeline_ab;
+// Reuse dead TopK scratch: the original hash checks and swap plans need 20.5 KiB.
+constexpr uint32_t TAIL_SRCSET=0, TAIL_DSTSET=2048, TAIL_PLAN_SRC=4096,
+ TAIL_PLAN_DST=6656, TAIL_CONTROL=9216;
+#include "helpers.h"
+#include "overlap_update.h"
+#include "capacity.h"
+#include "emit.h"
+#include "parallel_post.h"
+#include "terminal_output_routes.h"
+#include "terminal_finish.h"
+#include "staged_fetch_worker.h"
+namespace rotating {
+#include "terminal_transport.h"
+}
+// Per-request fences occupy independent cache lines. No all-device barrier.
+__aicore__ inline void Signal(__gm__ uint32_t* flags,uint32_t n,uint32_t generation){flags[n*32]=generation;kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+n*32),128);}
+__aicore__ inline void Await(__gm__ uint32_t* flags,uint32_t n,uint32_t generation){auto p=reinterpret_cast<__gm__ volatile uint32_t*>(flags+n*32);do{kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+n*32),128);}while(*p<generation);}
+// Simulation-only CQ latency. SYS_CNT-to-trace calibration is verified in report.
+constexpr uint64_t kSimCqDelayTicks=9000;
+// Diagnostic pass only: preserve the assignment partition before its owner retires it.
+__simt_vf__ __aicore__ LAUNCH_BOUND(512) inline void CaptureTerminalAssignments(
+ __gm__ uint32_t* sources,__gm__ uint32_t* destinations,__gm__ uint32_t* savedSources,
+ __gm__ uint32_t* savedDestinations,uint32_t first,uint32_t count){
+ for(uint32_t i=threadIdx.x;i<count;i+=512){
+  asc_stcg(savedSources+first+i,asc_ldcg(sources+i));
+  asc_stcg(savedDestinations+first+i,asc_ldcg(destinations+i));
+ }
+ asc_threadfence();
+}
+__simt_callee__ inline void RetireShared(
+ __gm__ rotating::Context* ctx,uint32_t begin,uint32_t count,uint32_t history,uint32_t b){
+ auto changes=(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity);
+ auto mapping=(reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(b)*history);
+ for(uint32_t i=begin+threadIdx.x;i<begin+count;i+=THREADS){
+  uint32_t token=asc_ldcg(changes+i);
+  if(token<history)asc_stcg(mapping+token,UINT32_MAX);
+  asc_stcg(changes+i,UINT32_MAX);
+ }
+}
+
+__simt_callee__ inline void RetirePriorJournal(__gm__ rotating::Context* ctx,uint32_t history,uint32_t q,uint32_t count,uint32_t b){
+ auto journal=(reinterpret_cast<__gm__ rotating::MappingJournal*>(ctx->mappingJournal)+uint64_t(b)*1);
+ if(!journal)return;
+ auto mapping=(reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(b)*history);
+ // Count was snapshotted before the existing all-output-reader rendezvous.
+ uint32_t begin=count*q/4,end=count*(q+1)/4;
+ for(uint32_t i=begin+threadIdx.x;i<end;i+=THREADS){uint32_t token=asc_ldcg(journal->tokens+i);if(token<history)asc_stcg(mapping+token,UINT32_MAX);}
+ if(!q && !threadIdx.x)asc_stcg(&journal->count,0U);
+}
+__simt_vf__ __aicore__ LAUNCH_BOUND(THREADS) inline void UpdateIndex(
+ __gm__ uint32_t* sources,__gm__ uint32_t* dest,uint32_t count,
+ uint32_t resident,uint32_t history,__gm__ uint64_t* keys,__gm__ uint32_t* scales,
+ __gm__ uint64_t* addresses,__gm__ uint64_t* logical,__ubuf__ uint32_t* work,__gm__ rotating::Context* ctx,uint32_t total,uint32_t q,uint32_t first,__gm__ uint32_t* header,__gm__ uint32_t* progress,uint32_t priorJournalCount,uint32_t b,__gm__ uint32_t* diagnostic,bool applied=false){
+ if(!applied)SwapColdIndexRows<false>(sources,dest,0,count,resident,history,keys,scales,work,addresses,logical,
+  ctx->reservedHot?reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+uint64_t(b)*resident:nullptr,
+  total,diagnostic-(12+q)*32);
+ if(!applied && (work[TAIL_CONTROL]&0x80000000U))return;
+ // Validation has already synchronized all workers. Preserve evidence before retirement.
+ if(count && !applied && work[TAIL_CONTROL] && !threadIdx.x){
+   uint32_t bad=UINT32_MAX,reason=0,source=UINT32_MAX,target=UINT32_MAX,previous=UINT32_MAX;
+   for(uint32_t i=0;i<count && bad==UINT32_MAX;++i){
+     uint32_t src=work[TAIL_PLAN_SRC+i],dst=work[TAIL_PLAN_DST+i],why=0;
+     if(src>=history)why|=2U;if(dst>=resident)why|=4U;
+     for(uint32_t j=0;j<i;++j){
+       if(src==work[TAIL_PLAN_SRC+j]){why|=8U;previous=first+j;}
+       if(dst==work[TAIL_PLAN_DST+j]){why|=16U;previous=first+j;}
+     }
+     if(why){bad=first+i;reason=why;source=src;target=dst;}
+   }
+   asc_stcg(diagnostic+12,bad);asc_stcg(diagnostic+13,reason);
+   asc_stcg(diagnostic+14,source);asc_stcg(diagnostic+15,target);
+   asc_stcg(diagnostic+16,previous);
+ }
+ // The immutable plan is already visible; key and metadata stores are disjoint.
+ // Metadata swaps run alongside key swaps in the same validated task.
+ asc_syncthreads();
+ if(!applied && !work[TAIL_CONTROL]){
+  for(uint32_t i=threadIdx.x;i<count;i+=THREADS){uint32_t src=work[TAIL_PLAN_SRC+i];if(src<resident){auto valid=reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(rotating::OwnerRow(ctx,b))*resident;asc_stcg(valid+src,0U);}}
+ }
+ RetireShared(ctx,first,count,history,b);
+ RetirePriorJournal(ctx,history,q,priorJournalCount,b);
+ if(!q){if(!threadIdx.x){auto row=(reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+uint64_t(b)*1);asc_stcg(&row->slots,total);}}
+ if(threadIdx.x<32){asc_stcg(header+threadIdx.x,0U);asc_stcg(progress+threadIdx.x,0U);}
+ asc_threadfence();
+}
+
+template<bool LargeBatch>
+__aicore__ inline void RunTerminalRow(GM_ADDR binding, uint32_t b, uint32_t q){
+ auto runtime=reinterpret_cast<__gm__ terminal_runtime::Binding*>(binding);
+ GM_ADDR arg=reinterpret_cast<GM_ADDR>(runtime->pipeline);
+ auto a=reinterpret_cast<__gm__ pipeline_ab::Args*>(arg);auto ctx=reinterpret_cast<__gm__ rotating::Context*>(a->context);auto s=rotating::LoadRuntimeShape(ctx);
+ bool profile=(runtime->options&1U)!=0;
+ uint32_t query=b*4+q;
+ auto flags=reinterpret_cast<__gm__ uint32_t*>(runtime->flags)+terminal_runtime::RowFlagOffset(b);
+ auto ts=reinterpret_cast<__gm__ uint64_t*>(runtime->times)+terminal_runtime::QueryTraceOffset(b,q);
+ const uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
+ auto update=reinterpret_cast<__gm__ uint64_t*>(a->updateBindings);
+ const uint64_t addressStride=update[7];
+ auto args=reinterpret_cast<__gm__ KvafExecuteBatchGetKernelArgs*>(runtime->queueArgs)+query;
+ auto post=reinterpret_cast<__gm__ rotating::FinalPost*>(ctx->owners+s.finalPostOffset)+query;
+ kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+q*32),128);
+ uint32_t generation=flags[q*32+1]+1;
+ uint32_t priorJournalCount=ctx->mappingJournal?(reinterpret_cast<__gm__ volatile rotating::MappingJournal*>(ctx->mappingJournal)+uint64_t(b)*1)->count:0;
+ uint32_t priorSlots=(reinterpret_cast<__gm__ volatile rotating::Row*>(ctx->rows)+b)->slots;
+ if(profile)ts[0]=GetSystemCycle();
+ TPipe pipe;
+ using Type=QLICommon::QLIType<fp8_e4m3fn_t,fp8_e4m3fn_t,int32_t,true,QLICommon::LI_LAYOUT::BSND,QLICommon::LI_LAYOUT::PA_BSND,bfloat16_t,float,float,uint16_t>;
+ QLIKernel::QLIVector<Type> op;QLICommon::ConstInfo ci{};ci.gSize=32;ci.qHeadNum=32;ci.kHeadNum=1;ci.headDim=128;ci.mBaseSize=64;ci.s1BaseSize=2;ci.s2BaseSize=128;ci.sparseCount=2048;ci.kSeqSize=s.history;ci.kCacheBlockSize=128;ci.maxBlockNumPerBatch=s.history/128;
+ QLITilingData tiling{};op.SetStreamingWorkspace(arg);op.InitParams(ci,&tiling,false);op.InitBuffers(&pipe,false);op.SetRotationContext(reinterpret_cast<GM_ADDR>(ctx));
+ GlobalTensor<uint16_t> scores;op.InitVecWorkspaceTensor(scores);GlobalTensor<bfloat16_t> weights;GlobalTensor<float> qs,ks;GlobalTensor<int32_t> out,blocks;out.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(ctx->selected));op.InitVecInputTensor(weights,qs,ks,out,blocks);
+ auto ends=reinterpret_cast<__gm__ const uint32_t*>(ctx->queryEnds);
+ uint32_t scanHistory=LargeBatch ? large_li::ScanHistory(s,ends,b) : rotating::ActiveScanHistory(s,ends,b);
+ op.AllocEventID();if(profile)ts[1]=GetSystemCycle();
+ uint32_t topkError=0;
+ if constexpr (LargeBatch) {
+  auto ready=reinterpret_cast<__gm__ uint32_t*>(runtime->reserved[2])+(b*8+q)*32;
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ready),128);
+  const uint32_t stagedCount=*reinterpret_cast<__gm__ volatile uint32_t*>(ready);
+  if(runtime->reserved[4] && large_li::HasStagedMisses(stagedCount)){
+   op.LoadPublishedLargeIds(query);
+   auto meta=op.IncrementalMeta(query);
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
+   const uint32_t count=stagedCount-large_li::kStagedBase;
+   meta[3]=count;
+   kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta),128);
+   if(count){
+    GlobalTensor<uint32_t> staged;
+    staged.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(runtime->reserved[4])+query*2048);
+    DataCopy(op.TerminalCompact(),staged,(count+7)/8*8);
+   }
+   SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
+  }else{
+   topkError=op.template TerminalQueryRuntime<true>(query,scanHistory);
+  }
+ }else{
+  topkError=op.template TerminalQueryRuntime<false>(query,scanHistory);
+ }
+ uint32_t ownError=topkError;if(profile)ts[2]=GetSystemCycle();Signal(flags,q,generation);
+ auto postWork=op.TerminalWork(),postIds=op.TerminalCompact(),postScratch=op.TerminalScratch();
+ auto compact=reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048;
+ auto mapping=(reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(b)*s.history);
+ uint32_t candidates=reinterpret_cast<__gm__ volatile uint32_t*>(rotating::TopKHeader(ctx))[query*32+6];
+ if(profile)ts[3]=GetSystemCycle();
+ auto tailBounds=reinterpret_cast<__gm__ uint32_t*>(ctx->tailBounds);
+ uint32_t tailBegin=tailBounds?tailBounds[b*2]:0,tailEnd=tailBounds?tailBounds[b*2+1]:0;
+ uint32_t tailCapacity=ctx->outputStride?uint32_t(ctx->outputStride)-s.resident:0;
+ uint32_t counts[4]={0,0,0,0};counts[q]=candidates;
+ uint32_t width=(candidates+31)/32*32;
+ // PackUniqueLocal uses one output slot per TopK position. Its control
+ // words immediately follow those outputs in the same private UB bank.
+ auto postControl=postScratch[2048];
+
+ auto activeLru=reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+uint64_t(b)*rotating::kLruSlots;
+ uint32_t slotCapacity=rotating::kLruSlots;bool capacityCounted=false;
+ auto headers=reinterpret_cast<__gm__ uint32_t*>(rotating::TopKHeader(ctx))+b*128;
+ for(uint32_t capacityPass=0;capacityPass<2;++capacityPass){
+ if(capacityPass){
+ Simt::VF_CALL<PrepareTerminalCapacity>(Simt::Dim3{32,1,1},
+  reinterpret_cast<__ubuf__ uint32_t*>(postIds.GetPhyAddr()),candidates,mapping,
+  headers,flags,generation,q,priorSlots,
+  reinterpret_cast<__ubuf__ uint32_t*>(postControl[16].GetPhyAddr()));
+ SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ uint32_t upper=postControl.GetValue(16);
+ capacityCounted=postControl.GetValue(18)!=0;
+ if(capacityCounted){candidates=postControl.GetValue(17);counts[q]=candidates;width=(candidates+31)/32*32;}
+ if(upper>rotating::kLruSlots){
+  auto extended=reinterpret_cast<__gm__ uint32_t*>(runtime->reserved[0])+uint64_t(b)*(rotating::kChangeCapacity+4*((s.resident+31)/32));
+  auto savedIds=reinterpret_cast<__gm__ uint32_t*>(ctx->incremental+uint64_t(s.batch)*512+uint64_t(b)*(4*2048*6+1024)+4*2048*2);
+  auto inverse=reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+uint64_t(b)*s.resident;
+  Simt::VF_CALL<ExtendTerminalLru>(Simt::Dim3{512,1,1},activeLru,extended,savedIds,inverse,
+   ctx->queryEnds?reinterpret_cast<__gm__ uint32_t*>(ctx->queryEnds)+b*4:nullptr,
+   s.resident,upper<rotating::kChangeCapacity?upper:rotating::kChangeCapacity,q,flags,extended+rotating::kChangeCapacity,
+   reinterpret_cast<__ubuf__ uint32_t*>(postIds[2048].GetPhyAddr()));
+  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+  slotCapacity=postIds.GetValue(2048);activeLru=extended;
+ }
+ if(profile)ts[19]=GetSystemCycle();
+ }
+ // Consume the original compact UB result directly; compact destinations use postWork.
+ // MERGED_OUTPUT_BEFORE_WQE
+ if(profile)ts[6]=GetSystemCycle();
+ Simt::VF_CALL<PackUniqueLocal<LargeBatch>>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(postIds.GetPhyAddr()),width,counts[0],counts[1],counts[2],counts[3],q,mapping,reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postControl.GetPhyAddr()),(reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+uint64_t(b)*1),reinterpret_cast<__gm__ uint64_t*>(rotating::RequestAddressTable(ctx,b,owner,s.history)),reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postWork[2048].GetPhyAddr()),s.resident,reinterpret_cast<__ubuf__ uint32_t*>(postWork[4096].GetPhyAddr()),activeLru,slotCapacity,capacityCounted,capacityPass==0,headers,priorSlots,(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity),(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+uint64_t(b)*rotating::kChangeCapacity),(uint64_t(tailEnd)<<32)|tailBegin,tailCapacity,reinterpret_cast<__gm__ uint32_t*>(runtime->templates)+query*32,args,reinterpret_cast<__ubuf__ uint32_t*>(op.TerminalIds().GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postControl[8].GetPhyAddr()),(reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history),flags,generation,s.history,reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+query*2048,owner*uint32_t(ctx->outputStride),update,s.batch,query);
+ SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ if(!postControl.GetValue(14))break;
+ }
+ if(profile)ts[11]=GetSystemCycle();
+ uint32_t own=postControl.GetValue(0);
+ uint32_t total=postControl.GetValue(13);
+ const auto batches=rotating::PlanTerminalBatches(own,total,priorSlots);
+ uint32_t slotBase=postControl.GetValue(1);
+ if(profile){ts[20]=own;ts[21]=own;ts[22]=slotBase;}
+ if(profile)ts[12]=GetSystemCycle();
+ auto ids=op.TerminalIds();
+ GlobalTensor<uint32_t> output,slots;
+ output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(runtime->logical)+query*2048);slots.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048);
+ SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+ // A remapped public row can share the exact slot allocation. Its sole
+ // writer must be the routed query, including when that query retires first.
+ const bool sharedSlotOutput = LargeBatch && update[23] == ctx->locations;
+ if (!sharedSlotOutput) DataCopy(slots,postScratch,2048);
+ PublishTerminalOutputs<LargeBatch>(update,s.batch,query,ids,postScratch,postControl[terminal_runtime::Routes<LargeBatch>::base],sharedSlotOutput ? 0 : ctx->locations+uint64_t(query)*2048*4);
+ uint32_t packError=postControl.GetValue(8);ownError|=packError;
+ if(profile)ts[7]=GetSystemCycle();
+ auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args->queue_state);
+ uint64_t originalHead=uint64_t(postWork.GetValue(6144+18))|(uint64_t(postWork.GetValue(6144+19))<<32);
+ if(own){
+  if(profile)ts[13]=GetSystemCycle();
+  rotating::WriteReservedWqes(s.tokenBytes,args->channel_entity,args->queue_state,args->output,postWork[4096],postScratch,postWork,postWork[2048],postWork[6144],own,256,false,nullptr,0,own,reinterpret_cast<__gm__ uint32_t*>(runtime->templates)+query*32,originalHead);
+  if (batches.count > 1) {
+   auto cfg = postWork[6144];
+   auto sq = reinterpret_cast<__gm__ uint32_t*>(cfg.ReinterpretCast<uint64_t>().GetValue(12));
+   Simt::VF_CALL<rotating::MarkTerminalPrefixes>(Simt::Dim3{32,1,1}, sq, cfg.GetValue(17), originalHead,
+       batches.ends[0], batches.ends[1], batches.ends[2], batches.count - 1);
+   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+  }
+ }
+ if(profile)ts[14]=GetSystemCycle();
+ // Logical IDs are emitted with slots after all admissions are visible.
+ if(profile)ts[15]=GetSystemCycle();
+ rotating::CommitTerminalPost(args,originalHead,batches.ends[0],post);
+ if(profile)ts[4]=GetSystemCycle();
+
+ op.FreeEventID();
+ if(profile)ts[5]=GetSystemCycle();
+ auto local=op.TerminalScratch();auto work=reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr());
+ // Publish output readiness and join in the same full-warp task.
+ auto allSources=reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity;
+ if(profile)ts[8]=GetSystemCycle();
+ kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),64);
+ if(profile && !q)ts[30]=(reinterpret_cast<__gm__ volatile rotating::MappingJournal*>(ctx->mappingJournal)+uint64_t(b)*1)->count;
+ kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ctx->rows)+uint64_t(b)*sizeof(rotating::Row),128);
+ // Include the actual prior-prefetch Index work, after all output readers join.
+ uint32_t first=total*q/4,last=total*(q+1)/4,n=total<=rotating::kChangeCapacity?last-first:0;
+ auto src=(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity)+first;auto dst=(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+uint64_t(b)*rotating::kChangeCapacity)+first;
+ if(profile){
+  Simt::VF_CALL<CaptureTerminalAssignments>(Simt::Dim3{512,1,1},src,dst,
+   reinterpret_cast<__gm__ uint32_t*>(a->eventsSrc)+uint64_t(b)*rotating::kChangeCapacity,
+   reinterpret_cast<__gm__ uint32_t*>(a->eventsDst)+uint64_t(b)*rotating::kChangeCapacity,first,n);
+  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ }
+ if(profile)ts[26]=GetSystemCycle();
+ uint32_t indexError=0;
+ Simt::VF_CALL<UpdateIndex>(Simt::Dim3{512,1,1},src,dst,n,s.resident,s.history,(reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*s.history*16),(reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*s.history),(reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride),(reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history),work,ctx,total,q,first,reinterpret_cast<__gm__ uint32_t*>(rotating::TopKHeader(ctx))+query*32,reinterpret_cast<__gm__ uint32_t*>(ctx->progress)+query*32,priorJournalCount,b,flags+(12+q)*32,false);
+ SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ indexError=total>rotating::kChangeCapacity?1U:local.GetValue(TAIL_CONTROL);
+
+ bool residentUpdate=(indexError&0x80000000U)!=0;
+ if(residentUpdate){
+  // No old TopK buffer is read after this point. Reuse its UB allocation for
+  // the production planner, which snapshots aliases before writing any row.
+  pipe.Reset();
+  TBuf<TPosition::VECCALC> parallelScratch;
+  pipe.InitBuffer(parallelScratch,kParallelIndexWords*sizeof(uint32_t));
+  auto parallelLocal=parallelScratch.Get<uint32_t>();
+  work=reinterpret_cast<__ubuf__ uint32_t*>(parallelLocal.GetPhyAddr());
+  if(total>kSmallIndexChanges){
+  const uint64_t snapshotChanges=s.resident<rotating::kChangeCapacity?s.resident:rotating::kChangeCapacity;
+  const uint64_t snapshotWords=snapshotChanges*2*kSnapshotWordsPerRow;
+  const uint64_t snapshotStride=uint64_t(s.history)*3>snapshotWords?uint64_t(s.history)*3:snapshotWords;
+  Simt::VF_CALL<ApplyParallelIndex<true>>(Simt::Dim3{512,1,1},allSources,dst-first,total,
+   s.resident,s.history,q,1U,
+   reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*s.history*16,
+   reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*s.history,
+   reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride,
+   reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history,
+   reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*s.resident,
+   flags,ctx->reservedHot?reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+uint64_t(b)*s.resident:nullptr,work,reinterpret_cast<__gm__ uint64_t*>(a->denseShadow)+uint64_t(b)*snapshotStride);
+  }else{
+  Simt::VF_CALL<ApplyParallelIndex<false>>(Simt::Dim3{512,1,1},allSources,dst-first,total,
+   s.resident,s.history,q,1U,
+   reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*s.history*16,
+   reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*s.history,
+   reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride,
+   reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history,
+   reinterpret_cast<__gm__ uint32_t*>(ctx->hotValid)+uint64_t(owner)*s.resident,
+   flags,ctx->reservedHot?reinterpret_cast<__gm__ int32_t*>(ctx->reservedHot)+uint64_t(b)*s.resident:nullptr,work,static_cast<__gm__ uint64_t*>(nullptr));
+  }
+  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+  indexError=parallelLocal.GetValue(0);
+  // Retirement is shared with the normal path; skip the already applied swap.
+  Simt::VF_CALL<UpdateIndex>(Simt::Dim3{512,1,1},src,dst,n,s.resident,s.history,
+   reinterpret_cast<__gm__ uint64_t*>(a->keys),reinterpret_cast<__gm__ uint32_t*>(a->scales),
+   reinterpret_cast<__gm__ uint64_t*>(a->addresses),reinterpret_cast<__gm__ uint64_t*>(a->logical),
+   work,ctx,total,q,first,reinterpret_cast<__gm__ uint32_t*>(rotating::TopKHeader(ctx))+query*32,
+   reinterpret_cast<__gm__ uint32_t*>(ctx->progress)+query*32,priorJournalCount,b,flags+(12+q)*32,true);
+  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ }
+ ownError|=(indexError<<4);
+ if(profile)ts[16]=GetSystemCycle();
+ uint64_t cqError=rotating::CompleteTerminalPost(args,post,batches,originalHead);
+ if(profile)ts[24]=GetSystemCycle();
+ if(q==1)rotating::CompleteTerminalPrefetch(ctx,b);
+ ownError|=uint32_t(cqError);
+ if(profile)ts[17]=GetSystemCycle();
+ if(profile)ts[9]=GetSystemCycle();
+ uint32_t prefetchError=q==1?(reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+b)->error:0;
+ cqError|=prefetchError;
+ if(ownError || cqError){
+   auto d=flags+(28+q)*32;
+   d[1]=topkError;d[2]=packError;d[3]=indexError;d[4]=post->error;
+   d[5]=prefetchError;d[6]=total;d[7]=first;d[8]=n;d[9]=own;
+   d[10]=post->pending;d[11]=generation;
+   if(!indexError || !n){for(uint32_t i=12;i<=16;++i)d[i]=UINT32_MAX;}
+ }
+ flags[(28+q)*32]=uint32_t(cqError)|ownError;
+ kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(flags+(28+q)*32),4);
+ Simt::VF_CALL<FinishTerminalRow<LargeBatch>>(Simt::Dim3{512,1,1},a,ctx,runtime,b,q,owner,total,first,n,flags,generation,scanHistory,work);
+ SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ if(profile)ts[10]=GetSystemCycle();
+ pipe.Destroy();if(profile)kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(ts),256);
+ }
+#include "terminal_schedule.h"
+#endif

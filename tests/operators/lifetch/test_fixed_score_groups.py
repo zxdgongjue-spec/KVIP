@@ -210,3 +210,35 @@ int main() {
     subprocess.run([compiler, "-std=c++17", "-O2", "-I", str(operators / "lightning_indexer_with_fetch/include"),
                     "-I", str(operators / "common/lifetch"), str(source), "-o", str(exe)], check=True)
     subprocess.run([str(exe)], check=True, timeout=5)
+
+
+def test_final_two_shard_cursor_proof(tmp_path):
+    """A published prefix may only bypass unvisited padding in the other shard."""
+    root = Path(__file__).resolve().parents[3] / "csrc/operators/common/lifetch"
+    host = tmp_path / "cursors.cpp"
+    host.write_text(r"""
+#include <cstdint>
+#include <cassert>
+#include <algorithm>
+struct RuntimeShape {
+    uint32_t rounds,history,resident,splitQ,indexHeads,batch,serviceLanes;
+};
+#include "sequence_schedule.h"
+int main() {
+    constexpr uint32_t resident=4;
+    for (uint32_t half : {1u, 2u, 4u, 7u}) {
+        for (uint32_t valid=resident; valid<=29; ++valid)
+            for (uint32_t a=resident; a<=31; ++a)
+                for (uint32_t b=resident; b<=31; ++b) {
+                    bool done = true;
+                    for (uint32_t token=resident; token<valid; ++token)
+                        if (token >= (((token-resident)/half)%2 ? b : a)) done = false;
+                    assert(SequencePrefixCovers(a | (uint64_t(b)<<32),resident,half,valid) == done);
+                }
+    }
+}
+""")
+    binary = tmp_path / "cursors"
+    subprocess.run([shutil.which("c++"), "-std=c++17", "-O2", "-I", str(root), str(host), "-o", str(binary)],
+                   check=True)
+    subprocess.run([str(binary)], check=True)

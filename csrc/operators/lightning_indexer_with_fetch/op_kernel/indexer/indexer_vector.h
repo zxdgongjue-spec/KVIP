@@ -96,7 +96,13 @@ public:
         // and covered-row addresses still use the bound physical history.
         uint32_t half=LargeBatch ? 0U : rotating::SequenceHalfWindow(runtimeShape_,scanHistory);
         rankHalf_=half;rankReady_=uint64_t(scanHistory)|(uint64_t(scanHistory)<<32);
+#if KVIP_FIXED_SMALL_TERMINAL
+        // Finish both alternating score shards before collecting misses from
+        // their exact final winners. A zero ordered key keeps the full selector.
+        AdvanceIncremental<true>(query,scanHistory,half?scanHistory:0,half);
+#else
         AdvanceIncremental<LargeBatch>(query,scanHistory,half?scanHistory:0,half);
+#endif
         JoinColdOutput();
         if(incrementalOutputPending_){WaitFlag<HardEvent::MTE3_V>(EVENT_ID6);incrementalOutputPending_=false;}
         PipeBarrier<PIPE_ALL>();
@@ -122,6 +128,26 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query, uint32_t scanHis
         PipeBarrier<PIPE_ALL>();
         return missing?1U:0U;
     }
+#if KVIP_FIXED_SMALL_TERMINAL
+    {
+        // LI2 and LI3 publish the pair of physical cursors and tagged winners.
+        // A nonzero minimum ordered key admits every uncovered final ID.
+        // The final KV plan still uses the live covered bitmap after LI3.
+        const uint64_t cursor = meta[1];
+        if ((uint32_t(cursor) >= valid || uint32_t(cursor >> 32) >= valid) &&
+                valid <= 131072 && uint16_t(meta[2]) && rotating::SequencePrefixCovers(cursor,
+                runtimeShape_.resident, rotating::SequenceHalfWindow(runtimeShape_, scanHistory), valid)) {
+            LoadPublishedLargeIds(query);
+            auto covered = reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddress(
+                ctx->incremental, runtimeShape_.batch, runtimeShape_.history, query / 4));
+            // The helper's MTE2 -> V event joins both the ID and bitmap copies.
+            meta[3] = kvip_prefetch_rank::CollectPositiveFinalMisses(
+                indicesOutLocal_, TerminalCompact(), topkSharedTmpLocal_[128], covered, valid);
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(meta), 128);
+            return 0;
+        }
+    }
+#endif
     TerminalQuery<LargeBatch>(query,scanHistory);
     return 0;
 }

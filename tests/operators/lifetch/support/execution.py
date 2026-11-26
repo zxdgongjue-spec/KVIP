@@ -3275,7 +3275,7 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None):
+                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None, two_cold_launch=None):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3327,6 +3327,7 @@ class FusedReplayState:
                     torch, library, self.workspace.arguments(self.storage), owner,
                     batch=self.batch, history=self.history, resident=self.resident,
                     intermediate_fetches=windows, prefetch_limit=prefetch_tokens,
+                    window_limit=384 if two_cold_launch is not None else None,
                     prefetch_rank_start=prefetch_rank_start,
                     aic_count=aics, token_bytes=self.token_bytes, **binding)
             update_type = UbmemIndexUpdate if ubmem else DirectIndexUpdate
@@ -3338,6 +3339,9 @@ class FusedReplayState:
                 status=torch.zeros(self.batch, dtype=torch.int32, device=device),
                 outputs=torch.zeros((2, self.batch * 4, 1, 2048), dtype=torch.int32, device=device))
             self.forward = StreamingForward(self.rotating, self.update, torch, prefetch_tokens)
+            if two_cold_launch is not None:
+                from large_two_cold import attach
+                attach(self, two_cold_launch)
             self.reset()
         except BaseException:
             if self.owns_lease:
@@ -3950,7 +3954,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused, p
                 resources.close()
 
 
-def run_path(config, directory, sequence, pages, *, fused, round_check=None, shared_pool=None, measure=None):
+def run_path(config, directory, sequence, pages, *, fused, round_check=None, shared_pool=None, measure=None,
+             large_two_cold=False):
     import acl
     import kvaf
     import torch
@@ -4017,9 +4022,16 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                                    valid=view.valid[indices].contiguous())
         page_addresses = expanded.addresses.cpu().numpy().view(np.uint64).reshape(g['batch'], -1)
         logical_addresses = (page_addresses[:, :, None] + np.arange(128, dtype=np.uint64) * np.uint64(width)).reshape(g['batch'], -1)
+        two_cold_launch = None
         if fused:
             if config.transport == 'urma':
                 (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers, soc=soc)
+                if large_two_cold:
+                    from large_two_cold import build as build_two_cold
+                    if g['batch'] not in (20, 24, 28, 32) or aics != 32 or config.intermediate_fetches != 3 or config.prefetch_tokens != 1024:
+                        raise ValueError("Three-window experiment requires fixed BS20/24/28/32 and row budget 1024")
+                    two_cold_build_args = (Path(__file__).with_name('large_two_cold_native'), library, build, soc)
+                    two_cold_launch = build_two_cold(*two_cold_build_args)
             else:
                 shape = UbmemGeometry(g['batch'], g['history'], g['resident'], g['heads'], width,
                                       aics, config.intermediate_fetches, soc)
@@ -4028,7 +4040,9 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 torch, runtime, view, library, initial, pages, logical_addresses,
                 transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
-                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024))
+                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024), two_cold_launch=two_cold_launch)
+            if two_cold_launch is not None:
+                state.two_cold_build_args = two_cold_build_args
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
@@ -4074,7 +4088,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         torch, runtime, view, library, initial, pages, logical_addresses,
                         transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
-                        prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease)
+                        prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease,
+                        two_cold_launch=two_cold_launch)
                     replica.failure_directory = directory
                 else:
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)

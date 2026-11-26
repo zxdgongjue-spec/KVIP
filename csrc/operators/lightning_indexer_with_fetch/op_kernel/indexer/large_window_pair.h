@@ -1,7 +1,11 @@
 // Included in QLIVector only for the one-request-per-cube large-batch kernel.
 // A vector lane owns two disjoint 128-byte TopK headers and two winner lists.
 // The original single writer still consumes all four lists and updates covered.
-__aicore__ inline void AdvanceLargeWindowPair(uint32_t row, uint32_t epoch, uint32_t ready) {
+__aicore__ inline void AdvanceLargeWindowPair(uint32_t row, uint32_t epoch, uint32_t ready
+#if KVIP_TEST_SIBLING_TRACE
+                                              , uint64_t scoreBegin, uint64_t scoreEnd
+#endif
+) {
     auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     const uint32_t first = (blockId_ % 2) * 2;
     auto events = reinterpret_cast<__gm__ rotating::Event*>(ctx->events);
@@ -11,11 +15,31 @@ __aicore__ inline void AdvanceLargeWindowPair(uint32_t row, uint32_t epoch, uint
     if (trace && !first) {
         events[epoch * runtimeShape_.serviceLanes + row].waitBegin = GetSystemCycle();
     }
+#if KVIP_TEST_SIBLING_TRACE
+    const uint64_t siblingArrival = first ? GetSystemCycle() : 0;
+#endif
     do {
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(previous), 128);
     } while (!reinterpret_cast<__gm__ volatile rotating::Event*>(previous)->complete);
 
     const uint64_t begin = trace ? GetSystemCycle() : 0;
+#if KVIP_TEST_SIBLING_TRACE
+    if (trace) {
+        // Two cold epochs, two separate cache lines. Store only after all
+        // clocks so publishing a stamp cannot lengthen the measured wait.
+        auto pipeline = reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_);
+        auto line = reinterpret_cast<__gm__ uint64_t*>(pipeline->times)
+                  + runtimeShape_.batch * 64 + (row * 4 + (first ? 3 : 0)) * 16;
+        const uint32_t slot = 4 + 4 * (epoch - 1);
+        line[slot] = scoreBegin;
+        line[slot + 1] = scoreEnd;
+        if (first) {
+            line[slot + 2] = siblingArrival;
+            line[slot + 3] = begin;
+        }
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(line), 128);
+    }
+#endif
     GlobalTensor<uint64_t> header;
     header.SetGlobalBuffer(IncrementalMeta(row * 4 + first));
     GlobalTensor<uint32_t> rows;

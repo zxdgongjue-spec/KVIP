@@ -34,8 +34,11 @@ class PackedAttribution(unittest.TestCase):
     def test_fused_by_batch_and_native(self):
         cases = [
             (1, True, ["v9_li_fixed_hot", "v9_li_kernel_1", "v9_li_fixed_cold", "v9_parallel_terminal"]),
+            (2, True, ["v9_li_fixed_hot", "v9_li_kernel_1", "v9_li_fixed_cold", "v9_parallel_terminal_fixed"]),
+            (16, True, ["v9_li_kernel", "v9_li_kernel_1", "v9_li_kernel_2", "v9_parallel_terminal_fixed"]),
             (16, True, ["v9_li_kernel_1", "v9_li_kernel_1", "v9_li_kernel_2", "v9_parallel_terminal"]),
             (32, True, ["v9_li_large_hot", "v9_li_large_threshold_cold", "v9_parallel_terminal_large"]),
+            (32, True, ["v9_li_large_hot", "v9_li_large_two_cold", "v9_parallel_terminal_large"]),
             (32, False, ["QuantLightningIndexer", "A5LiduFusedBatchGetPrepareMtp", "KvafExecuteBatchGetAivKernelV3"]),
         ]
         for batch, fused, names in cases:

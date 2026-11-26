@@ -99,7 +99,7 @@ int main() {
             }
             const auto budget=large_li::OwnerBudget(cost,fixed,shares?shares:1);
             uint32_t quota=helpers?large_li::SuffixQuota(tiles-s.resident/128,0,budget):0;
-            for(uint32_t rounds: {2,4,8,32}) {
+            for(uint32_t rounds: {2,3,4,8,32}) {
                 uint32_t cursor=s.resident/128, baseSum=0, assigned=0;
                 for(uint32_t e=1;e<rounds;++e) {
                     const auto span=large_li::Window(s.resident/128,tiles,rounds,e);

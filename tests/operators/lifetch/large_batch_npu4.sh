@@ -9,6 +9,11 @@ archive=
 fixed=0
 fixed_archive=
 packed_archive=
+packed_candidate=0
+large_cold_windows=${PEER_LARGE_COLD_WINDOWS:-2}
+if [[ $large_cold_windows != 2 && $large_cold_windows != 3 ]]; then
+    echo "PEER_LARGE_COLD_WINDOWS must be 2 or 3" >&2; exit 2
+fi
 batches=(20 24 28 32)
 groups=(10 4 17 7 2)
 if (( $# )); then
@@ -16,11 +21,13 @@ if (( $# )); then
         archive=$(cd "$2" && pwd)
     elif [[ $# == 2 && $1 == --reuse-g10-bs20-serial ]]; then
         reuse_serial=$2
-    elif [[ $1 == --fixed-q4 && $# -le 2 || $1 == --fixed-q4-packed && $# == 2 ]]; then
+    elif [[ $1 == --fixed-q4 && $# -le 2 || ( $1 == --fixed-q4-packed || $1 == --packed-aiv ) && $# == 2 ]]; then
         fixed=1
         default_batches="1 2 4 8 16 20 24 28 32"
-        if [[ $1 == --fixed-q4-packed ]]; then
+        if [[ $1 == --fixed-q4-packed || $1 == --packed-aiv ]]; then
+            if [[ $1 == --packed-aiv ]]; then packed_candidate=1; fi
             default_batches="16 32 1 2 4 8 20 24 28"
+            if (( packed_candidate )); then default_batches="32 28 24 20 16 8 4 2 1"; fi
             packed_archive=$(cd "$2" && pwd)
         elif (( $# == 2 )); then
             fixed_archive=$2
@@ -39,7 +46,7 @@ if (( $# )); then
         validate_selection '1 2 4 8 16 20 24 28 32' "${batches[@]}" &&
             validate_selection '10 4 17 7 2' "${groups[@]}" || { echo "Invalid FIXED_Q4_BATCHES/GROUPS" >&2; exit 2; }
     else
-        echo "Usage: $0 [--fixed-q4-packed FIXED_ARCHIVE | --fixed-q4 [LARGE_ARCHIVE] | --candidate-only RESULT_ROOT | --reuse-g10-bs20-serial RESULT_ROOT]" >&2
+        echo "Usage: $0 [--packed-aiv FIXED_ARCHIVE | --fixed-q4-packed FIXED_ARCHIVE | --fixed-q4 [LARGE_ARCHIVE] | --candidate-only RESULT_ROOT | --reuse-g10-bs20-serial RESULT_ROOT]" >&2
         exit 2
     fi
 fi
@@ -62,6 +69,7 @@ mkdir -p "$area" "$sources"
 prefix=largebs-q4
 if (( fixed )); then prefix=fixed-q4; fi
 if [[ -n $packed_archive ]]; then prefix=fixed-q4-packed; fi
+if (( packed_candidate )); then prefix="fixed-q4-aiv-${large_cold_windows}cold"; fi
 if [[ -n $packed_archive && -n ${PEER_PACKED_RESUME:-} ]]; then
     out=$(cd "$PEER_PACKED_RESUME" && pwd)
     [[ $out == "$area/$prefix."* && $(<"$out/packed_source.txt") == "$packed_archive" &&
@@ -100,7 +108,12 @@ helpers="$host_tools/tests/operators/lifetch"
 source "$helpers/support/peer_node_prepare.sh"
 # Protect this run against a second invocation using the same physical card.
 exec 9>"$sources/largebs-$(</proc/sys/kernel/random/boot_id)-npu$peer_physical_npu.lock"
-flock -n 9 || { echo "A large-batch replay is already running on NPU$peer_physical_npu"; exit 1; }
+if (( packed_candidate )); then
+    echo "WAITING_FOR_CARD physical_NPU=$peer_physical_npu" >&3
+    flock 9
+else
+    flock -n 9 || { echo "A large-batch replay is already running on NPU$peer_physical_npu"; exit 1; }
+fi
 exec 8>"$sdk.lock"
 flock 8
 baseline="$work/adaptive-sources/peer-serial-da318bdb"
@@ -155,7 +168,19 @@ printf '%s\n' "$actual" > "$out/kvaf_tree.txt"
 git -C "$sdk" rev-parse HEAD > "$out/kvaf.txt"
 if [[ -n $packed_archive ]]; then
     printf '%s\n' "$packed_archive" > "$out/packed_source.txt"
-    "$PYTHON" -B "$workers/fixed_q4_packed_report.py" verify-source "$out" "$packed_archive" "$root"
+    if (( packed_candidate )); then
+        ctl=$("$PYTHON" -B "$workers/fixed_q4_packed_report.py" reference "$out" "$packed_archive" "$root" "${PEER_PACKED_REFERENCE:-}")
+        if [[ -f $out/reference.txt && $(<"$out/reference.txt") != "$ctl" ]]; then
+            echo "Cannot resume against a different packed reference" >&2; exit 1
+        fi
+        printf '%s\n' "$ctl" > "$out/reference.txt"
+        printf 'PACKED_REFERENCE=%s fresh_arms=fused target_pct=15\n' "$ctl" >&3
+    else
+        "$PYTHON" -B "$workers/fixed_q4_packed_report.py" verify-source "$out" "$packed_archive" "$root"
+    fi
+    if (( packed_candidate && large_cold_windows == 2 )); then
+        echo 'WINDOW_SCHEDULE BS20/24/28/32 first=256 cold=384,384 row_limit=1024' >&3
+    fi
     echo "CONFIG packed_calls=10 blocks=2 groups=${groups[*]} batches=${batches[*]} physical_NPU=$peer_physical_npu archive=$packed_archive" >&3
 elif (( fixed )); then
     args=("$out")
@@ -240,9 +265,12 @@ run_arm() (
     fi
     args=(--trace "$trace" --group "$group" --batch "$batch" --cohort "$cohort" --arm "$arm" --kvaf-root "$sdk"
           --kvaf-server "127.0.0.1:$port" --output "$dir")
-    if (( fixed )); then args+=(--prepared "$out/g$group/donors"); fi
+    if (( fixed )); then args+=(--prepared "$prepared_bank"); fi
     if [[ -n $packed_archive ]]; then
         args+=(--packed-ten --serial-result "$packed_oracle")
+        if (( packed_candidate )); then args+=(--compare-packed-candidate); fi
+        if (( packed_candidate && batch == 32 )) && [[ ${pair##*/} == block1 ]]; then args+=(--window-density); fi
+        if (( packed_candidate && batch > 16 && large_cold_windows == 2 )); then args+=(--large-two-cold); fi
     elif [[ $arm == fused ]]; then
         if [[ -n $archive ]]; then
             args+=(--serial-result "$archive/g$group/bs$batch/serial" --compare-archived-pair)
@@ -310,6 +338,7 @@ run_packed_cohort() {
         mkdir -p "$dir"
         order=(serial fused)
         if (( block == 2 )); then order=(fused serial); fi
+        if (( packed_candidate )); then order=(fused); fi
         for arm in "${order[@]}"; do
             result="$dir/$arm"
             if [[ -f $result/placement_verified && -s $result/packed_result.json ]]; then
@@ -323,6 +352,10 @@ run_packed_cohort() {
             printf 'CASE_BEGIN G%s BS%s cohort=%s block=%s arm=%s\n' "$group" "$batch" "$cohort" "$block" "$arm" >&3
             run_arm "$group" "$batch" "$trace" "$arm" "$dir" "$cohort"
             [[ -s $result/packed_result.json ]]
+            if (( packed_candidate && batch == 32 && block == 1 )); then
+                grep ' WINDOW_DIAG ' "$result/worker.log" | tee -a "$out/summary.txt" >&3
+            fi
+            if (( packed_candidate && batch > 16 && large_cold_windows == 2 )); then grep '^WINDOWS ' "$result/worker.log" | tee -a "$out/summary.txt" >&3; fi
             "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref" "$result/thp.json"
             touch "$result/placement_verified"
         done
@@ -333,10 +366,13 @@ for group in "${groups[@]}"; do
     trace=$(bash "$helpers/peer_g2_input.sh" "$work" "$group")
     if (( fixed )); then
         mkdir -p "$out/g$group"
-        if [[ ! -f $out/g$group/donors/source.json ]]; then
+        prepared_bank="$out/g$group/donors"
+        if (( packed_candidate )) && [[ -s $ctl/g$group/donors/source.json ]]; then
+            prepared_bank="$ctl/g$group/donors"
+        elif [[ ! -f $prepared_bank/source.json ]]; then
             donor_stage=$(mktemp -d "$out/g$group/donors-prepare.XXXXXX")
             "$PYTHON" -B "$workers/large_batch_input.py" "$trace" "$group" "$donor_stage/bank"
-            mv "$donor_stage/bank" "$out/g$group/donors"
+            mv "$donor_stage/bank" "$prepared_bank"
             rmdir "$donor_stage"
         fi
     fi

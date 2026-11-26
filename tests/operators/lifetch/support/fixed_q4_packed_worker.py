@@ -69,7 +69,7 @@ class FrozenPackedRound:
         self.traffic.append(counts)
 
 
-def measure_packed(ex, proofs, serial, torch, states, sequence, config, directory, *, fused):
+def measure_packed(ex, proofs, serial, torch, states, sequence, config, directory, *, fused, window_density=False):
     from fixed_q4_packed_timing import profile_fixed_graph_batch
 
     if len(states) != CALLS or len(sequence.rounds) != 1 or config.warmup != WARMUP or config.mode != "bench":
@@ -86,6 +86,59 @@ def measure_packed(ex, proofs, serial, torch, states, sequence, config, director
     if result["correctness"] == "PASS" and len(frozen.traffic) != CALLS:
         raise ValueError("Missing packed-state verification or transport counts")
     proofs.update(exact_ID_sets=frozen.exact, traffic=frozen.traffic)
+    if window_density and result["correctness"] == "PASS":
+        from large_batch_pair import check_ordered_index, li_intervals
+        from window_density import summarize
+
+        # A single extra invocation runs after both events and the measured-state checks.
+        # Rebuild the frozen map, but preserve the live SQ/CQ cursors.
+        state = states[0]
+        inputs = sequence.inputs
+        state.reset()
+        mhz = state.forward.calibrate_counter_mhz()
+        state.forward.set_diagnostics(True)
+        state.forward.times.zero_()
+        state.forward.events_src.fill_(-1)
+        state.forward.events_dst.fill_(-1)
+        state.forward.terminal.times.zero_()
+        stream = torch.npu.current_stream(state.device)
+        stream.synchronize()
+        sibling_checks = score_spans = None
+        trace_args = getattr(state, "two_cold_build_args", None)
+        original_launch = state.forward.terminal_function
+        if trace_args:
+            from large_two_cold import build, attach
+            attach(state, build(*trace_args, trace_sibling=True))
+        try:
+            state.forward()
+            stream.synchronize()
+        except BaseException as error:
+            ex.NativeFetchSession.quarantine("window_density_completion_uncertain", error)
+            raise
+        finally:
+            state.forward.terminal_function = original_launch
+        state.check_completion()
+        ids, traffic = read_selected(state, inputs, True)
+        check_scores(inputs, ids, serial[0])
+        state.validate(inputs)
+        check_ordered_index(state, inputs.captured_layout, inputs.captured_hot_valid)
+        events = state.rotating.events.cpu().numpy().view("<u8").tolist()
+        clocks = state.forward.times.cpu().numpy()
+        li = li_intervals(clocks, state.batch, mhz)
+        if trace_args:
+            count = len(events) - 1
+            words = clocks[state.batch * 64:state.batch * 128].reshape(state.batch, 4, 16)
+            lane_times = words[:, :, 4:4 + 4 * count].reshape(state.batch, 4, count, 4)
+            sibling_checks = lane_times[:, 3, :, 2:].tolist()
+            score_spans = {name: lane_times[:, q, :, :2].tolist() for name, q in (("post_owner", 0), ("sibling", 3))}
+        winners = state.workspace.topk.cpu().numpy().reshape(state.batch, -1)
+        sources = state.forward.events_src.cpu().numpy()
+        density = summarize(events, li, state.token_bytes, winners=winners, sources=sources,
+                            sibling_checks=sibling_checks, score_spans=score_spans)
+        if sum(e["posted_tokens"] for e in density["epochs"]) != traffic["prefetch"]:
+            raise ValueError("Doorbells disagree with the independent row GET counters")
+        proofs["window_density"] = density
+        state.forward.set_diagnostics(False)
     return result
 
 
@@ -104,6 +157,30 @@ def save_packed(args, identity, inputs, proofs, workers, scratch_existed):
         if args.output.resolve() == Path.cwd() and not scratch_existed and scratch.is_dir() and not scratch.is_symlink():
             shutil.rmtree(scratch)
     atomic_json(args.output / "packed_result.json", summary)
+    if "window_density" in proofs:
+        density = proofs["window_density"]
+        windows = density["epochs"]
+        tokens = "/".join(str(v["posted_tokens"]) for v in windows)
+        blocked = "/".join(str(v["rows_arrived_before_previous_end"]) for v in windows[1:])
+        longest = density["longest_inter_post_us"]
+        gap = "NA" if longest is None else f"{longest:.2f}"
+        first_useful = density["first_useful_post_us"]
+        first_text = "NA" if first_useful is None else f"{first_useful:.2f}"
+        useful = "/".join(str(w["used_by_final_topk"]) for w in windows)
+        concurrent = "/".join(f"{v:.2f}" for v in density["adjacent_epochs_distinct_row_service_overlap_us"])
+        sibling = "/".join(str(w.get("sibling_rows_arrived_before_previous_end", "NA")) for w in windows[1:])
+        scored = "/".join(str(w.get("sibling_score_overlaps_previous_service_rows", "NA")) for w in windows[1:])
+        detailed = ""
+        if all("mean_sibling_exposed_previous_us" in w for w in windows[1:]):
+            waits = "/".join(f"{w['mean_sibling_exposed_previous_us']:.2f}" for w in windows[1:])
+            scored_time = "/".join(f"{w['sibling_mean_score_overlap_previous_service_us']:.2f}" for w in windows[1:])
+            detailed = f" sibling_mean_exposed_wait_us={waits} sibling_mean_score_span_overlap_us={scored_time}"
+        print(f"G{args.group} BS{args.batch} WINDOW_DIAG posted_tokens={tokens} "
+              f"useful_tokens={useful} first_useful_post_us={first_text} "
+              f"post_owner_rows_arrived_before_previous_end={blocked} "
+              f"sibling_rows_arrived_before_previous_end={sibling} sibling_score_span_overlaps_previous_service_rows={scored} "
+              f"distinct_row_service_overlap_us={concurrent} "
+              f"longest_gap_between_posts_us={gap}{detailed}")
     print(f"CHECK G{args.group} BS{args.batch} {args.arm} TopK_score_vs_strong_serial=PASS "
           f"queries={checked}/{checked} exact_ID_sets={proofs['exact_ID_sets']}/{checked} "
           f"KV_and_Index_rows={CALLS * args.batch}/{CALLS * args.batch} get_workers={workers}")

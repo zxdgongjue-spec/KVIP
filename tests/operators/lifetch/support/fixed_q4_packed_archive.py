@@ -27,12 +27,16 @@ def require(ok, error):
         raise ValueError(str(error))
 
 
-def same_production(repo, archived, current):
+def same_production(repo, archived, current, *, candidate=False):
     # This measurement only changes the harness. Check the deployed C++, Python,
     # KVAF integration patches and build scripts, including source changes on a branch.
+    paths = ["csrc", "python", "patches", "scripts", "pyproject.toml"]
+    if candidate:
+        paths += [":(exclude)csrc/operators/lightning_indexer_with_fetch/**", ":(exclude)python/kvip/operators/lifetch/**",
+                  ":(exclude)csrc/operators/common/lifetch/sequence_schedule.h"]
     completed = subprocess.run(
         ["git", "-C", str(repo), "diff", "--quiet", archived, current, "--",
-         "csrc", "python", "patches", "scripts", "pyproject.toml"],
+         *paths],
         check=False,
     )
     require(completed.returncode == 0, f"Production sources/build differ between {archived} and {current}")
@@ -50,7 +54,7 @@ def oracle_dir(archive, group, batch, cohort):
     return Path(arm.get("comparison_archive", pair)) / "serial"
 
 
-def load_archived_oracle(directory, identity, repo):
+def load_archived_oracle(directory, identity, repo, *, candidate=False):
     """Only return logical token IDs. Single-call event timings never leave this function."""
     directory = Path(directory)
     record = read(directory / "ARM_RESULT.json")
@@ -63,14 +67,14 @@ def load_archived_oracle(directory, identity, repo):
     # A previous single-event serial result is usable as an oracle only if its native path is unchanged.
     old_rev = old["native"]
     if old_rev == NATIVE:
-        same_production(repo, NATIVE, identity["native"])
+        same_production(repo, NATIVE, identity["native"], candidate=candidate)
     else:
         # The complete old fixed matrix could refer to an earlier large-BS archive. Its independent
         # strong serial uses the stock native LI, LIDU prepare and KVAF GET with two workers.
         subprocess.run(["git", "-C", str(repo), "diff", "--exit-code", "--quiet", old_rev, NATIVE,
                         "--", "csrc/operators/lidu", "python/kvip/operators/lidu",
                         "scripts/build.py", "patches"], check=True)
-        same_production(repo, NATIVE, identity["native"])
+        same_production(repo, NATIVE, identity["native"], candidate=candidate)
     proof = read(directory / "path/path_result.json")
     batch = identity["batch"]
     require(record["arm"] == "serial" and record["get_workers"] == 2
