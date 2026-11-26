@@ -2,6 +2,7 @@
 #include "prefetch.h"
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
 #include "window_frontier.h"
+#include "window_overlap_probe.h"
 #endif
 #if KVIP_STREAMING_LI
 #include "pipeline_types.h"
@@ -405,6 +406,10 @@ private:
     __aicore__ inline uint64_t PartitionedColdReady(uint32_t query, uint32_t half) const {
         uint32_t cursors[kvip_cold_score::kMaxParts];
         for (uint32_t part = 0; part < coldParts_; ++part) cursors[part] = ReadColdCursor(query, part);
+        return FoldPartitionedColdReady(cursors, half);
+    }
+
+    __aicore__ inline uint64_t FoldPartitionedColdReady(const uint32_t* cursors, uint32_t half) const {
         const uint32_t lastEpoch = runtimeShape_.rounds - 1;
         const uint32_t end0 = kvip_cold_score::Prefix(cursors, runtimeShape_.history, runtimeShape_.resident,
             half, lastEpoch, 0, coldParts_);
