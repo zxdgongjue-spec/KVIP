@@ -206,7 +206,9 @@ def save_packed(args, identity, inputs, proofs, workers, scratch_existed):
             fmt = lambda values: "/".join(f"{v:.2f}" for v in values)
             print(f"G{args.group} BS{args.batch} SPLIT_ROLE_DIAG last_LI3_row={roles['last_li3_row']} "
                   f"last_window_row={roles['last_window_row']} score3_us={fmt(row['score_us'])} "
-                  f"wait_ready3_us={fmt(row['wait_ready_us'])} service4_us={fmt(row['service_us'])} "
+                  f"wait_ready3_us={fmt(row['wait_ready_us'])} "
+                  f"wait_for_unfinished_score3_us={fmt(row['wait_for_unfinished_score_us'])} "
+                  f"service4_us={fmt(row['service_us'])} "
                   f"score3_overlap_service_us={fmt(row['score_overlapped_by_service_us'])} "
                   f"post_window_to_LI3_end_us={row['post_window_to_li3_end_us']:.2f}")
         print(f"G{args.group} BS{args.batch} WINDOW_DIAG posted_tokens={tokens} "

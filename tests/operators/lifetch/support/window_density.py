@@ -172,6 +172,10 @@ def split_role_intervals(clocks, events, li):
         per_row.append(dict(row=row, score_cycles=score, wait_ready_done_cycles=service,
                             score_us=[(end - begin) / mhz for begin, end in score],
                             wait_ready_us=[(ready - wait) / mhz for wait, ready, _ in service[1:]],
+                            # Publication follows score end. The remainder includes the signal,
+                            # polling, and timestamp reads even when V0 finished earlier.
+                            wait_for_unfinished_score_us=[
+                                max(0, score[e][1] - service[e + 1][0]) / mhz for e in range(3)],
                             service_us=[(done - ready) / mhz for _, ready, done in service],
                             score_service_overlap_matrix_us=overlaps,
                             score_overlapped_by_service_us=[sum(matches) for matches in overlaps],

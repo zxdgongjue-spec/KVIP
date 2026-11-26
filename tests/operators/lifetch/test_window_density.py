@@ -79,6 +79,7 @@ def test_split_role_scores_can_cross_two_earlier_windows():
     assert (result["last_li3_row"], result["last_window_row"]) == (1, 0)
     assert a["score_us"] == [22., 15., 11.5] and a["wait_ready_us"] == [7.5, 6.5, 5.5]
     assert a["score_overlapped_by_service_us"] == [14.5, 6.5, 6.]
+    assert a["wait_for_unfinished_score_us"] == [5., 6., 5.]
     late = deepcopy(clocks)
     late[1] = 65
     with pytest.raises(ValueError, match="score clocks|ready or service"):
