@@ -120,7 +120,11 @@ def cell_summary(root, group, batch):
         result['graph_saved_vs_previous_by_block_us'] = [
             mean(o['previous_fused']['graph'] - o['fused']['graph'] for o in observations[block::2])
             for block in range(2)]
-        result.update(saved_vs_previous_us=delta, reached_15pct=gain >= 15, no_slowdown=delta['graph'] >= 0)
+        graph = times['fused']['graph']
+        serial = times['serial']['graph']
+        result.update(saved_vs_previous_us=delta, reached_15pct=graph <= 0.85 * serial,
+                      gap_to_15_us=graph - 0.85 * serial, gap_to_20_us=graph - 0.80 * serial,
+                      no_slowdown=delta['graph'] >= 0)
     return result
 
 
@@ -141,6 +145,7 @@ def report_cell(row):
                       f"{first['first_nonempty_rows']:.1f}" if first else '')
         print(f"G{row['group']} BS{row['batch']} saved_vs_serial_us={saved['graph']:+.2f} "
               f"gain_vs_serial_pct={row['graph_gain_pct']:+.2f} target15={'PASS' if row['reached_15pct'] else 'MISS'} "
+              f"gap_to_15/20_us={row['gap_to_15_us']:+.2f}/{row['gap_to_20_us']:+.2f} "
               f"previous_minus_new_graph/LI/tail_us={delta['graph']:+.2f}/{delta['LI']:+.2f}/{delta['tail']:+.2f} "
               f"no_slowdown={'PASS' if row['no_slowdown'] else 'MISS'} "
               f"previous_minus_new_block1/block2_us={b1:+.2f}/{b2:+.2f} "
@@ -215,11 +220,11 @@ def main():
             bs16 = [c for c in cells if c['batch'] == 16]
             compared = [c['archived_pr30_minus_fused_us'] for c in bs16 if 'archived_pr30_minus_fused_us' in c]
             parity = sum(v >= 0 for v in compared)
-            payload['acceptance'] = dict(cells=len(cells), both=both,
+            payload['acceptance'] = dict(cells=len(cells), gain15=hits, gain20=passed, no_slowdown=steady, both=both,
                                          bs16=len(bs16), bs16_pr30_compared=len(compared), bs16_pr30_parity=parity,
                                          all_pass=both == len(cells) and parity == len(bs16))
             atomic_json(path, payload)
-            print(f'AIV_TARGET gain15={hits}/{len(cells)} no_slowdown={steady}/{len(cells)} '
+            print(f'AIV_TARGET gain15={hits}/{len(cells)} gain20={passed}/{len(cells)} no_slowdown={steady}/{len(cells)} '
                   f'both={both}/{len(cells)} bs16_PR30_parity={parity}/{len(bs16)} '
                   f'bs16_PR30_compared={len(compared)}/{len(bs16)} SUMMARY={path}')
             return

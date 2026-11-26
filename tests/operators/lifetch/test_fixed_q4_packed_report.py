@@ -79,6 +79,8 @@ def test_new_kernel_reuses_only_archived_times_and_checks_each_block(tmp_path):
     assert result['no_slowdown'] and result['reached_15pct']
     assert result['saved_vs_previous_us']['graph'] == 5
     assert result['saved_us']['graph'] == 105
+    assert result['gap_to_15_us'] == pytest.approx(307 - 0.85 * 412)
+    assert result['gap_to_20_us'] == pytest.approx(307 - 0.80 * 412)
     assert result['tokens_per_call']['previous_fused'] == {'prefetch': 20, 'final': 5}
     assert result['graph_saved_vs_previous_by_block_us'] == [5, 5]
     p = fresh / 'g17/bs8/cohort1/block2/fused/packed_result.json'
