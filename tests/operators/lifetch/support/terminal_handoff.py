@@ -17,6 +17,19 @@ P2_W1_KERNELS = {
     'p2_w1': ('v9_li_kernel', 'v9_li_kernel_threshold_p2_w1',
               'v9_li_kernel_cold_p2_w1', 'v9_parallel_terminal'),
 }
+COLD_GM_MODES = ('cold_gm_fenced', 'cold_gm_pipeline')
+COLD_GM_STAGE_FIELDS = {
+    'cold_gm_fenced': ('hot_us', 'cold_raw_threshold_us', 'cold_service_us', 'terminal_us'),
+    'cold_gm_pipeline': ('hot_us', 'cold_gm_pipeline_us', 'terminal_us'),
+}
+COLD_GM_KERNELS = {
+    'p2': P2_W1_KERNELS['p2'],
+    'cold_gm_fenced': ('v9_li_kernel_hot_cold_gm', 'v9_li_kernel_cold_gm_batch',
+                       'v9_li_kernel_cold_t2', 'v9_parallel_terminal'),
+    'cold_gm_pipeline': ('v9_li_kernel_hot_cold_gm', 'v9_li_kernel_cold_gm_batch',
+                         'v9_parallel_terminal'),
+}
+CHECKED_KERNELS = {**P2_W1_KERNELS, **COLD_GM_KERNELS}
 DYNAMIC_MAILBOX_BYTES = 192 * 128
 COUNT_COLUMNS = ('prefetch_requests', 'final_get_requests', 'total_get_requests')
 
@@ -134,6 +147,24 @@ def bind_dedicated_service(state, mode):
     forward = dense_terminal(state)
     if mode == 'p2':
         return
+    if mode in COLD_GM_MODES:
+        workspace = state.workspace
+        if not (workspace.tail_bounds.eq(0).all().item()
+                and workspace.inputs.query_ends.eq(state.history).all().item()):
+            raise ValueError('Cold GM requires full query bounds and no recent tail')
+        queries = state.batch * 4
+        if (workspace.compute.nbytes < queries * (state.history * 2 + 128)
+                or workspace.compute.data_ptr() % 128):
+            raise ValueError('Cold GM requires aligned per-query readiness lines after the Score rows')
+        library = forward.rotating.library
+        supported = library.kvip_cold_gm_supported
+        supported.argtypes, supported.restype = [ctypes.c_void_p], ctypes.c_uint32
+        if supported(forward.shape_pointer) != 1:
+            raise ValueError('Cold GM is unsupported for this Terminal shape')
+        function = getattr(library, f'kvip_parallel_tail_{mode}_forward')
+        function.argtypes, function.restype = [ctypes.c_void_p] * 4, ctypes.c_uint32
+        forward.terminal_function = function
+        return
     if mode == 'p2_w1':
         workspace = state.workspace
         if not (workspace.tail_bounds.eq(0).all().item()
@@ -184,9 +215,18 @@ def run_staged_eager(state, mode, progress):
     shape = rotating.runtime_shape
     bindings = forward.bindings.data_ptr()
     terminal = forward.terminal.workspace.data_ptr()
-    hot = 'v9_li_kernel_hot_ready_service' if mode in READY_SERVICE_MODES else 'v9_li_kernel'
+    hot = 'v9_li_kernel'
+    if mode in READY_SERVICE_MODES:
+        hot = 'v9_li_kernel_hot_ready_service'
+    elif mode in COLD_GM_MODES:
+        hot = 'v9_li_kernel_hot_cold_gm'
     stages = [('Hot', hot, shape.liCores, bindings)]
-    if mode == 'dynamic':
+    if mode in COLD_GM_MODES:
+        stages.append(('Cold GM batch', 'v9_li_kernel_cold_gm_batch', shape.liCores, bindings,
+                       int(mode == 'cold_gm_pipeline')))
+        if mode == 'cold_gm_fenced':
+            stages.append(('Cold GM consume', 'v9_li_kernel_cold_t2', shape.liCores, bindings))
+    elif mode == 'dynamic':
         stages.append(('Resident+Cold+Service', 'v9_li_kernel_dynamic_service', shape.liCores, bindings))
     else:
         threshold, cold = {
@@ -203,11 +243,12 @@ def run_staged_eager(state, mode, progress):
     progress('staged eager binding synchronization')
     stream.synchronize()
     progress('staged eager binding synchronized')
-    for label, symbol, blocks, workspace in stages:
+    for label, symbol, blocks, workspace, *parameters in stages:
         launch = getattr(rotating.library, f'aclrtlaunch_{symbol}')
-        launch.argtypes, launch.restype = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p], ctypes.c_uint32
+        launch.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p] + [ctypes.c_uint32] * len(parameters)
+        launch.restype = ctypes.c_uint32
         progress(f'staged eager {label} launch ({symbol})')
-        result = launch(blocks, stream.npu_stream, workspace)
+        result = launch(blocks, stream.npu_stream, workspace, *parameters)
         if result:
             raise RuntimeError(f'{symbol} launch failed: {result}')
         progress(f'staged eager {label} synchronization')
@@ -224,19 +265,19 @@ def fixture_hash(path):
     return digest.hexdigest()
 
 
-def terminal_stages(measured, *, dynamic=False, p2_w1_route=None):
+def terminal_stages(measured, *, dynamic=False, kernel_route=None):
     """Measure the actual launch boundaries within each checked graph invocation."""
-    names = DYNAMIC_STAGES if dynamic else STAGES
+    names = COLD_GM_STAGE_FIELDS.get(kernel_route, DYNAMIC_STAGES if dynamic else STAGES)
     rows = []
-    if p2_w1_route is not None:
+    if kernel_route is not None:
         intervals = measured['accounting']['kernel_intervals']
         seen = sorted((*intervals['li'], *intervals['topk_resolve_update']))
-        expected = P2_W1_KERNELS[p2_w1_route] * len(measured['samples'])
+        expected = CHECKED_KERNELS[kernel_route] * len(measured['samples'])
         actual = tuple(name.lower() for _, _, name in seen)
         if len(actual) != len(expected) or any(
                 not re.fullmatch(symbol + r'(?:_\d+)*', name)
                 for name, symbol in zip(actual, expected)):
-            raise ValueError(f'Profiler did not execute the {p2_w1_route} kernels: {actual}')
+            raise ValueError(f'Profiler did not execute the {kernel_route} kernels: {actual}')
     for sample in measured['samples']:
         intervals = sample['intervals_us']
         li = intervals.get('li', ())
@@ -267,4 +308,41 @@ def request_counts(rows, posts, windows, budget):
             raise ValueError(f'MR25 request {request} has invalid completed Get counters')
         result.append(dict(request=request, prefetch_by_window=by_window, final_get_by_query=by_query,
                            **dict(zip(COUNT_COLUMNS, (prefetch, final, prefetch + final)))))
+    return result
+
+
+def cold_gm_timeline(state, mode, clock_mhz):
+    """Read the AIV handoff stamps from a separate diagnostic replay."""
+    from diagnostics import union
+
+    queries = state.batch * 4
+    offset = queries * state.history * 2
+    lanes = state.workspace.compute[offset:offset + queries * 128].cpu().numpy().view('<u8').reshape(queries, 16)
+    records = []
+    for aiv, line in enumerate(lanes):
+        if int(line[0]) != 0x100000001:
+            raise ValueError(f'Cold GM AIV {aiv} did not publish both readiness flags')
+        raw_begin, raw_end, threshold_begin, threshold_end = map(int, line[1:5])
+        if not (0 < raw_begin < raw_end and 0 < threshold_begin < threshold_end):
+            raise ValueError(f'Cold GM AIV {aiv} has incomplete producer timestamps')
+        record = dict(aiv=aiv, request=aiv // 4, raw_score=[raw_begin, raw_end],
+                      threshold=[threshold_begin, threshold_end])
+        if mode == 'cold_gm_pipeline':
+            begin, end = map(int, line[5:7])
+            if not (max(raw_end, threshold_end) <= begin < end):
+                raise ValueError(f'Cold GM AIV {aiv} has invalid consumption timestamps')
+            record['classify_and_service'] = [begin, end]
+        records.append(record)
+
+    def overlap(left, right):
+        return sum(max(0, min(last_a, last_b) - max(first_a, first_b))
+                   for first_a, last_a in left for first_b, last_b in right) / clock_mhz
+
+    score = union(record['raw_score'] for record in records)
+    threshold = union(record['threshold'] for record in records)
+    result = dict(clock_mhz=clock_mhz, lanes=records,
+                  score_threshold_overlap_us=overlap(score, threshold))
+    if mode == 'cold_gm_pipeline':
+        service = union(record['classify_and_service'] for record in records)
+        result['score_consumer_overlap_us'] = overlap(score, service)
     return result

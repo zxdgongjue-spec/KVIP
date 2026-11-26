@@ -134,6 +134,7 @@ extern "C" uint32_t kvip_parallel_tail_supported(const rotating::RuntimeShape* s
 #include "../../common/lifetch/cold_score_partition.h"
 #include "../../common/lifetch/dedicated_cold_schedule.h"
 #include "../op_kernel/p2_w1_schedule.h"
+#include "../op_kernel/cold_gm_schedule.h"
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_hot_partitioned(uint32_t,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_threshold_cold_partitioned(uint32_t,void*,void*,uint32_t);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_partitioned(uint32_t,void*,void*,uint32_t);
@@ -146,6 +147,8 @@ extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_static_ready_service(uint32_t,
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_dynamic_service(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_threshold_p2_w1(uint32_t,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_p2_w1(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_hot_cold_gm(uint32_t,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_kernel_cold_gm_batch(uint32_t,void*,void*,uint32_t);
 #endif
 enum class ParallelTailStage { Hot, Threshold, ColdService, Terminal };
 
@@ -235,6 +238,33 @@ extern "C" uint32_t kvip_parallel_tail_p2_w1_forward(
     void* bindings, void* terminal, void* stream, const rotating::RuntimeShape* shape) {
     if (!kvip_p2_w1_supported(shape)) return 100000;
     return LaunchParallelTail(bindings, terminal, stream, shape, 2, 2, true);
+}
+
+extern "C" uint32_t kvip_cold_gm_supported(const rotating::RuntimeShape* shape) {
+    return kvip_parallel_tail_supported(shape) && kvip_cold_gm::Supports(*shape);
+}
+
+static uint32_t LaunchColdGm(void* bindings, void* terminal, void* stream,
+    const rotating::RuntimeShape* shape, bool consumeReadyRows) {
+    if (!bindings || !terminal || !stream || !kvip_cold_gm_supported(shape)) return 100000;
+    uint32_t result = aclrtlaunch_v9_li_kernel_hot_cold_gm(shape->liCores, stream, bindings);
+    if (!result) result = aclrtlaunch_v9_li_kernel_cold_gm_batch(
+        shape->liCores, stream, bindings, uint32_t(consumeReadyRows));
+    if (!result && !consumeReadyRows) {
+        result = aclrtlaunch_v9_li_kernel_cold_t2(shape->liCores, stream, bindings);
+    }
+    if (!result) result = aclrtlaunch_v9_parallel_terminal(shape->batch * 4, stream, terminal);
+    return result;
+}
+
+extern "C" uint32_t kvip_parallel_tail_cold_gm_fenced_forward(
+    void* bindings, void* terminal, void* stream, const rotating::RuntimeShape* shape) {
+    return LaunchColdGm(bindings, terminal, stream, shape, false);
+}
+
+extern "C" uint32_t kvip_parallel_tail_cold_gm_pipeline_forward(
+    void* bindings, void* terminal, void* stream, const rotating::RuntimeShape* shape) {
+    return LaunchColdGm(bindings, terminal, stream, shape, true);
 }
 
 extern "C" uint32_t kvip_dedicated_cold_supported(const rotating::RuntimeShape* shape) {

@@ -28,7 +28,8 @@ __aicore__ inline bool HasUniformLengths(const rotating::RuntimeShape& shape, GM
 }
 
 template <SequenceLiPhase Phase, bool ExternalBody = false, bool OwnWindow = false>
-__aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, uint32_t job = 0) {
+__aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, [[maybe_unused]] uint32_t job = 0,
+    GM_ADDR coldGmReady = nullptr) {
     using namespace AscendC; using namespace QLICommon;
     auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
@@ -36,7 +37,8 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, uint32_t job 
     constexpr bool traceHotSlot = Phase == SequenceLiPhase::Hot || Phase == SequenceLiPhase::UnifiedScore;
     constexpr bool traceColdSlot = Phase == SequenceLiPhase::Cold || Phase == SequenceLiPhase::PrecomputedCold ||
         Phase == SequenceLiPhase::DedicatedCold || Phase == SequenceLiPhase::ColdW1 ||
-        Phase == SequenceLiPhase::DynamicScore || Phase == SequenceLiPhase::DynamicService;
+        Phase == SequenceLiPhase::DynamicScore || Phase == SequenceLiPhase::DynamicService ||
+        Phase == SequenceLiPhase::ColdRawScore;
     const uint64_t stageTrace = (parts == 2 || Phase == SequenceLiPhase::Cold ||
         Phase == SequenceLiPhase::UnifiedScore)
         ? KVIP_TRACE_WORKSPACE(P(15)) : 0;
@@ -110,7 +112,7 @@ __aicore__ inline void RunLi(GM_ADDR bindings, uint32_t parts = 2, uint32_t job 
         if (splitSequence) op.template ProcessSequenceSplit<Phase>(parts);
         else op.Process();
     } else {
-        op.template ProcessSequenceSplit<Phase>(parts);
+        op.template ProcessSequenceSplit<Phase>(parts, coldGmReady);
     }
     KVIP_TRACE_RECORD(teardownScope, stageTrace, traceKernel, kvip_trace::LiPipeDestroy, 0, 0);
     pipe.Destroy();
@@ -135,10 +137,28 @@ __aicore__ inline bool UseEarlyW1(GM_ADDR bindings, uint32_t group) {
     return true;
 }
 
-__aicore__ inline uint32_t P2W1Group() {
+__aicore__ inline uint32_t P2MixGroup() {
     const uint32_t block = AscendC::GetBlockIdx();
     if ASCEND_IS_AIV { return block / 2; }
     return block;
+}
+
+__aicore__ inline GM_ADDR ColdGmReady(GM_ADDR bindings, const rotating::RuntimeShape& shape) {
+    const auto args = reinterpret_cast<__gm__ const uint64_t*>(bindings);
+    return reinterpret_cast<GM_ADDR>(args[12]) + kvip_cold_gm::ScoreBytes(shape);
+}
+
+__aicore__ inline void ColdGmTime(GM_ADDR line, bool profile, kvip_cold_gm::TimeWord word) {
+    if (profile) reinterpret_cast<__gm__ uint64_t*>(line)[word] = AscendC::GetSystemCycle();
+}
+
+__aicore__ inline void ColdGmThreshold(GM_ADDR bindings, GM_ADDR line, bool profile) {
+    using namespace AscendC;
+    ColdGmTime(line, profile, kvip_cold_gm::ThresholdBegin);
+    RunLi<SequenceLiPhase::Threshold>(bindings);
+    PipeBarrier<PIPE_ALL>();
+    ColdGmTime(line, profile, kvip_cold_gm::ThresholdEnd);
+    kvip_cold_gm::PublishReady(line, kvip_cold_gm::ThresholdReady);
 }
 
 __aicore__ inline void ResetPartitionedColdProgress(GM_ADDR bindings, uint32_t parts) {
@@ -360,6 +380,56 @@ extern "C" __global__ __aicore__ void v9_li_kernel_cold_t2(GM_ADDR bindings) {
     if ASCEND_IS_AIV { RunLi<SequenceLiPhase::PrecomputedCold>(bindings); }
 #endif
 }
+
+extern "C" __global__ __aicore__ void v9_li_kernel_hot_cold_gm(GM_ADDR bindings) {
+#if defined(__CCE_AICORE__) && !V9_UBMEM
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    if ASCEND_IS_AIV {
+        const auto args = reinterpret_cast<__gm__ const uint64_t*>(bindings);
+        const auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(args[14]));
+        const auto line = ColdGmReady(bindings, shape) + AscendC::GetBlockIdx() * kvip_cold_gm::kReadyLineBytes;
+        *reinterpret_cast<__gm__ volatile uint64_t*>(line) = 0;
+        kvaf_device::CleanCacheLines(line, kvip_cold_gm::kReadyLineBytes);
+    }
+    RunLi<SequenceLiPhase::Hot>(bindings);
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_li_kernel_cold_gm_batch(GM_ADDR bindings, uint32_t consumeReadyRows) {
+#if defined(__CCE_AICORE__) && !V9_UBMEM
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    using namespace AscendC;
+    const auto args = reinterpret_cast<__gm__ const uint64_t*>(bindings);
+    const auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(args[14]));
+    const bool thresholdFirst = kvip_cold_gm::ThresholdFirst(P2MixGroup(), shape.liCores);
+    const auto ready = ColdGmReady(bindings, shape);
+    const auto block = GetBlockIdx();
+    const auto line = ready + block * kvip_cold_gm::kReadyLineBytes;
+    bool profile = false;
+    if ASCEND_IS_AIV {
+        const auto workspace = reinterpret_cast<__gm__ const pipeline_ab::Args*>(args[15]);
+        profile = workspace && (workspace->prefetchCount & 0x80000000U);
+        if (thresholdFirst) ColdGmThreshold(bindings, line, profile);
+        ColdGmTime(line, profile, kvip_cold_gm::RawBegin);
+    }
+    RunLi<SequenceLiPhase::ColdRawScore>(bindings);
+    if ASCEND_IS_AIV {
+        PipeBarrier<PIPE_ALL>();
+        ColdGmTime(line, profile, kvip_cold_gm::RawEnd);
+        if (!thresholdFirst) ColdGmThreshold(bindings, line, profile);
+        kvip_cold_gm::PublishReady(line, kvip_cold_gm::RowReady);
+        if (consumeReadyRows) {
+            // The producer splits the whole Cold range in half. The consumer
+            // splits each window, so both producers must finish this row.
+            kvip_cold_gm::WaitRow(ready, block / kvip_cold_gm::kQueries, kvip_cold_gm::RowReady);
+            ColdGmTime(line, profile, kvip_cold_gm::ConsumeBegin);
+            RunLi<SequenceLiPhase::PrecomputedCold>(bindings, 2, 0, ready);
+            ColdGmTime(line, profile, kvip_cold_gm::ConsumeEnd);
+            if (profile) kvaf_device::CleanCacheLines(line, kvip_cold_gm::kReadyLineBytes);
+        }
+    }
+#endif
+}
 #endif
 
 extern "C" __global__ __aicore__ void v9_li_kernel_1(GM_ADDR bindings) {
@@ -387,7 +457,7 @@ extern "C" __global__ __aicore__ void v9_li_kernel_3(GM_ADDR bindings) {
 extern "C" __global__ __aicore__ void v9_li_kernel_threshold_p2_w1(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-    const bool early = UseEarlyW1(bindings, P2W1Group());
+    const bool early = UseEarlyW1(bindings, P2MixGroup());
     if ASCEND_IS_AIC { if (!early) return; }
     const auto args = reinterpret_cast<__gm__ const uint64_t*>(bindings);
     KVIP_TRACE_BEGIN(body, KVIP_TRACE_WORKSPACE(reinterpret_cast<GM_ADDR>(args[15])),
@@ -401,7 +471,7 @@ extern "C" __global__ __aicore__ void v9_li_kernel_threshold_p2_w1(GM_ADDR bindi
 extern "C" __global__ __aicore__ void v9_li_kernel_cold_p2_w1(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-    if (UseEarlyW1(bindings, P2W1Group())) {
+    if (UseEarlyW1(bindings, P2MixGroup())) {
         RunLi<SequenceLiPhase::ColdW1>(bindings);
     } else {
         RunLi<SequenceLiPhase::Cold>(bindings);

@@ -30,6 +30,7 @@
 
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
 #include "../p2_w1_schedule.h"
+#include "../cold_gm_schedule.h"
 #endif
 
 namespace QLIKernel {
@@ -39,7 +40,10 @@ using AscendC::CacheMode;
 using AscendC::CrossCoreSetFlag;
 using AscendC::CrossCoreWaitFlag;
 
-enum class SequenceLiPhase { Hot, Threshold, Cold, Final, UnifiedScore, PrecomputedCold, DedicatedCold, DynamicScore, DynamicService, W1Score, ColdW1 };
+enum class SequenceLiPhase {
+    Hot, Threshold, Cold, Final, UnifiedScore, PrecomputedCold, DedicatedCold,
+    DynamicScore, DynamicService, W1Score, ColdW1, ColdRawScore
+};
 
 // 由于S2循环前，RunInfo还没有赋值，使用TempLoopInfo临时存放B、N、S1轴相关的信息；同时减少重复计算
 struct TempLoopInfo {
@@ -72,7 +76,7 @@ public:
                                 uint32_t seqParts = 2);
     __aicore__ inline void Process();
     template <SequenceLiPhase Phase>
-    __aicore__ inline void ProcessSequenceSplit(uint32_t parts = 2);
+    __aicore__ inline void ProcessSequenceSplit(uint32_t parts = 2, GM_ADDR coldGmReady = nullptr);
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
     template <bool OwnWindow = false>
     __aicore__ inline void ProcessDedicatedCold(GM_ADDR compute);
@@ -727,8 +731,8 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
         if (stageTrace_ && (tile == begin || tile + 1 == end)) {
             uint32_t firstQ = kvip_trace::kAllQueries;
             if ASCEND_IS_AIV { firstQ = (tmpBlockIdx % 2) * 2; }
-            const uint32_t traceKernel = traceKernel_ == kvip_trace::Threshold ? kvip_trace::Threshold :
-                traceWindow_ ? kvip_trace::Cold : kvip_trace::Hot;
+            const uint32_t traceKernel = traceKernel_ == kvip_trace::Threshold || traceKernel_ == kvip_trace::Cold
+                ? traceKernel_ : traceWindow_ ? kvip_trace::Cold : kvip_trace::Hot;
             pipeSample = {stageTrace_, traceKernel,
                 traceWindow_, kvip_trace::PipeDetail(info.bIdx, firstQ, tile)};
         }
@@ -801,7 +805,8 @@ __aicore__ inline bool QuantLightningIndexerKernel<QLIT>::ScoreRecent(
 
 template <typename QLIT>
 template <SequenceLiPhase Phase>
-__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(uint32_t parts)
+__aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(
+    uint32_t parts, [[maybe_unused]] GM_ADDR coldGmReady)
 {
     uint32_t batch = splitCoreInfo.bN2Start;
     uint32_t shard = aiCoreIdx % parts;
@@ -851,11 +856,13 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(u
 
         uint32_t loop = 0, scaleLoop = 0;
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
-        if constexpr (Phase == SequenceLiPhase::UnifiedScore) {
-            KVIP_TRACE_RECORD(unifiedScanScope, stageTrace_, kvip_trace::Hot,
+        if constexpr (Phase == SequenceLiPhase::UnifiedScore || Phase == SequenceLiPhase::ColdRawScore) {
+            KVIP_TRACE_RECORD(unifiedScanScope, stageTrace_, traceKernel,
                 kvip_trace::ScanPhase(), 0, batch);
-            const auto tiles = kvip_hot_score::Split(runtimeShape_.history, shard, parts);
-            ScanSequenceHalf(tiles.begin, tiles.end, shard, loop, scaleLoop, true, false, true);
+            const uint32_t start = Phase == SequenceLiPhase::ColdRawScore ? resident_ : 0;
+            const auto tiles = kvip_hot_score::Split(runtimeShape_.history - start, shard, parts);
+            const uint32_t offset = start / S2_BASE_SIZE;
+            ScanSequenceHalf(tiles.begin + offset, tiles.end + offset, shard, loop, scaleLoop, true, false, true);
         } else
 #endif
         if constexpr (Phase == SequenceLiPhase::Hot) {
@@ -921,7 +928,22 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(u
                 KVIP_TRACE_BEGIN(progressScope, stageTrace_, Cold, ColdProgressPrepare, 0, batch);
                 vectorService.PrepareRotationProgress();
                 KVIP_TRACE_END(progressScope);
-                if (serviceLeader && serviceEpoch == 0) vectorService.RotateFetch(0, halfTokens);
+                if (serviceLeader && serviceEpoch == 0) {
+#if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
+                    if constexpr (Phase == SequenceLiPhase::PrecomputedCold) {
+                        if (coldGmReady) {
+                            // This physical AIV can serve a different request.
+                            // Later windows already wait for this W0 publication.
+                            const auto lane = rotating::ServiceLane(runtimeShape_.batch, runtimeShape_.splitQ,
+                                runtimeShape_.serviceAics, serviceCore, tmpBlockIdx % 2);
+                            for (uint32_t row = lane; row < runtimeShape_.batch; row += runtimeShape_.serviceLanes) {
+                                kvip_cold_gm::WaitRow(coldGmReady, row, kvip_cold_gm::ThresholdReady);
+                            }
+                        }
+                    }
+#endif
+                    vectorService.RotateFetch(0, halfTokens);
+                }
             }
             uint32_t begin = resident_ / S2_BASE_SIZE + shard * half;
             for (uint32_t epoch = 1; epoch < runtimeShape_.rounds; ++epoch, begin += 2 * half) {
@@ -993,7 +1015,7 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(u
             CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT);
             CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT + 1);
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
-            if constexpr (Phase == SequenceLiPhase::W1Score) {
+            if constexpr (Phase == SequenceLiPhase::W1Score || Phase == SequenceLiPhase::ColdRawScore) {
                 constexpr uint32_t peer = QLICommon::ConstInfo::AIV0_AIV1_OFFSET;
                 CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
                     QLICommon::ConstInfo::CROSS_VC_EVENT + peer);

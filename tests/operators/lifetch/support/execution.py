@@ -3815,9 +3815,13 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             if handoff:
                 from terminal_handoff import request_counts, terminal_stages
 
+                checked_kernels = (
+                    getattr(config, 'mr28_p2_w1_experiment', False)
+                    or getattr(config, 'mr28_cold_gm_experiment', False)
+                )
                 handoff_samples.extend(terminal_stages(
                     measured, dynamic=getattr(config, 'mr28_dedicated_service', None) == 'dynamic',
-                    p2_w1_route=handoff if getattr(config, 'mr28_p2_w1_experiment', False) else None))
+                    kernel_route=handoff if checked_kernels else None))
                 for index, state in enumerate(states):
                     rotating = state.rotating
                     records = request_counts(rotating.rows.cpu().numpy(), rotating.final_posts.cpu().numpy(),
@@ -3868,6 +3872,10 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                 for i, state in enumerate(states):
                     sample = dict(round=i, source_round=inputs.source_round,
                                   streaming_cycles=state.forward.diagnostic_cycles())
+                    if getattr(config, 'mr28_cold_gm_experiment', False) and handoff != 'p2':
+                        from terminal_handoff import cold_gm_timeline
+
+                        sample['cold_gm_timeline'] = cold_gm_timeline(state, handoff, clock_mhz)
                     if getattr(state.forward, 'terminal', None) is not None:
                         sample['algorithm'] = algorithm_after(state.rotating, detail_before[i],
                             admissions=state.forward.events_src.cpu().numpy(),
@@ -4299,6 +4307,9 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                     )
                 if p2_w1_experiment:
                     result['handoff_route'].update(w1_prescore=dedicated_service == 'p2_w1')
+                if getattr(config, 'mr28_cold_gm_experiment', False):
+                    result['handoff_route'].update(cold_score_writeback=dedicated_service != 'p2',
+                                                   cold_gm_row_consumer=dedicated_service == 'cold_gm_pipeline')
             atomic_json(directory / 'path_result.json', result)
             return result
         state.reset()

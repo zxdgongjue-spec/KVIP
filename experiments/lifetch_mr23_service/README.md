@@ -513,3 +513,50 @@ In the H7168/resident 4096 CANN model, the candidate shortened Hot through
 Cold+Service from 238,125 to 229,244 device ticks. Prefetch declined from
 2,612 to 2,368 WQEs and the first W1 doorbell moved 16,266 ticks later.
 This A5 runner measures the remaining Terminal and KV-ready effects.
+
+## MR28 Cold Score via GM
+
+Run on A5 from the shared checkout with the existing KVAF build. The
+comparison uses the same synthetic Q4, H128K, resident 16K, miss 10%,
+seed 43 and original prefetch budget. Start with BS16.
+
+```bash
+export KVIP_A5_DEVICE=0
+runner=experiments/lifetch_mr23_service/run_mr28_cold_gm.sh
+bash "$runner" --batch 16 --route cold_gm_pipeline --staged-eager --warmup 0 --iterations 1
+bash "$runner" --batch 16 --route all --warmup 2 --iterations 10
+bash "$runner" --batch 16 --route all --warmup 1 --iterations 3 --prefetch-trace
+```
+
+- `p2` uses the native route with rotating Service.
+- `cold_gm_fenced` starts the Cold raw Score and resident Top2048 after
+  the Hot Score launch. In one MIX kernel the first cohort scores first,
+  and the other cohort computes resident Top2048 first. The existing
+  Cold T2 consumer starts after the full-batch producer kernel finishes.
+- `cold_gm_pipeline` uses the same two producer cohorts. After the full
+  raw Score and resident thresholds for a request are visible, its AIVs
+  can load GM Score tiles and classify them while other requests are
+  still producing scores. The native rotating Service uses the
+  classified progress and window order. W0 only needs the resident
+  thresholds for the requests assigned to that service lane. Terminal
+  still follows the producer and consumer kernel on the transport stream.
+
+Both candidates reuse the canonical Score arena and append one
+128-byte readiness line per query. Each new replay begins with the
+Hot kernel clearing those lines. The same kernel and stream order
+provide the readiness reset and the final Terminal boundary. At BS16,
+128K and Q4, the producer covers the complete Cold range
+`[16384, 131072)`, including W1, W2 and W3. The two MIX groups for each
+request split that range into equal halves of 448 tiles. The batch
+writes 14,336 Cold tiles. The consumer performs an additional 14 MiB
+of logical raw Score reads for classification before the original
+window ranking uses the published Score and predicates.
+
+The paired report includes KV/Index validation, each stage's profiler
+mean, KV-ready graph timing and per-request Get counts. The separate
+diagnostic replay writes AIV phase stamps, envelope overlaps,
+prefetch doorbells and Terminal CQ timing to `detail_samples.json`.
+The overlap fields describe phase intervals and can include waits.
+`timing_eligible` specifies whether the per-request total Get workload
+is comparable. The pipeline row also reports the comparison against
+`cold_gm_fenced`.
