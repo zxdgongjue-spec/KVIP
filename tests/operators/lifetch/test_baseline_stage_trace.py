@@ -82,7 +82,20 @@ def test_trace_has_measured_lane_and_stage_envelopes():
     assert any(entry['pid'] == 1 and entry['tid'] == 64 for entry in spans)
 
 
-def test_bs2_separate_service_has_one_spare_aiv_for_each_window_and_lane():
+def bs2_dynamic_score_events(body):
+    for window in (1, 2, 3):
+        for shard in range(8):
+            row, part = divmod(shard, 4)
+            group = (shard + window - 1) % 8
+            ticket = 1 + (window - 1) * 8 + shard
+            detail = ticket << 8 | row << 4 | window << 2 | part
+            for lane in (64 + group, 2 * group, 2 * group + 1):
+                yield dict(body, lane=lane, iteration=window, detail=detail, phase=source_trace.DYNAMIC_SCORE_JOB,
+                           begin=7000 + 100 * window, end=7050 + 100 * window)
+
+
+@pytest.mark.parametrize('cold_route', source_trace.SMALL_SEPARATE_ROUTES)
+def test_bs2_separate_service_has_one_spare_aiv_for_each_window_and_lane(cold_route):
     events = [event for event in decode(sample_buffer(batch=2, cold_parts=4))
               if event['phase'] not in (WAIT_PARTITIONED_HALF, 150, 151)]
     body = next(event for event in events if event['kernel'] == 22 and event['phase'] == 1)
@@ -93,7 +106,9 @@ def test_bs2_separate_service_has_one_spare_aiv_for_each_window_and_lane():
             events.extend([dict(slot, phase=1), dict(slot, phase=150)])
             if window:
                 events.extend([dict(slot, phase=source_trace.DEDICATED_DRIVER_WAIT), dict(slot, phase=151)])
-    route = dict(batch=2, cold_route='small_cold_separate', cold_parts=4)
+    if cold_route == 'small_cold_separate_dynamic':
+        events.extend(bs2_dynamic_score_events(body))
+    route = dict(batch=2, cold_route=cold_route, cold_parts=4)
     verify_route(events, **route)
     moved = [dict(event, lane=0, block=0) if event['phase'] == 150 and event['lane'] == 16 else event
              for event in events]
@@ -102,6 +117,19 @@ def test_bs2_separate_service_has_one_spare_aiv_for_each_window_and_lane():
     missing_wait = [event for event in events if not (event['phase'] == 151 and event['lane'] == 19)]
     with pytest.raises(ValueError, match='spare AIVs'):
         verify_route(missing_wait, **route)
+
+
+def test_bs2_dynamic_score_rejects_out_of_order_cursor_and_incomplete_peers():
+    body = dict(kernel=22)
+    events = list(bs2_dynamic_score_events(body))
+    assert len(source_trace.verify_bs2_dynamic_score_jobs(events)) == 24
+    with pytest.raises(ValueError, match='MIX group'):
+        source_trace.verify_bs2_dynamic_score_jobs(events[:-1])
+    for event in events:
+        if source_trace.dynamic_job(event['detail']) == (0, 2, 0):
+            event.update(begin=7080, end=7090)
+    with pytest.raises(ValueError, match='prior window'):
+        source_trace.verify_bs2_dynamic_score_jobs(events)
 
 
 def test_handoff_counts_cold_cursor_reset_on_the_threshold_source_clock():

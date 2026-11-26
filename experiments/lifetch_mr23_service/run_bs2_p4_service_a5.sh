@@ -20,7 +20,7 @@ case "${1:-}" in
         ;;
 esac
 
-printf '%s\n' 'BS2 P4/W4: graph Event comparison'
+printf '%s\n' 'BS2 P4 Service matrix: graph Event comparison'
 bash "$runner" --bs2-p4-service --warmup 2 "$@"
-printf '%s\n' 'BS2 P4/W4: checked msprof comparison'
+printf '%s\n' 'BS2 P4 Service matrix: checked msprof comparison'
 exec bash "$runner" --bs2-p4-service --trace "$@"

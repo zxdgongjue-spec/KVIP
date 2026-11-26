@@ -67,9 +67,16 @@ SMALL_COLD_KERNELS = {**COLD_P4_KERNELS,
                       22: (KERNELS[22][0], 'v9_li_kernel_cold_ready_partitioned')}
 SMALL_COLD_SEPARATE_KERNELS = {**SMALL_COLD_KERNELS,
                                22: ('Cold P4 + separate Service', 'v9_li_kernel_cold_separate_service')}
+SMALL_COLD_SEPARATE_DYNAMIC_KERNELS = {
+    **SMALL_COLD_SEPARATE_KERNELS,
+    21: (KERNELS[21][0], 'v9_li_kernel_threshold_separate_dynamic'),
+    22: ('Dynamic Cold P4 + separate Service', 'v9_li_kernel_cold_separate_dynamic'),
+}
+SMALL_SEPARATE_ROUTES = ('small_cold_separate', 'small_cold_separate_dynamic')
 ROUTE_KERNELS = {'p2': KERNELS, 'cold_p4': COLD_P4_KERNELS,
                  'small_cold': SMALL_COLD_KERNELS, 'small_topk': KERNELS,
                  'small_cold_separate': SMALL_COLD_SEPARATE_KERNELS,
+                 'small_cold_separate_dynamic': SMALL_COLD_SEPARATE_DYNAMIC_KERNELS,
                  'dedicated': DEDICATED_KERNELS, 'static_ready': STATIC_READY_KERNELS,
                  'dynamic': DYNAMIC_KERNELS,
                  **{route: UNIFIED_KERNELS for route in UNIFIED_ROUTES}}
@@ -244,6 +251,7 @@ class StageBuffer:
             'cold_p4': 'kvip_parallel_tail_cold_partitioned_profile_forward',
             'small_cold': 'kvip_small_batch_cold_profile_forward',
             'small_cold_separate': 'kvip_small_batch_cold_separate_profile_forward',
+            'small_cold_separate_dynamic': 'kvip_small_batch_cold_separate_dynamic_profile_forward',
             'small_topk': 'kvip_small_batch_topk_profile_forward',
             'dedicated': 'kvip_parallel_tail_dedicated_service_profile_forward',
             'static_ready': 'kvip_parallel_tail_static_ready_service_profile_forward',
@@ -261,7 +269,7 @@ class StageBuffer:
         self.workspace = self.forward.workspace
         if self.workspace.numel() != 256:
             raise RuntimeError('LIFetch streaming binding must be exactly 256 bytes')
-        capacity = 2048 if cold_route == 'dynamic' else CAPACITY
+        capacity = 2048 if cold_route in ('dynamic', 'small_cold_separate_dynamic') else CAPACITY
         self.buffer = state.torch.zeros(HEADER_BYTES + LANES * (LANE_BYTES + capacity * EVENT.size),
                                         dtype=state.torch.uint8, device=state.device)
         header = struct.pack('<Q4I', MAGIC, VERSION, LANES, capacity, EVENT.size)
@@ -353,7 +361,7 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
             raise ValueError(f'Missing required pipe scopes: {missing_pipe}')
     if require_handoff_scopes:
         expected = dict(REQUIRED_HANDOFF)
-        if cold_route in ('cold_p4', 'small_cold', 'small_cold_separate', 'dedicated', 'static_ready', 'dynamic'):
+        if cold_route in ('cold_p4', 'small_cold', *SMALL_SEPARATE_ROUTES, 'dedicated', 'static_ready', 'dynamic'):
             expected[21] = expected[21] | {COLD_PROGRESS_RESET}
         if cold_route in ('dedicated', 'static_ready'):
             expected[22] = expected[22] | {231}
@@ -385,7 +393,7 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
     small_cold_groups = batch * (cold_parts if cold_route == 'small_cold' else 4)
     small_cold_lanes = set(range(2 * small_cold_groups)) | set(range(64, 64 + small_cold_groups))
     cold_lanes = {'cold_p4': p4_lanes, 'small_cold': small_cold_lanes, 'small_topk': four_aiv | two_aic,
-                  'small_cold_separate': p4_lanes | set(range(16, 24)),
+                  **dict.fromkeys(SMALL_SEPARATE_ROUTES, p4_lanes | set(range(16, 24))),
                   'dedicated': four_aiv | set(range(64, 88)),
                   'static_ready': four_aiv | set(range(64, 88)),
                   'dynamic': four_aiv | two_aic,
@@ -402,7 +410,7 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
         raise ValueError('A source scope has no corresponding kernel body on its lane')
     dedicated_scopes = {DEDICATED_DRIVER_WAIT, DEDICATED_READY_SNAPSHOT}
     dedicated_events = [event for event in events if event['phase'] in dedicated_scopes]
-    if cold_route == 'small_cold_separate':
+    if cold_route in SMALL_SEPARATE_ROUTES:
         if batch != 2 or cold_parts != 4:
             raise ValueError('Separate partitioned Service trace requires BS2 P4/W4')
         services = [(event['lane'], event['iteration'], event['detail']) for event in events
@@ -419,6 +427,8 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
                 or any(event['kernel'] == 22 and event['phase'] == 22 and event['lane'] >= 16
                        for event in events)):
             raise ValueError('Separate Service trace must use spare AIVs with one job per window and lane')
+        if cold_route == 'small_cold_separate_dynamic':
+            verify_bs2_dynamic_score_jobs(events)
     elif cold_route in ('dedicated', 'static_ready', 'dynamic'):
         if batch != 16:
             raise ValueError('Dedicated Service source trace requires BS16')
@@ -451,6 +461,40 @@ def verify_route(events, batch, *, require_pipe_scopes=False, require_handoff_sc
 
 def dynamic_job(detail):
     return (detail >> 4) & 15, (detail >> 2) & 3, detail & 3
+
+
+def verify_bs2_dynamic_score_jobs(events):
+    tickets = defaultdict(list)
+    for event in events:
+        if event['phase'] == DYNAMIC_SCORE_JOB:
+            detail = event['detail']
+            if event['kernel'] != 22 or dynamic_job(detail)[1] != event['iteration']:
+                raise ValueError('BS2 Score job tag does not match its window or kernel')
+            tickets[detail].append(event)
+    jobs = {}
+    group_intervals = defaultdict(list)
+    for detail, peers in tickets.items():
+        row, window, part = key = dynamic_job(detail)
+        aics = [event['lane'] for event in peers if event['lane'] >= 64]
+        if key in jobs or len(peers) != 3 or len(aics) != 1:
+            raise ValueError(f'BS2 Score job {key} did not run once as a MIX group')
+        group = aics[0] - 64
+        if group >= 8 or {event['lane'] for event in peers} != {64 + group, 2 * group, 2 * group + 1}:
+            raise ValueError(f'BS2 Score job {key} has mismatched FIXP peers')
+        begin, end = min(e['begin'] for e in peers), max(e['end'] for e in peers)
+        group_intervals[group].append((begin, end))
+        jobs[key] = dict(request=row, window=window, part=part, mix_group=group,
+                         ticket=detail >> 8, begin_tick=begin, end_tick=end)
+    if set(jobs) != {(b, w, p) for b in range(2) for w in (1, 2, 3) for p in range(4)}:
+        raise ValueError('BS2 dynamic Score did not cover each P4 shard in each Cold window')
+    for intervals in group_intervals.values():
+        ordered = sorted(intervals)
+        if any(left[1] > right[0] for left, right in zip(ordered, ordered[1:])):
+            raise ValueError('A BS2 Score MIX group ran two overlapping jobs')
+    for (row, window, part), job in jobs.items():
+        if window > 1 and jobs[row, window - 1, part]['end_tick'] > job['begin_tick']:
+            raise ValueError('A BS2 P4 cursor advanced before its prior window finished')
+    return [jobs[key] for key in sorted(jobs)]
 
 
 def verify_dynamic_jobs(events):
@@ -960,9 +1004,12 @@ def write_capture(directory, raw, counter_mhz, state, library, config, soc, mspr
                       cold_score_worker_pool=31, service_worker_pool=64)
     elif cold_route in UNIFIED_ROUTES:
         report['route'] = f'Full Score P{score_parts} + Cold T2 + four-AIV Terminal'
-    elif cold_route == 'small_cold_separate':
+    elif cold_route in SMALL_SEPARATE_ROUTES:
         report.update(route='Hot P2 + Cold P4 with separate Service', cold_score_aic=8,
                       cold_score_aiv=16, cold_service_aiv=8)
+        if cold_route == 'small_cold_separate_dynamic':
+            report.update(route='Hot P2 + dynamic Cold P4 with separate Service',
+                          bs2_dynamic_score_jobs=verify_bs2_dynamic_score_jobs(events))
     small_mode = getattr(config, 'small_batch_mode', None)
     if small_mode is not None:
         from small_batch import trace_evidence

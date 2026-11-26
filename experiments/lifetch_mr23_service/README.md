@@ -853,17 +853,28 @@ In the root `summary.csv`, the P4/W2 row reports marked stage deltas
 against P2/W2 under `same_window_*` and against P4/W4 under
 `same_parts_w4_*`. These are traced kernel measurements.
 
-### BS2 P4/W4 with separate Service AIVs
+### BS2 P4 Service matrix on A5
 
-Run both arms with the same Hot P2, eight Cold P4 Score groups, W4
-and prefetch settings. The separate arm launches four extra MIX groups.
-Their AICs return immediately. Eight extra AIVs each own one original
-`(window, lane)` job. After the original driver's two Score cursors
-reach its fragment end, the AIV runs the existing rotating Service with
-the same logical owner, predecessor and prefetch policy. W0 starts from
-the resident publication. Score producers continue to the next window.
-The separate arm fences MTE3 before each fragment's final cursor write.
-Candidate scoring can advance sooner, so actual prefetch counts may differ.
+The matrix runs the same BS2 fixture with Hot P2, eight Cold P4 Score MIX
+groups, Q4, history 128K, resident 16K, and 10% miss by default. It keeps
+the original prefetch budget (512 per request, 128 per window, starting
+rank 1024).
+
+| Arm | Windows | Score and Service |
+| --- | --- | --- |
+| `cold` | W4 | Static Score and rotating Service |
+| `cold_separate` | W4 | Static Score and eight dedicated Service AIVs |
+| `cold_separate_dynamic` | W4 | Dynamic Score tasks and the same eight dedicated Service AIVs |
+| `cold_w2` | W2 | Static Score and rotating Service reference |
+
+Each dedicated AIV owns one original `(window, lane)` job. W0 starts from
+the resident publication. The other windows wait on the original driver's
+two logical Score cursors and the preceding window's completion for that
+lane. The dynamic arm uses one spare AIC to assign each ready
+`(request, window, part)` to a free Score MIX group. The next job for a
+logical shard waits until the previous job has completed on the AIC and
+both AIVs. Before publishing a shard's end cursor, the producer releases
+Score and classification writes. Prefetch timing and Get counts can vary.
 
 ```bash
 runner=experiments/lifetch_mr23_service/run_bs2_p4_service_a5.sh
@@ -877,9 +888,11 @@ bash "$runner" --trace-only
 The default run prints separate output directories for the graph and
 the checked msprof replays. In the graph summary, compare
 `kv_ready_us` and the early/final Get counts. In the trace summary,
-compare the sampled AIC credit wait, the Service predecessor wait and
-the wait for the original Score driver. The two traced arms sample the
-first three tiles and the final tile of each Cold fragment. Each wait
-metric includes the largest union of matching spans on one logical lane
-and the longest individual span. Per-window figures are in
-`bs2_service_waits.json` next to each timeline.
+compare the AIC credit wait samples, Service predecessor wait and Service
+wait for the original Score driver. W4 samples the first three and last
+tile of each Cold fragment (96 AIC credit samples), and W2 samples the
+first and last tile (16). The largest union on one lane and the longest
+individual span are reported alongside sample counts. Per-window results
+are in `bs2_service_waits.json` next to each timeline. The dynamic arm
+reports `vs_separate_*` deltas and the actual Score job assignment by MIX
+group. The graph Event and the two trace clocks have separate measurements.

@@ -6,10 +6,11 @@ import hashlib
 
 import numpy as np
 
+SEPARATE_SERVICE_MODES = ('cold_separate', 'cold_separate_dynamic')
 SUPPORTED_BATCHES = {
     'p2': (1, 2, 4, 8, 16),
     'cold': (1, 2, 4, 8),
-    'cold_separate': (2,),
+    **dict.fromkeys(SEPARATE_SERVICE_MODES, (2,)),
     'cold_w2': (2,),
     'cold_p8': (1,),
     'cold_full': (1, 2, 8),
@@ -22,23 +23,28 @@ SUPPORTED_BATCHES = {
 }
 MODES = ('p2', 'cold', 'windows', 'topk', 'get')
 FULL32_MODES = {'cold_full', 'cold_full_w3', 'cold_full_w2'}
-PARTITIONED_MODES = FULL32_MODES | {'cold', 'cold_separate', 'cold_w2', 'cold_p8'}
+PARTITIONED_MODES = FULL32_MODES | {'cold', 'cold_w2', 'cold_p8', *SEPARATE_SERVICE_MODES}
 WINDOW_OVERRIDES = {'windows': 3, 'windows_w2': 2, 'cold_w2': 2, 'cold_full_w3': 3, 'cold_full_w2': 2}
 TRACE_ROUTES = dict(p2='p2', **dict.fromkeys(PARTITIONED_MODES, 'small_cold'),
                     windows='p2', windows_w2='p2', topk='small_topk', get='p2')
-TRACE_ROUTES['cold_separate'] = 'small_cold_separate'
+TRACE_ROUTES.update({mode: f'small_{mode}' for mode in SEPARATE_SERVICE_MODES})
 KERNELS = ('v9_li_kernel', 'v9_li_kernel_1', 'v9_li_kernel_2', 'v9_parallel_terminal')
 COLD_KERNELS = (KERNELS[0], 'v9_li_kernel_threshold_cold_partitioned',
                 'v9_li_kernel_cold_ready_partitioned', KERNELS[3])
 COLD_SEPARATE_KERNELS = (*COLD_KERNELS[:2], 'v9_li_kernel_cold_separate_service', COLD_KERNELS[-1])
+COLD_SEPARATE_DYNAMIC_KERNELS = (KERNELS[0], 'v9_li_kernel_threshold_separate_dynamic',
+                                 'v9_li_kernel_cold_separate_dynamic', KERNELS[-1])
 TOPK_KERNELS = (KERNELS[0], 'v9_li_kernel_resident_topk_high', *KERNELS[1:])
 GET_BALANCE_FLAG = 2
+SEPARATE_DYNAMIC_MAILBOX_BYTES = 32 * 128
 
 
 def cold_score_parts(mode, batch):
     if mode in FULL32_MODES:
         return 32 // batch
-    return {'cold': 4, 'cold_separate': 4, 'cold_w2': 4, 'cold_p8': 8}.get(mode, 2)
+    if mode in ('cold', 'cold_w2', *SEPARATE_SERVICE_MODES):
+        return 4
+    return 8 if mode == 'cold_p8' else 2
 
 
 def bind(state, mode):
@@ -65,8 +71,12 @@ def bind(state, mode):
         parts = choose(forward.shape_pointer)
         expected = cold_score_parts(mode, state.batch)
         required = shape.batch * 4 * (shape.history * 2 + 64 * parts)
+        alignment = 64
+        if mode == 'cold_separate_dynamic':
+            required += SEPARATE_DYNAMIC_MAILBOX_BYTES
+            alignment = 128
         if (parts != expected or state.workspace.compute.nbytes < required
-                or state.workspace.compute.data_ptr() % 64):
+                or state.workspace.compute.data_ptr() % alignment):
             raise ValueError(f'Cold P{expected} geometry or classified-progress capacity is unsupported')
     elif mode == 'topk':
         forward.resident_high_table = state.torch.empty(
@@ -128,10 +138,13 @@ def capture_resident_seed(state, stream, mode):
     launches = [(KERNELS[0], li_groups)]
     if mode == 'topk':
         launches.append((TOPK_KERNELS[1], state.batch * 8))
-    launches.append((COLD_KERNELS[1] if mode in PARTITIONED_MODES else KERNELS[1], li_groups))
+    threshold = COLD_KERNELS[1] if mode in PARTITIONED_MODES else KERNELS[1]
+    if mode == 'cold_separate_dynamic':
+        threshold = COLD_SEPARATE_DYNAMIC_KERNELS[1]
+    launches.append((threshold, li_groups))
     for symbol, blocks in launches:
         launch = getattr(state.rotating.library, f'aclrtlaunch_{symbol}')
-        extra = [cold_score_parts(mode, state.batch)] if symbol == COLD_KERNELS[1] else []
+        extra = [cold_score_parts(mode, state.batch)] if symbol in (COLD_KERNELS[1], COLD_SEPARATE_DYNAMIC_KERNELS[1]) else []
         launch.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p] + [ctypes.c_uint32] * len(extra)
         launch.restype = ctypes.c_uint32
         status = launch(blocks, stream.npu_stream, forward.bindings.data_ptr(), *extra)

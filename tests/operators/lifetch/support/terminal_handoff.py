@@ -30,13 +30,15 @@ COLD_GM_KERNELS = {
                          'v9_parallel_terminal'),
 }
 from small_batch import (
-    COLD_KERNELS as SMALL_COLD_KERNELS, COLD_SEPARATE_KERNELS, PARTITIONED_MODES, TOPK_KERNELS as SMALL_TOPK_KERNELS,
+    COLD_KERNELS as SMALL_COLD_KERNELS, COLD_SEPARATE_DYNAMIC_KERNELS, COLD_SEPARATE_KERNELS,
+    PARTITIONED_MODES, TOPK_KERNELS as SMALL_TOPK_KERNELS,
 )
 
 CHECKED_KERNELS = {**P2_W1_KERNELS, **COLD_GM_KERNELS,
                    **{f'small_{mode}': P2_W1_KERNELS['p2'] for mode in ('p2', 'windows', 'windows_w2', 'get')},
                    **{f'small_{mode}': SMALL_COLD_KERNELS for mode in PARTITIONED_MODES},
                    'small_cold_separate': COLD_SEPARATE_KERNELS,
+                   'small_cold_separate_dynamic': COLD_SEPARATE_DYNAMIC_KERNELS,
                    'small_topk': SMALL_TOPK_KERNELS}
 COLD_GM_STAGE_FIELDS['small_topk'] = (STAGES[0], 'resident_histogram_us', *STAGES[1:])
 DYNAMIC_MAILBOX_BYTES = 192 * 128
