@@ -362,8 +362,14 @@ run_packed_cohort() {
     done
 }
 
-for group in "${groups[@]}"; do
-    trace=$(bash "$helpers/peer_g2_input.sh" "$work" "$group")
+trace_paths=()
+run_group_batches() {
+    local group=$1 batch trace
+    shift
+    if [[ -z ${trace_paths[$group]:-} ]]; then
+        trace_paths[$group]=$(bash "$helpers/peer_g2_input.sh" "$work" "$group")
+    fi
+    trace=${trace_paths[$group]}
     if (( fixed )); then
         mkdir -p "$out/g$group"
         prepared_bank="$out/g$group/donors"
@@ -376,7 +382,7 @@ for group in "${groups[@]}"; do
             rmdir "$donor_stage"
         fi
     fi
-    for batch in "${batches[@]}"; do
+    for batch in "$@"; do
         cohorts=1
         if (( fixed )); then
             archive=
@@ -424,8 +430,19 @@ for group in "${groups[@]}"; do
             done
         fi
     done
-    if (( fixed )); then rm -rf -- "$out/g$group/donors"; fi
-done
+    if (( fixed )) && [[ $batch == "${batches[${#batches[@]} - 1]}" ]]; then
+        rm -rf -- "$out/g$group/donors"
+    fi
+}
+if (( packed_candidate )); then
+    # Finish each large shape for all five traces before entering smaller
+    # shapes, which have many more donor cohorts. Keep each donor bank once.
+    for batch in "${batches[@]}"; do
+        for group in "${groups[@]}"; do run_group_batches "$group" "$batch"; done
+    done
+else
+    for group in "${groups[@]}"; do run_group_batches "$group" "${batches[@]}"; done
+fi
 if [[ -n $packed_archive ]]; then
     "$PYTHON" -B "$workers/fixed_q4_packed_report.py" summary "$out" --groups "${groups[@]}" --batches "${batches[@]}" | tee -a "$out/summary.txt" >&3
     target_rc=0
