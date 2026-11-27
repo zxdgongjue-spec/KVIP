@@ -10,6 +10,10 @@ STUDY_READER = "e602ff4a688a733664aaabe84aa30732b9e68062"
 CELLS = {"window-tail-x2": (7,10), "window-tail-x4": (7,), "window-tail-x3": (10,)}
 
 
+class MissingNaturalPolicy(FileNotFoundError):
+    """No completed natural arm of this policy is available on this host."""
+
+
 def bind(mode, reference, group, batch):
     if mode not in CELLS or group not in CELLS[mode] or batch != 32:
         raise ValueError("Unexpected policy or BS32 window-tail diagnostic")
@@ -20,7 +24,7 @@ def bind(mode, reference, group, batch):
     else:
         arm = cached(STUDY_READER, reference, group, batch, name)
         if arm is None:
-            raise FileNotFoundError(f"No completed, same-card {name} natural archive at {reference}")
+            raise MissingNaturalPolicy(f"No completed, same-card {name} natural archive at {reference}")
     record, original, identity = values(arm, reference, group, batch, name)
     if (record["calls"] != 10 or len(record["traffic"]) != 10 or
             not record.get("cold_build_fingerprint") or

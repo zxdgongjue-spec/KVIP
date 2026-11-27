@@ -30,7 +30,7 @@ def run(args):
     local_only = window_mode and args.archive == Path("LOCAL")
     binding, previous, path = None, None, None
     if window_mode:
-        from b24_window_tail_diagnostic import CELLS, bind, select_policy
+        from b24_window_tail_diagnostic import CELLS, MissingNaturalPolicy, bind, select_policy
         import large_two_cold
         if args.group not in CELLS.get(mode, ()) or args.batch != 32:
             raise ValueError("Unexpected local window policy or group")
@@ -39,7 +39,7 @@ def run(args):
         if not local_only:
             try:
                 previous,binding = bind(mode, args.archive, args.group, args.batch)
-            except FileNotFoundError:
+            except MissingNaturalPolicy:
                 local_only=True
             else:
                 path = Path(binding["packed_result"])
@@ -172,10 +172,10 @@ def cached(source, group, batch, controller):
     if not local_sample:
         ref=source / f"g{group}/bs{batch}/block1/fused"
         if window_mode:
-            from b24_window_tail_diagnostic import bind
+            from b24_window_tail_diagnostic import MissingNaturalPolicy, bind
             try:
                 expected,binding=bind(mode,source,int(group),int(batch))
-            except FileNotFoundError:
+            except MissingNaturalPolicy:
                 local_sample=True
             else:
                 packed_path=Path(binding["packed_result"])
@@ -189,7 +189,11 @@ def cached(source, group, batch, controller):
             observed = json.loads(path.read_text())
             if local_sample:
                 from portable_two_row_audit import local, local_identity
-                if not local(path.parents[3],local_identity()):
+                from large_batch_placement import field
+                root=path.parents[3]
+                if (not local(root,local_identity()) or
+                        field(root,"kvaf")!="813f1750a50b7e6c92d5f5397f2fbc05befef6da" or
+                        field(root,"kvaf_tree")!="1de18e8315137d7a0227c3ae4c82afd45b5fe743"):
                     continue
                 if (observed["identity"]["native"]!="d0fc5963881bd38fa97eff0f6ef40c757a6e8713"
                         or observed["identity"]["group"]!=int(group) or observed["identity"]["batch"]!=int(batch)):
