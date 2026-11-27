@@ -9,6 +9,8 @@ import subprocess
 import numpy as np
 
 NATIVE = "af52a02b97daddadd5d93b9d100f2ff1b03b499d"
+Q1_BASE = "555e1e51c3639fad47e0132eaab426582cddc543"
+Q1_BATCHES = (1, 2, 4, 8, 16)
 SINGLE = "one_restored_graph_per_device_event_with_profiler"
 PACKED = "ten_independent_states_one_graph_one_event_v1"
 IDENTITY_KEYS = (
@@ -38,6 +40,16 @@ def same_production(repo, archived, current):
     require(completed.returncode == 0, f"Production sources/build differ between {archived} and {current}")
 
 
+def verify_q1_production(repo, current):
+    subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", Q1_BASE, current], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "diff", "--quiet", Q1_BASE, current, "--",
+         "csrc", "python", "patches", "scripts", "pyproject.toml",
+         ":(exclude)csrc/operators/lightning_indexer_with_fetch",
+         ":(exclude)python/kvip/operators/lifetch"], check=True,
+    )
+
+
 def oracle_dir(archive, group, batch, cohort):
     pair = archive / f"g{group}/bs{batch}"
     n = max(16 // batch, 1)
@@ -50,7 +62,7 @@ def oracle_dir(archive, group, batch, cohort):
     return Path(arm.get("comparison_archive", pair)) / "serial"
 
 
-def load_archived_oracle(directory, identity, repo):
+def load_archived_oracle(directory, identity, repo, *, q1_study=False):
     """Only return logical token IDs. Single-call event timings never leave this function."""
     directory = Path(directory)
     record = read(directory / "ARM_RESULT.json")
@@ -62,7 +74,10 @@ def load_archived_oracle(directory, identity, repo):
     # A compute-only or harness-only change may precede the currently measured operator.
     # A previous single-event serial result is usable as an oracle only if its native path is unchanged.
     old_rev = old["native"]
-    if old_rev == NATIVE:
+    if q1_study:
+        require(old_rev == identity["native"], "Q1 measurements need a fresh serial oracle from the same revision")
+        verify_q1_production(repo, old_rev)
+    elif old_rev == NATIVE:
         same_production(repo, NATIVE, identity["native"])
     else:
         # The complete old fixed matrix could refer to an earlier large-BS archive. Its independent

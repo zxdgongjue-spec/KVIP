@@ -4329,7 +4329,9 @@ class StreamingForward(LIFetchForward):
     def __init__(self, rotating, update, torch, prefetch_limit, *, fused_final=True, q_workers=2):
         if torch is not rotating.torch or prefetch_limit != rotating.prefetch_limit or not fused_final:
             raise ValueError("Diagnostics must use the exact public LIFetch binding and budget")
-        super().__init__(rotating, update, q_workers=q_workers)
+        width = os.environ.get("KVIP_LARGE_WINDOW_QUERIES_PER_WORKER")
+        super().__init__(rotating, update, q_workers=q_workers,
+                         large_window_queries_per_worker=int(width) if width is not None else None)
 
     def calibrate_counter_mhz(self):
         """Approximate cycle frequency against a long independent graph event."""

@@ -6,7 +6,9 @@ import shutil
 
 import numpy as np
 
-from large_batch_pair import CALLS, WARMUP, check_scores, mutable_buffers, read_selected
+from large_batch_pair import (
+    CALLS, LARGE_WINDOW_AIVS, LARGE_WINDOW_FIXED_WIDTHS, WARMUP, check_scores, mutable_buffers, read_selected,
+)
 from reporting import atomic_json
 
 
@@ -43,6 +45,9 @@ class FrozenPackedRound:
                 if state.lease is not first.lease:
                     raise ValueError("Expected one shared stream-ordered KVAF lease")
                 persistent += [state.workspace.topk, state.update.logical_output, terminal.owner.core_status]
+                window_q1_scratch = getattr(terminal, "window_q1_scratch", None)
+                if window_q1_scratch is not None:
+                    persistent.append(window_q1_scratch)
             else:
                 if state.native.owner.session.runtime is not first.native.owner.session.runtime:
                     raise ValueError("Expected one shared strong-serial GET runtime")
@@ -66,10 +71,40 @@ class FrozenPackedRound:
         selected, counts = read_selected(state, inputs, self.fused)
         self.exact += check_scores(inputs, selected, self.serial[index])
         state.validate(inputs)
+        if self.fused:
+            terminal = state.forward.terminal
+            scratch = getattr(terminal, "window_q1_scratch", None)
+            if scratch is not None:
+                # This runs after graph synchronization, outside the device event.
+                receipts = scratch[:state.batch, 1:, :5].cpu().numpy()
+                ready = receipts[:, :, 0]
+                if ready.shape != (state.batch, 4) or not np.all(ready == 1):
+                    raise ValueError(f"Call {index}: missing last-window Q1 device completion receipts")
+                counts["window_q1_ready_flags"] = int(ready.size)
+                mode = getattr(terminal, "large_window_queries_per_worker", None)
+                if mode is not None and mode != 2:
+                    counts["window_q_rows_by_width"] = window_q_rows_by_width(receipts[:, :, 4], mode)
         self.traffic.append(counts)
 
 
-def measure_packed(ex, proofs, serial, torch, states, sequence, config, directory, *, fused):
+def window_q_rows_by_width(widths, mode):
+    per_row = widths[:, 0]
+    if not np.all(widths == per_row[:, None]):
+        raise ValueError("Last-window Q receipts disagree on a request's Q width")
+    if not np.all(np.isin(per_row, (1, 2, 4))):
+        raise ValueError("Last-window Q receipts contain an invalid Q width")
+    rows = {str(width): int(np.count_nonzero(per_row == width)) for width in (1, 2, 4)}
+    if mode == 0:
+        used = sum((4 // int(width)) * count for width, count in rows.items())
+        if used > LARGE_WINDOW_AIVS:
+            raise ValueError("Automatic last-window Q split exceeds its one-wave AIV budget")
+    elif rows[str(LARGE_WINDOW_FIXED_WIDTHS[mode])] != len(per_row):
+        raise ValueError("Last-window Q receipts disagree with the requested fixed Q width")
+    return rows
+
+
+def measure_packed(ex, proofs, serial, torch, states, sequence, config, directory, *, fused,
+                   large_window_queries_per_worker=None):
     from fixed_q4_packed_timing import profile_fixed_graph_batch
 
     if len(states) != CALLS or len(sequence.rounds) != 1 or config.warmup != WARMUP or config.mode != "bench":
@@ -77,7 +112,8 @@ def measure_packed(ex, proofs, serial, torch, states, sequence, config, director
     frozen = FrozenPackedRound(states, sequence.inputs, serial, fused)
 
     def profile(*args, **kwargs):
-        result = profile_fixed_graph_batch(*args, batch=states[0].batch, **kwargs)
+        result = profile_fixed_graph_batch(*args, batch=states[0].batch,
+                                           large_window_queries_per_worker=large_window_queries_per_worker, **kwargs)
         proofs.update(result["packed"])
         return result
 

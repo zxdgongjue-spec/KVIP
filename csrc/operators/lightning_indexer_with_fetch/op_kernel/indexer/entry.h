@@ -32,6 +32,9 @@ __aicore__ inline void RunLi(GM_ADDR bindings
 #if KVIP_FIXED_SCORE_SHARDS
                              , GM_ADDR ready
 #endif
+#if KVIP_WINDOW_Q1
+                             , GM_ADDR windowQ1 = nullptr
+#endif
 ) {
     using namespace AscendC; using namespace QLICommon;
     auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
@@ -68,6 +71,9 @@ __aicore__ inline void RunLi(GM_ADDR bindings
     if ASCEND_IS_AIV {
         op.vectorService.SetPrefixStorage(P(13));
         op.vectorService.SetRotationContext(P(14));
+#if KVIP_WINDOW_Q1
+        op.vectorService.windowQ1_ = splitSequence ? windowQ1 : nullptr;
+#endif
     }
     if constexpr (Phase == SequenceLiPhase::Hot) {
         if (splitSequence) op.template ProcessSequenceSplit<Phase>();

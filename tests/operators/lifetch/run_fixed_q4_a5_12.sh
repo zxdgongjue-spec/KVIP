@@ -20,10 +20,32 @@ case "$mode" in
     packed_input=(--synthetic)
     packed_name=synthetic
     ;;
+  packed-q1-pair|packed-large-q1-pair|packed-large-q-policy)
+    trial=--window-q1-pair
+    packed_name=window-q1
+    case "$mode" in
+      packed-large-q1-pair)
+        trial=--large-window-q1-pair
+        packed_name=large-window-q1
+        ;;
+      packed-large-q-policy)
+        trial=--large-window-q-policy
+        packed_name=large-q-policy
+        ;;
+    esac
+    if [[ "${1:-}" == --dry-run ]]; then
+      shift
+      exec "${KVIP_PYTHON:-python3}" -B "$runner" --dry-run --synthetic "$trial" "$@"
+    fi
+    packed_input=(--synthetic "$trial")
+    ;;
   packed|q1-w2) ;;
   *)
     printf '%s\n' 'Usage:' '  run_fixed_q4_a5_12.sh packed G2_PREPARED_TRACE [runner options]' \
       '  run_fixed_q4_a5_12.sh packed-synthetic [runner options]' \
+      '  run_fixed_q4_a5_12.sh packed-q1-pair [runner options]' \
+      '  run_fixed_q4_a5_12.sh packed-large-q1-pair [runner options]' \
+      '  run_fixed_q4_a5_12.sh packed-large-q-policy [runner options]' \
       '  run_fixed_q4_a5_12.sh q1-w2 MR35_CHECKOUT MAIN_CHECKOUT' \
       '  run_fixed_q4_a5_12.sh --dry-run'
     if [[ "$mode" == --help || "$mode" == -h ]]; then exit 0; fi
@@ -37,6 +59,15 @@ lidu=${KVIP_LIDU_ROOT:-"$root/KVIP-mr28/csrc/operators/lidu"}
 py=${KVIP_PYTHON:-/usr/local/python3.12.13/bin/python3}
 build="$kvaf/build-npu"
 results=${KVIP_A5_RESULTS:-"$root/results"}
+physical_npu=${KVIP_A5_PHYSICAL_NPU:-2}
+if [[ ! "$physical_npu" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  printf 'KVIP_A5_PHYSICAL_NPU must be a physical NPU number.\n' >&2
+  exit 2
+fi
+if [[ "$mode" == q1-w2 && "$physical_npu" != 2 ]]; then
+  printf 'The historical q1-w2 launcher requires physical NPU 2.\n' >&2
+  exit 2
+fi
 
 if [[ "$mode" == packed ]]; then
   trace=${1:?Pass the prepared real G2 capture directory in the container}
@@ -61,8 +92,7 @@ elif [[ "$mode" == q1-w2 ]]; then
 fi
 
 git -C "$repo" diff --quiet HEAD --
-git -C "$repo" diff --quiet af52a02b97daddadd5d93b9d100f2ff1b03b499d HEAD -- \
-  csrc python patches scripts pyproject.toml
+git -C "$repo" merge-base --is-ancestor 555e1e51c3639fad47e0132eaab426582cddc543 HEAD
 test "$(git -C "$kvaf" rev-parse HEAD)" = 813f1750a50b7e6c92d5f5397f2fbc05befef6da
 for kind in get put; do
   test -s "$build/bin/kvaf_execute_batch_${kind}_kernels.o"
@@ -72,10 +102,10 @@ cann=$(sed -n 's/^ASCEND_CANN_PACKAGE_PATH:[^=]*=//p' "$build/CMakeCache.txt")
 test -n "$cann"
 source "$cann/set_env.sh"
 mkdir -p "$results"
-exec 9>"$results/.lifetch-a5-12-physical2.lock"
-flock -n 9 || { printf 'Another LIFetch run holds the physical NPU 2 lock.\n' >&2; exit 1; }
+exec 9>"$results/.lifetch-a5-12-physical${physical_npu}.lock"
+flock -n 9 || { printf 'Another LIFetch run holds the physical NPU %s lock.\n' "$physical_npu" >&2; exit 1; }
 
-probe=$("$py" - <<'PY'
+probe=$("$py" - "$physical_npu" <<'PY'
 import ctypes as c
 import sys
 
@@ -88,6 +118,7 @@ def check(name, code):
         raise SystemExit(f"{name}: rc={code}\n{msg}")
 
 check("aclInit", acl.aclInit(None))
+requested = int(sys.argv[1])
 count = c.c_uint32()
 check("aclrtGetDeviceCount", acl.aclrtGetDeviceCount(c.byref(count)))
 matches = []
@@ -96,17 +127,17 @@ for device in range(count.value):
     check("user to logical", acl.aclrtGetLogicDevIdByUserDevId(device, c.byref(logical)))
     check("logical to physical", acl.aclrtGetPhyDevIdByLogicDevId(logical.value, c.byref(physical)))
     print(f"device={device} logical={logical.value} physical={physical.value}", file=sys.stderr)
-    if physical.value == 2:
+    if physical.value == requested:
         matches.append(device)
 if len(matches) != 1:
-    raise SystemExit(f"Expected one mapping for physical NPU 2, found {matches}")
-check("aclrtSetDevice on physical NPU 2", acl.aclrtSetDevice(matches[0]))
+    raise SystemExit(f"Expected one mapping for physical NPU {requested}, found {matches}")
+check(f"aclrtSetDevice on physical NPU {requested}", acl.aclrtSetDevice(matches[0]))
 print(f"BENCH_DEVICE={matches[0]}")
 PY
 ) || { printf '%s\n' "$probe" >&2; exit 1; }
 device=$(sed -n 's/^BENCH_DEVICE=//p' <<< "$probe")
 [[ "$device" =~ ^[0-9]+$ ]]
-printf 'ACL OK: physical=2 device=%s\n' "$device"
+printf 'ACL OK: physical=%s device=%s\n' "$physical_npu" "$device"
 
 libs=("$lidu"/_custom_opp/vendors/*/op_api/lib/libcust_opapi.so)
 if [[ ${#libs[@]} -ne 1 || ! -f "${libs[0]}" ]]; then
@@ -130,10 +161,10 @@ print("CANN, KVAF and LIDU OK")
 PY
 
 if [[ "$mode" != q1-w2 ]]; then
-  out=$(mktemp -d "$results/packed-$packed_name-card2.XXXXXX")
+  out=$(mktemp -d "$results/packed-$packed_name-card${physical_npu}.XXXXXX")
   printf 'OUTPUT_PARENT=%s\n' "$out"
   PYTHONPATH="$repo/python:$PYTHONPATH" "$py" -B "$runner" "$@" "${packed_input[@]}" \
-    --device "$device" --physical-npu 2 --kvaf-root "$kvaf" --output "$out/run"
+    --device "$device" --physical-npu "$physical_npu" --kvaf-root "$kvaf" --output "$out/run"
   exit
 fi
 

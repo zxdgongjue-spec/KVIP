@@ -17,13 +17,22 @@ import sys
 
 import numpy as np
 
-from large_batch_input import FIXED_BATCHES, GROUPS, SYNTHETIC_GROUP, input_digest, load, load_synthetic
+from large_batch_input import BATCHES, FIXED_BATCHES, GROUPS, SYNTHETIC_GROUP, input_digest, load, load_synthetic
 from large_batch_reference import compute_reference, reference_identity, stage_serial
 from reporting import atomic_json
 from workloads import ReplayPagePlan, configuration
 
 CALLS = 10
 WARMUP = 4
+LARGE_WINDOW_AIVS = 64
+LARGE_WINDOW_FINAL_KERNELS = {
+    0: "v9_li_large_final_auto",
+    1: "v9_li_large_final_q1",
+    2: "v9_li_large_final_pair",
+    3: "v9_li_large_final_pair_dense",
+    4: "v9_li_large_final_q4",
+}
+LARGE_WINDOW_FIXED_WIDTHS = {1: 1, 2: 2, 3: 2, 4: 4}
 
 
 def check_scores(inputs, selected, serial):
@@ -47,7 +56,7 @@ def check_scores(inputs, selected, serial):
 KERNEL_SUFFIX = r"(?:(?:_[0-9]+)|(?:_mix_ai[cv])|(?:_ai[cv]))*"
 
 
-def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False):
+def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False, large_window_queries_per_worker=None):
     """Read raw, scope-relative CANN records, including both sides of MIX tasks."""
     from decimal import Decimal
 
@@ -65,8 +74,15 @@ def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False):
             "fetch": ("kvafexecutebatchgetaivkernelv2", "kvafexecutebatchgetaivkernelv3"),
         }
     )
+    if large_window_queries_per_worker is not None:
+        mode = large_window_queries_per_worker
+        if not fused or batch not in BATCHES or mode not in LARGE_WINDOW_FINAL_KERNELS:
+            raise ValueError("Deferred last-window profiler requires a native large fused arm")
+        names["LI23"] = ("v9_li_large_deferred_cold_auto" if mode == 0 else "v9_li_large_deferred_cold",)
+        names["last_window"] = (LARGE_WINDOW_FINAL_KERNELS[mode],)
     if batch == 16 and fused:
-        names = {"pr30_li": ("v9_li_kernel",), "tail": ("v9_parallel_terminal",)}
+        names = {"pr30_li": ("v9_li_kernel", "v9_li_window_q1_threshold", "v9_li_window_q1_cold"),
+                 "tail": ("v9_parallel_terminal",)}
     elif fused and batch < 16:
         names = {"LI1": ("v9_li_fixed_hot",), "LI2": ("v9_li_kernel_1",),
                  "LI3": ("v9_li_fixed_cold",), "tail": ("v9_parallel_terminal",)}
@@ -136,9 +152,13 @@ def fixed_invocation_intervals(stages, scope):
             launches[-1].append(record)
         if len(launches) != 3:
             raise ValueError(f"{scope}: expected three separate PR30 LI launches, got {len(launches)}")
-        for i, (name, launch) in enumerate(zip(("v9_li_kernel", "v9_li_kernel_1", "v9_li_kernel_2"), launches), 1):
-            if any(not re.fullmatch(name + KERNEL_SUFFIX, r[4], re.I) for r in launch):
-                raise ValueError(f"{scope}: wrong PR30 LI{i} kernel, expected {name}, got {launch}")
+        li_symbols = (
+            ("v9_li_kernel",), ("v9_li_kernel_1", "v9_li_window_q1_threshold"),
+            ("v9_li_kernel_2", "v9_li_window_q1_cold"),
+        )
+        for i, (names, launch) in enumerate(zip(li_symbols, launches, strict=True), 1):
+            if not any(all(re.fullmatch(name + KERNEL_SUFFIX, r[4], re.I) for r in launch) for name in names):
+                raise ValueError(f"{scope}: wrong PR30 LI{i} kernel, expected {names}, got {launch}")
             stages[f"LI{i}"] = launch
     intervals = {}
     for key, records in stages.items():
@@ -154,9 +174,10 @@ def fixed_invocation_intervals(stages, scope):
     return intervals
 
 
-def large_account(events, scope, elapsed, *, fused=True, batch=32):
+def large_account(events, scope, elapsed, *, fused=True, batch=32, large_window_queries_per_worker=None):
     """Recognize CANN device names and task types in one restored graph."""
-    stages = fixed_stage_records(events, scope, fused=fused, batch=batch)
+    stages = fixed_stage_records(events, scope, fused=fused, batch=batch,
+                                 large_window_queries_per_worker=large_window_queries_per_worker)
     return dict(intervals_us=fixed_invocation_intervals(stages, scope), event_us=elapsed)
 
 
@@ -165,6 +186,8 @@ def fixed_kernel_stages(stages, fused):
     expected = ("LI1", "LI23", "tail") if fused else ("li", "lidu_prepare", "fetch")
     if fused and "LI2" in stages:
         expected = ("LI1", "LI2", "LI3", "tail")
+    elif fused and "last_window" in stages:
+        expected = ("LI1", "LI23", "last_window", "tail")
     if set(stages) != set(expected) or any(len(stages[k]) != 1 for k in expected):
         raise ValueError(f"Unexpected production kernel sequence: {stages}")
     intervals = [stages[k][0] for k in expected]
@@ -291,7 +314,8 @@ def read_selected(state, inputs, fused):
         prefetch = state.rotating.rows[:, 9].cpu().numpy()
         if np.any(prefetch < 0) or np.any(prefetch > 2048):
             raise ValueError("Prefetch exceeded the per-request reservation")
-        traffic = dict(prefetch=int(prefetch.sum()), final=int(counts.sum()))
+        traffic = dict(prefetch=int(prefetch.sum()), final=int(counts.sum()),
+                       prefetch_by_request=prefetch.tolist(), final_by_request=counts.sum(axis=1).tolist())
         raw = state.workspace.topk.cpu().numpy().reshape(shape)
         unpack = state.workspace.inputs.unpack_indices.cpu().numpy().reshape(-1)
         if np.any(raw < 0) or np.any(raw >= state.history) or not np.array_equal(np.sort(unpack), np.arange(batch * 4)):
@@ -546,8 +570,10 @@ def measured_replays(ex, proofs, serial, torch, states, sequence, config, direct
         profiler.export_chrome_trace(str(trace.resolve()))
         data = json.loads(trace.read_text())
         events = data["traceEvents"] if isinstance(data, dict) else data
+        mode = getattr(state.forward.terminal, "large_window_queries_per_worker", None) if fused else None
         for scope, event_us in zip(scopes, elapsed):
-            account = large_account(events, scope, event_us, fused=fused, batch=state.batch)
+            account = large_account(events, scope, event_us, fused=fused, batch=state.batch,
+                                    large_window_queries_per_worker=mode)
             measurements.append(stage_sample(account, fused))
         if fused:
             mhz = state.forward.calibrate_counter_mhz()
@@ -658,6 +684,14 @@ def selected_device(device, physical_npu):
 
 
 def run(args):
+    os.environ.pop("KVIP_LARGE_WINDOW_QUERIES_PER_WORKER", None)
+    if args.native_window:
+        os.environ["KVIP_LIFETCH_WINDOW_Q"] = "0"
+    elif args.window_q1 or args.large_window_queries_per_worker is not None:
+        # Small Q1 and large AUTO exercise the production default without an override.
+        os.environ.pop("KVIP_LIFETCH_WINDOW_Q", None)
+        if args.large_window_queries_per_worker not in (None, 0):
+            os.environ["KVIP_LARGE_WINDOW_QUERIES_PER_WORKER"] = str(args.large_window_queries_per_worker)
     device, physical_npu = selected_device(args.device, args.physical_npu)
     import execution as ex
     from functools import partial
@@ -670,6 +704,9 @@ def run(args):
     revision = subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip()
     if subprocess.check_output(["git", "-C", repo, "status", "--porcelain", "-uno"], text=True).strip():
         raise ValueError("The checked-out measurement revision has tracked modifications")
+    if args.q1_study:
+        from fixed_q4_packed_archive import verify_q1_production
+        verify_q1_production(repo, revision)
     sdk_python = args.kvaf_root.resolve() / "build-npu/python"
     if not Path(kvaf.__file__).resolve().is_relative_to(sdk_python) or not Path(kvip.__file__).resolve().is_relative_to(
         repo / "python"
@@ -736,7 +773,7 @@ def run(args):
     previous = None
     if args.packed_ten:
         from fixed_q4_packed_archive import load_archived_oracle
-        serial = load_archived_oracle(args.serial_result, identity, repo)
+        serial = load_archived_oracle(args.serial_result, identity, repo, q1_study=args.q1_study)
     elif fused:
         base = identity
         if args.compare_archived_pair:
@@ -791,7 +828,32 @@ def run(args):
     scratch_existed = (args.output / "export_only_prof_dir").exists()
     if args.packed_ten:
         from fixed_q4_packed_worker import measure_packed, save_packed
-        benchmark = partial(measure_packed, ex, proofs, serial)
+        def benchmark(torch, states, sequence, config, directory, *, fused):
+            mode = None
+            if fused:
+                terminals = [state.forward.terminal for state in states]
+                active = [getattr(terminal, "window_q1_scratch", None) is not None for terminal in terminals]
+                modes = [getattr(terminal, "large_window_queries_per_worker", None) for terminal in terminals]
+                if any((on, width) != (active[0], modes[0]) for on, width in zip(active, modes, strict=True)):
+                    raise ValueError("Packed invocations use inconsistent Q window routes")
+                mode = modes[0]
+                if ((args.native_window and active[0])
+                        or (args.window_q1 and (not active[0] or mode is not None))
+                        or (args.large_window_queries_per_worker is not None
+                            and (not active[0] or mode != args.large_window_queries_per_worker))):
+                    raise ValueError("The packed fused graph did not bind the requested Q window route")
+                if args.q1_study:
+                    with Path(states[0].rotating.library._name).open("rb") as stream:
+                        proofs["fused_bridge_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+                proofs["window_q1_enabled"] = active[0] and mode is None
+                if args.batch in BATCHES:
+                    proofs["large_window_queries_per_worker"] = mode
+                route = "native"
+                if active[0]:
+                    route = "small-q1" if mode is None else f"large-policy-{mode}"
+                print(f"WINDOW_Q route={route}", flush=True)
+            return measure_packed(ex, proofs, serial, torch, states, sequence, config, directory,
+                                  fused=fused, large_window_queries_per_worker=mode)
     else:
         benchmark = partial(measured_replays, ex, proofs, serial)
     result = ex.run_path(
@@ -948,6 +1010,12 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arm", choices=("serial", "fused"), required=True)
     parser.add_argument("--packed-ten", action="store_true", help="Capture and time ten independent states in one graph")
+    parser.add_argument("--q1-study", action="store_true", help="Use a fresh oracle from the fixed-Q4 Q1 revision")
+    candidate = parser.add_mutually_exclusive_group()
+    candidate.add_argument("--native-window", action="store_true", help="Disable Q window optimization for the native control")
+    candidate.add_argument("--window-q1", action="store_true", help="Check the default small-batch Q1 route")
+    candidate.add_argument("--large-window-queries-per-worker", type=int, choices=tuple(LARGE_WINDOW_FINAL_KERNELS),
+                           help="Defer the last window of a native large fused arm")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--trace", type=Path)
     source.add_argument("--synthetic-fixture", type=Path, help="Prepared compact synthetic Q4 fixture directory")
@@ -968,6 +1036,16 @@ def parse_args(argv=None):
         "--keep-trace", action="store_true", help="Keep the raw profiler timeline after successful attribution"
     )
     args = parser.parse_args(argv)
+    if args.native_window or args.window_q1 or args.large_window_queries_per_worker is not None:
+        if args.synthetic_fixture is None or not args.q1_study or not args.packed_ten or args.arm != "fused":
+            parser.error("Q window controls require a synthetic fused packed arm in the Q1 study")
+    if args.window_q1:
+        from fixed_q4_packed_archive import Q1_BATCHES
+        if args.batch not in Q1_BATCHES:
+            parser.error("Window Q1 requires a supported fused packed arm in the Q1 study")
+    if args.large_window_queries_per_worker is not None:
+        if args.batch not in BATCHES:
+            parser.error("Deferred last window requires a native large fused packed arm in the Q1 study")
     if args.synthetic_fixture is not None:
         if args.group != SYNTHETIC_GROUP or args.round != 1 or args.cohort != 0:
             parser.error("Synthetic input requires group 0, round 1 and cohort 0")

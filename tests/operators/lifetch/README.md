@@ -121,7 +121,7 @@ python tests/operators/lifetch/test_lifetch.py bench --input real \
 
 ## 12 号机 Fixed Q4 九档配对
 
-在 `kvaf_vllm_ascend` 中复用现有 CANN、KVAF `813f1750` 和 LIDU。生产树固定为 `af52a02b`，并使用 `10442f1f` 的 packed worker。宿主机执行 `npu-smi info` 确认物理卡 2 空闲。容器启动脚本用 ACL 核验物理卡 2 对应的进程设备号。
+在现有 A5 容器中复用 CANN、KVAF `813f1750` 和 LIDU。在宿主机用 `npu-smi info` 确认可用的物理卡，容器内设置 `KVIP_A5_PHYSICAL_NPU`。启动脚本使用 ACL 映射进程设备号，串行 oracle 和融合均用当前提交、同一卡。
 
 ```bash
 # 在容器内生成合成输入，直接跑九档。
@@ -136,6 +136,22 @@ bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed "$G2_TRACE"
 合成入口固定 Q4、history 131072、resident 16384、32 index heads、目标 miss 10% 和 seed 43。合成请求复用同一组算分输入，每个请求保留独立的 KV 页身份。结果标记为 `synthetic`，用于评估分核趋势。真实 G2 性能仍以回放入口的测量为准。
 
 `packed-synthetic --dry-run` 和 `--dry-run` 分别枚举合成及 G2 的九个 oracle 和 36 个计时图。
+
+## 末窗 Q 分工
+
+LIFetch 在图捕获前按 bridge 和 shape 选择路径。支持的小 batch 默认使用末窗四路 Q1，支持的原生大 batch 默认使用 AUTO（mode 0）。在创建绑定前设置 `KVIP_LIFETCH_WINDOW_Q=0` 可恢复原窗口路径。Python 绑定也支持 `window_q=False`。使用原 MR39 的形状支持检查，包括 131072 物理历史和 16384 resident。旧 bridge、UBmem 和其他形状沿用原路由。
+
+沿用原 A5 launcher 运行对照。小 batch 的 `on` 与原生大 batch 的 `deferred_auto` 走上述默认路由。脚本显式关闭 `off`／`native`，固定 Q1、Q2、Q4 保留独立的大 batch 路线。
+
+```bash
+bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed-q1-pair
+bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed-large-q1-pair
+bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed-large-q-policy
+# 只对照原生、一波 Q2 和默认 AUTO
+bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed-large-q-policy --q-policy q2 auto
+```
+
+在模式名后加 `--dry-run` 查看计划。大 batch 对照固定 BS20/24/28/32、Q4、W4、目标 miss 10% 和正常预取。固定宽度 Q1/Q2/Q4 表示每 AIV 分别处理 1/2/4 个 Q。AUTO 估计各 Q 的新增待扫 tile 数，在 64 AIV 内选择单波分工。每请求由一个 owner 汇合、去重并提交 WQE。正式脚本记录实际 kernel、检查逐 Q 完成回执和分工，把整图、阶段和 Get 对账写入 `RESULT_ROOT/summary.csv` 与 `packed_summary.json`。可选 `--keep-trace` 保留原始 profiler 文件。
 
 ## 12 号机 Q1/W2 加倍复测
 

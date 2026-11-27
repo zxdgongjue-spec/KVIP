@@ -895,24 +895,32 @@ def account(events, name, elapsed, *, full=False, fused_final=False):
                        resolve_update="v9_streaming_resolve_update")
         if not fused_final:
             kernels["fetch"] = "v9_fetch_update_kernel"
-    if full and any(e.get("name", "").lower().startswith("v9_parallel_terminal") for e in events):
-        kernels = dict(li="v9_li_kernel", topk_resolve_update="v9_parallel_terminal")
+    parallel_terminal = full and any(
+        e.get("name", "").lower().startswith("v9_parallel_terminal") for e in events
+    )
+    groups_by_name = {stage: (symbol,) for stage, symbol in kernels.items()}
+    if parallel_terminal:
+        groups_by_name = {
+            "li": (
+                "v9_li_kernel", "v9_li_fixed_hot", "v9_li_fixed_cold",
+                "v9_li_window_q1_threshold", "v9_li_window_q1_cold", "v9_li_large_hot",
+                "v9_li_large_threshold_cold", "v9_li_large_deferred_cold", "v9_li_large_deferred_cold_auto",
+                "v9_li_large_final_auto", "v9_li_large_final_q1", "v9_li_large_final_pair",
+                "v9_li_large_final_pair_dense", "v9_li_large_final_q4",
+            ),
+            "topk_resolve_update": ("v9_parallel_terminal", "v9_parallel_terminal_large"),
+        }
     if any(e.get("name", "").lower().startswith("v9_early_fetch_kernel") for e in events):
-        kernels["early_fetch"] = "v9_early_fetch_kernel"
-    groups = {stage: [] for stage in kernels}
+        groups_by_name["early_fetch"] = ("v9_early_fetch_kernel",)
+    suffix = r"(?:(?:_\d+)|(?:_mix_ai[cv])|(?:_ai[cv]))*" if parallel_terminal else r"(?:_\d+)*"
+    names = {stage: re.compile("(?:" + "|".join(symbols) + ")" + suffix)
+             for stage, symbols in groups_by_name.items()}
+    groups = {stage: [] for stage in names}
     for event in events:
         n = event.get("name", "").lower()
         cat = (event.get("cat") or "").lower()
-        # CANN may omit cat. Accept exact kernel names with numeric dispatch
-        # suffixes, while excluding launch APIs and explicitly tagged CPU ops.
-        stage = next(
-            (
-                key
-                for key, prefix in kernels.items()
-                if n == prefix or (n.startswith(prefix + "_") and re.fullmatch(r"(?:_\d+)+", n[len(prefix) :]))
-            ),
-            None,
-        )
+        # CANN may omit cat. Match named device kernels and dispatch suffixes.
+        stage = next((key for key, pattern in names.items() if pattern.fullmatch(n)), None)
         if event.get("ph") != "X" or stage is None or (cat and "kernel" not in cat):
             continue
         timestamp = float(Decimal(str(event["ts"])) - origin)

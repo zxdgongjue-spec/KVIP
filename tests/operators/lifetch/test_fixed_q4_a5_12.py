@@ -18,6 +18,8 @@ def test_dry_run_needs_no_a5_dependencies(options, kind, group):
     script = Path(__file__).resolve().parent / "support/fixed_q4_a5_12.py"
     result = subprocess.check_output([sys.executable, "-B", script, "--dry-run", *options], text=True)
     data = json.loads(result)
+    assert data["production_revision"] == subprocess.check_output(["git", "-C", runner.REPO, "rev-parse", "HEAD"],
+                                                                  text=True).strip()
     assert data["batch_sizes"] == [1, 2, 4, 8, 16, 20, 24, 28, 32]
     assert data["group"] == group
     assert data["input_kind"] == kind
@@ -51,15 +53,16 @@ def test_synthetic_prepares_once_and_uses_fresh_oracles(tmp_path, monkeypatch):
     cpu.chmod(0o700)
     out = tmp_path / "out"
     args = SimpleNamespace(kvaf_root=kvaf, cpu_numa=None, cpu_ub_device=None, device=2, physical_npu=2,
-                           synthetic=True, trace=None, output=out)
+                           synthetic=True, trace=None, output=out, window_q1_pair=False,
+                           large_window_q1_pair=False, large_window_q_policy=False)
 
     def git_output(command, **_kwargs):
         if command[3] == "status":
             return ""
-        return runner.KVAF_REVISION if command[2] == kvaf else runner.NATIVE
+        return runner.KVAF_REVISION if command[2] == kvaf else runner.Q1_BASE
 
     monkeypatch.setattr(runner.subprocess, "check_output", git_output)
-    monkeypatch.setattr(runner, "same_production", lambda *_args: None)
+    monkeypatch.setattr(runner, "verify_q1_production", lambda *_args: None)
     monkeypatch.setattr(runner.shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(runner, "cpu_affinity", lambda _node: ("0", "0"))
     prepared, calls, cells, summaries = [], [], [], []

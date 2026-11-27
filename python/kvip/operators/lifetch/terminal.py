@@ -133,3 +133,18 @@ class TerminalLeaseBinding:
         self.workspace = torch.tensor(list(blob), dtype=torch.uint8, device=device)
         self.forward = forward
         return self.workspace
+
+    def attach_window_q(self, *, large):
+        """Bind graph-lived per-query receipts and the optional large AUTO plan."""
+        if hasattr(self, "window_q1_scratch"):
+            raise ValueError("Terminal final-window workspace is already attached")
+        torch, device = self.rotating.torch, self.rotating.device
+        rows = self.rotating.runtime_shape.batch + int(large)
+        scratch = torch.empty((rows, 5, 32), dtype=torch.int32, device=device)
+        address = scratch.data_ptr()
+        if not address or address % 128 or self.workspace.numel() != 128:
+            raise ValueError("Unexpected final-window terminal binding layout")
+        offset = struct.calcsize("<6Q2I5Q")  # terminal_runtime::Binding::reserved[5]
+        encoded = torch.tensor(list(struct.pack("<Q", address)), dtype=torch.uint8, device=device)
+        self.workspace[offset : offset + encoded.numel()].copy_(encoded)
+        self.window_q1_scratch = scratch

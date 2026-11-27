@@ -7,6 +7,7 @@ from pathlib import Path
 from statistics import mean
 
 from fixed_q4_packed_archive import NATIVE, same_production
+from large_batch_pair import LARGE_WINDOW_AIVS, LARGE_WINDOW_FIXED_WIDTHS
 from large_batch_placement import field, placement, same_card
 from reporting import atomic_json
 
@@ -22,33 +23,120 @@ def verify_source(out, archive, repo):
     same_production(repo, NATIVE, 'HEAD')
 
 
+def packed_arm(directory, arm, group, batch, cohort, root):
+    row = json.loads((directory / "packed_result.json").read_text())
+    identity = row["identity"]
+    if (not (directory / "placement_verified").is_file()
+            or row["arm"] != arm or row["calls"] != 10 or row["correctness"] != "PASS"
+            or identity["group"] != group or identity["batch"] != batch
+            or identity["physical_npu"] != int(field(root, "physical_npu"))
+            or identity["host"] != field(root, "host") or identity["native"] != field(root, "native")
+            or row["checked_queries"] != 40 * batch or row["checked_rows"] != 10 * batch
+            or (arm == "serial" and row["get_workers"] != 2)):
+        raise ValueError(f"Incomplete or mismatched packed result: {directory}")
+    if batch <= 16 and identity["donor_rows"] != list(range(cohort, 16, 16 // batch)):
+        raise ValueError(f"Wrong source requests for {directory}")
+    times = {s: row["mean_us"][s] for s in ("LI", "tail")}
+    times["graph"] = row["graph_mean_us"]
+    if (not all(isfinite(v) and v > 0 for v in times.values()) or
+            not isclose(times["graph"] * 10, row["graph_event_us"], rel_tol=1e-8)):
+        raise ValueError(f"Invalid ten-call device event or stage measurements: {directory}")
+    return row, times, (identity, placement(directory / "thp.json"))
+
+
 def read_pair(pair, group, batch, cohort, root):
-    rows = {}
-    identities = []
-    for arm in ('serial', 'fused'):
+    _, serial_times, serial_context = packed_arm(pair / "serial", "serial", group, batch, cohort, root)
+    _, fused_times, fused_context = packed_arm(pair / "fused", "fused", group, batch, cohort, root)
+    if serial_context != fused_context:
+        raise ValueError(f"Serial and fused inputs, runtime or memory placement differ: {pair}")
+    return dict(serial=serial_times, fused=fused_times)
+
+
+Q1_STAGES = (*STAGES, "LI1", "LI2", "LI3")
+
+
+def read_q1_pair(pair, group, batch, cohort, root):
+    rows, contexts, bridges = {}, [], []
+    for arm, enabled in (("off", False), ("on", True)):
         directory = pair / arm
-        row = json.loads((directory / 'packed_result.json').read_text())
-        identity = row['identity']
-        if (not (directory / 'placement_verified').is_file()
-                or row['arm'] != arm or row['calls'] != 10 or row['correctness'] != 'PASS'
-                or identity['group'] != group or identity['batch'] != batch
-                or identity['physical_npu'] != int(field(root, 'physical_npu'))
-                or identity['host'] != field(root, 'host') or identity['native'] != field(root, 'native')
-                or row['checked_queries'] != 40 * batch or row['checked_rows'] != 10 * batch
-                or (arm == 'serial' and row['get_workers'] != 2)):
-            raise ValueError(f'Incomplete or mismatched packed result: {directory}')
-        if batch <= 16 and identity['donor_rows'] != list(range(cohort, 16, 16 // batch)):
-            raise ValueError(f'Wrong source requests for {directory}')
-        times = {s: row['mean_us'][s] for s in ('LI', 'tail')}
-        times['graph'] = row['graph_mean_us']
-        if (not all(isfinite(v) and v > 0 for v in times.values()) or
-                not isclose(times['graph'] * 10, row['graph_event_us'], rel_tol=1e-8)):
-            raise ValueError(f'Invalid ten-call device event or stage measurements: {directory}')
-        identities.append((identity, placement(directory / 'thp.json')))
-        rows[arm] = times
-    if identities[0] != identities[1]:
-        raise ValueError(f'Serial and fused inputs, runtime or memory placement differ: {pair}')
-    return rows
+        row, times, context = packed_arm(directory, "fused", group, batch, cohort, root)
+        if (row.get("window_q1_enabled") is not enabled or row["get_workers"] != 40
+                or row["full_KV_Index_checked_calls"] != 10):
+            raise ValueError(f"Packed fused result did not complete in its requested Q1 mode: {directory}")
+        bridge = row.get("fused_bridge_sha256")
+        if not isinstance(bridge, str) or len(bridge) != 64:
+            raise ValueError(f"Missing loaded LIFetch bridge hash: {directory}")
+        stages = {s: row["mean_us"][s] for s in ("LI1", "LI2", "LI3")}
+        if not all(isfinite(v) and v > 0 for v in stages.values()):
+            raise ValueError(f"Invalid LI kernel durations: {directory}")
+        traffic = row["traffic"]
+        if len(traffic) != 10 or any(call.get("window_q1_ready_flags", 0) != 4 * batch * enabled for call in traffic):
+            raise ValueError(f"Missing or unexpected Q1 completion receipts: {directory}")
+        if any(
+            len(call[key + "_by_request"]) != batch or sum(call[key + "_by_request"]) != call[key]
+            or any(count < 0 for count in call[key + "_by_request"])
+            for call in traffic for key in ("prefetch", "final")
+        ):
+            raise ValueError(f"Missing packed per-request GET counts: {directory}")
+        rows[arm] = dict(mean_us={**times, **stages}, traffic=traffic)
+        contexts.append(context)
+        bridges.append(bridge)
+    if contexts[0] != contexts[1] or bridges[0] != bridges[1]:
+        raise ValueError(f"Q1 and baseline used different inputs, runtime, bridge, or memory placement: {pair}")
+    return dict(arms=rows, context=contexts[0], fused_bridge_sha256=bridges[0])
+
+
+LARGE_WINDOW_MODES = dict(native=None, deferred_pair=2, deferred_q1=1)
+LARGE_WINDOW_POLICY_MODES = dict(native=None, deferred_q1=1, deferred_q2=3, deferred_q4=4, deferred_auto=0)
+LARGE_WINDOW_STAGES = (*STAGES, "LI1", "LI23", "last_window")
+
+
+def read_large_q1_block(block, group, batch, cohort, root, *, modes=LARGE_WINDOW_MODES, require_widths=False):
+    rows, contexts, bridges = {}, [], []
+    for arm, mode in modes.items():
+        directory = block / arm
+        row, times, context = packed_arm(directory, "fused", group, batch, cohort, root)
+        if ("large_window_queries_per_worker" not in row or row["large_window_queries_per_worker"] != mode
+                or row["get_workers"] != 32 or row["full_KV_Index_checked_calls"] != 10):
+            raise ValueError(f"Native large fused result did not complete in its requested window mode: {directory}")
+        bridge = row.get("fused_bridge_sha256")
+        if not isinstance(bridge, str) or len(bridge) != 64:
+            raise ValueError(f"Missing loaded LIFetch bridge hash: {directory}")
+        durations = row["mean_us"]
+        stages = {s: durations[s] for s in ("LI1", "LI23")}
+        final = durations.get("last_window", 0)
+        if (not all(isfinite(v) and v > 0 for v in stages.values()) or not isfinite(final)
+                or (mode is not None and final <= 0) or (mode is None and final != 0)):
+            raise ValueError(f"Invalid native large final-window kernel durations: {directory}")
+        stages["last_window"] = final
+        traffic = row["traffic"]
+        flags = 4 * batch if mode is not None else 0
+        if len(traffic) != 10 or any(call.get("window_q1_ready_flags", 0) != flags for call in traffic):
+            raise ValueError(f"Missing or unexpected deferred final-window receipts: {directory}")
+        if require_widths and mode is not None:
+            for call in traffic:
+                widths = call.get("window_q_rows_by_width", {})
+                if (widths.keys() != {"1", "2", "4"}
+                        or any(type(count) is not int or count < 0 for count in widths.values())
+                        or sum(widths.values()) != batch):
+                    raise ValueError(f"Invalid deferred final-window width counts: {directory}")
+                if mode == 0:
+                    if sum((4 // int(width)) * count for width, count in widths.items()) > LARGE_WINDOW_AIVS:
+                        raise ValueError(f"Automatic width counts exceed the one-wave AIV budget: {directory}")
+                elif widths[str(LARGE_WINDOW_FIXED_WIDTHS[mode])] != batch:
+                    raise ValueError(f"Requested fixed width disagrees with the final-window receipts: {directory}")
+        if any(
+            len(call[key + "_by_request"]) != batch or sum(call[key + "_by_request"]) != call[key]
+            or any(count < 0 for count in call[key + "_by_request"])
+            for call in traffic for key in ("prefetch", "final")
+        ):
+            raise ValueError(f"Missing packed per-request GET counts: {directory}")
+        rows[arm] = dict(mean_us={**times, **stages}, traffic=traffic)
+        contexts.append(context)
+        bridges.append(bridge)
+    if any(ctx != contexts[0] for ctx in contexts[1:]) or any(bridge != bridges[0] for bridge in bridges[1:]):
+        raise ValueError(f"Native large routes used different inputs, runtime, bridge, or memory placement: {block}")
+    return dict(arms=rows, context=contexts[0], fused_bridge_sha256=bridges[0])
 
 
 def cell_summary(root, group, batch):

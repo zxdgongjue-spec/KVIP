@@ -35,6 +35,9 @@
 #if KVIP_URMA_WINDOW_LI
 #include "window_rank_pair.h"
 #endif
+#if KVIP_WINDOW_Q1
+#include "window_q1.h"
+#endif
 #endif
 
 namespace QLIKernel {
@@ -57,6 +60,47 @@ public:
         rotationProgressGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(
             reinterpret_cast<__gm__ rotating::Context*>(p)->progress));
     }
+#if KVIP_WINDOW_Q1
+    GM_ADDR windowQ1_ = nullptr;
+
+    __aicore__ inline void HelpWindowQ1(uint32_t row, uint32_t query, uint32_t half) {
+        fixed_window_q1::Wait(windowQ1_, row, 0);
+        RunWindowQ1(row, query, half, runtimeShape_.rounds - 1);
+        auto done = fixed_window_q1::Signal(windowQ1_, row, query);
+        done->calls = incrementalCalls_;
+        done->scanned = incrementalScanned_;
+        done->candidates = incrementalCandidates_;
+        fixed_window_q1::Publish(windowQ1_, row, query, 1);
+    }
+
+    __aicore__ inline void HelpLastWindowQ1(uint32_t half) {
+        if (!windowQ1_) return;
+#if KVIP_FIXED_SCORE_SHARDS
+        // Fixed score part 0 already owns every Service epoch. Part 1 has
+        // no Service work and has published its final score before this hook.
+        const uint32_t firstHelper = runtimeShape_.liCores * 2;
+        if (blockId_ < firstHelper) return;
+        const uint32_t helper = blockId_ - firstHelper;
+        const uint32_t row = helper / fixed_window_q1::kQueryCount;
+        const uint32_t query = helper % fixed_window_q1::kQueryCount + 1;
+        if (row < runtimeShape_.batch && query < fixed_window_q1::kQueryCount) {
+            PipeBarrier<PIPE_ALL>();
+            HelpWindowQ1(row, query, half);
+        }
+#else
+        // Each earlier Service owner finishes all Score and its own epoch
+        // before helping the last owner on the same lane.
+        const uint32_t rank = rotating::ServiceRank(runtimeShape_.batch, runtimeShape_.splitQ, blockId_ / 2);
+        const uint32_t query = rank / runtimeShape_.serviceAics + 1;
+        if (query >= fixed_window_q1::kQueryCount) return;
+        const uint32_t lane = (rank % runtimeShape_.serviceAics) * 2 + blockId_ % 2;
+        PipeBarrier<PIPE_ALL>();
+        for (uint32_t row = lane; row < runtimeShape_.batch; row += runtimeShape_.serviceLanes) {
+            HelpWindowQ1(row, query, half);
+        }
+#endif
+    }
+#endif
 #if KVIP_FIXED_SCORE_SHARDS
     bool fixedHelper_ = false;
     __aicore__ inline void PublishFixedHalf(uint32_t row, uint32_t lane, uint32_t half, uint32_t end) {
