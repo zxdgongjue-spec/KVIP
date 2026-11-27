@@ -47,6 +47,15 @@ class LocalNaturalGraph(unittest.TestCase):
         with self.assertRaises(ValueError):
             study.check_earned_limits(data,28)
 
+    def test_moderate_ceilings_on_the_final_call(self):
+        rows = [[40,224,224,224,192] for _ in range(32)]
+        data = {"traffic":[{"row_window_prefetch":[r.copy() for r in rows]} for _ in range(10)]}
+        study.check_earned_limits(data,32,study.MODERATE)
+        data["traffic"][-1]["row_window_prefetch"][-1][2] = 225
+        with self.assertRaises(ValueError):
+            study.check_earned_limits(data,32,study.MODERATE)
+        study.check_earned_limits(data,32,study.ADVANCE)
+
     def test_each_batch_selects_only_this_host(self):
         self.original("other-host")
         self.assertEqual(study.choose(self.area,32,self.reader)[0],"local-run")

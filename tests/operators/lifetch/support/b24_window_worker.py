@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from b24_window_policy import ADVANCE, WINDOW_CEILINGS, install, policy, trace_lanes
+from b24_window_policy import CREDIT_CEILINGS, install, policy, trace_lanes
 
 
 def diagnostic(ex, torch, state, inputs, oracle, mode):
@@ -75,15 +75,15 @@ def run(a):
 
     import os
     local = os.environ.get("PEER_G7_X4_LOCAL") == "1"
-    if local and (a.mode not in ("window-x4-early",ADVANCE) or a.group != 7 or a.batch not in (28, 32)):
+    if local and (a.mode not in ("window-x4-early",*CREDIT_CEILINGS) or a.group != 7 or a.batch not in (28, 32)):
         raise ValueError("Unexpected local window shape")
     original = None if local else json.loads((a.ref / f"g{a.group}/bs{a.batch}/block1/fused/packed_result.json").read_bytes())
     install(large_two_cold, a.mode)
     regular_traffic = large_batch_pair.window_traffic
-    if a.mode == ADVANCE:
+    if a.mode in CREDIT_CEILINGS:
         def earned_traffic(counters, counts, grants=(), *, carry_credit=False):
             traffic = regular_traffic(counters, counts, grants, carry_credit=True)
-            if grants and np.any(counters[:,7:] > np.asarray(WINDOW_CEILINGS)):
+            if grants and np.any(counters[:,7:] > np.asarray(CREDIT_CEILINGS[a.mode])):
                 raise ValueError("Terminal or intermediate window exceeded its individual ceiling")
             return traffic
         large_batch_pair.window_traffic = earned_traffic

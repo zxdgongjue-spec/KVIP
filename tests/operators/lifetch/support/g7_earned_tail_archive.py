@@ -4,8 +4,9 @@ import argparse
 from pathlib import Path
 from statistics import mean
 
-from b24_window_report import stats, values
-from g7_x4_local import ADVANCE, MODE, check_earned_limits, choose, placement, valid_local
+from b24_window_report import serial_reference, stats, values
+from export_large_rank_evidence import IDENTITY_KEYS
+from g7_x4_local import ADVANCE, MODE, MODERATE, check_earned_limits, choose, placement, valid_local
 
 BENCH = "fe37fdc78a3292eef34b71334437dd768380f583"
 
@@ -58,29 +59,36 @@ def inspect_call(call, batch):
                 first16_min=sum(sorted(first_rows)[:16]), first16_max=sum(sorted(first_rows)[-16:]))
 
 
-def find(area, batch, mode):
-    state, ref, arm = choose(area, batch, BENCH, mode)
+def find(area, batch, mode, reader):
+    state, ref, arm = choose(area, batch, reader, mode)
+    serial = None
     if state == "paired-cache":
-        r, _, _ = values(arm, ref, 7, batch, mode)
+        r, _, identity = values(arm, ref, 7, batch, mode)
+        if mode == MODERATE:
+            serial = serial_reference(ref, identity, 7, batch)
     elif state == "local-cache":
         r = valid_local(arm, batch, mode)
+        if mode == MODERATE:
+            local_id = {k: r["identity"][k] for k in IDENTITY_KEYS}
+            serial = serial_reference(arm.parents[3], (local_id, placement(arm / "thp.json")), 7, batch)
     else:
         return None
-    if mode == ADVANCE:
-        check_earned_limits(r, batch)
-    return arm, r, placement(arm / "thp.json")
+    if mode in (ADVANCE, MODERATE):
+        check_earned_limits(r, batch, mode)
+    return arm, r, placement(arm / "thp.json"), serial
 
 
-def output(area, batch):
+def output(area, batch, moderate_reader=None):
     found = []
-    for mode in (MODE, ADVANCE):
-        hit = find(area, batch, mode)
+    modes = (MODE, ADVANCE, MODERATE) if moderate_reader else (MODE, ADVANCE)
+    for mode in modes:
+        hit = find(area, batch, mode, moderate_reader if mode == MODERATE else BENCH)
         found.append(hit)
         tag = f"G7 BS{batch} {mode}"
         if hit is None:
             print(f"{tag} UNAVAILABLE missing_completed_same_host_NPU4_archive")
             continue
-        arm, r, _ = hit
+        arm, r, _, _ = hit
         if len(r["traffic"]) != 10:
             raise ValueError("Expected results from all ten measured calls")
         calls = [inspect_call(t, batch) for t in r["traffic"]]
@@ -97,21 +105,37 @@ def output(area, batch):
               f"largest_one_Q_first_mean={mean(c['max_q_first'] for c in calls):.1f} "
               f"any_16_rows_first_doorbell_range_mean={mean(c['first16_min'] for c in calls):.1f}.."
               f"{mean(c['first16_max'] for c in calls):.1f} timestamp_peak_4us=UNAVAILABLE")
-    if any(x is None for x in found):
-        print(f"G7 BS{batch} vs_ordinary_five=UNAVAILABLE no_complete_pair")
-        return
-    (ap, old, old_loc), (bp, new, new_loc) = found
-    if (old_loc != new_loc or old["identity"] != new["identity"]
-            or old["tail_text"] != new["tail_text"] or old["original_library"] != new["original_library"]):
-        print(f"G7 BS{batch} vs_ordinary_five=UNAVAILABLE mismatched_input_placement_or_tail")
-        return
-    print(f"G7 BS{batch} old_minus_earned_graph/LI/LI1/LI23/tail_mean_us="
-          + "/".join(f"{a-b:+.2f}" for a, b in zip(stats(old), stats(new), strict=True)))
+    target = found[-1]
+    for mode, ref_hit in zip(modes[:-1], found[:-1], strict=True):
+        label = "ordinary_five" if mode == MODE else "earned_five"
+        if target is None or ref_hit is None:
+            print(f"G7 BS{batch} vs_{label}=UNAVAILABLE no_complete_pair")
+            continue
+        _, old, old_loc, _ = ref_hit
+        _, new, new_loc, _ = target
+        if (old_loc != new_loc or old["identity"] != new["identity"]
+                or old["tail_text"] != new["tail_text"] or old["original_library"] != new["original_library"]):
+            print(f"G7 BS{batch} vs_{label}=UNAVAILABLE mismatched_input_placement_or_tail")
+            continue
+        saved = "/".join(f"{a-b:+.2f}" for a, b in zip(stats(old), stats(new), strict=True))
+        gain = 100 * (1 - new["graph_mean_us"] / old["graph_mean_us"])
+        print(f"G7 BS{batch} vs_{label} graph/LI/LI1/LI23/tail_saved_mean_us={saved} graph_gain_pct={gain:+.2f}")
+    if moderate_reader and target:
+        _, new, _, serial = target
+        if serial:
+            value = new["graph_mean_us"]
+            baseline = serial["graph"]
+            print(f"G7 BS{batch} vs_strong_serial graph_saved_mean_us={baseline-value:+.2f} "
+                  f"graph_gain_pct={100*(1-value/baseline):+.2f} gap_to_15/20_us={value-.85*baseline:+.2f}/{value-.8*baseline:+.2f}")
+        else:
+            print(f"G7 BS{batch} vs_strong_serial=UNAVAILABLE no_matching_same_card_archive")
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("peer_baseline", type=Path)
+    p.add_argument("--moderate-reader")
+    p.add_argument("--batch", type=int, choices=(32, 28))
     args = p.parse_args()
-    for size in (32, 28):
-        output(args.peer_baseline, size)
+    for size in (args.batch,) if args.batch else (32, 28):
+        output(args.peer_baseline, size, args.moderate_reader)
