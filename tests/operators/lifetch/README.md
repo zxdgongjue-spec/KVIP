@@ -149,6 +149,9 @@ bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed-large-q1-pair
 bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed-large-q-policy
 # 只对照原生、一波 Q2 和默认 AUTO
 bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed-large-q-policy --q-policy q2 auto
+# 只跑原五档，保留串行 oracle 和末窗 Q1 开关对照
+bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed-q1-pair \
+  --batch 1 --batch 2 --batch 4 --batch 8 --batch 16
 ```
 
 在模式名后加 `--dry-run` 查看计划。大 batch 对照固定 BS20/24/28/32、Q4、W4、目标 miss 10% 和正常预取。固定宽度 Q1/Q2/Q4 表示每 AIV 分别处理 1/2/4 个 Q。AUTO 估计各 Q 的新增待扫 tile 数，在 64 AIV 内选择单波分工。每请求由一个 owner 汇合、去重并提交 WQE。正式脚本记录实际 kernel、检查逐 Q 完成回执和分工，把整图、阶段和 Get 对账写入 `RESULT_ROOT/summary.csv` 与 `packed_summary.json`。可选 `--keep-trace` 保留原始 profiler 文件。

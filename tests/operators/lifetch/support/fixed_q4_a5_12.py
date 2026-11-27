@@ -54,9 +54,13 @@ def large_policy_comparisons(modes):
     return comparisons
 
 
-def plan(synthetic=False, window_q1_pair=False, large_window_q1_pair=False, q_policies=None, *, revision=None):
+def plan(
+    synthetic=False, window_q1_pair=False, large_window_q1_pair=False, q_policies=None, *,
+    revision=None, batch_filter=None,
+):
     large = large_window_q1_pair or q_policies is not None
-    batches = NATIVE_LARGE_BATCHES if large else FIXED_BATCHES
+    supported = NATIVE_LARGE_BATCHES if large else FIXED_BATCHES
+    batches = tuple(batch for batch in supported if batch_filter is None or batch in batch_filter)
     blocks = LARGE_Q1_BLOCKS if large_window_q1_pair else BLOCKS
     if q_policies is not None:
         modes = large_policy_modes(q_policies)
@@ -78,11 +82,12 @@ def plan(synthetic=False, window_q1_pair=False, large_window_q1_pair=False, q_po
     if synthetic:
         data["synthetic_fixture_config"] = SYNTHETIC_FIXTURE
     if window_q1_pair:
-        q1_graphs = len(Q1_BATCHES) * sum(map(len, Q1_BLOCKS))
+        enabled = [batch for batch in batches if batch in Q1_BATCHES]
+        q1_graphs = len(enabled) * sum(map(len, Q1_BLOCKS))
         data["measured_graphs"] += q1_graphs
         data["window_q1_pair"] = dict(
-            baseline_revision=Q1_BASE, enabled_batches=list(Q1_BATCHES),
-            unsupported_batches=[batch for batch in FIXED_BATCHES if batch not in Q1_BATCHES],
+            baseline_revision=Q1_BASE, enabled_batches=enabled,
+            unsupported_batches=[batch for batch in batches if batch not in Q1_BATCHES],
             blocks=Q1_BLOCKS, measured_graphs=q1_graphs, scope="last_window_only",
         )
     if large_window_q1_pair:
@@ -364,10 +369,11 @@ def write_large_q1_summary(out, rows, metadata):
 def write_summary(out, rows, metadata):
     q1_study = "window_q1_pair" in metadata
     q1_completed = sum(row.get("window_q1", {}).get("status") == "completed" for row in rows)
-    complete = len(rows) == len(FIXED_BATCHES) and (not q1_study or q1_completed == len(Q1_BATCHES))
+    completed_graphs = len(rows) * sum(map(len, BLOCKS)) + q1_completed * sum(map(len, Q1_BLOCKS))
     atomic_json(out / "packed_summary.json", {
-        **metadata, "complete": complete,
-        "completed_graphs": len(rows) * sum(map(len, BLOCKS)) + q1_completed * sum(map(len, Q1_BLOCKS)),
+        **metadata, "complete": len(rows) == len(metadata["batch_sizes"])
+        and completed_graphs == metadata["measured_graphs"],
+        "completed_graphs": completed_graphs,
         "cells": rows,
     })
     fields = [
@@ -432,7 +438,8 @@ def run(args):
     print(f"RESULT_ROOT={out}", flush=True)
 
     metadata = {
-        **plan(args.synthetic, args.window_q1_pair, args.large_window_q1_pair, q_policies, revision=revision),
+        **plan(args.synthetic, args.window_q1_pair, args.large_window_q1_pair, q_policies,
+               revision=revision, batch_filter=args.batch),
         "test_revision": revision, "kvaf_revision": kvaf_revision,
         "physical_npu": args.physical_npu, "device": args.device, "cpu_numa": node,
     }
@@ -509,6 +516,8 @@ def main():
     parser.add_argument("--timeout-seconds", type=int, default=7200)
     parser.add_argument("--keep-trace", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--batch", type=int, action="append", choices=FIXED_BATCHES,
+                        help="Select a batch size. Repeat to select more than one.")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--window-q1-pair", action="store_true",
                        help="Add same-binary fused off/on AB/BA for supported final-window Q1 shapes")
@@ -527,11 +536,15 @@ def main():
         parser.error("--large-window-q-policy requires --synthetic")
     if args.q_policy is not None and not args.large_window_q_policy:
         parser.error("--q-policy requires --large-window-q-policy")
+    if ((args.large_window_q1_pair or args.large_window_q_policy)
+            and args.batch is not None and any(batch not in NATIVE_LARGE_BATCHES for batch in args.batch)):
+        parser.error("Native large-window modes support batch 20, 24, 28 or 32")
     if args.large_window_q_policy and args.q_policy is None:
         args.q_policy = Q_POLICY_CHOICES
     if args.dry_run:
         revision = subprocess.check_output(["git", "-C", REPO, "rev-parse", "HEAD"], text=True).strip()
-        data = plan(args.synthetic, args.window_q1_pair, args.large_window_q1_pair, args.q_policy, revision=revision)
+        data = plan(args.synthetic, args.window_q1_pair, args.large_window_q1_pair, args.q_policy,
+                    revision=revision, batch_filter=args.batch)
         print(json.dumps(data, indent=2))
         return
     if args.trace is None and not args.synthetic:

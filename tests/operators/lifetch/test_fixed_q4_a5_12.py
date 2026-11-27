@@ -45,7 +45,8 @@ def test_synthetic_and_trace_are_exclusive():
     assert result.returncode == 2 and "not allowed with argument" in result.stderr
 
 
-def test_synthetic_prepares_once_and_uses_fresh_oracles(tmp_path, monkeypatch):
+@pytest.mark.parametrize("batches", [None, (1, 2, 4, 8, 16)])
+def test_synthetic_prepares_once_and_uses_fresh_oracles(tmp_path, monkeypatch, batches):
     kvaf = tmp_path / "kvaf"
     cpu = kvaf / "build-cpu/runtime/kvaf_cpu_service"
     cpu.parent.mkdir(parents=True)
@@ -54,7 +55,7 @@ def test_synthetic_prepares_once_and_uses_fresh_oracles(tmp_path, monkeypatch):
     out = tmp_path / "out"
     args = SimpleNamespace(kvaf_root=kvaf, cpu_numa=None, cpu_ub_device=None, device=2, physical_npu=2,
                            synthetic=True, trace=None, output=out, window_q1_pair=False,
-                           large_window_q1_pair=False, large_window_q_policy=False)
+                           large_window_q1_pair=False, large_window_q_policy=False, batch=batches)
 
     def git_output(command, **_kwargs):
         if command[3] == "status":
@@ -93,19 +94,22 @@ def test_synthetic_prepares_once_and_uses_fresh_oracles(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "write_summary", lambda _out, rows, metadata: summaries.append((len(rows), metadata)))
     runner.run(args)
     assert prepared == [(out / "fixture", runner.SYNTHETIC_FIXTURE)]
-    assert calls[:9] == [
+    expected_batches = batches or runner.FIXED_BATCHES
+    batch_count = len(expected_batches)
+    assert calls[:batch_count] == [
         (batch, "serial", out / f"synthetic/bs{batch}/cohort0/oracle/serial", None)
-        for batch in runner.FIXED_BATCHES
+        for batch in expected_batches
     ]
     expected = []
-    for batch in runner.FIXED_BATCHES:
+    for batch in expected_batches:
         case = out / f"synthetic/bs{batch}/cohort0"
         for block, order in enumerate(runner.BLOCKS, 1):
             expected.extend((batch, route, case / f"block{block}" / route, case / "oracle/serial") for route in order)
-    assert calls[9:] == expected
-    assert len(cells) == 9
+    assert calls[batch_count:] == expected
+    assert len(cells) == batch_count
     count, metadata = summaries[-1]
-    assert count == 9 and metadata["input_kind"] == "synthetic" and metadata["group"] == 0
+    assert count == batch_count and metadata["input_kind"] == "synthetic" and metadata["group"] == 0
+    assert tuple(metadata["batch_sizes"]) == expected_batches
     assert metadata["synthetic_fixture"] == fixture_info and "trace" not in metadata
 
 
@@ -153,6 +157,10 @@ def test_one_cohort_summary_reuses_pair_evidence(tmp_path):
     write_summary(tmp_path, [row], plan())
     report = json.loads((tmp_path / "packed_summary.json").read_text())
     assert report["cells"][0]["observations"][1]["order"] == ["fused", "serial"]
+    assert not report["complete"]
+    write_summary(tmp_path, [row], plan(batch_filter=[8]))
+    selected = json.loads((tmp_path / "packed_summary.json").read_text())
+    assert selected["complete"] and selected["completed_graphs"] == 4
     with (tmp_path / "summary.csv").open(newline="") as handle:
         data = list(csv.DictReader(handle))[0]
     assert data["fused_graph_us"] == "85" and data["input_kind"] == "real"
