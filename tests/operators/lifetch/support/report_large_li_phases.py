@@ -116,9 +116,38 @@ def li_diagnostic(raw):
     return out
 
 
-def report(root):
+
+def score_exposure(record, diagnostic):
+    """Split each owner cold interval; sibling work is a separate, potentially overlapping series."""
+    row = diagnostic["row"]
+    clock = record["separate_LI_diagnostic"]["clock_mhz"]
+    prior_window, *cold = [epoch[row] for epoch in record["separate_window_event_u64"]]
+    owner = record["separate_score_span_cycles"]["post_owner"][row]
+    sibling = record["separate_score_span_cycles"]["sibling"][row]
+    sibling_checks = record["separate_sibling_predecessor_cycles"][row]
+    require(len(owner) == len(sibling) == len(sibling_checks) == len(cold), "Wrong number of score intervals")
+    parts = []
+    for event, o, s, waited in zip(cold, owner, sibling, sibling_checks):
+        left, right = prior_window[1], event[4]
+        require(0 < o[0] <= o[1] <= right and 0 < s[0] <= s[1] <= waited[0] <= waited[1]
+                and waited[1] >= left and event[1] >= waited[1], "Invalid paired score timestamps")
+        in_cold = max(0, min(o[1], right) - max(o[0], left))
+        before = max(0, min(right, o[0]) - left)
+        after = max(0, right - max(left, o[1]))
+        require(before + in_cold + after == right - left, "Cold split does not close")
+        parts.append(dict(pre_score=before/clock, owner_score_call=in_cold/clock, post_score_to_rank=after/clock,
+                          sibling_score_call=(s[1]-s[0])/clock, sibling_exposed_predecessor=max(0,left-waited[0])/clock,
+                          sibling_score_overlap_previous_rank_service=max(0,min(s[1],left)-max(s[0],prior_window[13]))/clock))
+        prior_window = event
+    require(isclose(sum(p["pre_score"]+p["owner_score_call"]+p["post_score_to_rank"] for p in parts),
+                    diagnostic["phases_us"]["cold_advance"],abs_tol=1e-6), "LI3 critical row does not close")
+    return parts
+
+
+def report(root, rank_revision=None, batches=BATCHES, groups=GROUPS):
     old, control = Path(field(root, "packed_source")), Path(field(root, "reference"))
-    require(field(root, "native") == CARRY and field(old, "native") == ORIGINAL
+    policy = "four-ranks" if rank_revision else "four-window-carry"
+    require(field(root, "native") == (rank_revision or CARRY) and field(old, "native") == ORIGINAL
             and field(control, "native") == CONTROL and field(root, "physical_npu") == "3"
             and field(control, "packed_source") == str(old), "Wrong archive chain")
     for key in ("host", "physical_npu", "kvaf", "kvaf_tree"):
@@ -127,14 +156,16 @@ def report(root):
                                        for p in (root,old,control)) else "boot_id"
     require(field(root,identity_key) and field(root,identity_key) == field(old,identity_key)
             == field(control,identity_key), "Different machines")
-    print("Current four-window carry, same-card original ten-call control, archived original instrumented call.")
+    print(f"Current {policy}, same-card original ten-call control, archived original instrumented call.")
     cells = []
-    for batch in BATCHES:
-        for group in GROUPS:
-            ident, parts = timing(root,group,batch,1)
+    for batch in batches:
+        for group in groups:
+            count = int(field(root,"candidate_blocks"))
+            require(count in (1, 2), "Unsupported candidate block count")
+            ident, parts = timing(root,group,batch,count)
             baseline_ident, baseline = timing(control,group,batch,2)
             require(ident == baseline_ident, "Packed inputs differ")
-            require(parts[0].get("large_window_policy") == "four-window-carry", "Wrong window policy")
+            require(all(part.get("large_window_policy") == policy for part in parts), "Wrong window policy")
             single = read(old / f"g{group}/bs{batch}/fused/ARM_RESULT.json")
             require(single["arm"] == "fused" and single["identity"]["native"] == ORIGINAL
                     and single["identity"]["protocol"] == "one_restored_graph_per_device_event_with_profiler"
@@ -159,8 +190,25 @@ def report(root):
                 print(f"{loc} CURRENT_DIAG LI3_span_us={density['li3_span_us']:.2f}"
                       f" mean_prior_check_by_window_us={fmt(w['mean_check_to_rank_us'] for w in density['epochs'])}"
                       f" mean_rank_through_service_by_window_us={fmt(w['mean_rank_and_service_us'] for w in density['epochs'])}")
+            critical = None
+            if rank_revision:
+                raw = parts[0]
+                require(raw["measured_cold_symbol"] == "v9_li_large_four_ranks"
+                        and raw["diagnostic_cold_symbol"] == "v9_li_large_four_ranks_trace"
+                        and raw["cold_build_fingerprint"] != raw["diagnostic_cold_build_fingerprint"]
+                        and raw["diagnostic_ranks"]["checked_queries"] == 4*batch
+                        and raw["window_grants_per_row"] == [256]*4, "Missing separate four-rank clock proof")
+                critical = li_diagnostic(raw)
+                exposures = score_exposure(raw, critical)
+                critical["by_cold_window"] = exposures
+                s = critical["phases_us"]
+                print(f"{loc} CURRENT_LAST_ROW row={critical['row']} LI2/LI3/overlap_us="
+                      f"{fmt(critical['union_us'][k] for k in ('LI2_active_us','LI3_active_us','overlap_us'))}"
+                      f" first/cold_advance/prior_check/rank_join/row_service/retire_us={fmt(s.values())}")
+                print(f"{loc} CURRENT_LAST_ROW by_cold_window "
+                      + " ".join(f"{key}_us={fmt(window[key] for window in exposures)}" for key in exposures[0]))
             cells.append(dict(group=group,batch=batch,current=current,control=previous,
-                              original_diagnostic=diag,current_density=density))
+                              original_diagnostic=diag,current_density=density,current_critical=critical))
     return cells
 
 
@@ -168,7 +216,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root",type=Path)
     parser.add_argument("--json",type=Path)
+    parser.add_argument("--rank-revision", help="Expected exact four-rank candidate revision")
+    parser.add_argument("--groups", nargs="+", type=int, choices=GROUPS, default=GROUPS)
+    parser.add_argument("--batches", nargs="+", type=int, choices=BATCHES, default=BATCHES)
     args = parser.parse_args()
-    cells = report(args.root.resolve())
+    cells = report(args.root.resolve(),args.rank_revision,args.batches,args.groups)
     if args.json:
         args.json.write_text(json.dumps(cells,indent=2)+"\n")
