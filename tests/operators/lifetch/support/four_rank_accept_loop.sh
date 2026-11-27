@@ -5,6 +5,7 @@ report="$controller_root/tests/operators/lifetch/support/four_rank_accept.py"
 extra_report=
 case $audit_mode in
     two-row-*) extra_report="$controller_root/tests/operators/lifetch/support/b24_two_row_results.py" ;;
+    window-x*) extra_report="$controller_root/tests/operators/lifetch/support/b24_window_report.py" ;;
     team-schedule) extra_report="$controller_root/tests/operators/lifetch/support/b24_team_schedule.py" ;;
 esac
 for group in "${groups[@]}"; do

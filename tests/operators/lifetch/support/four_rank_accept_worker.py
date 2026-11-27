@@ -132,6 +132,9 @@ def device_journal(s, inputs, pages, counts, map_digests=None):
 
 def run(a):
     sys.path.insert(0, str(a.timed / "tests/operators/lifetch/support"))
+    if a.mode.startswith("window-x"):
+        from b24_window_worker import run as run_windows
+        return run_windows(a)
     if a.mode == "two-row-natural":
         if a.batch != 32:
             raise ValueError("The two-row tail requires BS32")
@@ -393,7 +396,8 @@ def run(a):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("mode", choices=["journal", "serial", "frozen", "two-row-natural", "two-row-frozen", "team-schedule"])
+    from b24_window_policy import MODES
+    p.add_argument("mode", choices=[*MODES, "journal", "serial", "frozen", "two-row-natural", "two-row-frozen", "team-schedule"])
     for name in ("timed", "ref"):
         p.add_argument(name, type=Path)
     for name in ("group", "batch"):

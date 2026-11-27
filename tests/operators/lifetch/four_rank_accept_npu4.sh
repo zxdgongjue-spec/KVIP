@@ -11,9 +11,9 @@ case $extra in
     tail) extra=isolated-scheduling ;;
     bs20) extra=isolated-schedule-focus ;;
 esac
-case $extra in natural) ;; paired-frozen|isolated-li|isolated-tail|isolated-all|isolated-scheduling|isolated-schedule-only|isolated-schedule-focus) [[ $mode != serial-only ]] || exit 2 ;; *) exit 2 ;; esac
+case $extra in windows-focus|windows-all) [[ $mode == window-study ]] || exit 2 ;; natural) ;; paired-frozen|isolated-li|isolated-tail|isolated-all|isolated-scheduling|isolated-schedule-only|isolated-schedule-focus) [[ $mode != serial-only ]] || exit 2 ;; *) exit 2 ;; esac
 native=
-if [[ $mode != serial-only ]]; then native=$(git -C "$repo" rev-parse --verify "$mode^{commit}"); fi
+if [[ $mode != serial-only && $mode != window-study ]]; then native=$(git -C "$repo" rev-parse --verify "$mode^{commit}"); fi
 base=d0fc5963881bd38fa97eff0f6ef40c757a6e8713
 serial=10442f1ffa314606c23f54b73e49ecfc372f1f9a
 work=/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold
@@ -45,13 +45,16 @@ if ! "$py" -B -c 'import numpy, hashlib; assert hasattr(hashlib, "file_digest")'
 fi
 audit() {
     local timed rc
-    if [[ $1 == team-schedule ]]; then
-        local group batch complete=1 hit
+    if [[ $1 == team-schedule || $1 == window-x* ]]; then
+        local checker="$entry/support/b24_team_schedule.py"
+        if [[ $1 == window-x* ]]; then checker="$entry/support/b24_window_report.py"; fi
+        local group batch complete=1 hit lookup="$3"
+        if [[ $1 == window-x* ]]; then lookup=$reader; fi
         for batch in $FIXED_Q4_BATCHES; do
             for group in $FIXED_Q4_GROUPS; do
-                hit=$("$py" -B "$entry/support/b24_team_schedule.py" cached "$3" "$3" "$group" "$batch" "$1")
+                hit=$("$py" -B "$checker" cached "$lookup" "$3" "$group" "$batch" "$1")
                 if [[ -n $hit ]]; then
-                    "$py" -B "$entry/support/b24_team_schedule.py" show "$hit" "$3" "$group" "$batch" "$1"
+                    "$py" -B "$checker" show "$hit" "$3" "$group" "$batch" "$1"
                 else
                     complete=0
                 fi
@@ -68,6 +71,28 @@ audit() {
     PEER_FOUR_RANK_AUDIT=$1 PEER_TIMED_SOURCE=$timed PEER_AUDIT_REFERENCE=$3 \
         bash "$entry/large_batch_npu4.sh" --four-ranks-candidate-only
 }
+if [[ $mode == window-study ]]; then
+    [[ $extra == windows-focus || $extra == windows-all ]]
+    if [[ -s /etc/machine-id && -s $ref/machine_id.txt ]]; then
+        cmp -s /etc/machine-id "$ref/machine_id.txt"
+    else
+        cmp -s /proc/sys/kernel/random/boot_id "$ref/boot_id.txt"
+    fi
+    exec > >(tee "$stamp/windows.log") 2>&1
+    echo "WINDOW_LOG=$stamp/windows.log"
+    if [[ $extra == windows-focus ]]; then
+        # The low-miss shortfall and the busy link give opposite predictions.
+        FIXED_Q4_GROUPS=2 FIXED_Q4_BATCHES="28 32" audit window-x2-early "$base" "$ref"
+        FIXED_Q4_GROUPS="10 7" FIXED_Q4_BATCHES=32 audit window-x2-early "$base" "$ref"
+        FIXED_Q4_GROUPS=7 FIXED_Q4_BATCHES=32 audit window-x4-early "$base" "$ref"
+    else
+        for study in window-x2-early window-x4-early window-x3-linear window-x8-early window-x2-linear window-x4-linear; do
+            audit "$study" "$base" "$ref"
+        done
+    fi
+    "$py" -B "$entry/support/b24_window_report.py" summary "$reader" "$ref"
+    exit 0
+fi
 if [[ $mode == serial-only ]]; then
     if "$py" -B "$entry/support/four_rank_accept.py" serial-summary "$ref"; then exit 0; else rc=$?; fi
     (( rc == 3 )) || exit "$rc"
