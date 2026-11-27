@@ -5,7 +5,7 @@ set -euo pipefail
 repo=${1:?expected KVIP Git checkout}
 baseline=$(cd "${2:?expected four-rank result root}" && pwd -P)
 mode=${3:-all}
-case $mode in tail|li|all) ;; *) echo 'Expected tail, li or all' >&2; exit 2 ;; esac
+case $mode in tail|li|all|prefetch-ready) ;; *) echo 'Expected tail, li, prefetch-ready or all' >&2; exit 2 ;; esac
 here=$(cd "$(dirname "$0")" && pwd -P)
 work=$(cd "$baseline/../.." && pwd -P)
 [[ ${baseline%/*} == "$work/peer-baseline" && -s $baseline/packed_summary.json &&

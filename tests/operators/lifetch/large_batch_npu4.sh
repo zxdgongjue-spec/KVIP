@@ -466,12 +466,13 @@ fi
 if [[ -n $diag_source ]]; then
     count=0
     for group in 7 2 10; do
-        case $group:${PEER_RANK_DIAG_MODE:?} in 7:li|2:tail|10:tail) continue ;; esac
+        case $group:${PEER_RANK_DIAG_MODE:?} in 7:li|2:tail|10:tail|2:prefetch-ready|10:prefetch-ready) continue ;; esac
         trace=
         mkdir -p "$out/g$group"
         prepared_bank="$out/g$group/donors"
         shapes=(32)
         if [[ $group == 7 ]]; then shapes+=(28); fi
+        if [[ $PEER_RANK_DIAG_MODE == prefetch-ready ]]; then shapes=(28); fi
         for batch in "${shapes[@]}"; do
             pair="$out/g$group/bs$batch"
             mkdir -p "$pair"
@@ -482,7 +483,7 @@ if [[ -n $diag_source ]]; then
             if [[ -n $cached ]]; then
                 printf '%s\n' "$cached" > "$pair/diagnostic_source.txt"
                 echo "DIAGNOSTIC_REUSED G$group BS$batch source=$cached" >&3
-                grep -E "^(SINGLE_DIAGNOSTIC |BATCH_CLOCK |LAST_TEAM |LI_COUNTER)" "$cached/worker.log" | tee -a "$out/summary.txt" >&3
+                grep -E "^(SINGLE_DIAGNOSTIC |BATCH_CLOCK |LAST_TEAM |LI_COUNTER|PREFETCH_CQ )" "$cached/worker.log" | tee -a "$out/summary.txt" >&3
                 count=$((count+1))
                 continue
             fi
@@ -498,7 +499,7 @@ if [[ -n $diag_source ]]; then
             "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref/thp.json" "$pair/fused/thp.json"
             touch "$pair/fused/placement_verified"
             printf '%s\n' "$pair/fused" > "$pair/diagnostic_source.txt"
-            grep -E "^(SINGLE_DIAGNOSTIC |BATCH_CLOCK |LAST_TEAM |LI_COUNTER)" "$pair/fused/worker.log" | tee -a "$out/summary.txt" >&3
+            grep -E "^(SINGLE_DIAGNOSTIC |BATCH_CLOCK |LAST_TEAM |LI_COUNTER|PREFETCH_CQ )" "$pair/fused/worker.log" | tee -a "$out/summary.txt" >&3
             count=$((count+1))
         done
         rm -rf -- "$out/g$group/donors"
