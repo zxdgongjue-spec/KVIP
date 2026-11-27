@@ -76,7 +76,13 @@ class PortableAudit(TestCase):
         qs[0].update(own=7, batches=[batch(2,10),batch(7,20)])
         qs[1].update(own=1, batches=[batch(1,10)])
         r=dict(tail=dict(clock_mhz=2,decoded=dict(qs=qs)),identity=dict(batch=1),traffic=dict(final=8))
-        self.assertEqual(pressure(r),dict(peak_unretired=2,batches=[2,1],tokens=[3,5],drain_p50_us=[1.5,1.5]))
+        self.assertEqual(pressure(r),dict(peak_unretired=2,batches=[2,1],tokens=[3,5],post_to_retire_p50_us=[2.0,2.0],drain_p50_us=[1.5,1.5]))
         qs[0]["batches"][1]["drain_begin"]=5
         with self.assertRaisesRegex(ValueError,"clock order"):
             pressure(r)
+
+    def test_teams_require_distinct_rows_and_include_touching_private_waits(self):
+        from peer_tail_clocks import simultaneous_drains
+        waits = [(0,10,20),(0,15,30),(1,16,23),(1,23,26),(2,17,19),(2,22,25)]
+        self.assertEqual(simultaneous_drains(waits,3), [(17,19),(22,25)])
+        self.assertEqual(simultaneous_drains(waits,4), [])
