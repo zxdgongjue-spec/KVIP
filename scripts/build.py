@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-REVISION = "87e261ae4d07d4868cfdbb306d15f3f137edfc3d"
+REVISION = "54b5fd0b4703ed849467f357cfaca9f499236798"
 
 
 def call(command, cwd=None, env=None):
@@ -56,7 +56,6 @@ def prepare_dependency(root, transport):
     if head != REVISION:
         raise RuntimeError(f"Expected KVAF main revision {REVISION}, found {head}")
     patches = [
-        (ROOT / "scripts/patches/kvaf-ddr-create-timeout.patch", ()),
         (ROOT / "scripts/patches/kvaf-main-fused-device.patch", ()),
     ]
     lease_fix = ROOT / "scripts/patches/kvaf-prepared-get-lease.patch"
