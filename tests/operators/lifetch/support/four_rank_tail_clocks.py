@@ -49,6 +49,13 @@ def build_probe(repo, normal_library, sdk_build, soc):
     return ctypes.CDLL(str(library))
 
 
+def expected_final_prefixes(own, total):
+    if not own:
+        return []
+    ends = [(own * n + 15) // 16 for n in (1, 6, 11)] if total >= 256 and own > 1 else []
+    return list(dict.fromkeys([*ends, own]))
+
+
 def decode(stamps, detail, mhz):
     require(math.isfinite(mhz) and mhz > 0 and len(stamps) == len(detail), "Invalid clock calibration/shape")
     origin = min(q[0] for row in stamps for q in row)
@@ -61,8 +68,7 @@ def decode(stamps, detail, mhz):
         for q, (t, extra) in enumerate(zip(row, clocks)):
             stages = query_spans(t, q)
             own = t[20]
-            ends = ([min(own, (own*n+15)//16) for n in (1,6,11)] if total >= 256 and own > 1 else [])
-            ends = list(dict.fromkeys(ends + ([own] if own else [])))
+            ends = expected_final_prefixes(own, total)
             require(len(extra) == 32 and extra[0] == len(ends) and extra[1:1+len(ends)] == ends,
                     f"G7 R{r} Q{q+1}: evaluated prefix counts do not match")
             windows = []

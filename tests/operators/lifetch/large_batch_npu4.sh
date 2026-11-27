@@ -267,6 +267,8 @@ elif (( packed )); then
             printf 'captured_logical_scores\n' > "$out/selection_oracle.txt"
         fi
         if [[ -n $follow_ref ]]; then
+            printf '%s\n' "${PEER_FOUR_RANK_NEW_DEVICE_BUILD:?}" > "$out/followup_new_device_build.txt"
+            printf '%s\n' "${PEER_FOUR_RANK_SAME_PACING:?}" > "$out/followup_same_pacing.txt"
             follow_report="$controller_root/tests/operators/lifetch/support/four_rank_followup.py"
             "$PYTHON" -B "$follow_report" verify "$out" "$follow_ref"
             echo "FOLLOWUP source=$follow_ref candidate=$native scope=$PEER_FOUR_RANK_SCOPE fresh_arms=fused archived_baseline=1" >&3

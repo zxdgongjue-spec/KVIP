@@ -32,14 +32,31 @@ ensure_tree() (
     printf '%s\n' "$path"
 )
 if [[ -d $candidate ]]; then
-    timed=$(cd "$candidate" && pwd -P)
+    timed=$(git -C "$candidate" rev-parse --show-toplevel)
+    timed=$(cd "$timed" && pwd -P)
     [[ -z $(git -C "$timed" status --porcelain) ]] || { echo "Candidate worktree has local changes: $timed" >&2; exit 2; }
     native=$(git -C "$timed" rev-parse --verify HEAD)
 else
     native=$(git -C "$repo" rev-parse --verify "${candidate}^{commit}")
     timed=$(ensure_tree "$native")
 fi
-[[ $native != "$(<"$ref/native.txt")" ]] || { echo 'Candidate is the archived baseline' >&2; exit 2; }
+base=$(git -C "$timed" rev-parse --verify "$(<"$ref/native.txt")^{commit}")
+# The runner and kernel live on separate branches. A runner-only revision must never replay the control.
+device_paths=(csrc/operators/lightning_indexer_with_fetch csrc/operators/common
+              csrc/operators/lidu/op_kernel/hot_slot_selection.h tests/operators/lifetch/support/large_two_cold_native)
+host_paths=(python/kvip tests/operators/lifetch/support/large_two_cold.py)
+export PEER_FOUR_RANK_NEW_DEVICE_BUILD=1
+if git -C "$timed" diff --quiet "$base" "$native" -- "${device_paths[@]}"; then
+    if git -C "$timed" diff --quiet "$base" "$native" -- "${host_paths[@]}"; then
+        echo "Candidate $native has the same timed operator inputs as archive $base" >&2; exit 2
+    fi
+    PEER_FOUR_RANK_NEW_DEVICE_BUILD=0
+fi
+terminal=csrc/operators/lightning_indexer_with_fetch/op_kernel/terminal
+export PEER_FOUR_RANK_SAME_PACING=0
+if git -C "$timed" diff --quiet "$base" "$native" -- "$terminal/terminal_transport.h" "$terminal/row_kernel.h"; then
+    PEER_FOUR_RANK_SAME_PACING=1
+fi
 control=$(ensure_tree "$controller")
 test -f "$timed/tests/operators/lifetch/support/large_two_cold_native/kernel.cpp"
 export PEER_G2_WORK="$work" PEER_PHYSICAL_NPU=4 ASCEND_RT_VISIBLE_DEVICES=4 PEER_LOCAL_ONLY=1
