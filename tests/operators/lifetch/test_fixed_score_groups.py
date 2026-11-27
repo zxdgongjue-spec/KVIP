@@ -146,10 +146,16 @@ struct RunInfo {
     bool isFirstS2InnerLoop, isLastS2InnerLoop, reuseQuery=false, retainQuery=false;
 };
 }
+namespace fixed_window_q {
+bool DeferInWindow(bool enabled, unsigned owner, unsigned epoch, unsigned tile) {
+    return enabled && (epoch == 2 || epoch == 3) && owner + 1 == epoch && tile < 3;
+}
+}
 struct Cube {
-    unsigned history, begin=0, end=0, loads=0, releases=0;
+    unsigned history, begin=0, end=0, loads=0, releases=0, deferred=0;
     bool occupied=false;
-    void ComputeMm1(const QLICommon::RunInfo& i) {
+    template<bool Defer = false> void ComputeMm1(const QLICommon::RunInfo& i) {
+        if constexpr (Defer) ++deferred;
         if (!occupied || i.tile < begin || i.tile >= end) {
             // A cache miss needs the current KEY_MTE1_MTE2 credit.
             assert(!occupied);
@@ -169,7 +175,8 @@ template<class T> struct QuantLightningIndexerKernel {
     struct { void ProcessVec1(QLICommon::RunInfo, unsigned, bool) {} } vectorService;
     static constexpr unsigned S2_BASE_SIZE=128;
     void CalcRunInfo(unsigned, unsigned tile, QLICommon::RunInfo& out, unsigned, unsigned) { out.tile=tile; }
-    void ScanSequenceHalf(unsigned,unsigned,unsigned,unsigned&,unsigned&,bool,bool=false);
+    bool fixedDeferCredit_ = false;
+    void ScanSequenceHalf(unsigned,unsigned,unsigned,unsigned&,unsigned&,bool,bool=false,unsigned=0,unsigned=0);
 };
 """
         + native[start:end] + "\n}\n"
@@ -183,6 +190,15 @@ int main() {
     assert(!recent.matmulService.occupied && !recent.matmulService.releases);
     recent.ScanSequenceHalf(20, 21, 0, loop, scale, true);
     assert(!recent.matmulService.occupied && recent.matmulService.loads == 1 && recent.matmulService.releases == 1);
+    assert(recent.matmulService.deferred == 0);
+    QuantLightningIndexerKernel<int> overlap;
+    overlap.fixedDeferCredit_ = true;
+    overlap.matmulService.history = 32;
+    loop = scale = 0;
+    overlap.ScanSequenceHalf(0, 4, 0, loop, scale, false, false, 2, 1);
+    assert(overlap.matmulService.deferred == 3 && !overlap.matmulService.occupied);
+    overlap.ScanSequenceHalf(12, 17, 0, loop, scale, true, false, 3, 1);
+    assert(overlap.matmulService.deferred == 3 && !overlap.matmulService.occupied);
     for (unsigned history : {131072u,131328u}) for (unsigned batch : {1u,2u,4u,8u}) {
         rotating::RuntimeShape s{};
         s.batch=batch; s.history=history; s.resident=16384; s.indexHeads=32; s.aicCount=32;
@@ -255,6 +271,18 @@ int main() {
         s.serviceAics = (batch + 1) / 2;
         s.serviceLanes = 2 * s.serviceAics;
         s.tokenBytes = 656;
+        auto &credit = workspace[fixed_window_q::kCreditOptionOffset / 8];
+        assert(!fixed_window_q::DeferCredits(args, s));
+        credit = 1;
+        assert(fixed_window_q::DeferCredits(args, s) == (batch == 4));
+        for (uint32_t owner = 0; owner < 4; ++owner)
+            for (uint32_t epoch = 0; epoch < 4; ++epoch)
+                for (uint32_t tile = 0; tile < 8; ++tile) {
+                    auto eligible = (owner == 1 || owner == 2) && epoch == owner + 1 && tile < 3;
+                    assert(fixed_window_q::DeferInWindow(true, owner, epoch, tile) == eligible);
+                    assert(!fixed_window_q::DeferInWindow(false, owner, epoch, tile));
+                }
+        credit = 0;
         auto &option = workspace[fixed_window_q::kScratchOffset / 8];
         assert(!fixed_window_q::Scratch(args, s));
         option = reinterpret_cast<uint64_t>(mailbox.data());

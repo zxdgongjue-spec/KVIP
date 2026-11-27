@@ -3853,6 +3853,40 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
                         dict(path='fused' if fused else 'serial', samples=samples,
                              graph_accounting=measured['accounting'], graph_calls=len(states),
                              timing=measured['timing'], trace=measured['trace']))
+        profile_path = os.environ.get('KVIP_FIXED_Q4_PRESSURE_PROFILE')
+        if profile_path:
+            import acl
+            from fixed_q4_pressure_msprof import scoped_msprof
+
+            first, inputs = states[0], next(iter(sequence))
+            profile_path = Path(profile_path)
+            first.reset()
+            first.prepare(inputs)
+            first.forward.counter_clock_mhz = first.forward.calibrate_counter_mhz()
+            first.forward.set_diagnostics(True)
+            first.forward.times.zero_()
+            stream.synchronize()
+            before = algorithm_before(first.rotating)
+            before['logical_ids'] = first.input_layout.copy()
+            unmarked_launch = first.forward.terminal_function
+            first.forward.terminal_function = first.forward.pressure_profile_launcher
+            try:
+                with scoped_msprof(acl.prof, profile_path, config.device) as capture_status:
+                    pending = True
+                    first.forward()
+                    stream.synchronize()
+                    pending = False
+                first.validate(inputs)
+                sample = dict(device_clock_mhz=first.forward.counter_clock_mhz,
+                              streaming_cycles=first.forward.diagnostic_cycles(),
+                              algorithm=algorithm_after(first.rotating, before,
+                                  admissions=first.forward.events_src.cpu().numpy()))
+                atomic_json(profile_path / 'window_cycles.json', sample)
+                atomic_json(profile_path / 'capture.json', dict(capture_status, correctness='PASS',
+                                                                scope='warmed_eager_marked_forward'))
+            finally:
+                first.forward.terminal_function = unmarked_launch
+
         # Detailed stamps are additional diagnostics, never performance samples.
         if fused and config.mode == 'diagnose' and config.level >= 2:
             clock_mhz = states[0].forward.calibrate_counter_mhz()
@@ -3954,9 +3988,15 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
 
 
 def run_path(config, directory, sequence, pages, *, fused, round_check=None, shared_pool=None):
-    from fixed_q4_combo import ARMS, bind as bind_combo
+    from fixed_q4_combo import ARMS, PRESSURE_MODES, bind as bind_combo
 
     combo_arm = os.environ.get('KVIP_FIXED_Q4_COMBO_ARM')
+    pressure_mode = os.environ.get('KVIP_FIXED_Q4_PRESSURE_MODE')
+    pressure_profile = os.environ.get('KVIP_FIXED_Q4_PRESSURE_PROFILE')
+    if pressure_mode and (pressure_mode not in PRESSURE_MODES or combo_arm != 'fixed_q1'):
+        raise ValueError('The pressure experiment requires fixed_q1 and a known pressure mode')
+    if pressure_profile and (not pressure_mode or config.iterations != 1):
+        raise ValueError('A scoped pressure trace requires one checked pressure invocation')
     if combo_arm and (combo_arm not in ARMS or config.mode != 'diagnose'
                       or config.input != 'synthetic' or config.transport != 'urma' or not fused):
         raise ValueError('Fixed-Q4 comparison requires a known arm and synthetic fused URMA diagnose')
@@ -4040,7 +4080,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
                 prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024))
             if combo_arm:
-                combo = bind_combo(state, combo_arm, library)
+                combo = bind_combo(state, combo_arm, library, pressure_mode)
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
@@ -4087,7 +4127,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
                         prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease)
-                    if combo_arm and bind_combo(replica, combo_arm, library) != combo:
+                    if combo_arm and bind_combo(replica, combo_arm, library, pressure_mode) != combo:
                         raise RuntimeError('Fixed-Q4 arm changed between graph inputs')
                     replica.failure_directory = directory
                 else:

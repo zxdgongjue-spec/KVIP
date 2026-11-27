@@ -11,12 +11,19 @@ ARMS = {
     'p2_q1': (False, 4),
     'fixed_q1': (True, 4),
 }
+PRESSURE_MODES = {
+    'baseline': (32, False),
+    'cold_p4': (16, False),
+    'overlap': (32, True),
+    'combined': (16, True),
+}
+CREDIT_OFFSET = 224
 SCRATCH_OFFSET = 232
 LINES = 5
 LINE_BYTES = 128
 
 
-def bind(state, arm, library):
+def bind(state, arm, library, pressure_mode=None):
     fixed, workers = ARMS[arm]
     forward = state.forward
     shape = state.rotating.runtime_shape
@@ -39,8 +46,28 @@ def bind(state, arm, library):
         pointer = np.asarray([address], dtype='<u8').view('u1')
         forward.workspace[SCRATCH_OFFSET:SCRATCH_OFFSET + 8].copy_(state.torch.from_numpy(pointer))
         forward.fixed_q4_window_scratch = scratch
-    return dict(arm=arm, score_groups=groups, windows=shape.rounds, service_lanes=shape.serviceLanes,
-                q_workers=workers, library=str(library))
+    route = dict(arm=arm, score_groups=groups, windows=shape.rounds, service_lanes=shape.serviceLanes,
+                 q_workers=workers, library=str(library))
+    if pressure_mode is not None:
+        if arm != 'fixed_q1' or shape.batch != 4 or shape.rounds != 4 or groups != 32:
+            raise ValueError('The credit experiment requires BS4/W4 fixed Score and last-window Q1')
+        cold_groups, deferred = PRESSURE_MODES[pressure_mode]
+        option = np.asarray([int(deferred)], dtype='<u8').view('u1')
+        forward.workspace[CREDIT_OFFSET:CREDIT_OFFSET + 8].copy_(state.torch.from_numpy(option))
+        pressure_launch = state.rotating.library.kvip_fixed_q4_pressure_forward
+        pressure_launch.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_uint32] * 2
+        pressure_launch.restype = ctypes.c_uint32
+
+        def launch(*args):
+            return pressure_launch(*args, cold_groups, 0)
+
+        def profile_launch(*args):
+            return pressure_launch(*args, cold_groups, 1)
+
+        forward.terminal_function = launch
+        forward.pressure_profile_launcher = profile_launch
+        route.update(pressure_mode=pressure_mode, cold_score_groups=cold_groups, deferred_credit=deferred)
+    return route
 
 
 def validate_query_join(forward):

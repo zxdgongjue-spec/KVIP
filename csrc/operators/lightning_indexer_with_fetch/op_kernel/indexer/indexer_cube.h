@@ -38,6 +38,7 @@ public:
     __aicore__ inline void InitParams(const ConstInfo &constInfo);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
+    template <bool DeferResultCredit = false>
     __aicore__ inline void ComputeMm1(const QLICommon::RunInfo &runInfo);
 
     static constexpr uint64_t KEY_BUF_NUM = 3;
@@ -68,6 +69,13 @@ public:
     static constexpr uint64_t L0C_BUFFER_OFFSET = M_BASIC_BLOCK_L0 * S2_BASIC_BLOCK_L0;
 
 protected:
+    __aicore__ inline void WaitResultCredit(uint32_t loop) {
+        const uint32_t bank = QLICommon::ConstInfo::CROSS_VC_EVENT + loop % 2;
+        CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(bank);
+        CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
+            bank + QLICommon::ConstInfo::AIV0_AIV1_OFFSET);
+    }
+
     __aicore__ inline void Fixp(uint64_t s1gGmOffset, uint64_t s2GmOffset, uint64_t s1gL0RealSize,
                                 uint64_t s2L0RealSize, const QLICommon::RunInfo &runInfo);
     __aicore__ inline void ComputeL0c(uint64_t s1gL0RealSize, uint64_t s2L0RealSize, const QLICommon::RunInfo &runInfo);
@@ -154,10 +162,11 @@ QLIMatmul<QLIT>::InitMm1GlobalTensor(const GlobalTensor<int32_t> &blkTableGm, co
 }
 
 template <typename QLIT>
+template <bool DeferResultCredit>
 __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &runInfo)
 {
-    CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT + runInfo.loop % 2);
-    CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_VC_EVENT + runInfo.loop % 2 + QLICommon::ConstInfo::AIV0_AIV1_OFFSET);
+    bool pendingCredit = DeferResultCredit;
+    if constexpr (!DeferResultCredit) WaitResultCredit(runInfo.loop);
     uint64_t s2GmBaseOffset = runInfo.s2Idx * constInfo_.s2BaseSize;
     uint64_t s1gProcessSize = runInfo.actMBaseSize;
     uint64_t s2ProcessSize = runInfo.actualSingleProcessSInnerSize;
@@ -216,6 +225,14 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
 
                         SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
 
+                        if constexpr (DeferResultCredit) {
+                            // AIC-private MTE and MMAD may issue before the
+                            // matching result bank is released by BOTH AIVs.
+                            if (pendingCredit) {
+                                WaitResultCredit(runInfo.loop);
+                                pendingCredit = false;
+                            }
+                        }
                         Fixp(s1gGmOffset + s1gOffset, s2GmOffset + s2L1Offset, s1gL0RealSize, s2L0RealSize, runInfo);
                         SetFlag<HardEvent::FIX_M>(FIX_M_EVENT + l0BufIdx_ % L0_BUF_NUM);
                         l0BufIdx_++;
@@ -306,6 +323,14 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
 
                         SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
 
+                        if constexpr (DeferResultCredit) {
+                            // AIC-private MTE and MMAD may issue before the
+                            // matching result bank is released by BOTH AIVs.
+                            if (pendingCredit) {
+                                WaitResultCredit(runInfo.loop);
+                                pendingCredit = false;
+                            }
+                        }
                         Fixp(s1gGmOffset + s1gOffset, (s2L1Offset - l1S2Offset),
                                                 s1gL0RealSize, s2L0RealSize, runInfo);
                         SetFlag<HardEvent::FIX_M>(FIX_M_EVENT + l0BufIdx_ % L0_BUF_NUM);
@@ -329,6 +354,10 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
         }
     }
 
+    if constexpr (DeferResultCredit) {
+        // Keep the credit ledger balanced for an empty issue as well.
+        if (pendingCredit) WaitResultCredit(runInfo.loop);
+    }
     CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_CV_EVENT + runInfo.loop % 2);
     CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_CV_EVENT + runInfo.loop % 2 + QLICommon::ConstInfo::AIV0_AIV1_OFFSET);
 }

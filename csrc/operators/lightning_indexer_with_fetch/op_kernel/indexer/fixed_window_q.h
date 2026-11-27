@@ -2,7 +2,22 @@
 #pragma once
 
 namespace fixed_window_q {
+constexpr uint32_t kCreditOptionOffset = 224;
 constexpr uint32_t kScratchOffset = 232;
+constexpr uint32_t kBanks = 2;
+
+__aicore__ inline bool DeferCredits(GM_ADDR workspace, const rotating::RuntimeShape& shape)
+{
+    return workspace && shape.batch == 4 && shape.rounds == 4 && shape.liCores == 8
+        && *reinterpret_cast<__gm__ const uint64_t*>(workspace + kCreditOptionOffset) == 1;
+}
+
+__aicore__ inline bool DeferInWindow(bool enabled, uint32_t ownerEpoch, uint32_t epoch, uint32_t tile)
+{
+    // The first reuse can occur at the third tile. Leave all later waits
+    // in their normal place and preserve both bank flags and loop parity.
+    return enabled && (epoch == 2 || epoch == 3) && ownerEpoch + 1 == epoch && tile <= kBanks;
+}
 constexpr uint32_t kLineBytes = 128;
 constexpr uint32_t kQueries = 4;
 constexpr uint32_t kLinesPerRow = 5;

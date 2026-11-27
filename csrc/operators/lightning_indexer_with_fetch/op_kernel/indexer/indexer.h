@@ -90,6 +90,7 @@ public:
     bool sequenceSplit_ = false;
 #if KVIP_FIXED_SCORE_SHARDS
     __gm__ uint32_t* fixedReady_ = nullptr;
+    bool fixedDeferCredit_ = false;
 #endif
     bool sequenceTopKOnly_ = false;
 #if !V9_UBMEM
@@ -156,7 +157,11 @@ protected:
     __aicore__ inline void ProcessMain();
     __aicore__ inline void ScanSequenceHalf(uint32_t begin, uint32_t end, uint32_t shard,
 #if !V9_UBMEM
-                                           uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery = false);
+                                           uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery = false
+#if KVIP_FIXED_SCORE_SHARDS
+                                           , uint32_t epoch = 0, uint32_t ownerEpoch = 0
+#endif
+                                           );
     __aicore__ inline bool ScoreRecent(uint32_t& loop, uint32_t qScaleLoop,
                                       uint32_t shard = 0, uint32_t shards = 1, bool reuseRetained = false);
     __aicore__ inline void FinishBaseBlock(const QLICommon::RunInfo& runInfo);
@@ -692,7 +697,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessInvalid()
 template <typename QLIT>
 __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
 #if !V9_UBMEM
-    uint32_t begin, uint32_t end, uint32_t shard, uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery)
+    uint32_t begin, uint32_t end, uint32_t shard, uint32_t& loop, uint32_t& scaleLoop, bool last, bool newQuery
+#if KVIP_FIXED_SCORE_SHARDS
+    , uint32_t epoch, uint32_t ownerEpoch
+#endif
+    )
 #else
     uint32_t begin, uint32_t end, uint32_t shard, uint32_t& loop, uint32_t& scaleLoop, bool last)
 #endif
@@ -722,7 +731,12 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ScanSequenceHalf(
         info.reuseQuery = newQuery && tile == begin;
 #endif
         if ASCEND_IS_AIC {
-            matmulService.ComputeMm1(info);
+#if KVIP_FIXED_SCORE_SHARDS
+            if (fixed_window_q::DeferInWindow(fixedDeferCredit_, ownerEpoch, epoch, tile - begin)) {
+                matmulService.template ComputeMm1<true>(info);
+            } else
+#endif
+            { matmulService.ComputeMm1(info); }
         } else {
 #if KVIP_LARGE_BATCH_LI
             vectorService.ProcessVec1(info, 0, false, shard == 2);
@@ -787,7 +801,8 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
     uint32_t batch = splitCoreInfo.bN2Start;
     uint32_t shard = aiCoreIdx % 2;
 #if KVIP_FIXED_SCORE_SHARDS
-    const uint32_t parts = fixed_score::GroupsPerRow(runtimeShape_.batch) / 2;
+    // GetBlockNum is the number of launched MIX groups on both AIC and AIV.
+    const uint32_t parts = GetBlockNum() / runtimeShape_.liCores;
     const uint32_t part = aiCoreIdx / runtimeShape_.liCores;
     const uint32_t recentPart = shard * parts + part, recentParts = 2 * parts;
 #else
@@ -896,7 +911,8 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
                 if (end > scanEnd / S2_BASE_SIZE) end = scanEnd / S2_BASE_SIZE;
 #if KVIP_FIXED_SCORE_SHARDS
                 auto slice = fixed_score::Split(begin, end, part, parts);
-                ScanSequenceHalf(slice.begin, slice.end, shard, loop, scaleLoop, epoch + 1 == runtimeShape_.rounds);
+                ScanSequenceHalf(slice.begin, slice.end, shard, loop, scaleLoop,
+                    epoch + 1 == runtimeShape_.rounds, false, epoch, serviceEpoch);
                 if ASCEND_IS_AIV {
                     // Each original half has multiple disjoint producers. Make
                     // its contiguous end visible only after this lane of each

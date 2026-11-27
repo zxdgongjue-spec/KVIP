@@ -58,6 +58,9 @@ __aicore__ inline void RunLi(GM_ADDR bindings
     op.runtimeShape_ = shape;
 #if KVIP_FIXED_SCORE_SHARDS
     op.fixedReady_ = reinterpret_cast<__gm__ uint32_t*>(ready);
+    if constexpr (Phase == SequenceLiPhase::Cold) {
+        op.fixedDeferCredit_ = splitSequence && fixed_window_q::DeferCredits(P(15), shape);
+    }
     op.vectorService.fixedHelper_ = splitSequence && physical >= shape.liCores;
 #endif
 #if !V9_UBMEM

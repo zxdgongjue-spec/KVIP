@@ -1,3 +1,5 @@
+#include <acl/acl_prof.h>
+#include <cstring>
 #include "../op_kernel/pipeline_types.h"
 #include "api.h"
 #include "context.h"
@@ -138,18 +140,49 @@ extern "C" uint32_t kvip_parallel_tail_supported(const rotating::RuntimeShape* s
     return shape && shape->batch && shape->batch<=16 && shape->finalWorkers==4 &&
         shape->batch*4<=shape->aicCount*2 && rotating::UseSequenceSplit(*shape);
 }
-// This launch requires the extended terminal binding with ready lines. Old
-// captured callers keep using kvip_parallel_tail_forward and its original ABI.
+template <typename Launch>
+static uint32_t FixedStage(void* stream, const char* begin, const char* end, bool profile, Launch launch) {
+    if (profile) {
+        const auto result = aclprofMarkEx(begin, std::strlen(begin), stream);
+        if (result) return result;
+    }
+    const auto result = launch();
+    return !result && profile ? aclprofMarkEx(end, std::strlen(end), stream) : result;
+}
+
+static uint32_t LaunchFixedQ4(void* bindings, void* terminal, void* stream,
+    const rotating::RuntimeShape* shape, uint32_t hotGroups, uint32_t coldGroups, bool profile) {
+    uint32_t result = FixedStage(stream, "KVIP_LIFETCH_HOT_BEGIN", "KVIP_LIFETCH_HOT_END", profile, [&] {
+        return aclrtlaunch_v9_li_fixed_hot(hotGroups, stream, bindings, terminal);
+    });
+    if (!result) result = FixedStage(stream, "KVIP_LIFETCH_THRESHOLD_BEGIN", "KVIP_LIFETCH_THRESHOLD_END", profile, [&] {
+        return aclrtlaunch_v9_li_kernel_1(shape->liCores, stream, bindings);
+    });
+    if (!result) result = FixedStage(stream, "KVIP_LIFETCH_COLD_SERVICE_BEGIN", "KVIP_LIFETCH_COLD_SERVICE_END", profile, [&] {
+        return aclrtlaunch_v9_li_fixed_cold(coldGroups, stream, bindings, terminal);
+    });
+    if (!result) result = FixedStage(stream, "KVIP_LIFETCH_TERMINAL_BEGIN", "KVIP_LIFETCH_TERMINAL_END", profile, [&] {
+        return aclrtlaunch_v9_parallel_terminal(shape->batch * 4, stream, terminal);
+    });
+    return result;
+}
+
+// Normal fixed-Q4 keeps the original launch geometry and ABI.
 extern "C" uint32_t kvip_fixed_q4_small_forward(void* bindings, void* terminal,
     void* stream, const rotating::RuntimeShape* shape) {
     if (!bindings || !terminal || !stream || !shape) return 100000;
-    uint32_t groups = fixed_score::LaunchGroups(*shape);
+    const uint32_t groups = fixed_score::LaunchGroups(*shape);
     if (!groups || !kvip_parallel_tail_supported(shape)) return 100000;
-    uint32_t result = aclrtlaunch_v9_li_fixed_hot(groups, stream, bindings, terminal);
-    if (!result) result = aclrtlaunch_v9_li_kernel_1(shape->liCores, stream, bindings);
-    if (!result) result = aclrtlaunch_v9_li_fixed_cold(groups, stream, bindings, terminal);
-    if (!result) result = aclrtlaunch_v9_parallel_terminal(shape->batch * 4, stream, terminal);
-    return result;
+    return LaunchFixedQ4(bindings, terminal, stream, shape, groups, groups, false);
+}
+
+extern "C" uint32_t kvip_fixed_q4_pressure_forward(void* bindings, void* terminal,
+    void* stream, const rotating::RuntimeShape* shape, uint32_t coldGroups, uint32_t profile) {
+    if (!bindings || !terminal || !stream || !shape || shape->batch != 4) return 100000;
+    const uint32_t groups = fixed_score::LaunchGroups(*shape);
+    if (groups != 32 || (coldGroups != 16 && coldGroups != groups) ||
+        profile > 1 || !kvip_parallel_tail_supported(shape)) return 100000;
+    return LaunchFixedQ4(bindings, terminal, stream, shape, groups, coldGroups, profile != 0);
 }
 extern "C" uint32_t kvip_parallel_tail_forward(void* bindings,void* terminal,
     void* stream,const rotating::RuntimeShape* shape) {
