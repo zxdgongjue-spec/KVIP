@@ -14,7 +14,8 @@ from run_mr28_baseline_msprof import capture_route
 from run_mr28_dedicated_service import write_summary
 from kvip.operators.lifetch.geometry import li_geometry
 from small_batch import (
-    ADAPTIVE_ROUTES, FULL32_MODES, MODES, PARTITIONED_MODES, SUPPORTED_BATCHES, TRACE_ROUTES, WINDOW_Q_WORKERS,
+    ADAPTIVE_ROUTES, FULL32_MODES, MODES, PARTITIONED_MODES, SUPPORTED_BATCHES, TRACE_ROUTES,
+    WINDOW_Q_BATCHES, WINDOW_Q_WORKERS,
     cold_score_parts, selected_windows,
 )
 from terminal_handoff import CHECKED_KERNELS, COLD_GM_STAGE_FIELDS, STAGES
@@ -63,6 +64,9 @@ def balanced_arms(batch):
 
 
 def study_arms(args):
+    if args.window_q1_matrix:
+        arms = ('cold_w2', 'cold_w2_q1') if args.trace else ('p2', 'cold_w2', 'cold_w2_q1')
+        return dict.fromkeys(WINDOW_Q_BATCHES, arms)
     if args.bs2_window_q:
         return {2: tuple(WINDOW_Q_WORKERS)}
     if args.adaptive_pw:
@@ -129,9 +133,11 @@ def plan(args, kvaf):
                            measurement_kind=measurement, mode=mode, requested_windows=requested, effective_windows=effective,
                            hot_score_parts=2, hot_score_aic=2 * physical, hot_score_aiv=4 * physical,
                            service_aics=service_aics, cold_score_parts=parts, cold_score_groups=physical * parts,
-                           service_owner_groups=2 * physical, service_group_slots=service_aics * effective,
+                           service_owner_groups=(service_aics * effective if args.window_q1_matrix else 2 * physical),
+                           service_group_slots=service_aics * effective,
                            max_requests_per_service_aiv=(physical + 2 * service_aics - 1) // (2 * service_aics),
-                           window_probe=args.window_probe, bs2_window_q=args.bs2_window_q,
+                           window_probe=args.window_probe,
+                           window_q=(args.bs2_window_q or args.window_q1_matrix) and mode in WINDOW_Q_WORKERS,
                            arguments=arguments, kernels=CHECKED_KERNELS[f'small_{mode}'])
 
 
@@ -201,10 +207,10 @@ def trace_arm(output, case, config, profiler):
         if case.get('window_probe'):
             counts, row['window_scopes'] = window_probe_scopes(capture['source'], case)
             row.update({f'{name}_scopes': count for name, count in counts.items()})
-        if case.get('bs2_window_q'):
+        if case['window_q']:
             from window_q_trace import analyze_window_q
 
-            metrics, scopes = analyze_window_q(capture['source'], WINDOW_Q_WORKERS[case['mode']])
+            metrics, scopes = analyze_window_q(capture['source'], WINDOW_Q_WORKERS[case['mode']], case['physical_batch'])
             row.update(metrics)
             save(case_output / 'window_q_report.json', dict(metrics=metrics, scopes=scopes, requests=report['requests']))
         return row
@@ -352,12 +358,16 @@ def main():
                        help='capture BS2 msprof pairs: P2/P4 at W2, W4/W2 at P4, or both')
     route.add_argument('--bs2-window-q', action='store_true',
                        help='compare W1 serial Q4, Q2+Q2 and four Q1 at BS2 P4/W2, miss 10%')
+    route.add_argument('--window-q1-matrix', action='store_true',
+                       help='compare main P2, P4/W2 serial Q4 and four Q1 at BS1/2/4/8')
     route.add_argument('--adaptive-pw', action='store_true',
                        help='compare native P2, fixed best P/W and adaptive P/W with retired AIV Service')
     route.add_argument('--window-probe', choices=WINDOW_PROBES,
                        help='compare fixed-geometry bulk cursor or early Top2048 header read')
     parser.add_argument('--repeats', type=int, default=1, help='repeat the matrix with the same bridge and independent workers')
     parser.add_argument('--trace', action='store_true', help='capture one checked msprof replay per arm')
+    parser.add_argument('--main-root', type=Path,
+                        help='separate, unmodified main checkout for --window-q1-matrix performance')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--warmup', type=int)
     parser.add_argument('--iterations', type=int, default=5)
@@ -365,8 +375,8 @@ def main():
     args = parser.parse_args()
     if args.bs2_trace_pair:
         args.trace = True
-    if args.bs2_window_q and any(miss != 10 for miss in args.miss_percent or ()):
-        parser.error('--bs2-window-q uses the BS2 miss 10% fixture')
+    if (args.bs2_window_q or args.window_q1_matrix) and any(miss != 10 for miss in args.miss_percent or ()):
+        parser.error('The W1 query trials use the miss 10% fixture')
     study = study_arms(args)
     if study:
         if args.group_bs32 or any(batch not in study for batch in args.batch or ()):
@@ -402,7 +412,8 @@ def main():
                     full32=args.full32, window_sweep=args.window_sweep, balanced=args.balanced,
                     cold_window_matrix=args.cold_window_matrix,
                     bs2_trace_pair=args.bs2_trace_pair,
-                    bs2_window_q=args.bs2_window_q,
+                    bs2_window_q=args.bs2_window_q, window_q1_matrix=args.window_q1_matrix,
+                    main_root=str(args.main_root.resolve()) if args.main_root else None,
                     adaptive_pw=args.adaptive_pw, window_probe=args.window_probe,
                     granularity_study=args.granularity_study, repeats=args.repeats,
                     scopes=dict(queries=4, history=131072, resident=16384,
@@ -415,6 +426,14 @@ def main():
         return 0
     if not cases:
         parser.error('No runnable scenario selected; BS32 requires --group-bs32')
+    if args.window_q1_matrix and not args.trace:
+        if args.main_root is None:
+            parser.error('--window-q1-matrix performance requires --main-root')
+        args.main_root = args.main_root.resolve()
+        if (git(args.main_root, 'rev-parse', 'HEAD') != MAIN
+                or git(args.main_root, 'status', '--porcelain', '--untracked-files=no')):
+            parser.error(f'--main-root must be a clean main checkout at {MAIN}')
+        from window_q_main import measure_main
     if git(kvaf, 'rev-parse', 'HEAD') != KVAF:
         raise ValueError(f'Use the pinned KVAF checkout at {KVAF}')
     profiler = shutil.which(os.environ.get('KVIP_MSPROF', 'msprof')) if args.trace else None
@@ -441,7 +460,12 @@ def main():
             print(f"Round {repeat}/{args.repeats}, BS{case['batch']} miss{miss:g} "
                   f"{case['mode']} P{case['cold_score_parts']}/W{case['effective_windows']} "
                   f"({case['cold_score_groups']} Cold MIX groups)", flush=True)
-            row = trace_arm(run_dir, case, config, profiler) if args.trace else perf_arm(run_dir, case, config)
+            if args.window_q1_matrix and case['mode'] == 'p2':
+                row = measure_main(args.main_root, run_dir, case, MAIN)
+            else:
+                row = trace_arm(run_dir, case, config, profiler) if args.trace else perf_arm(run_dir, case, config)
+                if args.window_q1_matrix:
+                    row['source_commit'] = manifest['commit']
             row.update(repeat=repeat, miss_percent=miss, physical_batch=case['physical_batch'],
                        waves=case['waves'],
                        hot_score_parts=case['hot_score_parts'], hot_score_aic=case['hot_score_aic'],
@@ -476,7 +500,19 @@ def main():
                         compare_arms(before, row, trace=False)
                 summarize(output, rows)
                 continue
-            if args.bs2_window_q:
+            if args.window_q1_matrix and not args.trace:
+                if row['variant'] == 'p2':
+                    bases[pair] = row
+                    summarize(output, rows)
+                    continue
+                main = bases[pair]
+                if main['fixture_sha256'] != row['fixture_sha256']:
+                    raise ValueError(f'BS{row["batch"]}: fixture differs from main')
+                compare_request_counts(main, row, prefix='vs_main_')
+                row['vs_main_raw_kv_ready_delta_us'] = row['kv_ready_us'] - main['kv_ready_us']
+                print(f'  KV ready / main: {row["vs_main_raw_kv_ready_ratio"]:.4f}x, '
+                      f'Get {row["vs_main_get_count_comparison"]}', flush=True)
+            if args.bs2_window_q or args.window_q1_matrix:
                 row['w1_topk_workers_per_request'] = WINDOW_Q_WORKERS[row['variant']]
                 if row['variant'] == 'cold_w2':
                     focused_baselines[pair] = row

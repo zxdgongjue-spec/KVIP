@@ -729,7 +729,7 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half,uint32_t lane)
     const auto option = p8Row || earlyShape ? kvip_window_probe::Option(streamingWorkspace_) : 0;
     auto topkReady = earlyShape ? kvip_window_probe::Ready(option) : nullptr;
     bool headerIssued = false;
-    const bool parallelQ = epoch == 1 && windowQTrial_.scratch;
+    const bool parallelQ = epoch == 1 && lane < runtimeShape_.batch && windowQTrial_.scratch;
 #endif
     // The predecessor wait is part of the optional window service and can
     // delay the producer. Capture it separately from incremental computation.

@@ -8,10 +8,13 @@ import numpy as np
 
 ADAPTIVE_ROUTES = {1: 'cold_p8', 2: 'cold_w2', 8: 'cold_full_w2'}
 WINDOW_Q_WORKERS = {'cold_w2': 1, 'cold_w2_q2': 2, 'cold_w2_q1': 4}
+WINDOW_Q_BATCHES = (1, 2, 4, 8)
 SUPPORTED_BATCHES = {
     'p2': (1, 2, 4, 8, 16),
     'cold': (1, 2, 4, 8),
-    **dict.fromkeys(WINDOW_Q_WORKERS, (2,)),
+    'cold_w2': WINDOW_Q_BATCHES,
+    'cold_w2_q2': (2,),
+    'cold_w2_q1': WINDOW_Q_BATCHES,
     'cold_p8': (1,),
     'cold_p8_bulk': (1,),
     'cold_full': (1, 2, 8),
@@ -42,7 +45,7 @@ GET_BALANCE_FLAG = 2
 WINDOW_PROBE_OPTION_OFFSET = 224
 WINDOW_READY_LINE_BYTES = 128
 WINDOW_Q_OPTION_OFFSET = 232
-WINDOW_Q_SCRATCH_BYTES = 1280
+WINDOW_Q_BYTES_PER_REQUEST = 5 * WINDOW_READY_LINE_BYTES
 
 
 def selected_mode(mode, batch):
@@ -125,7 +128,7 @@ def bind(state, mode):
     q_workers = WINDOW_Q_WORKERS.get(mode, 1)
     if q_workers > 1:
         forward.window_q_scratch = state.torch.zeros(
-            WINDOW_Q_SCRATCH_BYTES, dtype=state.torch.uint8, device=state.device)
+            shape.batch * WINDOW_Q_BYTES_PER_REQUEST, dtype=state.torch.uint8, device=state.device)
         address = forward.window_q_scratch.data_ptr()
         if not address or address % WINDOW_READY_LINE_BYTES:
             raise ValueError('The split-Q window requires aligned GM state')

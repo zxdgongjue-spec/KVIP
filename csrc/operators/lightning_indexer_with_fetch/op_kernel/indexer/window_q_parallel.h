@@ -4,10 +4,8 @@
 namespace kvip_window_q {
 constexpr uint32_t kOptionOffset = 232;
 constexpr uint32_t kLineBytes = 128;
-constexpr uint32_t kRequests = 2;
 constexpr uint32_t kQueries = 4;
 constexpr uint32_t kLinesPerRequest = 5;
-constexpr uint32_t kScratchBytes = kRequests * kLinesPerRequest * kLineBytes;
 
 struct Snapshot {
     uint64_t frontier[kQueries];
@@ -30,10 +28,12 @@ struct Trial {
 
 __aicore__ inline Trial LoadTrial(GM_ADDR workspace, const rotating::RuntimeShape& shape, uint32_t parts)
 {
-    if (!workspace || parts != 4 || shape.batch != kRequests || shape.rounds != 2 ||
+    const uint32_t batch = shape.batch;
+    if (!workspace || parts != 4 || (batch != 1 && batch != 2 && batch != 4 && batch != 8) ||
+        shape.rounds != 2 ||
         shape.history != 131072 || shape.resident != 16384 || shape.indexHeads != 32 ||
-        shape.aicCount != 32 || shape.splitQ != 1 || shape.liCores != 4 ||
-        shape.serviceAics != 1 || shape.serviceLanes != kRequests) {
+        shape.aicCount != 32 || shape.splitQ != 1 || shape.liCores != 2 * batch ||
+        shape.serviceAics != (batch + 1) / 2 || shape.serviceLanes != 2 * shape.serviceAics) {
         return {};
     }
     const uint64_t option = *reinterpret_cast<__gm__ const uint64_t*>(workspace + kOptionOffset);
@@ -41,6 +41,25 @@ __aicore__ inline Trial LoadTrial(GM_ADDR workspace, const rotating::RuntimeShap
     const uint64_t address = option - workers;
     if (!address || (workers != 2 && workers != 4)) return {};
     return {reinterpret_cast<GM_ADDR>(address), workers};
+}
+
+struct Helper {
+    uint32_t row;
+    uint32_t worker;
+};
+
+__aicore__ inline Helper ScoreHelper(uint32_t batch, uint32_t aiv)
+{
+    if (batch == 1) {
+        // G0 serves W0 and G2 serves W1. Reuse both peers of G1 and one of G3.
+        return {0, aiv == 2 ? 1U : aiv == 3 ? 2U : aiv == 6 ? 3U : 0U};
+    }
+    // W0 owns G0, G4, ... in the first half of the Score grid. W1 has
+    // its owners in the second half. All other first-half groups have no
+    // Service work in W2 and can contribute one helper to each paired row.
+    const uint32_t group = aiv / 2;
+    const uint32_t rowPair = group / 4;
+    return {2 * rowPair + aiv % 2, rowPair < batch / 2 ? group % 4 : 0};
 }
 
 __aicore__ inline GM_ADDR Line(GM_ADDR scratch, uint32_t row, uint32_t line)
@@ -73,10 +92,10 @@ __aicore__ inline void Publish(GM_ADDR scratch, uint32_t row, uint32_t worker, u
     kvaf_device::CleanCacheLines(Line(scratch, row, worker + 1), kLineBytes);
 }
 
-__aicore__ inline void Reset(Trial trial, uint32_t lane)
+__aicore__ inline void Reset(Trial trial, uint32_t batch, uint32_t lane)
 {
-    // The partitioned threshold launch has eight AIVs, one per signal.
-    if (lane < kRequests * kQueries) {
+    // The partitioned threshold launch has four AIVs per request.
+    if (lane < batch * kQueries) {
         Publish(trial.scratch, lane / kQueries, lane % kQueries, 0);
     }
 }

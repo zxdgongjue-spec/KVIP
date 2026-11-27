@@ -912,3 +912,56 @@ and can overlap. The tagged msprof trace retains the original vendor
 clock. Use `vs_serial_q4_*` in the summary for paired deltas. Changes in
 worker timing can change the observed ready frontier and the split
 between prefetch and final Get, so inspect the Get evidence with timing.
+
+### W1 Q1 A5 matrix
+
+`--window-q1-matrix` runs BS1/2/4/8 at Q4, history 128K, resident 16K
+and miss 10%. Each performance comparison includes the unmodified main
+P2 from `df8ad2598e70e4b5e266b15028ab26c601a2bdf2`, P4/W2 serial Q4 and
+P4/W2 four-way Q1. Main uses effective W2 for BS1 and W4 for BS2/4/8.
+The two P4/W2 arms use 4/8/16/32 Cold MIX groups and the same Hot P2.
+All arms preserve the 512/request and 128/window prefetch limits.
+
+On the host, fetch and check out the MR branch and prepare a separate
+main checkout in the existing shared directory.
+
+```bash
+base=/home/w00568585/vLLM-DSA
+repo="$base/third_party/KVIP-mr32"
+main="$base/third_party/KVIP-main-df8ad259"
+git -C "$repo" fetch origin refs/heads/codex/lifetch-bs2-window-q-a5
+git -C "$repo" switch --detach FETCH_HEAD
+git -C "$repo" fetch origin main
+if [[ ! -e "$main" ]]; then
+    git -C "$repo" worktree add --detach "$main" df8ad2598e70e4b5e266b15028ab26c601a2bdf2
+fi
+```
+
+In the A5 container, use the existing offline KVAF and LIDU environment.
+If needed, run the existing host `--prepare-deps` and container
+`--build-deps` steps before benchmarking.
+
+```bash
+base=/home/w00568585/vLLM-DSA
+export KVIP_A5_DEVICE=0
+export KVIP_KVAF_ROOT="$base/third_party/KVAF-unified-813f1750"
+export KVIP_AB_OUTPUT="$base/results/lifetch-window-q1-matrix"
+runner="$base/third_party/KVIP-mr32/experiments/lifetch_mr23_service/run_full32_a5.sh"
+bash "$runner" --window-q1-matrix --main-root "$base/third_party/KVIP-main-df8ad259" --warmup 2 --iterations 5
+bash "$runner" --window-q1-matrix --trace
+```
+
+Pass `--batch 1`, `--batch 2`, `--batch 4` or `--batch 8` to select
+one batch, or repeat the option to select several. Performance
+`summary.csv` records Graph Event KV ready, phase durations and Get
+counts, with `vs_main_*` and `vs_serial_q4_*` comparisons. The main
+and experimental workers build in separate checkouts and are matched
+on the fixture hash and per-call request evidence. A comparison with
+different Get counts is recorded as observed timing with its workload
+difference.
+
+The separate trace run captures the two P4/W2 arms. Each
+`window_q_report.json` includes the Score tail, Top2048, owner join,
+candidate MTE2, dedup VF issue and WQE submission. Use the corresponding
+`lifetch_msprof_trace.json` to inspect vector execution alongside the
+source issue scope.

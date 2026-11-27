@@ -92,11 +92,9 @@ public:
     }
 
     __aicore__ inline void RunWindowQHelper(uint32_t half) {
-        // G1, G2, G3 supply a vector peer to each request. G4 retains
-        // both W1 owners and G0 remains dedicated to the original W0.
-        const uint32_t worker = blockId_ / 2;
-        if (!windowQTrial_.scratch || worker == 0 || worker >= windowQTrial_.workers) return;
-        const uint32_t row = blockId_ % 2;
+        if (!windowQTrial_.scratch) return;
+        const auto [row, worker] = kvip_window_q::ScoreHelper(runtimeShape_.batch, blockId_);
+        if (worker == 0 || worker >= windowQTrial_.workers) return;
         DrainColdPublication();
         kvip_window_q::Wait(windowQTrial_.scratch, row, 0);
         RunParallelWindowQueries(row, worker, half);

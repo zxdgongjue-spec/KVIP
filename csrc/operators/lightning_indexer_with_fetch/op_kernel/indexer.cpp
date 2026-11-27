@@ -263,7 +263,7 @@ extern "C" __global__ __aicore__ void v9_li_kernel_threshold_cold_partitioned(GM
         const auto args = reinterpret_cast<__gm__ const uint64_t*>(bindings);
         const auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(args[14]));
         const auto trial = kvip_window_q::LoadTrial(reinterpret_cast<GM_ADDR>(args[15]), shape, parts);
-        if (trial.scratch) kvip_window_q::Reset(trial, AscendC::GetBlockIdx());
+        if (trial.scratch) kvip_window_q::Reset(trial, shape.batch, AscendC::GetBlockIdx());
 #endif
         ResetPartitionedColdProgress(bindings, parts);
         RunLi<SequenceLiPhase::Threshold>(bindings);
