@@ -48,4 +48,14 @@ bash "$dir/large_batch_npu4.sh" "${args[@]}" | tee -a "$log"
 new=$(sed -n 's/^REPLAY_COMPLETE cells=20 RESULT_ROOT=//p' "$log")
 [[ -n $new && -s $new/packed_summary.json ]] || { echo "Incomplete candidate result; see $log" >&2; exit 1; }
 "$py" -B "$dir/support/report_large_li_phases.py" "$new" --rank-revision "$revision" --json "$new/li_phase_comparison.json" | tee -a "$log"
+"$py" -B - "$new/li_phase_comparison.json" <<'PYREPORT'
+import json
+import sys
+from pathlib import Path
+
+rows = json.loads(Path(sys.argv[1]).read_text())
+expected = {(group, batch) for group in (7, 2, 10, 4, 17) for batch in (32, 28, 24, 20)}
+if len(rows) != len(expected) or {(r["group"], r["batch"]) for r in rows} != expected:
+    raise SystemExit("Incomplete twenty-cell LI report: " + sys.argv[1])
+PYREPORT
 printf 'PHASE_REPORT=%s\n' "$new/li_phase_comparison.json"
