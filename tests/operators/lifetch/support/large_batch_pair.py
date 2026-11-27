@@ -17,7 +17,7 @@ import sys
 
 import numpy as np
 
-from large_batch_input import FIXED_BATCHES, GROUPS, input_digest, load
+from large_batch_input import FIXED_BATCHES, GROUPS, SYNTHETIC_GROUP, input_digest, load, load_synthetic
 from large_batch_reference import compute_reference, reference_identity, stage_serial
 from reporting import atomic_json
 from workloads import ReplayPagePlan, configuration
@@ -680,7 +680,11 @@ def run(args):
         sdk_kernel_sha = hashlib.file_digest(stream, "sha256").hexdigest()
     if args.arm == "fused" and args.serial_result is None:
         raise ValueError("The fused arm requires the matching strong serial result")
-    sequence, donors = load(args.trace.resolve(), args.group, args.round, args.batch, args.cohort, args.prepared)
+    synthetic = args.synthetic_fixture is not None
+    if synthetic:
+        sequence, donors = load_synthetic(args.synthetic_fixture.resolve(), args.batch)
+    else:
+        sequence, donors = load(args.trace.resolve(), args.group, args.round, args.batch, args.cohort, args.prepared)
     inputs = sequence.inputs
     pages = ReplayPagePlan(sequence)
     fingerprint = input_digest(inputs, pages, donors)
@@ -708,8 +712,11 @@ def run(args):
         donor_rows=donors,
         protocol="one_restored_graph_per_device_event_with_profiler",
     )
+    if synthetic:
+        identity["input_kind"] = "synthetic"
+    label = "synthetic" if synthetic else f"G{args.group}"
     print(
-        f"INPUT G{args.group} BS{args.batch} sha256={fingerprint} donor_rows={donors} pages={pages.page_count} "
+        f"INPUT {label} BS{args.batch} sha256={fingerprint} donor_rows={donors} pages={pages.page_count} "
         f"Q_ends_min/max={inputs.query_ends.min()}/{inputs.query_ends.max()}",
         flush=True,
     )
@@ -755,14 +762,10 @@ def run(args):
             "bench" if args.packed_ten else "diagnose",
             "--transport",
             "urma",
-            "--input",
-            "real",
-            "--trace-root",
-            str(args.trace),
-            "--group",
-            str(args.group),
-            "--round-range",
-            "1:1",
+            *(["--input", "synthetic"] if synthetic else [
+                "--input", "real", "--trace-root", str(args.trace),
+                "--group", str(args.group), "--round-range", "1:1",
+            ]),
             "--device",
             str(device),
             "--kvaf-root",
@@ -791,7 +794,10 @@ def run(args):
         benchmark = partial(measure_packed, ex, proofs, serial)
     else:
         benchmark = partial(measured_replays, ex, proofs, serial)
-    result = ex.run_path(cfg, args.output / "path", sequence, pages, fused=fused, measure=benchmark)
+    result = ex.run_path(
+        cfg, args.output / "path", sequence, pages, fused=fused, measure=benchmark,
+        preserve_initial_lru=synthetic,
+    )
     workers = (32 if args.batch > 16 else 40) if fused else 2
     if result["correctness"] != "PASS" or result["failures"] or result["runtime_workers"] != workers:
         raise ValueError(f"{args.arm}: production replay failed or used incorrect worker count")
@@ -860,7 +866,7 @@ def run(args):
             and not scratch_existed
         ):
             shutil.rmtree(scratch)
-    tag = f"G{args.group} BS{args.batch} {args.arm}"
+    tag = f"{label} BS{args.batch} {args.arm}"
     print(
         f"CHECK {tag} TopK_score=PASS queries={checked}/{checked} Index_slots=PASS "
         f"rows={CALLS * args.batch}/{CALLS * args.batch} full_KV_Index=PASS full_KV_rows={args.batch}/{args.batch}"
@@ -938,12 +944,14 @@ def run(args):
             )
 
 
-if __name__ == "__main__":
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arm", choices=("serial", "fused"), required=True)
     parser.add_argument("--packed-ten", action="store_true", help="Capture and time ten independent states in one graph")
-    parser.add_argument("--trace", type=Path, required=True)
-    parser.add_argument("--group", type=int, choices=GROUPS, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--trace", type=Path)
+    source.add_argument("--synthetic-fixture", type=Path, help="Prepared compact synthetic Q4 fixture directory")
+    parser.add_argument("--group", type=int, choices=(*GROUPS, SYNTHETIC_GROUP), required=True)
     parser.add_argument("--round", type=int, default=1)
     parser.add_argument("--batch", type=int, choices=FIXED_BATCHES, required=True)
     parser.add_argument("--cohort", type=int, default=0)
@@ -959,4 +967,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--keep-trace", action="store_true", help="Keep the raw profiler timeline after successful attribution"
     )
-    run(parser.parse_args())
+    args = parser.parse_args(argv)
+    if args.synthetic_fixture is not None:
+        if args.group != SYNTHETIC_GROUP or args.round != 1 or args.cohort != 0:
+            parser.error("Synthetic input requires group 0, round 1 and cohort 0")
+        if args.prepared is not None or args.reuse_serial_archive or args.compare_archived_pair:
+            parser.error("Synthetic input requires its own fixture and live serial oracle")
+    elif args.group == SYNTHETIC_GROUP:
+        parser.error("Group 0 is reserved for synthetic input")
+    return args
+
+
+if __name__ == "__main__":
+    run(parse_args())

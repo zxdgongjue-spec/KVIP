@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Run one real G2 cohort at every fixed-Q4 batch size on a prepared A5 container."""
+"""Run one captured or synthetic cohort at every fixed-Q4 batch size on A5."""
 
 import argparse
 from contextlib import ExitStack
@@ -16,23 +16,26 @@ import time
 
 from fixed_q4_packed_archive import NATIVE, same_production
 from fixed_q4_packed_report import STAGES, read_pair, report_cell
-from large_batch_input import FIXED_BATCHES, read_source, save_source
+from large_batch_input import FIXED_BATCHES, SYNTHETIC_GROUP, read_source, save_source
 from large_batch_pair import CALLS, WARMUP
 from large_batch_placement import placement
 from reporting import atomic_json
+from workloads import prepare_compact_fixture
 
 SUPPORT = Path(__file__).resolve().parent
 REPO = SUPPORT.parents[3]
 KVAF_REVISION = "813f1750a50b7e6c92d5f5397f2fbc05befef6da"
 GROUP, COHORT = 2, 0
 BLOCKS = (("serial", "fused"), ("fused", "serial"))
+SYNTHETIC_FIXTURE = dict(history=131072, resident=16384, miss_percent=10, index_heads=32, seed=43)
 
 
-def plan():
-    return dict(
+def plan(synthetic=False):
+    data = dict(
         protocol="ten_independent_calls_one_device_event",
         production_revision=NATIVE,
-        group=GROUP,
+        input_kind="synthetic" if synthetic else "real",
+        group=SYNTHETIC_GROUP if synthetic else GROUP,
         cohort=COHORT,
         batch_sizes=FIXED_BATCHES,
         blocks=BLOCKS,
@@ -42,6 +45,9 @@ def plan():
         graph_warmups=WARMUP,
         prefetch=dict(tokens=1024, windows_requested=4, rank_start=1024),
     )
+    if synthetic:
+        data["synthetic_fixture_config"] = SYNTHETIC_FIXTURE
+    return data
 
 
 def cpu_affinity(requested):
@@ -89,7 +95,7 @@ def wait_for_service(process, log, port):
     raise RuntimeError(f"KVAF CPU service did not listen on port {port}; see {log}")
 
 
-def run_arm(args, directory, batch, arm, prepared, node, cpus, *, oracle=None, adapter=None):
+def run_arm(args, directory, batch, arm, source_options, group, node, cpus, *, oracle=None, adapter=None):
     directory.mkdir(parents=True)
     port = free_tcp_port()
     cpu_log = directory / "cpu.log"
@@ -102,8 +108,8 @@ def run_arm(args, directory, batch, arm, prepared, node, cpus, *, oracle=None, a
         command += ["--ub-device", adapter]
     worker = [
         sys.executable, "-B", str(SUPPORT / "large_batch_pair.py"),
-        "--trace", str(args.trace), "--group", str(GROUP), "--round", "1",
-        "--batch", str(batch), "--cohort", str(COHORT), "--prepared", str(prepared),
+        *source_options, "--group", str(group), "--round", "1",
+        "--batch", str(batch), "--cohort", str(COHORT),
         "--arm", arm, "--device", str(args.device), "--physical-npu", str(args.physical_npu),
         "--kvaf-root", str(args.kvaf_root), "--kvaf-server", f"127.0.0.1:{port}",
         "--output", str(directory),
@@ -113,7 +119,8 @@ def run_arm(args, directory, batch, arm, prepared, node, cpus, *, oracle=None, a
     if args.keep_trace:
         worker += ["--keep-trace"]
 
-    print(f"CASE_BEGIN G{GROUP} BS{batch} cohort={COHORT} arm={arm} output={directory}", flush=True)
+    label = "synthetic" if group == SYNTHETIC_GROUP else f"G{group}"
+    print(f"CASE_BEGIN {label} BS{batch} cohort={COHORT} arm={arm} output={directory}", flush=True)
     with ExitStack() as stack:
         def launch(command, log):
             output = stack.enter_context(log.open("w"))
@@ -134,9 +141,9 @@ def run_arm(args, directory, batch, arm, prepared, node, cpus, *, oracle=None, a
         worker_log = directory / "worker.log"
         job = launch(worker, worker_log)
         if job.wait(timeout=args.timeout_seconds):
-            raise RuntimeError(f"G{GROUP} BS{batch} {arm} worker failed; see {worker_log}")
+            raise RuntimeError(f"{label} BS{batch} {arm} worker failed; see {worker_log}")
         if monitor.wait(timeout=10):
-            raise RuntimeError(f"G{GROUP} BS{batch} {arm} placement probe failed; see {monitor_log}")
+            raise RuntimeError(f"{label} BS{batch} {arm} placement probe failed; see {monitor_log}")
         actual_node, actual_adapter = placement(thp)
         if actual_node != node or (adapter and actual_adapter != adapter):
             raise ValueError(f"Requested NUMA/UB {node}/{adapter}, measured {actual_node}/{actual_adapter}: {thp}")
@@ -144,9 +151,9 @@ def run_arm(args, directory, batch, arm, prepared, node, cpus, *, oracle=None, a
     return actual_adapter
 
 
-def summarize_cell(out, cell, batch):
+def summarize_cell(out, cell, batch, group=GROUP):
     observations = [
-        dict(order=order, mean_us=read_pair(cell / f"block{index}", GROUP, batch, COHORT, out))
+        dict(order=order, mean_us=read_pair(cell / f"block{index}", group, batch, COHORT, out))
         for index, order in enumerate(BLOCKS, 1)
     ]
     times = {
@@ -154,7 +161,8 @@ def summarize_cell(out, cell, batch):
         for arm in BLOCKS[0]
     }
     saved = {stage: times["serial"][stage] - times["fused"][stage] for stage in STAGES}
-    return dict(group=GROUP, batch=batch, cohort=COHORT, cohorts=1, blocks=len(BLOCKS),
+    return dict(input_kind="synthetic" if group == SYNTHETIC_GROUP else "real",
+                group=group, batch=batch, cohort=COHORT, cohorts=1, blocks=len(BLOCKS),
                 calls_per_graph=CALLS, mean_us=times, saved_us=saved,
                 graph_gain_pct=100 * saved["graph"] / times["serial"]["graph"],
                 reached_20pct=times["fused"]["graph"] <= 0.8 * times["serial"]["graph"],
@@ -167,7 +175,7 @@ def write_summary(out, rows, metadata):
         "completed_graphs": len(rows) * sum(map(len, BLOCKS)), "cells": rows,
     })
     fields = [
-        "group", "batch", "cohort", *[
+        "input_kind", "group", "batch", "cohort", *[
             f"{arm}_{stage}_us" for arm in BLOCKS[0] for stage in STAGES
         ], "graph_gain_pct",
     ]
@@ -175,7 +183,7 @@ def write_summary(out, rows, metadata):
         writer = csv.DictWriter(file, fieldnames=fields)
         writer.writeheader()
         for row in rows:
-            values = {key: row[key] for key in ("group", "batch", "cohort", "graph_gain_pct")}
+            values = {key: row[key] for key in ("input_kind", "group", "batch", "cohort", "graph_gain_pct")}
             for arm in BLOCKS[0]:
                 for stage in STAGES:
                     values[f"{arm}_{stage}_us"] = row["mean_us"][arm][stage]
@@ -197,8 +205,6 @@ def run(args):
     args.taskset = shutil.which("taskset")
     if not os.access(args.cpu_service, os.X_OK) or not args.taskset:
         raise ValueError(f"Required CPU-service executable and taskset are unavailable: {args.cpu_service}")
-    args.trace = args.trace.resolve(strict=True)
-    source, refs = read_source(args.trace, GROUP, 1)
     node, cpus = cpu_affinity(args.cpu_numa)
 
     out = args.output.resolve()
@@ -208,18 +214,32 @@ def run(args):
     (out / "native.txt").write_text(revision + "\n")
     (out / "physical_npu.txt").write_text(f"{args.physical_npu}\n")
     (out / "host.txt").write_text(os.uname().nodename + "\n")
-    prepared = out / f"g{GROUP}" / "donors"
-    prepared.parent.mkdir()
-    save_source(prepared, args.trace, GROUP, 1, source, refs)
     print(f"RESULT_ROOT={out}", flush=True)
 
-    metadata = {**plan(), "test_revision": revision, "kvaf_revision": kvaf_revision,
-                "physical_npu": args.physical_npu, "device": args.device, "trace": str(args.trace), "cpu_numa": node}
-    cells = {batch: out / f"g{GROUP}/bs{batch}/cohort{COHORT}" for batch in FIXED_BATCHES}
+    metadata = {**plan(args.synthetic), "test_revision": revision, "kvaf_revision": kvaf_revision,
+                "physical_npu": args.physical_npu, "device": args.device, "cpu_numa": node}
+    group = metadata["group"]
+    if args.synthetic:
+        fixture = out / "fixture"
+        print(f"PREPARE_SYNTHETIC_FIXTURE={fixture}", flush=True)
+        metadata["synthetic_fixture"] = prepare_compact_fixture(fixture, **SYNTHETIC_FIXTURE)
+        metadata["fixture"] = str(fixture)
+        source_options = ["--synthetic-fixture", str(fixture)]
+        group_root = out / "synthetic"
+    else:
+        trace = args.trace.resolve(strict=True)
+        group_root = out / f"g{group}"
+        source, refs = read_source(trace, group, 1)
+        prepared = group_root / "donors"
+        prepared.parent.mkdir()
+        save_source(prepared, trace, group, 1, source, refs)
+        metadata["trace"] = str(trace)
+        source_options = ["--trace", str(trace), "--prepared", str(prepared)]
+    cells = {batch: group_root / f"bs{batch}/cohort{COHORT}" for batch in FIXED_BATCHES}
     adapter = args.cpu_ub_device
     for batch, cell in cells.items():
         oracle = cell / "oracle" / "serial"
-        adapter = run_arm(args, oracle, batch, "serial", prepared, node, cpus, adapter=adapter)
+        adapter = run_arm(args, oracle, batch, "serial", source_options, group, node, cpus, adapter=adapter)
     metadata["cpu_ub_device"] = adapter
 
     rows = []
@@ -227,9 +247,9 @@ def run(args):
         oracle = cell / "oracle" / "serial"
         for index, order in enumerate(BLOCKS, 1):
             for arm in order:
-                run_arm(args, cell / f"block{index}" / arm, batch, arm, prepared, node, cpus,
+                run_arm(args, cell / f"block{index}" / arm, batch, arm, source_options, group, node, cpus,
                         oracle=oracle, adapter=adapter)
-        row = summarize_cell(out, cell, batch)
+        row = summarize_cell(out, cell, batch, group)
         rows.append(row)
         report_cell(row)
         write_summary(out, rows, metadata)
@@ -238,7 +258,9 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--trace", type=Path, help="real Q4 capture containing G2, round 1")
+    inputs = parser.add_mutually_exclusive_group()
+    inputs.add_argument("--trace", type=Path, help="real Q4 capture containing G2, round 1")
+    inputs.add_argument("--synthetic", action="store_true", help="generate deterministic Q4 input without a replay directory")
     parser.add_argument("--device", type=int, help="ACL user ordinal corresponding to the selected physical card")
     parser.add_argument("--physical-npu", type=int, default=2)
     parser.add_argument("--kvaf-root", type=Path)
@@ -250,9 +272,11 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.dry_run:
-        print(json.dumps(plan(), indent=2))
+        print(json.dumps(plan(args.synthetic), indent=2))
         return
-    for name in ("trace", "device", "kvaf_root", "output"):
+    if args.trace is None and not args.synthetic:
+        parser.error("--trace or --synthetic is required for live measurement")
+    for name in ("device", "kvaf_root", "output"):
         if getattr(args, name) is None:
             parser.error(f"--{name.replace('_', '-')} is required for live measurement")
     if args.device < 0 or args.physical_npu < 0 or args.timeout_seconds <= 0:

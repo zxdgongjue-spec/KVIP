@@ -2,6 +2,7 @@
 """CPU regressions for the large-batch input identity and profiler accounting."""
 
 import ctypes
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,10 +14,10 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "support"))
-from large_batch_input import BATCHES, FrozenRound, expand, input_digest, load, save_source
+from large_batch_input import BATCHES, FrozenRound, expand, input_digest, load, load_synthetic, save_source
 from fixed_bs16_report import BATCHES as FIXED_BATCHES, PUBLISHED_EVENT_PER_CALL, combined_pass
-from large_batch_pair import check_scores, large_account, last_row_windows, li_intervals, selected_device, stage_sample, tail_team_intervals, verify_abc, verify_assignments, verify_physical_device
-from workloads import ReplayPagePlan, ReplayRound
+from large_batch_pair import check_scores, large_account, last_row_windows, li_intervals, parse_args, selected_device, stage_sample, tail_team_intervals, verify_abc, verify_assignments, verify_physical_device
+from workloads import ReplayPagePlan, ReplayRound, score_values
 
 
 def fixture():
@@ -174,6 +175,65 @@ class LargeBatchReplay(unittest.TestCase):
                                  input_digest(stream.inputs, ReplayPagePlan(stream), donors))
             with self.assertRaises(ValueError):
                 load(trace, 2, 1, 8, 0, bank)
+
+    def test_synthetic_compact_scores_private_pages_and_frozen_lru(self):
+        history, resident, heads = 131072, 16384, 32
+        scores = np.full((4, history), -2.0, dtype=np.float32)
+        scores[:, 100:2148] = 1
+        scores[:, [2400, resident + 1]] = 1
+        order = np.roll(np.arange(history, dtype=np.int32), 91)
+        logical = np.empty_like(scores)
+        logical[:, order] = scores
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "fixture.json").write_text(json.dumps(dict(
+                history=history, resident=resident, storage=history, queries=4, visible_lengths=[history] * 4,
+                full_chain_fixture=dict(model="compact_builtin_v1", index_heads=heads),
+            )))
+            np.save(root / "physical_to_logical.npy", order)
+            np.save(root / "logical_scores.npy", logical)
+            for index, values in enumerate((
+                np.zeros((4, heads, 128), dtype=np.uint8),
+                np.zeros((history, 128), dtype=np.uint8),
+                np.ones((4, heads), dtype=np.float32),
+                np.ones((4, heads), dtype=np.float32),
+                np.ones(history, dtype=np.float32),
+            )):
+                values.tofile(root / f"arg{index}.bin")
+
+            sequence, donors = load_synthetic(root, 2)
+            inputs = sequence.inputs
+            self.assertEqual(donors, [0, 8])
+            self.assertEqual(sequence.rounds[0][0].manifest_path, root / "fixture.json")
+            self.assertEqual(inputs.geometry["sparse_mode"], 0)
+            np.testing.assert_array_equal(inputs.query_ends, np.full((2, 4), history))
+            np.testing.assert_array_equal(score_values(inputs.logical_score_keys[0]), scores)
+            inputs.validate_topk(np.broadcast_to(np.arange(100, 2148), (2, 4, 2048)))
+            touched = np.flatnonzero(scores[0, :resident] == 1)
+            np.testing.assert_array_equal(inputs.captured_lru[0, -touched.size:], touched)
+            np.testing.assert_array_equal(inputs.captured_lru[0], inputs.captured_lru[1])
+            pages = ReplayPagePlan(sequence)
+            self.assertEqual(pages.page_count, 2 * history // 128)
+            for row in range(2):
+                page = pages.page_payload([pages.page_indices[row, 0]])
+                np.testing.assert_array_equal(pages.token_payload(row, [0]), page[:1])
+            self.assertFalse(np.array_equal(pages.token_payload(0, [0]), pages.token_payload(1, [0])))
+
+    def test_synthetic_worker_requires_its_own_group_and_oracle(self):
+        common = ["--arm", "serial", "--batch", "32", "--output", "out", "--kvaf-root", "kvaf"]
+        synthetic = ["--synthetic-fixture", "fixture"]
+        self.assertEqual(parse_args([*common, *synthetic, "--group", "0"]).batch, 32)
+        self.assertEqual(parse_args([*common, "--trace", "trace", "--group", "2"]).trace, Path("trace"))
+        for invalid in (
+            [*synthetic, "--group", "2"],
+            [*synthetic, "--group", "0", "--cohort", "1"],
+            [*synthetic, "--group", "0", "--prepared", "trace-bank"],
+            [*synthetic, "--group", "0", "--reuse-serial-archive", "trace-archive"],
+            [*synthetic, "--group", "0", "--trace", "trace"],
+            ["--trace", "trace", "--group", "0"],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args([*common, *invalid])
 
     def test_small_batch_kernel_accounting(self):
         marker = dict(name="sample", ph="X", ts=90, dur=60)

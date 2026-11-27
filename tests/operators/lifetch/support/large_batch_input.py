@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Expand a real BS16 Q4 trace, preserving each donor's scores and cache state."""
+"""Expand one frozen BS16 Q4 donor, preserving scores and cache state."""
 
 from dataclasses import fields
 import hashlib
@@ -8,12 +8,13 @@ from pathlib import Path
 
 import numpy as np
 
-from workloads import CaptureReference, ReplayRound, ReplaySequence
+from workloads import TOPK, TOKEN_BYTES, CaptureReference, ReplayRound, ReplaySequence
 
 
 BATCHES = (20, 24, 28, 32)
 FIXED_BATCHES = (1, 2, 4, 8, 16, *BATCHES)
 GROUPS = (10, 4, 17, 7, 2)
+SYNTHETIC_GROUP = 0
 
 
 class FrozenRound:
@@ -130,6 +131,78 @@ def load(trace, group, source_round, batch, cohort=0, prepared=None):
         source, refs = mapped_source(prepared, trace, group, source_round)
     inputs, donors = expand(source, batch, cohort)
     return FrozenRound(inputs, refs), donors
+
+
+def load_synthetic(fixture, batch):
+    """Use the compact synthetic QK operands with private DDR pages for every request."""
+    manifest = fixture / "fixture.json"
+    config = json.loads(manifest.read_text())
+    full_chain = config["full_chain_fixture"]
+    history, resident, heads = config["history"], config["resident"], full_chain["index_heads"]
+    if (
+        full_chain["model"] != "compact_builtin_v1"
+        or config["queries"] != 4
+        or config["storage"] != history
+        or config["visible_lengths"] != [history] * 4
+        or (history, resident, heads) != (131072, 16384, 32)
+    ):
+        raise ValueError("Synthetic packed input requires a compact H128K/R16K full-prefix Q4 fixture with 32 heads")
+
+    order = np.load(fixture / "physical_to_logical.npy", allow_pickle=False)
+    scores = np.load(fixture / "logical_scores.npy", allow_pickle=False)
+    if (
+        scores.shape != (4, history)
+        or scores.dtype != np.float32
+        or not np.isfinite(scores).all()
+        or order.dtype.kind not in "iu"
+        or not np.array_equal(np.sort(order), np.arange(history))
+    ):
+        raise ValueError("Invalid compact synthetic score oracle or token permutation")
+    # Treat the physical fixture positions as the logical IDs of this workload,
+    # as the existing single-call synthetic benchmark does.
+    bf16 = (scores[:, order].view(np.uint32) >> 16).astype(np.uint16)
+    scores = np.where(bf16 & 0x8000, ~bf16, bf16 ^ 0x8000)
+    keys = np.fromfile(fixture / "arg1.bin", np.uint8).reshape(history, 128)
+    scales = np.fromfile(fixture / "arg4.bin", np.float32).reshape(history)
+    query = np.fromfile(fixture / "arg0.bin", np.uint8).reshape(4, heads, 128)
+    weights = (np.fromfile(fixture / "arg2.bin", np.float32).view(np.uint32) >> 16).astype(np.uint16)
+    query_scale = np.fromfile(fixture / "arg3.bin", np.float32).reshape(4, heads)
+
+    # Begin in ascending slot order and promote the touched slots in slot
+    # order, matching SlotLRU. Protect all cutoff ties so the chosen victims
+    # do not depend on which tied TopK tokens a particular arm returns.
+    cutoffs = np.partition(scores, -TOPK, axis=1)[:, -TOPK, None]
+    touched = np.any(scores[:, :resident] >= cutoffs, axis=0)
+    oldest = np.concatenate((np.flatnonzero(~touched), np.flatnonzero(touched))).astype(np.int32)
+
+    def rows(array):
+        return np.broadcast_to(array, (16, *array.shape))
+
+    requests = tuple((f"synthetic-{row + 1}", row + 1) for row in range(16))
+    ref = CaptureReference(0, 1, 1, SYNTHETIC_GROUP, manifest, requests)
+    source = ReplayRound(
+        source_round=1, scheduler_round=1,
+        identities=tuple((ref.dp_rank, *request) for request in requests),
+        geometry=dict(batch=16, history=history, resident=resident, heads=heads,
+                      token_bytes=TOKEN_BYTES, output_stride=resident, sparse_mode=0),
+        logical_keys=rows(keys),
+        logical_scales=rows(scales),
+        query=rows(query),
+        weights=rows(weights.reshape(4, heads)),
+        query_scale=rows(query_scale),
+        query_ends=np.full((16, 4), history, dtype=np.int32),
+        tail_bounds=np.zeros((16, 2), dtype=np.int32),
+        logical_address_valid=rows(np.ones(history, dtype=np.uint8)),
+        page_keys=((None,) * (history // 128),) * 16,
+        captured_layout=rows(np.arange(history)),
+        captured_hot_valid=rows(np.ones(resident, dtype=np.int32)),
+        captured_lru=rows(oldest),
+        source_paths=(str(manifest),),
+        logical_score_keys=rows(scores),
+        logical_score_valid=rows(np.ones((4, history), dtype=bool)),
+    )
+    inputs, donors = expand(source, batch)
+    return FrozenRound(inputs, (ref,)), donors
 
 
 def input_digest(inputs, pages, donors):

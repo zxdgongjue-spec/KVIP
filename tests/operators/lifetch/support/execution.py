@@ -3950,7 +3950,8 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused, p
                 resources.close()
 
 
-def run_path(config, directory, sequence, pages, *, fused, round_check=None, shared_pool=None, measure=None):
+def run_path(config, directory, sequence, pages, *, fused, round_check=None, shared_pool=None, measure=None,
+             preserve_initial_lru=False):
     import acl
     import kvaf
     import torch
@@ -4031,7 +4032,11 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024))
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
-        if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
+        # A packed comparison fingerprints its initial cache state and shares
+        # it across both arms. The generic synthetic benchmark still seeds the
+        # serial LRU from the native TopK it actually observes.
+        if (config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0
+                and not fused and not preserve_initial_lru):
             from kvip.cache.lru import SlotLRU
             selected = state.native_li(torch_npu, state.fixture).cpu().numpy().reshape(g['batch'], -1)
             chains = []

@@ -12,9 +12,18 @@ case "$mode" in
   --dry-run)
     exec "${KVIP_PYTHON:-python3}" -B "$runner" --dry-run "$@"
     ;;
+  packed-synthetic)
+    if [[ "${1:-}" == --dry-run ]]; then
+      shift
+      exec "${KVIP_PYTHON:-python3}" -B "$runner" --synthetic --dry-run "$@"
+    fi
+    packed_input=(--synthetic)
+    packed_name=synthetic
+    ;;
   packed|q1-w2) ;;
   *)
     printf '%s\n' 'Usage:' '  run_fixed_q4_a5_12.sh packed G2_PREPARED_TRACE [runner options]' \
+      '  run_fixed_q4_a5_12.sh packed-synthetic [runner options]' \
       '  run_fixed_q4_a5_12.sh q1-w2 MR35_CHECKOUT MAIN_CHECKOUT' \
       '  run_fixed_q4_a5_12.sh --dry-run'
     if [[ "$mode" == --help || "$mode" == -h ]]; then exit 0; fi
@@ -36,7 +45,9 @@ if [[ "$mode" == packed ]]; then
     printf 'Prepared G2 capture is missing in the container: %s\n' "$trace" >&2
     exit 2
   fi
-else
+  packed_input=(--trace "$trace")
+  packed_name=g2
+elif [[ "$mode" == q1-w2 ]]; then
   if (( $# != 2 )); then
     printf '%s\n' 'q1-w2 needs the MR35 and main checkouts.' >&2
     exit 2
@@ -118,10 +129,10 @@ if not callable(lidu_fused_batch_get_prepare_mtp_out):
 print("CANN, KVAF and LIDU OK")
 PY
 
-if [[ "$mode" == packed ]]; then
-  out=$(mktemp -d "$results/packed-g2-card2.XXXXXX")
+if [[ "$mode" != q1-w2 ]]; then
+  out=$(mktemp -d "$results/packed-$packed_name-card2.XXXXXX")
   printf 'OUTPUT_PARENT=%s\n' "$out"
-  PYTHONPATH="$repo/python:$PYTHONPATH" "$py" -B "$runner" "$@" --trace "$trace" \
+  PYTHONPATH="$repo/python:$PYTHONPATH" "$py" -B "$runner" "$@" "${packed_input[@]}" \
     --device "$device" --physical-npu 2 --kvaf-root "$kvaf" --output "$out/run"
   exit
 fi
