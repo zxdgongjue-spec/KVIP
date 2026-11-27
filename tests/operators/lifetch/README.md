@@ -150,6 +150,25 @@ bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed-q1-pair
 
 沿用九档合成 Q4、H131072/R16384、目标 miss 10%、seed 43，先跑九个同卡串行 oracle 和原串行／融合 AB/BA 的 36 个图，再用同一二进制为支持 Q1 的五档各跑四个 Q1 开关图。每图十调用、预热四次。KV、Index、Top2048 及候选逐 Q 完成标记均在计时范围外核验。`RESULT_ROOT` 下的 `summary.csv` 和 `packed_summary.json` 给出整图与阶段耗时、预取、最终 Get 和工作量一致性。
 
+## 12 号机原生大 batch 末窗 Q1
+
+用相同合成输入独立跑 BS20、24、28、32。每档生成一份同卡强串行 TopK oracle。同一融合二进制运行以下三臂。
+
+| 路线 | 末窗 W3 的执行 |
+|---|---|
+| 原生 `native` | Score 同一启动内，各请求由两个 AIV 各做两个 Q，随后单 owner 去重发单 |
+| 后移 `deferred_pair` | Score kernel 完成后，由独立 AIV kernel 按每请求两路 Q2 执行 |
+| 后移 `deferred_q1` | 与后移 2+2 使用相同步数和请求映射，每请求四路 Q1 |
+
+两条后移路线由 16 个四 AIV 组按行处理，使用同一末窗就绪分数、每请求一个发单 owner。原融合的提前最终补取候选筛选只保留在原生臂，后移两臂由原 Terminal 完整处理。W0～W2、Cold Score 分片、预取预算和最终正确性规则沿用原几何。比较两条后移路线可测逐 Q 并行增量，比较后移 Q1 与原生可测整链是否抵消阶段拆分的开销。
+
+```bash
+bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed-large-q1-pair --dry-run
+bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed-large-q1-pair
+```
+
+固定 Q4、H131072/R16384、目标 miss 10%、seed 43。三臂两轮反序，四档共 4 个 oracle 和 24 个计时图，每图十个独立调用。逐请求搬运计数和阶段耗时写入 `RESULT_ROOT/summary.csv` 及 `packed_summary.json`。
+
 ## 12 号机 Q1/W2 加倍复测
 
 用两个独立的干净检出目录。MR35 W2 实测版本为 `a9f4fe3b`，主仓基线为 `df8ad259`。

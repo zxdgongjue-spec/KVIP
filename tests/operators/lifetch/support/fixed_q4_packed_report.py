@@ -85,6 +85,46 @@ def read_q1_pair(pair, group, batch, cohort, root):
     return dict(arms=rows, context=contexts[0], fused_bridge_sha256=bridges[0])
 
 
+LARGE_WINDOW_MODES = dict(native=None, deferred_pair=2, deferred_q1=1)
+LARGE_WINDOW_STAGES = (*STAGES, "LI1", "LI23", "last_window")
+
+
+def read_large_q1_block(block, group, batch, cohort, root):
+    rows, contexts, bridges = {}, [], []
+    for arm, mode in LARGE_WINDOW_MODES.items():
+        directory = block / arm
+        row, times, context = packed_arm(directory, "fused", group, batch, cohort, root)
+        if ("large_window_queries_per_worker" not in row or row["large_window_queries_per_worker"] != mode
+                or row["get_workers"] != 32 or row["full_KV_Index_checked_calls"] != 10):
+            raise ValueError(f"Native large fused result did not complete in its requested window mode: {directory}")
+        bridge = row.get("fused_bridge_sha256")
+        if not isinstance(bridge, str) or len(bridge) != 64:
+            raise ValueError(f"Missing loaded LIFetch bridge hash: {directory}")
+        durations = row["mean_us"]
+        stages = {s: durations[s] for s in ("LI1", "LI23")}
+        final = durations.get("last_window", 0)
+        if (not all(isfinite(v) and v > 0 for v in stages.values()) or not isfinite(final)
+                or (mode is not None and final <= 0) or (mode is None and final != 0)):
+            raise ValueError(f"Invalid native large final-window kernel durations: {directory}")
+        stages["last_window"] = final
+        traffic = row["traffic"]
+        flags = 4 * batch if mode is not None else 0
+        if len(traffic) != 10 or any(call.get("window_q1_ready_flags", 0) != flags for call in traffic):
+            raise ValueError(f"Missing or unexpected deferred final-window receipts: {directory}")
+        if any(
+            len(call[key + "_by_request"]) != batch or sum(call[key + "_by_request"]) != call[key]
+            or any(count < 0 for count in call[key + "_by_request"])
+            for call in traffic for key in ("prefetch", "final")
+        ):
+            raise ValueError(f"Missing packed per-request GET counts: {directory}")
+        rows[arm] = dict(mean_us={**times, **stages}, traffic=traffic)
+        contexts.append(context)
+        bridges.append(bridge)
+    if any(ctx != contexts[0] for ctx in contexts[1:]) or any(bridge != bridges[0] for bridge in bridges[1:]):
+        raise ValueError(f"Native large routes used different inputs, runtime, bridge, or memory placement: {block}")
+    return dict(arms=rows, context=contexts[0], fused_bridge_sha256=bridges[0])
+
+
 def cell_summary(root, group, batch):
     cell = root / f'g{group}/bs{batch}'
     observations = []

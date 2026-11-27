@@ -143,6 +143,9 @@ extern "C" uint32_t kvip_fixed_q4_window_q1_supported(const rotating::RuntimeSha
 }
 extern "C" uint32_t aclrtlaunch_v9_li_large_hot(uint32_t,void*,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_li_large_threshold_cold(uint32_t,void*,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_large_deferred_cold(uint32_t,void*,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_large_final_pair(uint32_t,void*,void*,void*);
+extern "C" uint32_t aclrtlaunch_v9_li_large_final_q1(uint32_t,void*,void*,void*);
 extern "C" uint32_t aclrtlaunch_v9_parallel_terminal_large(uint32_t,void*,void*);
 extern "C" uint32_t kvip_parallel_tail_supported(const rotating::RuntimeShape* shape) {
     if (shape && rotating::NativeLargeBatch(shape->batch, shape->aicCount))
@@ -172,6 +175,24 @@ extern "C" uint32_t kvip_fixed_q4_window_q1_forward(void* bindings, void* termin
     if (!result) result = aclrtlaunch_v9_li_window_q1_threshold(shape->liCores, stream, bindings, terminal);
     if (!result) result = aclrtlaunch_v9_li_window_q1_cold(shape->liCores, stream, bindings, terminal);
     if (!result) result = aclrtlaunch_v9_parallel_terminal(shape->batch * 4, stream, terminal);
+    return result;
+}
+extern "C" uint32_t kvip_large_window_final_supported(const rotating::RuntimeShape* shape) {
+    return shape && rotating::NativeLargeBatch(shape->batch, shape->aicCount) &&
+        kvip_parallel_tail_supported(shape) && shape->rounds == 4 && !shape->splitQ &&
+        shape->history == 131072 && shape->resident == 16384 && shape->tokenBytes == 656;
+}
+extern "C" uint32_t kvip_large_window_final_forward(void* bindings, void* terminal,
+    void* stream, const rotating::RuntimeShape* shape, uint32_t queries_per_worker) {
+    if (!bindings || !terminal || !stream || !kvip_large_window_final_supported(shape) ||
+        (queries_per_worker != 1 && queries_per_worker != 2)) return 100000;
+    uint32_t result = aclrtlaunch_v9_li_large_hot(shape->liCores, stream, bindings, terminal);
+    if (!result) result = aclrtlaunch_v9_li_large_deferred_cold(shape->liCores, stream, bindings, terminal);
+    if (!result) {
+        result = queries_per_worker == 1 ? aclrtlaunch_v9_li_large_final_q1(64, stream, bindings, terminal) :
+                                          aclrtlaunch_v9_li_large_final_pair(64, stream, bindings, terminal);
+    }
+    if (!result) result = aclrtlaunch_v9_parallel_terminal_large(64, stream, terminal);
     return result;
 }
 extern "C" uint32_t kvip_parallel_tail_forward(void* bindings,void* terminal,

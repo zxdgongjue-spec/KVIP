@@ -15,7 +15,11 @@ import sys
 import time
 
 from fixed_q4_packed_archive import NATIVE, Q1_BASE, Q1_BATCHES, same_production, verify_q1_production
-from fixed_q4_packed_report import Q1_STAGES, STAGES, read_pair, read_q1_pair, report_cell
+from fixed_q4_packed_report import (
+    LARGE_WINDOW_MODES, LARGE_WINDOW_STAGES, Q1_STAGES, STAGES,
+    read_large_q1_block, read_pair, read_q1_pair, report_cell,
+)
+from large_batch_input import BATCHES as NATIVE_LARGE_BATCHES
 from large_batch_input import FIXED_BATCHES, SYNTHETIC_GROUP, read_source, save_source
 from large_batch_pair import CALLS, WARMUP
 from large_batch_placement import placement
@@ -28,20 +32,27 @@ KVAF_REVISION = "813f1750a50b7e6c92d5f5397f2fbc05befef6da"
 GROUP, COHORT = 2, 0
 BLOCKS = (("serial", "fused"), ("fused", "serial"))
 Q1_BLOCKS = (("off", "on"), ("on", "off"))
+LARGE_Q1_BASE = "4e4ffd5f6ad7232d6e90a83f76dc2c627d51657f"
+LARGE_Q1_BLOCKS = (tuple(LARGE_WINDOW_MODES), tuple(reversed(LARGE_WINDOW_MODES)))
+LARGE_Q1_COMPARISONS = (
+    ("deferred_pair", "native"), ("deferred_q1", "deferred_pair"), ("deferred_q1", "native"),
+)
 SYNTHETIC_FIXTURE = dict(history=131072, resident=16384, miss_percent=10, index_heads=32, seed=43)
 
 
-def plan(synthetic=False, window_q1_pair=False):
+def plan(synthetic=False, window_q1_pair=False, large_window_q1_pair=False):
+    batches = NATIVE_LARGE_BATCHES if large_window_q1_pair else FIXED_BATCHES
+    blocks = LARGE_Q1_BLOCKS if large_window_q1_pair else BLOCKS
     data = dict(
         protocol="ten_independent_calls_one_device_event",
         production_revision=NATIVE,
         input_kind="synthetic" if synthetic else "real",
         group=SYNTHETIC_GROUP if synthetic else GROUP,
         cohort=COHORT,
-        batch_sizes=FIXED_BATCHES,
-        blocks=BLOCKS,
-        oracles=len(FIXED_BATCHES),
-        measured_graphs=len(FIXED_BATCHES) * sum(map(len, BLOCKS)),
+        batch_sizes=batches,
+        blocks=blocks,
+        oracles=len(batches),
+        measured_graphs=len(batches) * sum(map(len, blocks)),
         calls_per_graph=CALLS,
         graph_warmups=WARMUP,
         prefetch=dict(tokens=1024, windows_requested=4, rank_start=1024),
@@ -55,6 +66,11 @@ def plan(synthetic=False, window_q1_pair=False):
             baseline_revision=Q1_BASE, enabled_batches=list(Q1_BATCHES),
             unsupported_batches=[batch for batch in FIXED_BATCHES if batch not in Q1_BATCHES],
             blocks=Q1_BLOCKS, measured_graphs=q1_graphs, scope="last_window_only",
+        )
+    if large_window_q1_pair:
+        data["large_window_q1_pair"] = dict(
+            baseline_revision=LARGE_Q1_BASE, enabled_batches=list(batches),
+            queries_per_worker=LARGE_WINDOW_MODES, scope="deferred_last_window_only",
         )
     return data
 
@@ -105,7 +121,7 @@ def wait_for_service(process, log, port):
 
 
 def run_arm(args, directory, batch, arm, source_options, group, node, cpus, *,
-            oracle=None, adapter=None, window_q1=False):
+            oracle=None, adapter=None, window_q1=False, large_window_queries_per_worker=None):
     directory.mkdir(parents=True)
     port = free_tcp_port()
     cpu_log = directory / "cpu.log"
@@ -128,13 +144,17 @@ def run_arm(args, directory, batch, arm, source_options, group, node, cpus, *,
         worker += ["--packed-ten", "--serial-result", str(oracle)]
     if args.keep_trace:
         worker.append("--keep-trace")
-    if args.window_q1_pair:
+    if args.window_q1_pair or args.large_window_q1_pair:
         worker.append("--q1-study")
     if window_q1:
         worker.append("--window-q1")
+    if large_window_queries_per_worker is not None:
+        worker += ["--large-window-queries-per-worker", str(large_window_queries_per_worker)]
 
     label = "synthetic" if group == SYNTHETIC_GROUP else f"G{group}"
     switch = f" window_q1={int(window_q1)}" if args.window_q1_pair and arm == "fused" else ""
+    if args.large_window_q1_pair and arm == "fused":
+        switch = f" window_route={directory.name}"
     print(f"CASE_BEGIN {label} BS{batch} cohort={COHORT} arm={arm}{switch} output={directory}", flush=True)
     with ExitStack() as stack:
         def launch(command, log):
@@ -206,13 +226,7 @@ def q1_cell(args, out, cell, batch, oracle, source_options, group, node, cpus, a
         calls = [call for run in runs for call in run["traffic"]]
         traffic[arm] = {key: mean(call[key] for call in calls) for key in ("prefetch", "final")}
         traffic[arm]["total"] = sum(traffic[arm].values())
-    changed_request_records = changed_totals = 0
-    for obs in observations:
-        for before, after in zip(obs["arms"]["off"]["traffic"], obs["arms"]["on"]["traffic"], strict=True):
-            for p0, p1, f0, f1 in zip(before["prefetch_by_request"], after["prefetch_by_request"],
-                                      before["final_by_request"], after["final_by_request"], strict=True):
-                changed_request_records += p0 != p1 or f0 != f1
-                changed_totals += p0 + f0 != p1 + f1
+    changed_request_records, changed_totals = changed_get_counts(observations, "off", "on")
     saved = {stage: times["off"][stage] - times["on"][stage] for stage in Q1_STAGES}
     gain = 100 * saved["graph"] / times["off"]["graph"]
     print(f"BS{batch} window Q1 graph_off_us={times['off']['graph']:.2f} "
@@ -221,6 +235,81 @@ def q1_cell(args, out, cell, batch, oracle, source_options, group, node, cpus, a
     return dict(status="completed", mean_us=times, saved_us=saved, graph_gain_pct=gain, traffic_mean=traffic,
                 changed_request_records=changed_request_records, changed_total_records=changed_totals,
                 observations=observations)
+
+
+def changed_get_counts(observations, before_arm, after_arm):
+    changed_request_records = changed_totals = 0
+    for obs in observations:
+        before_calls = obs["arms"][before_arm]["traffic"]
+        after_calls = obs["arms"][after_arm]["traffic"]
+        for before, after in zip(before_calls, after_calls, strict=True):
+            for p0, p1, f0, f1 in zip(before["prefetch_by_request"], after["prefetch_by_request"],
+                                      before["final_by_request"], after["final_by_request"], strict=True):
+                changed_request_records += p0 != p1 or f0 != f1
+                changed_totals += p0 + f0 != p1 + f1
+    return changed_request_records, changed_totals
+
+
+def large_q1_cell(args, out, cell, batch, oracle, source_options, group, node, cpus, adapter):
+    observations = []
+    for index, order in enumerate(LARGE_Q1_BLOCKS, 1):
+        block = cell / "large_window" / f"block{index}"
+        for arm in order:
+            run_arm(args, block / arm, batch, "fused", source_options, group, node, cpus, oracle=oracle,
+                    adapter=adapter, large_window_queries_per_worker=LARGE_WINDOW_MODES[arm])
+        observations.append(dict(order=order, **read_large_q1_block(block, group, batch, COHORT, out)))
+    left, right = observations
+    if (left["context"], left["fused_bridge_sha256"]) != (right["context"], right["fused_bridge_sha256"]):
+        raise ValueError(f"Native large forward and reverse groups used different paired contexts: {cell}")
+
+    times, traffic, comparisons = {}, {}, {}
+    for arm in LARGE_WINDOW_MODES:
+        runs = [row["arms"][arm] for row in observations]
+        times[arm] = {stage: mean(run["mean_us"][stage] for run in runs) for stage in LARGE_WINDOW_STAGES}
+        calls = [call for run in runs for call in run["traffic"]]
+        traffic[arm] = {key: mean(call[key] for call in calls) for key in ("prefetch", "final")}
+        traffic[arm]["total"] = sum(traffic[arm].values())
+    for arm, reference in LARGE_Q1_COMPARISONS:
+        changed, changed_totals = changed_get_counts(observations, reference, arm)
+        saved = {stage: times[reference][stage] - times[arm][stage] for stage in LARGE_WINDOW_STAGES}
+        comparisons[f"{arm}_vs_{reference}"] = dict(
+            graph_gain_pct=100 * saved["graph"] / times[reference]["graph"], saved_us=saved,
+            changed_request_records=changed, changed_total_records=changed_totals,
+        )
+    print(f"BS{batch} native large " + " ".join(f"{arm}_graph_us={t['graph']:.2f}" for arm, t in times.items()))
+    for pairing, data in comparisons.items():
+        print(f"BS{batch} {pairing} graph_gain_pct={data['graph_gain_pct']:+.2f} "
+              f"changed_request_records={data['changed_request_records']} "
+              f"changed_total_records={data['changed_total_records']}")
+    return dict(batch=batch, cohort=COHORT, group=group, mean_us=times, traffic_mean=traffic,
+                comparisons=comparisons, observations=observations)
+
+
+def write_large_q1_summary(out, rows, metadata):
+    graphs_per_cell = sum(map(len, LARGE_Q1_BLOCKS))
+    atomic_json(out / "packed_summary.json", {
+        **metadata, "complete": len(rows) == len(NATIVE_LARGE_BATCHES),
+        "completed_graphs": len(rows) * graphs_per_cell, "cells": rows,
+    })
+    fields = [
+        "input_kind", "group", "batch", "cohort",
+        *[f"{arm}_{stage}_us" for arm in LARGE_WINDOW_MODES for stage in LARGE_WINDOW_STAGES],
+        *[f"{arm}_{counter}_requests" for arm in LARGE_WINDOW_MODES for counter in ("prefetch", "final", "total")],
+        *[f"{arm}_vs_{ref}_{key}" for arm, ref in LARGE_Q1_COMPARISONS
+          for key in ("graph_gain_pct", "changed_request_records", "changed_total_records")],
+    ]
+    with (out / "summary.csv").open("w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            values = {"input_kind": metadata["input_kind"], **{key: row[key] for key in ("group", "batch", "cohort")}}
+            for arm in LARGE_WINDOW_MODES:
+                values.update({f"{arm}_{stage}_us": value for stage, value in row["mean_us"][arm].items()})
+                values.update({f"{arm}_{key}_requests": value for key, value in row["traffic_mean"][arm].items()})
+            for pairing, comparison in row["comparisons"].items():
+                for key in ("graph_gain_pct", "changed_request_records", "changed_total_records"):
+                    values[f"{pairing}_{key}"] = comparison[key]
+            writer.writerow(values)
 
 
 def write_summary(out, rows, metadata):
@@ -270,7 +359,8 @@ def run(args):
     revision = subprocess.check_output(["git", "-C", REPO, "rev-parse", "HEAD"], text=True).strip()
     if subprocess.check_output(["git", "-C", REPO, "status", "--porcelain", "-uno"], text=True).strip():
         raise ValueError("The checked-out measurement revision has tracked modifications")
-    if args.window_q1_pair:
+    q1_study = args.window_q1_pair or args.large_window_q1_pair
+    if q1_study:
         verify_q1_production(REPO, revision)
     else:
         same_production(REPO, NATIVE, revision)
@@ -295,10 +385,13 @@ def run(args):
     (out / "host.txt").write_text(os.uname().nodename + "\n")
     print(f"RESULT_ROOT={out}", flush=True)
 
-    metadata = {**plan(args.synthetic, args.window_q1_pair), "test_revision": revision, "kvaf_revision": kvaf_revision,
-                "physical_npu": args.physical_npu, "device": args.device, "cpu_numa": node}
+    metadata = {
+        **plan(args.synthetic, args.window_q1_pair, args.large_window_q1_pair),
+        "test_revision": revision, "kvaf_revision": kvaf_revision,
+        "physical_npu": args.physical_npu, "device": args.device, "cpu_numa": node,
+    }
     group = metadata["group"]
-    metadata["production_revision"] = revision if args.window_q1_pair else NATIVE
+    metadata["production_revision"] = revision if q1_study else NATIVE
     if args.synthetic:
         fixture = out / "fixture"
         print(f"PREPARE_SYNTHETIC_FIXTURE={fixture}", flush=True)
@@ -315,12 +408,21 @@ def run(args):
         save_source(prepared, trace, group, 1, source, refs)
         metadata["trace"] = str(trace)
         source_options = ["--trace", str(trace), "--prepared", str(prepared)]
-    cells = {batch: group_root / f"bs{batch}/cohort{COHORT}" for batch in FIXED_BATCHES}
+    cells = {batch: group_root / f"bs{batch}/cohort{COHORT}" for batch in metadata["batch_sizes"]}
     adapter = args.cpu_ub_device
     for batch, cell in cells.items():
         oracle = cell / "oracle" / "serial"
         adapter = run_arm(args, oracle, batch, "serial", source_options, group, node, cpus, adapter=adapter)
     metadata["cpu_ub_device"] = adapter
+
+    if args.large_window_q1_pair:
+        rows = []
+        for batch, cell in cells.items():
+            oracle = cell / "oracle" / "serial"
+            rows.append(large_q1_cell(args, out, cell, batch, oracle, source_options, group, node, cpus, adapter))
+            write_large_q1_summary(out, rows, metadata)
+        print(f"PACKED_COMPLETE cells={len(rows)} SUMMARY={out / 'packed_summary.json'}", flush=True)
+        return
 
     rows = []
     for batch, cell in cells.items():
@@ -360,13 +462,18 @@ def main():
     parser.add_argument("--timeout-seconds", type=int, default=7200)
     parser.add_argument("--keep-trace", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--window-q1-pair", action="store_true",
-                        help="Add same-binary fused off/on AB/BA for supported final-window Q1 shapes")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--window-q1-pair", action="store_true",
+                       help="Add same-binary fused off/on AB/BA for supported final-window Q1 shapes")
+    modes.add_argument("--large-window-q1-pair", action="store_true",
+                       help="Compare native and deferred two-Q / one-Q last windows on BS20, 24, 28, 32")
     args = parser.parse_args()
     if args.window_q1_pair and not args.synthetic:
         parser.error("--window-q1-pair requires --synthetic")
+    if args.large_window_q1_pair and not args.synthetic:
+        parser.error("--large-window-q1-pair requires --synthetic")
     if args.dry_run:
-        print(json.dumps(plan(args.synthetic, args.window_q1_pair), indent=2))
+        print(json.dumps(plan(args.synthetic, args.window_q1_pair, args.large_window_q1_pair), indent=2))
         return
     if args.trace is None and not args.synthetic:
         parser.error("--trace or --synthetic is required for live measurement")

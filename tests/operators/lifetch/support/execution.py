@@ -3340,6 +3340,9 @@ class FusedReplayState:
             self.forward = StreamingForward(self.rotating, self.update, torch, prefetch_tokens)
             if os.environ.get("KVIP_FIXED_Q4_WINDOW_Q1") == "1":
                 self._bind_fixed_window_q1()
+            large_window_width = os.environ.get("KVIP_LARGE_WINDOW_QUERIES_PER_WORKER")
+            if large_window_width is not None:
+                self._bind_large_final_window(int(large_window_width))
             self.reset()
         except BaseException:
             if self.owns_lease:
@@ -3348,7 +3351,6 @@ class FusedReplayState:
 
     def _bind_fixed_window_q1(self):
         import ctypes
-        import struct
 
         terminal = self.forward.terminal
         shape = self.rotating.runtime_shape
@@ -3360,8 +3362,43 @@ class FusedReplayState:
         supported.restype = ctypes.c_uint32
         if not supported(ctypes.byref(shape)):
             raise ValueError(f"Packed window Q1 is unavailable for BS{shape.batch}/W{shape.rounds}")
+        self._attach_window_receipts()
+        launch = library.kvip_fixed_q4_window_q1_forward
+        launch.argtypes = [ctypes.c_void_p] * 4
+        launch.restype = ctypes.c_uint32
+        self.forward.terminal_function = launch
 
-        scratch = self.torch.empty((shape.batch, 5, 32), dtype=self.torch.int32, device=self.device)
+    def _bind_large_final_window(self, queries_per_worker):
+        import ctypes
+
+        terminal = self.forward.terminal
+        shape = self.rotating.runtime_shape
+        library = self.rotating.library
+        supported = getattr(library, "kvip_large_window_final_supported", None)
+        if terminal is None or supported is None or queries_per_worker not in (1, 2):
+            raise ValueError("Deferred large window requires the experimental URMA bridge and Q1 or Q2")
+        supported.argtypes = [ctypes.POINTER(type(shape))]
+        supported.restype = ctypes.c_uint32
+        if not supported(ctypes.byref(shape)):
+            raise ValueError(f"Deferred large window is unavailable for BS{shape.batch}/W{shape.rounds}")
+        self._attach_window_receipts()
+        terminal.large_window_queries_per_worker = queries_per_worker
+        launch = library.kvip_large_window_final_forward
+        launch.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_uint32]
+        launch.restype = ctypes.c_uint32
+
+        def launch_with_width(bindings, workspace, stream, shape_pointer):
+            return launch(bindings, workspace, stream, shape_pointer, queries_per_worker)
+
+        self.forward.terminal_function = launch_with_width
+
+    def _attach_window_receipts(self):
+        import struct
+
+        terminal = self.forward.terminal
+        if hasattr(terminal, "window_q1_scratch"):
+            raise ValueError("The graph already binds an experimental last window")
+        scratch = self.torch.empty((self.batch, 5, 32), dtype=self.torch.int32, device=self.device)
         if scratch.data_ptr() % 128 or terminal.workspace.numel() != 128:
             raise ValueError("Unexpected packed window Q1 binding layout")
         offset = struct.calcsize("<6Q2I5Q")  # terminal_runtime::Binding::reserved[5]
@@ -3369,10 +3406,6 @@ class FusedReplayState:
                                     dtype=self.torch.uint8, device=self.device)
         terminal.workspace[offset:offset + address.numel()].copy_(address)
         terminal.window_q1_scratch = scratch
-        launch = library.kvip_fixed_q4_window_q1_forward
-        launch.argtypes = [ctypes.c_void_p] * 4
-        launch.restype = ctypes.c_uint32
-        self.forward.terminal_function = launch
 
     def upload(self, target, array):
         self_value = self.torch.from_numpy(np.ascontiguousarray(array)).to(self.device)

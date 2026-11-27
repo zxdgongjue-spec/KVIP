@@ -22,10 +22,11 @@ def _terminal_finishes(records):
     return finishes
 
 
-def _profile_result(events, scope, elapsed_us, *, fused, batch, calls):
+def _profile_result(events, scope, elapsed_us, *, fused, batch, calls, large_window_queries_per_worker=None):
     if calls < 1 or not isfinite(elapsed_us) or elapsed_us <= 0:
         raise ValueError("Expected a positive graph event time and invocation count")
-    records = fixed_stage_records(events, scope, fused=fused, batch=batch, strict_bounds=True)
+    records = fixed_stage_records(events, scope, fused=fused, batch=batch, strict_bounds=True,
+                                  large_window_queries_per_worker=large_window_queries_per_worker)
     finishes = _terminal_finishes(records["tail" if fused else "fetch"])
     if len(finishes) != calls:
         raise ValueError(f"{scope}: expected {calls} terminal launches, found {len(finishes)}")
@@ -64,17 +65,20 @@ def _profile_result(events, scope, elapsed_us, *, fused, batch, calls):
     return profile
 
 
-def packed_account(events, scope, elapsed_us, *, fused, batch, calls=10):
+def packed_account(events, scope, elapsed_us, *, fused, batch, calls=10, large_window_queries_per_worker=None):
     """Graph event/calls, device-stage means and percentiles from these same calls.
 
     For each arm the graph mean comprises LI, tail, gaps between kernels in
     one call, gaps between calls, and graph edges. Only the graph as a whole
     has device timing events. Each invocation has its own observed kernel span.
     """
-    return _profile_result(events, scope, elapsed_us, fused=fused, batch=batch, calls=calls)["packed"]
+    return _profile_result(events, scope, elapsed_us, fused=fused, batch=batch, calls=calls,
+                           large_window_queries_per_worker=large_window_queries_per_worker)["packed"]
 
 
-def profile_fixed_graph_batch(torch, graph, *, batch, calls, folder, serial=False, transport="urma", stream=None):
-    parser = partial(_profile_result, fused=not serial, batch=batch, calls=calls)
+def profile_fixed_graph_batch(torch, graph, *, batch, calls, folder, serial=False, transport="urma", stream=None,
+                              large_window_queries_per_worker=None):
+    parser = partial(_profile_result, fused=not serial, batch=batch, calls=calls,
+                     large_window_queries_per_worker=large_window_queries_per_worker)
     return profile_graph_batch(torch, graph, calls=calls, folder=folder, serial=serial,
                                transport=transport, stream=stream, result_parser=parser)

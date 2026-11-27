@@ -80,7 +80,8 @@ class FrozenPackedRound:
         self.traffic.append(counts)
 
 
-def measure_packed(ex, proofs, serial, torch, states, sequence, config, directory, *, fused):
+def measure_packed(ex, proofs, serial, torch, states, sequence, config, directory, *, fused,
+                   large_window_queries_per_worker=None):
     from fixed_q4_packed_timing import profile_fixed_graph_batch
 
     if len(states) != CALLS or len(sequence.rounds) != 1 or config.warmup != WARMUP or config.mode != "bench":
@@ -88,7 +89,8 @@ def measure_packed(ex, proofs, serial, torch, states, sequence, config, director
     frozen = FrozenPackedRound(states, sequence.inputs, serial, fused)
 
     def profile(*args, **kwargs):
-        result = profile_fixed_graph_batch(*args, batch=states[0].batch, **kwargs)
+        result = profile_fixed_graph_batch(*args, batch=states[0].batch,
+                                           large_window_queries_per_worker=large_window_queries_per_worker, **kwargs)
         proofs.update(result["packed"])
         return result
 

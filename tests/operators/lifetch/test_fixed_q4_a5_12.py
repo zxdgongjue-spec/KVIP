@@ -51,7 +51,7 @@ def test_synthetic_prepares_once_and_uses_fresh_oracles(tmp_path, monkeypatch):
     cpu.chmod(0o700)
     out = tmp_path / "out"
     args = SimpleNamespace(kvaf_root=kvaf, cpu_numa=None, cpu_ub_device=None, device=2, physical_npu=2,
-                           synthetic=True, trace=None, output=out, window_q1_pair=False)
+                           synthetic=True, trace=None, output=out, window_q1_pair=False, large_window_q1_pair=False)
 
     def git_output(command, **_kwargs):
         if command[3] == "status":
@@ -237,3 +237,94 @@ def test_bs16_q1_profiler_aliases():
     assert fixed_invocation_intervals(recorded, "scope") == {
         "LI1": [(4, 5)], "LI2": [(8, 9)], "LI3": [(12, 13)], "tail": [(16, 17)],
     }
+
+
+def test_native_large_q1_dry_run_uses_only_four_native_shapes():
+    script = Path(__file__).resolve().parent / "support/fixed_q4_a5_12.py"
+    command = [sys.executable, "-B", script, "--large-window-q1-pair", "--dry-run"]
+    rejected = subprocess.run(command, text=True, capture_output=True)
+    assert rejected.returncode == 2 and "requires --synthetic" in rejected.stderr
+    data = json.loads(subprocess.check_output([*command, "--synthetic"], text=True))
+    assert data["batch_sizes"] == [20, 24, 28, 32]
+    assert data["oracles"] == 4 and data["measured_graphs"] == 24
+    assert data["blocks"] == [
+        ["native", "deferred_pair", "deferred_q1"], ["deferred_q1", "deferred_pair", "native"],
+    ]
+    assert data["calls_per_graph"] == 10 and data["graph_warmups"] == 4
+    assert data["large_window_q1_pair"]["queries_per_worker"] == {"native": None, "deferred_pair": 2, "deferred_q1": 1}
+    assert data["prefetch"] == {"tokens": 1024, "windows_requested": 4, "rank_start": 1024}
+
+
+@pytest.mark.parametrize("mode, final_symbol", [(2, "v9_li_large_final_pair"), (1, "v9_li_large_final_q1")])
+def test_native_large_deferred_window_gets_separate_profiler_stage(mode, final_symbol):
+    from large_batch_pair import fixed_invocation_intervals, fixed_kernel_stages, fixed_stage_records
+
+    names = ("v9_li_large_hot", "v9_li_large_deferred_cold", final_symbol, "v9_parallel_terminal_large")
+    events = [dict(name="scope", ph="X", ts=0, dur=30)]
+    for index, name in enumerate(names, 1):
+        events.append(dict(name=f"{name}_1", ph="X", cat="kernel", ts=5 * index, dur=index))
+    recorded = fixed_stage_records(events, "scope", fused=True, batch=32, strict_bounds=True,
+                                   large_window_queries_per_worker=mode)
+    times = fixed_kernel_stages(fixed_invocation_intervals(recorded, "scope"), fused=True)
+    assert times["LI"] == 6 and times["last_window"] == 3 and times["tail"] == 4
+    with pytest.raises(ValueError, match="Unattributed device task"):
+        fixed_stage_records(events, "scope", fused=True, batch=32, strict_bounds=True,
+                            large_window_queries_per_worker=3 - mode)
+
+
+def test_native_large_comparison_verifies_receipts_and_traffic(tmp_path, monkeypatch):
+    batch = 32
+    cell = tmp_path / "synthetic/bs32/cohort0"
+    oracle = cell / "oracle/serial"
+    for key, value in (("native", "native-q1-revision"), ("host", "a5-12"), ("physical_npu", "2")):
+        (tmp_path / f"{key}.txt").write_text(value)
+    modes = []
+
+    def fake_arm(_args, output, actual_batch, arm, _src, group, _node, _cpus, *,
+                 oracle=None, adapter=None, large_window_queries_per_worker=None):
+        assert arm == "fused" and actual_batch == batch and group == 0
+        assert oracle == cell / "oracle/serial" and adapter == "adapter"
+        mode = large_window_queries_per_worker
+        modes.append(mode)
+        output.mkdir(parents=True)
+        (output / "placement_verified").touch()
+        (output / "thp.json").write_text(json.dumps(dict(
+            status="measured", page_mode="thp", coverage_min_pct=100, ub_device="adapter",
+            numa_pages_overlapping_vmas={"0": 100},
+        )))
+        graph, last_window = {None: (100, 0), 2: (120, 27), 1: (108, 15)}[mode]
+        prefetch = [2] * batch
+        final = [4] * batch
+        if mode == 1:
+            # First request changes partition only, while second changes total.
+            prefetch[0], final[0], final[1] = 1, 5, 5
+        call = dict(prefetch=sum(prefetch), final=sum(final), prefetch_by_request=prefetch, final_by_request=final,
+                    window_q1_ready_flags=4 * batch if mode else 0)
+        (output / "packed_result.json").write_text(json.dumps(dict(
+            identity=dict(group=0, batch=batch, host="a5-12", native="native-q1-revision", physical_npu=2,
+                          sequence_sha256="same"),
+            arm=arm, calls=10, checked_queries=40 * batch, checked_rows=10 * batch, correctness="PASS",
+            get_workers=32, full_KV_Index_checked_calls=10, large_window_queries_per_worker=mode,
+            fused_bridge_sha256="a" * 64, graph_event_us=10 * graph, graph_mean_us=graph,
+            mean_us=dict(LI=60 + last_window, tail=30, LI1=20, LI23=40, last_window=last_window),
+            traffic=[call] * 10,
+        )))
+
+    monkeypatch.setattr(runner, "run_arm", fake_arm)
+    row = runner.large_q1_cell(None, tmp_path, cell, batch, oracle, [], 0, "0", "0", "adapter")
+    assert modes == [None, 2, 1, 1, 2, None]
+    pair_gain = row["comparisons"]["deferred_q1_vs_deferred_pair"]
+    assert pair_gain["graph_gain_pct"] == 10
+    assert pair_gain["changed_request_records"] == 40 and pair_gain["changed_total_records"] == 20
+    assert row["comparisons"]["deferred_q1_vs_native"]["graph_gain_pct"] == -8
+    runner.write_large_q1_summary(tmp_path, [row], plan(synthetic=True, large_window_q1_pair=True))
+    with (tmp_path / "summary.csv").open(newline="") as handle:
+        summary = list(csv.DictReader(handle))[0]
+    assert summary["deferred_q1_vs_native_graph_gain_pct"] == "-8.0"
+    assert summary["deferred_q1_last_window_us"] == "15"
+    path = cell / "large_window/block1/deferred_q1/packed_result.json"
+    data = json.loads(path.read_text())
+    data["traffic"][0]["window_q1_ready_flags"] = 0
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="completion|receipts"):
+        runner.read_large_q1_block(cell / "large_window/block1", 0, batch, 0, tmp_path)

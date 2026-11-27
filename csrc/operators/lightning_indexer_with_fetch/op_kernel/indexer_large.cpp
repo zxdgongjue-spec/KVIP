@@ -7,6 +7,8 @@
 #include "terminal/terminal_runtime_abi.h"
 
 #if defined(__CCE_AICORE__)
+#include "indexer/window_q1.h"
+
 namespace QLIKernel {
 template <class T> __aicore__ inline void QuantLightningIndexerKernel<T>::ProcessLargeThreshold(uint32_t q) {
     CalcGS1LoopParams(assignedRow_);
@@ -83,6 +85,7 @@ struct Inputs {
     __gm__ pipeline_ab::Args* stream;
     __gm__ uint32_t* flags;
     __gm__ uint32_t* stagedMisses;
+    GM_ADDR deferredReady;
     rotating::RuntimeShape shape;
     uint32_t core, vecLane, helpers;
 
@@ -93,6 +96,7 @@ struct Inputs {
         stream = reinterpret_cast<__gm__ pipeline_ab::Args*>(binding->pipeline);
         flags = reinterpret_cast<__gm__ uint32_t*>(binding->reserved[2]);
         stagedMisses = reinterpret_cast<__gm__ uint32_t*>(binding->reserved[4]);
+        deferredReady = reinterpret_cast<GM_ADDR>(binding->reserved[5]);
         shape = rotating::LoadRuntimeShape(ctx);
         if ASCEND_IS_AIV {
             core = GetBlockIdx() / 2;
@@ -381,6 +385,7 @@ __aicore__ inline void FinishPair(const Inputs& input, const RowPlan& plan, Inde
     vec.PostWindow(epoch, 0);
 }
 
+template<bool DeferLastWindow>
 __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint32_t planCount) {
     JoinThreshold(input, plan.row);
     TPipe pipe;
@@ -390,6 +395,11 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint3
     if ASCEND_IS_AIV {
         if (overlap) QLIKernel::PrimeLargeBanks();
         if (!input.vecLane) {
+            if constexpr (DeferLastWindow) {
+                for (uint32_t q = 0; q < 4; ++q) {
+                    fixed_window_q1::Publish(input.deferredReady, plan.row, q, 0);
+                }
+            }
             if (input.Trace()) {
                 uint64_t start = GetSystemCycle();
                 for (uint32_t q = 0; q < 4; ++q) {
@@ -422,6 +432,9 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint3
                 input.Wait(plan.row, 6 + input.vecLane, epoch);
             }
             PublishProgress(input, plan.row, input.vecLane * 2, 2, span.end);
+            if constexpr (DeferLastWindow) {
+                if (epoch + 1 == input.shape.rounds) break;
+            }
             op.vectorService.AllocEventID();
             op.vectorService.AdvanceLargeWindowPair(plan.row, epoch, span.end * 128);
             FinishPair(input, plan, op, epoch);
@@ -429,7 +442,7 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint3
         }
     }
     if ASCEND_IS_AIV {
-        if (input.stagedMisses) {
+        if (!DeferLastWindow && input.stagedMisses) {
             // Probe once; a late row, an outstanding own Post or an ineligible Q
             // simply defers its exact classification to its original tail owner.
             auto last = reinterpret_cast<__gm__ rotating::Event*>(input.ctx->events) +
@@ -463,6 +476,101 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint3
         }
     }
 }
+
+template<bool DeferLastWindow>
+__aicore__ inline void ThresholdCold(GM_ADDR bindings, GM_ADDR terminal) {
+    Inputs input(bindings, terminal);
+    if constexpr (DeferLastWindow) {
+        if (!input.deferredReady) return;
+    }
+    bool helper = input.core >= input.shape.batch;
+    uint32_t first = helper ? input.core - input.shape.batch : input.core;
+    Threshold(input, first, helper);
+    RowPlan plans[7];
+    uint32_t own;
+    uint32_t planCount = Plan<true>(input, helper, plans, own);
+    if (!helper) {
+        ColdOwner<DeferLastWindow>(input, plans[own], planCount);
+    } else {
+        // Finish the current window for every assigned row before moving to
+        // the next window. Rows with no suffix never wait for this helper.
+        bool ready[7]{};
+        for (uint32_t epoch = 1; epoch < input.shape.rounds; ++epoch) {
+            for (uint32_t i = 0; i < planCount; ++i) {
+                if (!plans[i].quota) {
+                    continue;
+                }
+                if (!ready[i]) {
+                    JoinThreshold(input, plans[i].row);
+                    ready[i] = true;
+                }
+                ColdHelper(input, plans[i], epoch, planCount);
+            }
+        }
+    }
+}
+
+template<uint32_t Queries>
+__aicore__ inline void FinishDeferredWindow(GM_ADDR bindings, GM_ADDR terminal) {
+    Inputs input(bindings, terminal);
+    if (!input.deferredReady) return;
+    constexpr uint32_t teamLanes = 4;
+    constexpr uint32_t teams = 16;
+    const uint32_t block = GetBlockIdx();
+    const uint32_t worker = block % teamLanes;
+    const uint32_t first = worker * Queries;
+    if (first >= teamLanes) return;
+    const uint32_t epoch = input.shape.rounds - 1;
+    const bool trace = input.Trace();
+    for (uint32_t row = block / teamLanes; row < input.shape.batch; row += teams) {
+        // Every row's two score producers and optional suffix producers have
+        // returned before this launch. Both partitionings use that same cut.
+        auto progress = reinterpret_cast<__gm__ uint32_t*>(input.ctx->progress) + (row * 4 + first) * 32;
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(progress), 128);
+        const uint32_t ready = *reinterpret_cast<__gm__ volatile uint32_t*>(progress);
+        TPipe pipe;
+        Indexer op;
+        input.Init(op, pipe, row, false);
+        auto& vec = op.vectorService;
+        vec.AllocEventID();
+        vec.template AdvanceLargeWindowQueries<Queries>(row, epoch, ready, first);
+        if (trace) {
+            auto result = fixed_window_q1::Signal(input.deferredReady, row, first);
+            result->calls = vec.incrementalCalls_;
+            result->scanned = vec.incrementalScanned_;
+            result->candidates = vec.incrementalCandidates_;
+        }
+        for (uint32_t q = first; q < first + Queries; ++q) {
+            if (q) fixed_window_q1::Publish(input.deferredReady, row, q, 1);
+        }
+        if (!first) {
+            for (uint32_t q = Queries; q < teamLanes; ++q) {
+                fixed_window_q1::Wait(input.deferredReady, row, q);
+            }
+            if (trace) {
+                uint32_t calls = vec.incrementalCalls_;
+                uint32_t scanned = vec.incrementalScanned_;
+                uint32_t candidates = vec.incrementalCandidates_;
+                for (uint32_t q = Queries; q < teamLanes; q += Queries) {
+                    const auto result = fixed_window_q1::Signal(input.deferredReady, row, q);
+                    calls += result->calls;
+                    scanned += result->scanned;
+                    candidates += result->candidates;
+                }
+                auto event = reinterpret_cast<__gm__ rotating::Event*>(input.ctx->events) +
+                    epoch * input.shape.serviceLanes + row;
+                auto stamp = reinterpret_cast<__gm__ uint64_t*>(event->pad);
+                stamp[3] = GetSystemCycle();
+                stamp[4] = uint64_t(calls) | (uint64_t(scanned) << 16) | (uint64_t(candidates) << 40);
+                kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event), 128);
+            }
+            vec.PostLargeWindowRow(row, epoch);
+            fixed_window_q1::Publish(input.deferredReady, row, 0, 1);
+        }
+        vec.FreeEventID();
+        pipe.Destroy();
+    }
+}
 } // namespace
 #endif
 
@@ -487,31 +595,27 @@ extern "C" __global__ __aicore__ void v9_li_large_hot(GM_ADDR bindings, GM_ADDR 
 extern "C" __global__ __aicore__ void v9_li_large_threshold_cold(GM_ADDR bindings, GM_ADDR terminal) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-    Inputs input(bindings, terminal);
-    bool helper = input.core >= input.shape.batch;
-    uint32_t first = helper ? input.core - input.shape.batch : input.core;
-    Threshold(input, first, helper);
-    RowPlan plans[7];
-    uint32_t own;
-    uint32_t planCount = Plan<true>(input, helper, plans, own);
-    if (!helper) {
-        ColdOwner(input, plans[own], planCount);
-    } else {
-        // Finish the current window for every assigned row before moving to
-        // the next window. Rows with no suffix never wait for this helper.
-        bool ready[7]{};
-        for (uint32_t epoch = 1; epoch < input.shape.rounds; ++epoch) {
-            for (uint32_t i = 0; i < planCount; ++i) {
-                if (!plans[i].quota) {
-                    continue;
-                }
-                if (!ready[i]) {
-                    JoinThreshold(input, plans[i].row);
-                    ready[i] = true;
-                }
-                ColdHelper(input, plans[i], epoch, planCount);
-            }
-        }
-    }
+    ThresholdCold<false>(bindings, terminal);
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_li_large_deferred_cold(GM_ADDR bindings, GM_ADDR terminal) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    ThresholdCold<true>(bindings, terminal);
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_li_large_final_pair(GM_ADDR bindings, GM_ADDR terminal) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV { FinishDeferredWindow<2>(bindings, terminal); }
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_li_large_final_q1(GM_ADDR bindings, GM_ADDR terminal) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV { FinishDeferredWindow<1>(bindings, terminal); }
 #endif
 }

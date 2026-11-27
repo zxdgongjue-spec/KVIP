@@ -17,7 +17,7 @@ import sys
 
 import numpy as np
 
-from large_batch_input import FIXED_BATCHES, GROUPS, SYNTHETIC_GROUP, input_digest, load, load_synthetic
+from large_batch_input import BATCHES, FIXED_BATCHES, GROUPS, SYNTHETIC_GROUP, input_digest, load, load_synthetic
 from large_batch_reference import compute_reference, reference_identity, stage_serial
 from reporting import atomic_json
 from workloads import ReplayPagePlan, configuration
@@ -47,7 +47,7 @@ def check_scores(inputs, selected, serial):
 KERNEL_SUFFIX = r"(?:(?:_[0-9]+)|(?:_mix_ai[cv])|(?:_ai[cv]))*"
 
 
-def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False):
+def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False, large_window_queries_per_worker=None):
     """Read raw, scope-relative CANN records, including both sides of MIX tasks."""
     from decimal import Decimal
 
@@ -65,6 +65,12 @@ def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False):
             "fetch": ("kvafexecutebatchgetaivkernelv2", "kvafexecutebatchgetaivkernelv3"),
         }
     )
+    if large_window_queries_per_worker is not None:
+        finish_kernel = {2: "v9_li_large_final_pair", 1: "v9_li_large_final_q1"}
+        if not fused or batch not in BATCHES or large_window_queries_per_worker not in finish_kernel:
+            raise ValueError("Deferred last-window profiler requires a native large fused arm")
+        names["LI23"] = ("v9_li_large_deferred_cold",)
+        names["last_window"] = (finish_kernel[large_window_queries_per_worker],)
     if batch == 16 and fused:
         names = {"pr30_li": ("v9_li_kernel", "v9_li_window_q1_threshold", "v9_li_window_q1_cold"),
                  "tail": ("v9_parallel_terminal",)}
@@ -170,6 +176,8 @@ def fixed_kernel_stages(stages, fused):
     expected = ("LI1", "LI23", "tail") if fused else ("li", "lidu_prepare", "fetch")
     if fused and "LI2" in stages:
         expected = ("LI1", "LI2", "LI3", "tail")
+    elif fused and "last_window" in stages:
+        expected = ("LI1", "LI23", "last_window", "tail")
     if set(stages) != set(expected) or any(len(stages[k]) != 1 for k in expected):
         raise ValueError(f"Unexpected production kernel sequence: {stages}")
     intervals = [stages[k][0] for k in expected]
@@ -666,8 +674,11 @@ def selected_device(device, physical_npu):
 def run(args):
     # Never inherit a candidate switch into the baseline or native oracle.
     os.environ.pop("KVIP_FIXED_Q4_WINDOW_Q1", None)
+    os.environ.pop("KVIP_LARGE_WINDOW_QUERIES_PER_WORKER", None)
     if args.window_q1:
         os.environ["KVIP_FIXED_Q4_WINDOW_Q1"] = "1"
+    if args.large_window_queries_per_worker is not None:
+        os.environ["KVIP_LARGE_WINDOW_QUERIES_PER_WORKER"] = str(args.large_window_queries_per_worker)
     device, physical_npu = selected_device(args.device, args.physical_npu)
     import execution as ex
     from functools import partial
@@ -807,12 +818,22 @@ def run(args):
         def benchmark(torch, states, sequence, config, directory, *, fused):
             if fused and args.q1_study:
                 enabled = [getattr(state.forward.terminal, "window_q1_scratch", None) is not None for state in states]
-                if enabled != [args.window_q1] * len(states):
+                expected_scratch = args.window_q1 or args.large_window_queries_per_worker is not None
+                if enabled != [expected_scratch] * len(states):
                     raise ValueError("The packed fused graph did not bind the requested Q1 mode")
+                large_modes = [getattr(state.forward.terminal, "large_window_queries_per_worker", None)
+                               for state in states]
+                if large_modes != [args.large_window_queries_per_worker] * len(states):
+                    raise ValueError("The packed fused graph did not bind the requested deferred window mode")
                 with Path(states[0].rotating.library._name).open("rb") as stream:
                     proofs["fused_bridge_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
                 proofs["window_q1_enabled"] = args.window_q1
-            return measure_packed(ex, proofs, serial, torch, states, sequence, config, directory, fused=fused)
+                if args.batch in BATCHES:
+                    proofs["large_window_queries_per_worker"] = args.large_window_queries_per_worker
+            return measure_packed(
+                ex, proofs, serial, torch, states, sequence, config, directory, fused=fused,
+                large_window_queries_per_worker=args.large_window_queries_per_worker,
+            )
     else:
         benchmark = partial(measured_replays, ex, proofs, serial)
     result = ex.run_path(
@@ -970,7 +991,10 @@ def parse_args(argv=None):
     parser.add_argument("--arm", choices=("serial", "fused"), required=True)
     parser.add_argument("--packed-ten", action="store_true", help="Capture and time ten independent states in one graph")
     parser.add_argument("--q1-study", action="store_true", help="Use a fresh oracle from the fixed-Q4 Q1 revision")
-    parser.add_argument("--window-q1", action="store_true", help="Bind the window Q1 candidate")
+    candidate = parser.add_mutually_exclusive_group()
+    candidate.add_argument("--window-q1", action="store_true", help="Bind the window Q1 candidate")
+    candidate.add_argument("--large-window-queries-per-worker", type=int, choices=(1, 2),
+                           help="Defer the last window of a native large fused arm")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--trace", type=Path)
     source.add_argument("--synthetic-fixture", type=Path, help="Prepared compact synthetic Q4 fixture directory")
@@ -997,6 +1021,9 @@ def parse_args(argv=None):
         from fixed_q4_packed_archive import Q1_BATCHES
         if not args.q1_study or not args.packed_ten or args.arm != "fused" or args.batch not in Q1_BATCHES:
             parser.error("Window Q1 requires a supported fused packed arm in the Q1 study")
+    if args.large_window_queries_per_worker is not None:
+        if not args.q1_study or not args.packed_ten or args.arm != "fused" or args.batch not in BATCHES:
+            parser.error("Deferred last window requires a native large fused packed arm in the Q1 study")
     if args.synthetic_fixture is not None:
         if args.group != SYNTHETIC_GROUP or args.round != 1 or args.cohort != 0:
             parser.error("Synthetic input requires group 0, round 1 and cohort 0")
