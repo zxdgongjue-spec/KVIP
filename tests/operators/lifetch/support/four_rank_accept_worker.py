@@ -148,7 +148,9 @@ def run(a):
         for r in range(a.batch):
             for q in range(4):
                 keys = inputs.logical_score_keys[r, q]
-                ids = np.flatnonzero(inputs.logical_score_valid[r, q])
+                ids = np.flatnonzero(inputs.logical_score_valid[r, q, : int(inputs.query_ends[r, q])])
+                if ids.size < 2048:
+                    raise ValueError(f"Missing valid causal scores for row {r}, Q{q + 1}")
                 top = np.argpartition(keys[ids], -2048)[-2048:]
                 ref[r, q] = np.sort(ids[top])
         inputs.validate_topk(ref)
