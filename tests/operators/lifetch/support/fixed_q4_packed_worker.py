@@ -78,7 +78,7 @@ def measure_packed(ex, proofs, serial, torch, states, sequence, config, director
     frozen = FrozenPackedRound(states, sequence.inputs, serial, fused, carry_credit)
 
     launch = getattr(states[0], "large_window_launch", None)
-    expected_li23 = "v9_li_large_threshold_cold" if carry_credit else None
+    expected_li23 = "v9_li_large_four_window_credit" if carry_credit else None
     if carry_credit:
         proofs.update(large_window_policy="four-window-carry", measured_cold_symbol=expected_li23)
     if launch:

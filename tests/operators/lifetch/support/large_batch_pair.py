@@ -326,7 +326,7 @@ def read_selected(state, inputs, fused, *, carry_credit=False):
             grants = WINDOW_GRANTS[launch.window_policy]
         if carry_credit:
             if launch is not None or batch not in (20, 24, 28, 32):
-                raise ValueError("Carry-forward uses the regular four-window large-batch kernel")
+                raise ValueError("Carry-forward requires the dedicated four-window entry for large batches")
             grants = (256,) * 4
         counters = state.rotating.rows[:, 9:16 + max(1, len(grants))].cpu().numpy()
         traffic = window_traffic(counters, counts, grants, carry_credit=carry_credit)
