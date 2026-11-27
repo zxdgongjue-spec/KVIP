@@ -22,6 +22,14 @@
 #include "lib/matrix/matmul/tiling.h"
 #include "indexer_types.h"
 
+// The four-window LI3 and its fixed-rank replay use a separate device
+// translation unit from LI1, BS16 and the communication tail.
+#if KVIP_LARGE_FOUR_WINDOW_CREDIT || defined(KVIP_TEST_WINDOW_RANK1)
+#define KVIP_LI3_KEY_LOOKAHEAD 1
+#else
+#define KVIP_LI3_KEY_LOOKAHEAD 0
+#endif
+
 namespace QLIKernel {
 using namespace QLICommon;
 template <typename QLIT>
@@ -48,6 +56,9 @@ public:
     static constexpr uint32_t QUERY_MTE1_MTE2_EVENT = EVENT_ID5;         // KEY_MTE1_MTE2_EVENT + KEY_BUF_NUM;
     static constexpr uint32_t M_MTE1_EVENT = EVENT_ID3;
 
+#if KVIP_LI3_KEY_LOOKAHEAD
+    static constexpr uint32_t NEXT_KEY_MTE2_MTE1_EVENT = EVENT_ID3;
+#endif
     static constexpr uint32_t MTE2_MTE1_EVENT = EVENT_ID2;
     static constexpr uint32_t MTE1_M_EVENT = EVENT_ID2;
     static constexpr uint32_t FIX_M_EVENT = EVENT_ID2;
@@ -77,7 +88,12 @@ protected:
                                           uint64_t s1gL0RealSize, const QLICommon::RunInfo &runInfo);
     __aicore__ inline void QueryNd2Nz(uint64_t s1gL1RealSize, uint64_t s1gL1Offset, const QLICommon::RunInfo &runInfo);
     __aicore__ inline void KeyNd2Nz(uint64_t s2L1RealSize, uint64_t s2GmOffset, const QLICommon::RunInfo &runInfo);
+#if KVIP_LI3_KEY_LOOKAHEAD
+    __aicore__ inline void KeyNd2NzForPA(uint64_t s2L1RealSize, uint64_t s2GmOffset,
+                                        const QLICommon::RunInfo &runInfo, uint32_t bankAhead = 0);
+#else
     __aicore__ inline void KeyNd2NzForPA(uint64_t s2L1RealSize, uint64_t s2GmOffset, const QLICommon::RunInfo &runInfo);
+#endif
     GlobalTensor<int32_t> blkTableGm_;
     GlobalTensor<K_T> keyGm_;
     GlobalTensor<Q_T> queryGm_;
@@ -103,6 +119,9 @@ protected:
     uint64_t queryL1Mte1BufIdx_ = 0;
     uint64_t l0BufIdx_ = 0;
 
+#if KVIP_LI3_KEY_LOOKAHEAD
+    bool nextKeyBankReady_ = false;
+#endif
     bool isKeyCacheValid_ = false; // L1中是否有可复用的数据
     uint64_t keyGmStart_ = 0; // L1数据对应的GM S2偏移
     uint64_t keyLoadedSize_ = 0; // L1中实际加载的S2元素数量
@@ -248,10 +267,19 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
             bool keyCacheHit = isKeyCacheValid_ && (s2GmBaseOffset >= keyGmStart_) &&
                                  (s2GmBaseOffset + s2ProcessSize <= keyGmStart_ + keyLoadedSize_);
             if (!keyCacheHit) {
+#if !KVIP_LI3_KEY_LOOKAHEAD
                 WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + keyL1BufIdx_ % KEY_BUF_NUM);
+#endif
                 // 缓存未命中，需要从GM搬到L1 min（256, 剩余s2）
                 uint64_t s2TotalRemainNum = runInfo.actS2Size - s2GmBaseOffset;
                 uint64_t s2L1LoadSize = (s2TotalRemainNum < s2BasicBlock_) ? s2TotalRemainNum : s2BasicBlock_;
+#if KVIP_LI3_KEY_LOOKAHEAD
+                if (nextKeyBankReady_) {
+                    WaitFlag<HardEvent::MTE2_MTE1>(NEXT_KEY_MTE2_MTE1_EVENT);
+                    nextKeyBankReady_ = false;
+                } else {
+                    WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + keyL1BufIdx_ % KEY_BUF_NUM);
+#endif
                 if (PAGE_ATTENTION) {
                     KeyNd2NzForPA(s2L1LoadSize, s2GmBaseOffset + s2GmOffset, runInfo);
                 }else {
@@ -260,6 +288,9 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
 
                 SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
                 WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
+#if KVIP_LI3_KEY_LOOKAHEAD
+                }
+#endif
 
                 isKeyCacheValid_ = true;
                 keyGmStart_ = s2GmBaseOffset;
@@ -267,6 +298,22 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
             }
             uint64_t l1S2Offset = s2GmBaseOffset - keyGmStart_;
             uint64_t l1TotalSize = keyLoadedSize_;
+#if KVIP_LI3_KEY_LOOKAHEAD
+            // The current bank still supplies its second 128-token tile to
+            // L0B. Start reading the next two tiles into the next free L1 bank.
+            // Keep the transfer within this worker's interval and valid K.
+            if constexpr (PAGE_ATTENTION) {
+                const uint64_t next = keyGmStart_ + keyLoadedSize_;
+                if (keyCacheHit && l1S2Offset == 128 && keyLoadedSize_ == 256 &&
+                    constInfo_.s2BaseSize == 128 && !runInfo.isLastS2InnerLoop &&
+                    next + 256 <= runInfo.validS2Len && next + 256 <= runInfo.actS2Size) {
+                    WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + (keyL1BufIdx_ + 1) % KEY_BUF_NUM);
+                    KeyNd2NzForPA(256, next, runInfo, 1);
+                    SetFlag<HardEvent::MTE2_MTE1>(NEXT_KEY_MTE2_MTE1_EVENT);
+                    nextKeyBankReady_ = true;
+                }
+            }
+#endif
             // s1gProcessSize当前必定不会超过2倍的s1g basic block
             for (uint64_t s1gGmOffset = 0; s1gGmOffset < s1gProcessSize; s1gGmOffset += constInfo_.mBaseSize) {
                 uint64_t s1gL1RealSize =
@@ -362,7 +409,11 @@ __aicore__ inline void QLIMatmul<QLIT>::KeyNd2Nz(uint64_t s2L1RealSize, uint64_t
 // blkNum, blkSize, N2, D
 template <typename QLIT>
 __aicore__ inline void QLIMatmul<QLIT>::KeyNd2NzForPA(uint64_t s2L1RealSize, uint64_t s2GmOffset,
+#if KVIP_LI3_KEY_LOOKAHEAD
+                                                    const QLICommon::RunInfo &runInfo, uint32_t bankAhead)
+#else
                                                     const QLICommon::RunInfo &runInfo)
+#endif
 {
     uint64_t s2L1Offset = 0;
     while (s2L1Offset < s2L1RealSize) {
@@ -383,8 +434,13 @@ __aicore__ inline void QLIMatmul<QLIT>::KeyNd2NzForPA(uint64_t s2L1RealSize, uin
         nd2nzPara.dstNzNStride = 1;
         nd2nzPara.srcNdMatrixStride = 0;
         nd2nzPara.dstNzMatrixStride = 0;
+#if KVIP_LI3_KEY_LOOKAHEAD
+        DataCopy(keyL1_[((keyL1BufIdx_ + bankAhead) % KEY_BUF_NUM) * keyBufferOffset_ + s2L1Offset * FP8_BLOCK_CUBE],
+                 keyGm_[keyGmOffset], nd2nzPara);
+#else
         DataCopy(keyL1_[(keyL1BufIdx_ % KEY_BUF_NUM) * keyBufferOffset_ + s2L1Offset * FP8_BLOCK_CUBE],
                  keyGm_[keyGmOffset], nd2nzPara);
+#endif
 
         s2L1Offset += s2Mte2Size;
     }
@@ -542,4 +598,5 @@ __aicore__ inline void QLIMatmul<QLIT>::FreeEventID()
     WaitFlag<HardEvent::FIX_M>(FIX_M_EVENT + 1);
 }
 } // namespace QLIKernel
+#undef KVIP_LI3_KEY_LOOKAHEAD
 #endif
