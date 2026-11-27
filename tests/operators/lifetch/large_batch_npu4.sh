@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Five real Q4 traces paired with the strong two-worker serial path.
 set -eo pipefail
-root=$(cd "$(dirname "$0")/../../.." && pwd)
+controller_root=$(cd "$(dirname "$0")/../../.." && pwd -P)
+root=$(cd "${PEER_TIMED_SOURCE:-$controller_root}" && pwd -P)
 work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold}
 reuse_serial=
 archive=
@@ -112,11 +113,28 @@ if [[ $four_ranks != 0 ]]; then
 fi
 if [[ -n $bs32_li ]]; then prefix="$prefix-bs32-$bs32_li"; fi
 if (( packed_blocks == 1 )); then prefix="$prefix-one-block"; fi
-if [[ -n $packed_archive && -n ${PEER_PACKED_RESUME:-} ]]; then
-    out=$(cd "$PEER_PACKED_RESUME" && pwd)
-    [[ $out == "$area/$prefix."* && $(<"$out/packed_source.txt") == "$packed_archive" &&
-       $(<"$out/native.txt") == "$(git -C "$root" rev-parse HEAD)" &&
-       $(<"$out/physical_npu.txt") == "$peer_physical_npu" ]] || { echo "Wrong packed resume directory: $out" >&2; exit 2; }
+sdk_rev=813f1750a50b7e6c92d5f5397f2fbc05befef6da
+sdk_tree=1de18e8315137d7a0227c3ae4c82afd45b5fe743
+native=$(git -C "$root" rev-parse HEAD)
+resuming=0
+if [[ -n ${PEER_PACKED_RESUME:-} ]]; then
+    (( packed )) || { echo "Resume needs a packed measurement" >&2; exit 2; }
+    resuming=1
+    out=$(cd "$PEER_PACKED_RESUME" && pwd -P)
+    [[ ${out%/*} == "$(cd "$area" && pwd -P)" && ${out##*/} == "$prefix."* &&
+       -f $out/packed_source.txt && $(<"$out/packed_source.txt") == "$packed_archive" &&
+       $(<"$out/native.txt") == "$native" && $(<"$out/physical_npu.txt") == "$peer_physical_npu" &&
+       $(<"$out/host.txt") == "$(uname -n)" && $(<"$out/boot_id.txt") == "$(</proc/sys/kernel/random/boot_id)" &&
+       $(<"$out/kvaf.txt") == "$sdk_rev" && $(<"$out/kvaf_tree.txt") == "$sdk_tree" ]] ||
+        { echo "Resume source, host, boot, card or SDK mismatch: $out" >&2; exit 2; }
+    if [[ -s $out/machine_id.txt || -s /etc/machine-id ]]; then
+        cmp -s "$out/machine_id.txt" /etc/machine-id || { echo "Resume machine ID mismatch: $out" >&2; exit 2; }
+    fi
+    git -C "$root" diff --quiet HEAD -- || { echo "Tracked changes in timed worktree: $root" >&2; exit 2; }
+    if (( standalone )); then
+        [[ $(<"$out/selection_oracle.txt") == captured_logical_scores && ! -e $out/reference.txt ]] ||
+            { echo "Resume oracle mismatch: $out" >&2; exit 2; }
+    fi
     if (( packed_candidate )); then
         saved_blocks=2
         if [[ -f $out/candidate_blocks.txt ]]; then saved_blocks=$(<"$out/candidate_blocks.txt"); fi
@@ -142,9 +160,20 @@ fi
 if [[ -r /usr/local/Ascend/nnal/atb/set_env.sh ]]; then source /usr/local/Ascend/nnal/atb/set_env.sh; fi
 set -u
 support_rev=e34e8e0411d6f3decb3fd6aabff877e3a419b4f9
-sdk_rev=813f1750a50b7e6c92d5f5397f2fbc05befef6da
 sdk="$sources/unified-sdk-813f1750-d6cfd392"
 workers="$root/tests/operators/lifetch/support"
+# Protect this run against a second invocation using the same physical card.
+card_lock="$sources/largebs-$(</proc/sys/kernel/random/boot_id)-npu$peer_physical_npu.lock"
+exec 9>"$card_lock"
+if (( packed_candidate )); then
+    if ! flock -n 9; then
+        echo "WAITING_FOR_CARD physical_NPU=$peer_physical_npu lock=$card_lock" >&3
+        if command -v lslocks >/dev/null; then lslocks -n -o PID,COMMAND,PATH | grep -F -- "$card_lock" >&3 || true; fi
+        flock 9
+    fi
+else
+    flock -n 9 || { echo "A large-batch replay is already running on NPU$peer_physical_npu"; exit 1; }
+fi
 host_tools="$out/host-tools"
 mkdir -p "$host_tools"
 if ! git -C "$root" cat-file -e "$support_rev^{commit}" 2>/dev/null; then
@@ -153,14 +182,6 @@ fi
 git -C "$root" archive "$support_rev" tests/operators/lifetch/{peer_g2_input.sh,support/{workloads.py,peer_thp.py,query_owner_input.py,peer_node_prepare.sh}} | tar -x -C "$host_tools"
 helpers="$host_tools/tests/operators/lifetch"
 source "$helpers/support/peer_node_prepare.sh"
-# Protect this run against a second invocation using the same physical card.
-exec 9>"$sources/largebs-$(</proc/sys/kernel/random/boot_id)-npu$peer_physical_npu.lock"
-if (( packed_candidate )); then
-    echo "WAITING_FOR_CARD physical_NPU=$peer_physical_npu" >&3
-    flock 9
-else
-    flock -n 9 || { echo "A large-batch replay is already running on NPU$peer_physical_npu"; exit 1; }
-fi
 exec 8>"$sdk.lock"
 flock 8
 baseline="$work/adaptive-sources/peer-serial-da318bdb"
@@ -170,7 +191,7 @@ if (( standalone )); then
 else
     peer_prepare_node "$root" "$baseline" "$clean" "$work" "$out"
 fi
-"$PYTHON" -B -c 'import os; print(os.uname().nodename)' > "$out/host.txt"
+if (( !resuming )); then uname -n > "$out/host.txt"; fi
 if [[ ! -e "$sdk" ]]; then
     if ! git -C "$clean" cat-file -e "$sdk_rev^{commit}" 2>/dev/null; then
         git -C "$clean" fetch -q --no-tags https://gitcode.com/CacheOS/KVAF.git refs/heads/main
@@ -184,7 +205,7 @@ sdk_git=(env "GIT_INDEX_FILE=$index/index" git -C "$sdk")
 "${sdk_git[@]}" add -u
 "${sdk_git[@]}" add access_operator/algorithms/get/direct/urma_aiv/include/kvaf_batch_get_device.h
 actual=$("${sdk_git[@]}" write-tree)
-[[ $actual == 1de18e8315137d7a0227c3ae4c82afd45b5fe743 ]] || { echo "Unexpected KVAF source tree $actual"; exit 1; }
+[[ $actual == "$sdk_tree" && $(git -C "$sdk" rev-parse HEAD) == "$sdk_rev" ]] || { echo "Unexpected KVAF source tree $actual"; exit 1; }
 rm -rf -- "$index"
 cache="$clean/build-cpu/CMakeCache.txt"
 headers=$(sed -n 's/^KVAF_URMA_ROOT:[^=]*=//p' "$cache")
@@ -214,17 +235,21 @@ if [[ $ASCEND_RT_VISIBLE_DEVICES != "$peer_physical_npu" || $PEER_PHYSICAL_NPU !
     echo "Dependency setup changed the selected physical card" >&2
     exit 1
 fi
-printf '%s\n' "$(git -C "$root" rev-parse HEAD)" > "$out/native.txt"
-if [[ -r /etc/machine-id ]]; then cat /etc/machine-id > "$out/machine_id.txt"; fi
-printf '%s\n' "$peer_physical_npu" > "$out/physical_npu.txt"
-cat /proc/sys/kernel/random/boot_id > "$out/boot_id.txt"
-printf '%s\n' "$actual" > "$out/kvaf_tree.txt"
-git -C "$sdk" rev-parse HEAD > "$out/kvaf.txt"
+if (( !resuming )); then
+    printf '%s\n' "$native" > "$out/native.txt"
+    if [[ -r /etc/machine-id ]]; then cat /etc/machine-id > "$out/machine_id.txt"; fi
+    printf '%s\n' "$peer_physical_npu" > "$out/physical_npu.txt"
+    cat /proc/sys/kernel/random/boot_id > "$out/boot_id.txt"
+    printf '%s\n' "$actual" > "$out/kvaf_tree.txt"
+    printf '%s\n' "$sdk_rev" > "$out/kvaf.txt"
+fi
 if (( packed )); then
-    printf '%s\n' "$packed_archive" > "$out/packed_source.txt"
+    if (( !resuming )); then printf '%s\n' "$packed_archive" > "$out/packed_source.txt"; fi
     if (( standalone )); then
-        printf '1\n' > "$out/candidate_blocks.txt"
-        printf 'captured_logical_scores\n' > "$out/selection_oracle.txt"
+        if (( !resuming )); then
+            printf '1\n' > "$out/candidate_blocks.txt"
+            printf 'captured_logical_scores\n' > "$out/selection_oracle.txt"
+        fi
         echo "CANDIDATE_ONLY oracle=captured_logical_scores fresh_arms=fused comparisons=unavailable" >&3
     elif (( packed_candidate )); then
         printf '%s\n' "$packed_blocks" > "$out/candidate_blocks.txt"
@@ -259,6 +284,14 @@ fi
 placement="auto auto"
 if [[ -z $archive && -z $fixed_archive && -z $packed_archive ]]; then
     placement=$("$PYTHON" -B "$workers/large_batch_placement.py" find "$out")
+fi
+trace_paths=()
+if (( standalone && resuming )); then
+    verified=$("$PYTHON" -B "$controller_root/tests/operators/lifetch/support/fixed_q4_resume.py" \
+        "$out" "$root" "$helpers" "$work" "$KVAF_BATCH_GET_KERNEL" 2>&3)
+    while IFS=$'\t' read -r key value; do
+        if [[ $key == placement ]]; then placement=$value; elif [[ -n $key ]]; then trace_paths[$key]=$value; fi
+    done <<<"$verified"
 fi
 read -r planned_node planned_adapter <<<"$placement"
 set_cpu_placement() {
@@ -304,7 +337,7 @@ run_arm() (
     dir="$pair/$arm"
     mkdir "$dir"
     port=$("$PYTHON" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
-    "${command[@]}" --listen 127.0.0.1 --port "$port" --memory-page-mode thp >"$dir/cpu.log" 2>&1 &
+    "${command[@]}" --listen 127.0.0.1 --port "$port" --memory-page-mode thp 9>&- >"$dir/cpu.log" 2>&1 &
     server=$!
     monitor=
     cleanup() {
@@ -321,7 +354,7 @@ run_arm() (
         sleep .1
     done
     grep -Fq "LISTEN address=127.0.0.1 port=$port" "$dir/cpu.log" || { tail -20 "$dir/cpu.log"; exit 1; }
-    "$PYTHON" -B "$helpers/support/peer_thp.py" --unified-sdk --pid "$server" --log "$dir/cpu.log" --output "$dir/thp.json" --timeout 7200 &
+    "$PYTHON" -B "$helpers/support/peer_thp.py" --unified-sdk --pid "$server" --log "$dir/cpu.log" --output "$dir/thp.json" --timeout 7200 9>&- &
     monitor=$!
     if [[ $arm == candidate || $arm == pr30_reference ]]; then
         (cd "$dir" && timeout --kill-after=30s 7200s bash "$root/tests/operators/lifetch/fixed_bs16_pr30.sh" \
@@ -353,7 +386,12 @@ run_arm() (
             args+=(--serial-result "$pair/serial")
         fi
     fi
-    (cd "$dir" && timeout --kill-after=30s 7200s "$PYTHON" -B "$workers/large_batch_pair.py" "${args[@]}") >"$dir/worker.log" 2>&1 || { tail -20 "$dir/worker.log"; exit 1; }
+    (cd "$dir" && timeout --kill-after=30s 7200s "$PYTHON" -B "$workers/large_batch_pair.py" "${args[@]}") >"$dir/worker.log" 2>&1 || {
+        worker_rc=$?
+        printf 'WORKER_FAILED G%s BS%s arm=%s rc=%s worker_log=%s\n' "$group" "$batch" "$arm" "$worker_rc" "$dir/worker.log" >&3
+        tail -20 "$dir/worker.log"
+        exit "$worker_rc"
+    }
     wait "$monitor"
     monitor=
 )
@@ -422,12 +460,18 @@ run_packed_cohort() {
         for arm in "${order[@]}"; do
             result="$dir/$arm"
             if [[ -f $result/placement_verified && -s $result/packed_result.json ]]; then
-                "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref" "$result/thp.json"
+                if (( standalone )); then
+                    (( resuming )) || { echo "Unexpected existing cell: $result" >&2; return 1; }
+                    echo "REUSED G$group BS$batch block=$block arm=$arm" >&3
+                else
+                    "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref" "$result/thp.json"
+                fi
                 continue
             fi
             if [[ -e $result ]]; then
                 backup=$(mktemp -d "$dir/incomplete.XXXXXX")
                 mv -- "$result" "$backup/"
+                echo "PARTIAL_SAVED G$group BS$batch path=$backup/$arm" >&3
             fi
             printf 'CASE_BEGIN G%s BS%s cohort=%s block=%s arm=%s\n' "$group" "$batch" "$cohort" "$block" "$arm" >&3
             run_arm "$group" "$batch" "$trace" "$arm" "$dir" "$cohort"
@@ -464,7 +508,6 @@ run_packed_cohort() {
     done
 }
 
-trace_paths=()
 run_group_batches() {
     local group=$1 batch trace
     shift
@@ -477,7 +520,14 @@ run_group_batches() {
         prepared_bank="$out/g$group/donors"
         if (( packed_candidate )) && [[ -n $ctl && -s $ctl/g$group/donors/source.json ]]; then
             prepared_bank="$ctl/g$group/donors"
+        elif (( standalone && resuming )) && [[ -f $out/g$group/bs$1/block1/fused/placement_verified ]]; then
+            # Completed cells had their input fingerprints checked before any worker started.
+            :
         elif [[ ! -f $prepared_bank/source.json ]]; then
+            if [[ -e $prepared_bank ]]; then
+                donor_backup=$(mktemp -d "$out/g$group/incomplete-donors.XXXXXX")
+                mv -- "$prepared_bank" "$donor_backup/"
+            fi
             donor_stage=$(mktemp -d "$out/g$group/donors-prepare.XXXXXX")
             "$PYTHON" -B "$workers/large_batch_input.py" "$trace" "$group" "$donor_stage/bank"
             mv "$donor_stage/bank" "$prepared_bank"
@@ -592,7 +642,7 @@ fi
 rm -rf -- "$host_tools"
 # The per-arm JSON and placement records contain the measurement. Setup and
 # import transcripts in this new output directory are only needed on failure.
-rm -f -- "$out"/{run,venv,pybind11,lidu-import,build-lidu,build-cpu}.log
+if (( !resuming )); then rm -f -- "$out"/{run,venv,pybind11,lidu-import,build-lidu,build-cpu}.log; fi
 if (( fixed )); then
     echo "REPLAY_COMPLETE cells=$((${#groups[@]} * ${#batches[@]})) RESULT_ROOT=$out" >&3
     trap - EXIT
