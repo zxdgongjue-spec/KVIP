@@ -115,6 +115,12 @@ if [[ -n $bs32_li ]]; then prefix="$prefix-bs32-$bs32_li"; fi
 if (( packed_blocks == 1 )); then prefix="$prefix-one-block"; fi
 sdk_rev=813f1750a50b7e6c92d5f5397f2fbc05befef6da
 sdk_tree=1de18e8315137d7a0227c3ae4c82afd45b5fe743
+follow_ref=${PEER_FOUR_RANK_FOLLOWUP:-}
+if [[ -n $follow_ref ]]; then
+    (( standalone && four_ranks )) && [[ $peer_physical_npu == 4 && -z ${PEER_RANK_DIAG_SOURCE:-} ]] ||
+        { echo 'Follow-up requires the NPU4 four-rank entry' >&2; exit 2; }
+    prefix=fixed-q4-rank-followup
+fi
 diag_source=${PEER_RANK_DIAG_SOURCE:-}
 if [[ -n $diag_source ]]; then
     (( standalone )) && [[ $peer_physical_npu == 4 && -z ${PEER_PACKED_RESUME:-} ]] ||
@@ -260,7 +266,13 @@ elif (( packed )); then
             printf '1\n' > "$out/candidate_blocks.txt"
             printf 'captured_logical_scores\n' > "$out/selection_oracle.txt"
         fi
-        echo "CANDIDATE_ONLY oracle=captured_logical_scores fresh_arms=fused comparisons=unavailable" >&3
+        if [[ -n $follow_ref ]]; then
+            follow_report="$controller_root/tests/operators/lifetch/support/four_rank_followup.py"
+            "$PYTHON" -B "$follow_report" verify "$out" "$follow_ref"
+            echo "FOLLOWUP source=$follow_ref candidate=$native scope=$PEER_FOUR_RANK_SCOPE fresh_arms=fused archived_baseline=1" >&3
+        else
+            echo "CANDIDATE_ONLY oracle=captured_logical_scores fresh_arms=fused comparisons=unavailable" >&3
+        fi
     elif (( packed_candidate )); then
         printf '%s\n' "$packed_blocks" > "$out/candidate_blocks.txt"
         ctl=$("$PYTHON" -B "$workers/fixed_q4_packed_report.py" reference "$out" "$packed_archive" "$root" "${PEER_PACKED_REFERENCE:-}")
@@ -292,7 +304,9 @@ elif (( fixed )); then
 fi
 # Use the same registered CPU memory placement for the serial and fused arms.
 placement="auto auto"
-if [[ -z $archive && -z $fixed_archive && -z $packed_archive ]]; then
+if [[ -n $follow_ref ]]; then
+    placement=$("$PYTHON" -B "$workers/large_batch_placement.py" get "$follow_ref/g7/bs32/block1/fused/thp.json")
+elif [[ -z $archive && -z $fixed_archive && -z $packed_archive ]]; then
     placement=$("$PYTHON" -B "$workers/large_batch_placement.py" find "$out")
 fi
 trace_paths=()
@@ -504,7 +518,12 @@ run_packed_cohort() {
     local group=$1 batch=$2 trace=$3 cohort=$4 pair=$5
     local block arm ref dir backup packed_oracle placement node adapter result
     local -a order
-    if (( standalone )); then
+    if [[ -n $follow_ref ]]; then
+        ref="$follow_ref/g$group/bs$batch/block1/fused/thp.json"
+        placement=$("$PYTHON" -B "$workers/large_batch_placement.py" get "$ref")
+        read -r planned_node planned_adapter <<<"$placement"
+        set_cpu_placement "$planned_node" "$planned_adapter" archived
+    elif (( standalone )); then
         ref=
         set_cpu_placement "$planned_node" "$planned_adapter"
     else
@@ -555,7 +574,9 @@ run_packed_cohort() {
                 { (( packed_candidate && batch == 32 )) && [[ -n $bs32_li ]]; }; then
                 grep '^WINDOWS ' "$result/worker.log" | tee -a "$out/summary.txt" >&3
             fi
-            if (( standalone )); then
+            if [[ -n $follow_ref ]]; then
+                "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref" "$result/thp.json"
+            elif (( standalone )); then
                 placement=$("$PYTHON" -B "$workers/large_batch_placement.py" get "$result/thp.json")
                 read -r node adapter <<<"$placement"
                 [[ $planned_node == auto || $planned_node == "$node" ]] &&
@@ -581,7 +602,9 @@ run_group_batches() {
     if (( fixed )); then
         mkdir -p "$out/g$group"
         prepared_bank="$out/g$group/donors"
-        if (( packed_candidate )) && [[ -n $ctl && -s $ctl/g$group/donors/source.json ]]; then
+        if [[ -n $follow_ref && -s $follow_ref/g$group/donors/source.json ]]; then
+            prepared_bank="$follow_ref/g$group/donors"
+        elif (( packed_candidate )) && [[ -n $ctl && -s $ctl/g$group/donors/source.json ]]; then
             prepared_bank="$ctl/g$group/donors"
         elif (( standalone && resuming )) && [[ -f $out/g$group/bs$1/block1/fused/placement_verified ]]; then
             # Completed cells had their input fingerprints checked before any worker started.
@@ -616,7 +639,9 @@ run_group_batches() {
                 run_pair "$group" "$batch" "$trace" "$cohort" "$pair"
             fi
         done
-        if (( standalone )); then
+        if [[ -n $follow_ref ]]; then
+            "$PYTHON" -B "$follow_report" cell "$out" "$follow_ref" "$group" "$batch" | tee -a "$out/summary.txt" >&3
+        elif (( standalone )); then
             "$PYTHON" -B "$workers/fixed_q4_candidate_only.py" cell "$out" "$group" "$batch" | tee -a "$out/summary.txt" >&3
         elif (( packed )); then
             "$PYTHON" -B "$workers/fixed_q4_packed_report.py" cell "$out" "$group" "$batch" | tee -a "$out/summary.txt" >&3
@@ -654,7 +679,20 @@ run_group_batches() {
         rm -rf -- "$out/g$group/donors"
     fi
 }
-if (( packed_candidate )); then
+if [[ -n $follow_ref ]]; then
+    for group in "${groups[@]}"; do
+        if [[ $PEER_FOUR_RANK_SCOPE == focus && $group != 7 ]]; then
+            run_group_batches "$group" 32
+        else
+            run_group_batches "$group" "${batches[@]}"
+        fi
+        rm -rf -- "$out/g$group/donors"
+    done
+    "$PYTHON" -B "$follow_report" summary "$out" "$follow_ref" "$PEER_FOUR_RANK_SCOPE" >&3
+    rm -rf -- "$host_tools"
+    echo "REPLAY_COMPLETE RESULT_ROOT=$out" >&3
+    exit 0
+elif (( packed_candidate )); then
     # Finish each large shape for all five traces before entering smaller
     # shapes, which have many more donor cohorts. Keep each donor bank once.
     for batch in "${batches[@]}"; do
