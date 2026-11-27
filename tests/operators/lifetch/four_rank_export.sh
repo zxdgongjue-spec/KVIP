@@ -4,13 +4,18 @@ set -euo pipefail
 repo=${1:?expected KVIP checkout}
 rev=$(git -C "$repo" rev-parse --verify "${2:?expected exact exporter commit}^{commit}")
 shift 2
+exporter=export_four_rank_inputs.py
+if [[ ${1:-} == --critical-rows ]]; then
+    exporter=export_four_rank_critical_rows.py
+    shift
+fi
 work=/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold
 stage=$(mktemp -d)
 trap 'rm -rf -- "$stage"' EXIT
 git -C "$repo" archive "$rev" tests/operators/lifetch/support | tar -xf - -C "$stage"
 for py in "$work/peer-baseline/python-da318bdb/bin/python" /usr/local/python3.12.13/bin/python3 python3; do
     if "$py" -B -c 'import hashlib,numpy; assert hasattr(hashlib,"file_digest")' 2>/dev/null; then
-        "$py" -B "$stage/tests/operators/lifetch/support/export_four_rank_inputs.py" "$@"
+        "$py" -B "$stage/tests/operators/lifetch/support/$exporter" "$@"
         exit 0
     fi
 done
