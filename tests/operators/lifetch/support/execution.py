@@ -3275,7 +3275,8 @@ class FusedReplayState:
     state must not have live graphs or unfinished device work.
     """
     def __init__(self, torch, runtime, table, library, initial, pages, addresses,
-                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None, large_window_launch=None):
+                 *, transport, device, aics, windows, prefetch_tokens, soc, prefetch_rank_start=1024, lease=None, large_window_launch=None,
+                 carry_window_credit=False):
         from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
         from kvip.cache.index_storage import IndexCacheStorage
         from kvip.operators.lifetch.binding import LIFetchBinding
@@ -3328,6 +3329,7 @@ class FusedReplayState:
                     batch=self.batch, history=self.history, resident=self.resident,
                     intermediate_fetches=windows, prefetch_limit=prefetch_tokens,
                     window_limit=large_window_launch.window_limit if large_window_launch is not None else None,
+                    carry_window_credit=carry_window_credit,
                     prefetch_rank_start=prefetch_rank_start,
                     aic_count=aics, token_bytes=self.token_bytes, **binding)
             update_type = UbmemIndexUpdate if ubmem else DirectIndexUpdate
@@ -3955,7 +3957,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused, p
 
 
 def run_path(config, directory, sequence, pages, *, fused, round_check=None, shared_pool=None, measure=None,
-             large_window_policy=None):
+             large_window_policy=None, carry_window_credit=False):
     import acl
     import kvaf
     import torch
@@ -4047,7 +4049,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 torch, runtime, view, library, initial, pages, logical_addresses,
                 transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
-                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024), large_window_launch=large_window_launch)
+                prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024), large_window_launch=large_window_launch, carry_window_credit=carry_window_credit)
             if large_window_launch is not None:
                 state.large_window_build_args = large_window_build_args
         else:
@@ -4096,7 +4098,7 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
                         prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease,
-                        large_window_launch=large_window_launch)
+                        large_window_launch=large_window_launch, carry_window_credit=carry_window_credit)
                     replica.failure_directory = directory
                 else:
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)

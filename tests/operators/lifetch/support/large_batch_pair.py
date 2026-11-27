@@ -783,6 +783,10 @@ def run(args):
         if serial.shape != (CALLS, args.batch, 4, 2048):
             raise ValueError("Strong serial output shape mismatch")
     policy = args.large_window_policy
+    if args.carry_credit and (policy or not fused or not args.packed_ten or not args.compare_packed_candidate
+                              or args.batch not in (20, 24, 28, 32) or inputs.geometry["history"] != 131328
+                              or np.unique((inputs.query_ends[:, -1] + 127) // 128).size != 1):
+        raise ValueError("Four-window carry requires a fixed 128K large-batch packed candidate")
     if policy and (not args.packed_ten or not args.compare_packed_candidate or not fused
                    or args.batch not in (20, 24, 28, 32)):
         raise ValueError(f"{policy} requires a fresh packed BS20/24/28/32 fused candidate")
@@ -802,7 +806,7 @@ def run(args):
     else:
         benchmark = partial(measured_replays, ex, proofs, serial)
     result = ex.run_path(cfg, args.output / "path", sequence, pages, fused=fused, measure=benchmark,
-                         large_window_policy=policy)
+                         large_window_policy=policy, carry_window_credit=args.carry_credit)
     workers = (32 if args.batch > 16 else 40) if fused else 2
     if result["correctness"] != "PASS" or result["failures"] or result["runtime_workers"] != workers:
         raise ValueError(f"{args.arm}: production replay failed or used incorrect worker count")
