@@ -186,7 +186,11 @@ def run(a):
     if old["physical_npu"] != 4 or any(old[k] != v for k, v in wanted.items()):
         raise ValueError("Archive and live run differ in input, device, SDK or hardware")
     fused = a.mode != "serial"
-    timed = a.mode != "journal"
+    journal = a.mode in ("journal", "team-schedule")
+    timed = not journal
+    if a.mode == "team-schedule" and rev != "d0fc5963881bd38fa97eff0f6ef40c757a6e8713":
+        raise ValueError("A scheduler capture must use the original fixed four-window source")
+
     cfg = configuration(
         [
             "bench",
@@ -234,7 +238,7 @@ def run(a):
                 ref[r, q] = np.sort(ids[top])
         inputs.validate_topk(ref)
         worker = partial(measure_packed, ex, proof, np.broadcast_to(ref, (10, *ref.shape)))
-    if a.mode == "journal":
+    if journal:
 
         kwargs = dict(large_window_policy="four-ranks")
 
@@ -255,6 +259,10 @@ def run(a):
             if rec["cold_build_fingerprint"] != s.large_window_launch.source_fingerprint:
                 raise ValueError("Diagnostic and measured LI executable differ")
             proof.update(terminal_image(s, a.sdk))
+            if rev == "d0fc5963881bd38fa97eff0f6ef40c757a6e8713":
+                from b24_team_schedule import capture
+                proof["terminal_team_schedule"] = capture(s)
+            proof.update(measured_calls=0, diagnostic_calls=1)
             s.forward.set_diagnostics(False)
             _, counts = read_selected(s, inputs, True)
             records = device_journal(s, inputs, pages, counts)
@@ -376,14 +384,16 @@ def run(a):
             raise ValueError("The controlled pair must share the LI binary and compiler and exercise distinct tail images")
         summary.update(compare(control, summary, recovered_maps))
         summary["scope"] = "controlled ten-call graph with guarded GET and terminal journaling on both arms"
-    path = {"serial": "packed_result.json", "journal": "journal.json", "frozen": "frozen.json",
+    if a.mode == "team-schedule":
+        atomic_json(a.out / "journal.json", dict(summary, arm="journal"))
+    path = {"team-schedule": "team-schedule.json", "serial": "packed_result.json", "journal": "journal.json", "frozen": "frozen.json",
             "two-row-frozen": "two-row-frozen.json"}[a.mode]
     atomic_json(a.out / path, summary)
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("mode", choices=["journal", "serial", "frozen", "two-row-natural", "two-row-frozen"])
+    p.add_argument("mode", choices=["journal", "serial", "frozen", "two-row-natural", "two-row-frozen", "team-schedule"])
     for name in ("timed", "ref"):
         p.add_argument(name, type=Path)
     for name in ("group", "batch"):
