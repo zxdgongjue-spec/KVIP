@@ -24,6 +24,15 @@ from workloads import ReplayPagePlan, configuration
 
 CALLS = 10
 WARMUP = 4
+LARGE_WINDOW_AIVS = 64
+LARGE_WINDOW_FINAL_KERNELS = {
+    0: "v9_li_large_final_auto",
+    1: "v9_li_large_final_q1",
+    2: "v9_li_large_final_pair",
+    3: "v9_li_large_final_pair_dense",
+    4: "v9_li_large_final_q4",
+}
+LARGE_WINDOW_FIXED_WIDTHS = {1: 1, 2: 2, 3: 2, 4: 4}
 
 
 def check_scores(inputs, selected, serial):
@@ -66,11 +75,11 @@ def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False, lar
         }
     )
     if large_window_queries_per_worker is not None:
-        finish_kernel = {2: "v9_li_large_final_pair", 1: "v9_li_large_final_q1"}
-        if not fused or batch not in BATCHES or large_window_queries_per_worker not in finish_kernel:
+        mode = large_window_queries_per_worker
+        if not fused or batch not in BATCHES or mode not in LARGE_WINDOW_FINAL_KERNELS:
             raise ValueError("Deferred last-window profiler requires a native large fused arm")
-        names["LI23"] = ("v9_li_large_deferred_cold",)
-        names["last_window"] = (finish_kernel[large_window_queries_per_worker],)
+        names["LI23"] = ("v9_li_large_deferred_cold_auto" if mode == 0 else "v9_li_large_deferred_cold",)
+        names["last_window"] = (LARGE_WINDOW_FINAL_KERNELS[mode],)
     if batch == 16 and fused:
         names = {"pr30_li": ("v9_li_kernel", "v9_li_window_q1_threshold", "v9_li_window_q1_cold"),
                  "tail": ("v9_parallel_terminal",)}
@@ -993,7 +1002,7 @@ def parse_args(argv=None):
     parser.add_argument("--q1-study", action="store_true", help="Use a fresh oracle from the fixed-Q4 Q1 revision")
     candidate = parser.add_mutually_exclusive_group()
     candidate.add_argument("--window-q1", action="store_true", help="Bind the window Q1 candidate")
-    candidate.add_argument("--large-window-queries-per-worker", type=int, choices=(1, 2),
+    candidate.add_argument("--large-window-queries-per-worker", type=int, choices=tuple(LARGE_WINDOW_FINAL_KERNELS),
                            help="Defer the last window of a native large fused arm")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--trace", type=Path)

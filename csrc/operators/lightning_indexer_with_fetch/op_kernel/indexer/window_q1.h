@@ -16,6 +16,7 @@ struct Completion {
     uint32_t calls;
     uint32_t scanned;
     uint32_t candidates;
+    uint32_t queriesPerWorker;
 };
 
 static_assert(sizeof(Snapshot) <= kLineBytes && sizeof(Completion) <= kLineBytes);

@@ -6,7 +6,9 @@ import shutil
 
 import numpy as np
 
-from large_batch_pair import CALLS, WARMUP, check_scores, mutable_buffers, read_selected
+from large_batch_pair import (
+    CALLS, LARGE_WINDOW_AIVS, LARGE_WINDOW_FIXED_WIDTHS, WARMUP, check_scores, mutable_buffers, read_selected,
+)
 from reporting import atomic_json
 
 
@@ -70,14 +72,35 @@ class FrozenPackedRound:
         self.exact += check_scores(inputs, selected, self.serial[index])
         state.validate(inputs)
         if self.fused:
-            scratch = getattr(state.forward.terminal, "window_q1_scratch", None)
+            terminal = state.forward.terminal
+            scratch = getattr(terminal, "window_q1_scratch", None)
             if scratch is not None:
                 # This runs after graph synchronization, outside the device event.
-                ready = scratch[:, 1:, 0].cpu().numpy()
+                receipts = scratch[:state.batch, 1:, :5].cpu().numpy()
+                ready = receipts[:, :, 0]
                 if ready.shape != (state.batch, 4) or not np.all(ready == 1):
                     raise ValueError(f"Call {index}: missing last-window Q1 device completion receipts")
                 counts["window_q1_ready_flags"] = int(ready.size)
+                mode = getattr(terminal, "large_window_queries_per_worker", None)
+                if mode is not None and mode != 2:
+                    counts["window_q_rows_by_width"] = window_q_rows_by_width(receipts[:, :, 4], mode)
         self.traffic.append(counts)
+
+
+def window_q_rows_by_width(widths, mode):
+    per_row = widths[:, 0]
+    if not np.all(widths == per_row[:, None]):
+        raise ValueError("Last-window Q receipts disagree on a request's Q width")
+    if not np.all(np.isin(per_row, (1, 2, 4))):
+        raise ValueError("Last-window Q receipts contain an invalid Q width")
+    rows = {str(width): int(np.count_nonzero(per_row == width)) for width in (1, 2, 4)}
+    if mode == 0:
+        used = sum((4 // int(width)) * count for width, count in rows.items())
+        if used > LARGE_WINDOW_AIVS:
+            raise ValueError("Automatic last-window Q split exceeds its one-wave AIV budget")
+    elif rows[str(LARGE_WINDOW_FIXED_WIDTHS[mode])] != len(per_row):
+        raise ValueError("Last-window Q receipts disagree with the requested fixed Q width")
+    return rows
 
 
 def measure_packed(ex, proofs, serial, torch, states, sequence, config, directory, *, fused,

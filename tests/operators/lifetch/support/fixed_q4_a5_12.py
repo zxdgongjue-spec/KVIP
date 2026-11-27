@@ -16,12 +16,12 @@ import time
 
 from fixed_q4_packed_archive import NATIVE, Q1_BASE, Q1_BATCHES, same_production, verify_q1_production
 from fixed_q4_packed_report import (
-    LARGE_WINDOW_MODES, LARGE_WINDOW_STAGES, Q1_STAGES, STAGES,
+    LARGE_WINDOW_MODES, LARGE_WINDOW_POLICY_MODES, LARGE_WINDOW_STAGES, Q1_STAGES, STAGES,
     read_large_q1_block, read_pair, read_q1_pair, report_cell,
 )
 from large_batch_input import BATCHES as NATIVE_LARGE_BATCHES
 from large_batch_input import FIXED_BATCHES, SYNTHETIC_GROUP, read_source, save_source
-from large_batch_pair import CALLS, WARMUP
+from large_batch_pair import CALLS, LARGE_WINDOW_AIVS, WARMUP
 from large_batch_placement import placement
 from reporting import atomic_json
 from workloads import prepare_compact_fixture
@@ -33,16 +33,34 @@ GROUP, COHORT = 2, 0
 BLOCKS = (("serial", "fused"), ("fused", "serial"))
 Q1_BLOCKS = (("off", "on"), ("on", "off"))
 LARGE_Q1_BASE = "4e4ffd5f6ad7232d6e90a83f76dc2c627d51657f"
+LARGE_Q_POLICY_BASE = "c21add5543e32045c8e22da4e58e50f7b9e48f87"
 LARGE_Q1_BLOCKS = (tuple(LARGE_WINDOW_MODES), tuple(reversed(LARGE_WINDOW_MODES)))
 LARGE_Q1_COMPARISONS = (
     ("deferred_pair", "native"), ("deferred_q1", "deferred_pair"), ("deferred_q1", "native"),
 )
 SYNTHETIC_FIXTURE = dict(history=131072, resident=16384, miss_percent=10, index_heads=32, seed=43)
+Q_POLICY_CHOICES = ("q1", "q2", "q4", "auto")
 
 
-def plan(synthetic=False, window_q1_pair=False, large_window_q1_pair=False):
-    batches = NATIVE_LARGE_BATCHES if large_window_q1_pair else FIXED_BATCHES
+def large_policy_modes(q_policies):
+    requested = {"native", *(f"deferred_{policy}" for policy in q_policies)}
+    return {arm: mode for arm, mode in LARGE_WINDOW_POLICY_MODES.items() if arm in requested}
+
+
+def large_policy_comparisons(modes):
+    comparisons = [(arm, "native") for arm in modes if arm != "native"]
+    if "deferred_q2" in modes:
+        comparisons.extend((arm, "deferred_q2") for arm in modes if arm not in ("native", "deferred_q2"))
+    return comparisons
+
+
+def plan(synthetic=False, window_q1_pair=False, large_window_q1_pair=False, q_policies=None):
+    large = large_window_q1_pair or q_policies is not None
+    batches = NATIVE_LARGE_BATCHES if large else FIXED_BATCHES
     blocks = LARGE_Q1_BLOCKS if large_window_q1_pair else BLOCKS
+    if q_policies is not None:
+        modes = large_policy_modes(q_policies)
+        blocks = (tuple(modes), tuple(reversed(modes)))
     data = dict(
         protocol="ten_independent_calls_one_device_event",
         production_revision=NATIVE,
@@ -71,6 +89,12 @@ def plan(synthetic=False, window_q1_pair=False, large_window_q1_pair=False):
         data["large_window_q1_pair"] = dict(
             baseline_revision=LARGE_Q1_BASE, enabled_batches=list(batches),
             queries_per_worker=LARGE_WINDOW_MODES, scope="deferred_last_window_only",
+        )
+    if q_policies is not None:
+        data["large_window_q_policy"] = dict(
+            baseline_revision=LARGE_Q_POLICY_BASE, mode_codes=modes, scope="deferred_last_window_only",
+            available_aivs=LARGE_WINDOW_AIVS, q_tasks={batch: 4 * batch for batch in batches},
+            fixed_wave_capacity=dict(q1=LARGE_WINDOW_AIVS // 4, q2=LARGE_WINDOW_AIVS // 2, q4=LARGE_WINDOW_AIVS),
         )
     return data
 
@@ -144,7 +168,7 @@ def run_arm(args, directory, batch, arm, source_options, group, node, cpus, *,
         worker += ["--packed-ten", "--serial-result", str(oracle)]
     if args.keep_trace:
         worker.append("--keep-trace")
-    if args.window_q1_pair or args.large_window_q1_pair:
+    if args.window_q1_pair or args.large_window_q1_pair or args.large_window_q_policy:
         worker.append("--q1-study")
     if window_q1:
         worker.append("--window-q1")
@@ -153,7 +177,7 @@ def run_arm(args, directory, batch, arm, source_options, group, node, cpus, *,
 
     label = "synthetic" if group == SYNTHETIC_GROUP else f"G{group}"
     switch = f" window_q1={int(window_q1)}" if args.window_q1_pair and arm == "fused" else ""
-    if args.large_window_q1_pair and arm == "fused":
+    if (args.large_window_q1_pair or args.large_window_q_policy) and arm == "fused":
         switch = f" window_route={directory.name}"
     print(f"CASE_BEGIN {label} BS{batch} cohort={COHORT} arm={arm}{switch} output={directory}", flush=True)
     with ExitStack() as stack:
@@ -250,26 +274,35 @@ def changed_get_counts(observations, before_arm, after_arm):
     return changed_request_records, changed_totals
 
 
-def large_q1_cell(args, out, cell, batch, oracle, source_options, group, node, cpus, adapter):
+def large_q1_cell(args, out, cell, batch, oracle, source_options, group, node, cpus, adapter, *, policy_modes=None):
+    modes = LARGE_WINDOW_MODES if policy_modes is None else policy_modes
+    blocks = (tuple(modes), tuple(reversed(modes)))
+    pairings = LARGE_Q1_COMPARISONS if policy_modes is None else large_policy_comparisons(modes)
     observations = []
-    for index, order in enumerate(LARGE_Q1_BLOCKS, 1):
+    for index, order in enumerate(blocks, 1):
         block = cell / "large_window" / f"block{index}"
         for arm in order:
             run_arm(args, block / arm, batch, "fused", source_options, group, node, cpus, oracle=oracle,
-                    adapter=adapter, large_window_queries_per_worker=LARGE_WINDOW_MODES[arm])
-        observations.append(dict(order=order, **read_large_q1_block(block, group, batch, COHORT, out)))
+                    adapter=adapter, large_window_queries_per_worker=modes[arm])
+        checked = read_large_q1_block(block, group, batch, COHORT, out, modes=modes,
+                                     require_widths=policy_modes is not None)
+        observations.append(dict(order=order, **checked))
     left, right = observations
     if (left["context"], left["fused_bridge_sha256"]) != (right["context"], right["fused_bridge_sha256"]):
         raise ValueError(f"Native large forward and reverse groups used different paired contexts: {cell}")
 
-    times, traffic, comparisons = {}, {}, {}
-    for arm in LARGE_WINDOW_MODES:
+    times, traffic, comparisons, widths = {}, {}, {}, {}
+    for arm, mode in modes.items():
         runs = [row["arms"][arm] for row in observations]
         times[arm] = {stage: mean(run["mean_us"][stage] for run in runs) for stage in LARGE_WINDOW_STAGES}
         calls = [call for run in runs for call in run["traffic"]]
         traffic[arm] = {key: mean(call[key] for call in calls) for key in ("prefetch", "final")}
         traffic[arm]["total"] = sum(traffic[arm].values())
-    for arm, reference in LARGE_Q1_COMPARISONS:
+        if policy_modes is not None and mode is not None:
+            widths[arm] = {
+                width: mean(call["window_q_rows_by_width"][width] for call in calls) for width in ("1", "2", "4")
+            }
+    for arm, reference in pairings:
         changed, changed_totals = changed_get_counts(observations, reference, arm)
         saved = {stage: times[reference][stage] - times[arm][stage] for stage in LARGE_WINDOW_STAGES}
         comparisons[f"{arm}_vs_{reference}"] = dict(
@@ -281,31 +314,45 @@ def large_q1_cell(args, out, cell, batch, oracle, source_options, group, node, c
         print(f"BS{batch} {pairing} graph_gain_pct={data['graph_gain_pct']:+.2f} "
               f"changed_request_records={data['changed_request_records']} "
               f"changed_total_records={data['changed_total_records']}")
-    return dict(batch=batch, cohort=COHORT, group=group, mean_us=times, traffic_mean=traffic,
-                comparisons=comparisons, observations=observations)
+    result = dict(batch=batch, cohort=COHORT, group=group, mean_us=times, traffic_mean=traffic,
+                  comparisons=comparisons, observations=observations)
+    if policy_modes is not None:
+        result["window_q_rows_by_width_mean"] = widths
+        for arm, counts in widths.items():
+            print(f"BS{batch} {arm} mean_rows_q1={counts['1']:.2f} "
+                  f"mean_rows_q2={counts['2']:.2f} mean_rows_q4={counts['4']:.2f}")
+    return result
 
 
 def write_large_q1_summary(out, rows, metadata):
-    graphs_per_cell = sum(map(len, LARGE_Q1_BLOCKS))
+    policy = metadata.get("large_window_q_policy")
+    modes = LARGE_WINDOW_MODES if policy is None else policy["mode_codes"]
+    pairings = LARGE_Q1_COMPARISONS if policy is None else large_policy_comparisons(modes)
+    graphs_per_cell = sum(map(len, metadata["blocks"]))
     atomic_json(out / "packed_summary.json", {
-        **metadata, "complete": len(rows) == len(NATIVE_LARGE_BATCHES),
+        **metadata, "complete": len(rows) == len(metadata["batch_sizes"]),
         "completed_graphs": len(rows) * graphs_per_cell, "cells": rows,
     })
     fields = [
         "input_kind", "group", "batch", "cohort",
-        *[f"{arm}_{stage}_us" for arm in LARGE_WINDOW_MODES for stage in LARGE_WINDOW_STAGES],
-        *[f"{arm}_{counter}_requests" for arm in LARGE_WINDOW_MODES for counter in ("prefetch", "final", "total")],
-        *[f"{arm}_vs_{ref}_{key}" for arm, ref in LARGE_Q1_COMPARISONS
+        *[f"{arm}_{stage}_us" for arm in modes for stage in LARGE_WINDOW_STAGES],
+        *[f"{arm}_{counter}_requests" for arm in modes for counter in ("prefetch", "final", "total")],
+        *[f"{arm}_vs_{ref}_{key}" for arm, ref in pairings
           for key in ("graph_gain_pct", "changed_request_records", "changed_total_records")],
     ]
+    if policy is not None:
+        fields.extend(f"{arm}_mean_rows_q{width}" for arm, mode in modes.items()
+                      if mode is not None for width in (1, 2, 4))
     with (out / "summary.csv").open("w", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fields)
         writer.writeheader()
         for row in rows:
             values = {"input_kind": metadata["input_kind"], **{key: row[key] for key in ("group", "batch", "cohort")}}
-            for arm in LARGE_WINDOW_MODES:
+            for arm in modes:
                 values.update({f"{arm}_{stage}_us": value for stage, value in row["mean_us"][arm].items()})
                 values.update({f"{arm}_{key}_requests": value for key, value in row["traffic_mean"][arm].items()})
+            for arm, counts in row.get("window_q_rows_by_width_mean", {}).items():
+                values.update({f"{arm}_mean_rows_q{width}": count for width, count in counts.items()})
             for pairing, comparison in row["comparisons"].items():
                 for key in ("graph_gain_pct", "changed_request_records", "changed_total_records"):
                     values[f"{pairing}_{key}"] = comparison[key]
@@ -359,7 +406,8 @@ def run(args):
     revision = subprocess.check_output(["git", "-C", REPO, "rev-parse", "HEAD"], text=True).strip()
     if subprocess.check_output(["git", "-C", REPO, "status", "--porcelain", "-uno"], text=True).strip():
         raise ValueError("The checked-out measurement revision has tracked modifications")
-    q1_study = args.window_q1_pair or args.large_window_q1_pair
+    q_policies = args.q_policy if args.large_window_q_policy else None
+    q1_study = args.window_q1_pair or args.large_window_q1_pair or args.large_window_q_policy
     if q1_study:
         verify_q1_production(REPO, revision)
     else:
@@ -386,7 +434,7 @@ def run(args):
     print(f"RESULT_ROOT={out}", flush=True)
 
     metadata = {
-        **plan(args.synthetic, args.window_q1_pair, args.large_window_q1_pair),
+        **plan(args.synthetic, args.window_q1_pair, args.large_window_q1_pair, q_policies),
         "test_revision": revision, "kvaf_revision": kvaf_revision,
         "physical_npu": args.physical_npu, "device": args.device, "cpu_numa": node,
     }
@@ -415,11 +463,13 @@ def run(args):
         adapter = run_arm(args, oracle, batch, "serial", source_options, group, node, cpus, adapter=adapter)
     metadata["cpu_ub_device"] = adapter
 
-    if args.large_window_q1_pair:
+    if args.large_window_q1_pair or args.large_window_q_policy:
+        policy_modes = large_policy_modes(q_policies) if q_policies is not None else None
         rows = []
         for batch, cell in cells.items():
             oracle = cell / "oracle" / "serial"
-            rows.append(large_q1_cell(args, out, cell, batch, oracle, source_options, group, node, cpus, adapter))
+            rows.append(large_q1_cell(args, out, cell, batch, oracle, source_options, group, node, cpus, adapter,
+                                      policy_modes=policy_modes))
             write_large_q1_summary(out, rows, metadata)
         print(f"PACKED_COMPLETE cells={len(rows)} SUMMARY={out / 'packed_summary.json'}", flush=True)
         return
@@ -467,13 +517,23 @@ def main():
                        help="Add same-binary fused off/on AB/BA for supported final-window Q1 shapes")
     modes.add_argument("--large-window-q1-pair", action="store_true",
                        help="Compare native and deferred two-Q / one-Q last windows on BS20, 24, 28, 32")
+    modes.add_argument("--large-window-q-policy", action="store_true",
+                       help="Compare native, fixed Q1/Q2/Q4 and automatic deferred last-window layouts")
+    parser.add_argument("--q-policy", action="extend", nargs="+", choices=Q_POLICY_CHOICES,
+                        help="Restrict the large Q policy matrix to selected deferred policies plus native")
     args = parser.parse_args()
     if args.window_q1_pair and not args.synthetic:
         parser.error("--window-q1-pair requires --synthetic")
     if args.large_window_q1_pair and not args.synthetic:
         parser.error("--large-window-q1-pair requires --synthetic")
+    if args.large_window_q_policy and not args.synthetic:
+        parser.error("--large-window-q-policy requires --synthetic")
+    if args.q_policy is not None and not args.large_window_q_policy:
+        parser.error("--q-policy requires --large-window-q-policy")
+    if args.large_window_q_policy and args.q_policy is None:
+        args.q_policy = Q_POLICY_CHOICES
     if args.dry_run:
-        print(json.dumps(plan(args.synthetic, args.window_q1_pair, args.large_window_q1_pair), indent=2))
+        print(json.dumps(plan(args.synthetic, args.window_q1_pair, args.large_window_q1_pair, args.q_policy), indent=2))
         return
     if args.trace is None and not args.synthetic:
         parser.error("--trace or --synthetic is required for live measurement")

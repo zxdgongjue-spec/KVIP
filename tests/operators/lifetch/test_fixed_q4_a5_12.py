@@ -6,6 +6,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "support"))
@@ -51,7 +52,8 @@ def test_synthetic_prepares_once_and_uses_fresh_oracles(tmp_path, monkeypatch):
     cpu.chmod(0o700)
     out = tmp_path / "out"
     args = SimpleNamespace(kvaf_root=kvaf, cpu_numa=None, cpu_ub_device=None, device=2, physical_npu=2,
-                           synthetic=True, trace=None, output=out, window_q1_pair=False, large_window_q1_pair=False)
+                           synthetic=True, trace=None, output=out, window_q1_pair=False, large_window_q1_pair=False,
+                           large_window_q_policy=False)
 
     def git_output(command, **_kwargs):
         if command[3] == "status":
@@ -255,11 +257,35 @@ def test_native_large_q1_dry_run_uses_only_four_native_shapes():
     assert data["prefetch"] == {"tokens": 1024, "windows_requested": 4, "rank_start": 1024}
 
 
-@pytest.mark.parametrize("mode, final_symbol", [(2, "v9_li_large_final_pair"), (1, "v9_li_large_final_q1")])
+def test_native_large_q_policy_can_select_arms():
+    script = Path(__file__).resolve().parent / "support/fixed_q4_a5_12.py"
+    command = [sys.executable, "-B", script, "--large-window-q-policy", "--dry-run"]
+    rejected = subprocess.run(command, text=True, capture_output=True)
+    assert rejected.returncode == 2 and "requires --synthetic" in rejected.stderr
+    data = json.loads(subprocess.check_output([*command, "--synthetic"], text=True))
+    assert data["batch_sizes"] == [20, 24, 28, 32]
+    assert data["oracles"] == 4 and data["measured_graphs"] == 40
+    assert data["blocks"][0] == ["native", "deferred_q1", "deferred_q2", "deferred_q4", "deferred_auto"]
+    assert data["blocks"][1] == list(reversed(data["blocks"][0]))
+    assert data["large_window_q_policy"]["q_tasks"] == {"20": 80, "24": 96, "28": 112, "32": 128}
+    assert data["large_window_q_policy"]["fixed_wave_capacity"] == {"q1": 16, "q2": 32, "q4": 64}
+
+    subset = json.loads(subprocess.check_output(
+        [*command, "--synthetic", "--q-policy", "auto", "q2"], text=True,
+    ))
+    assert subset["measured_graphs"] == 24
+    assert subset["large_window_q_policy"]["mode_codes"] == {"native": None, "deferred_q2": 3, "deferred_auto": 0}
+
+
+@pytest.mark.parametrize("mode, final_symbol", [
+    (2, "v9_li_large_final_pair"), (1, "v9_li_large_final_q1"),
+    (3, "v9_li_large_final_pair_dense"), (4, "v9_li_large_final_q4"), (0, "v9_li_large_final_auto"),
+])
 def test_native_large_deferred_window_gets_separate_profiler_stage(mode, final_symbol):
     from large_batch_pair import fixed_invocation_intervals, fixed_kernel_stages, fixed_stage_records
 
-    names = ("v9_li_large_hot", "v9_li_large_deferred_cold", final_symbol, "v9_parallel_terminal_large")
+    cold = "v9_li_large_deferred_cold_auto" if mode == 0 else "v9_li_large_deferred_cold"
+    names = ("v9_li_large_hot", cold, final_symbol, "v9_parallel_terminal_large")
     events = [dict(name="scope", ph="X", ts=0, dur=30)]
     for index, name in enumerate(names, 1):
         events.append(dict(name=f"{name}_1", ph="X", cat="kernel", ts=5 * index, dur=index))
@@ -269,10 +295,11 @@ def test_native_large_deferred_window_gets_separate_profiler_stage(mode, final_s
     assert times["LI"] == 6 and times["last_window"] == 3 and times["tail"] == 4
     with pytest.raises(ValueError, match="Unattributed device task"):
         fixed_stage_records(events, "scope", fused=True, batch=32, strict_bounds=True,
-                            large_window_queries_per_worker=3 - mode)
+                            large_window_queries_per_worker=(mode + 1) % 5)
 
 
-def test_native_large_comparison_verifies_receipts_and_traffic(tmp_path, monkeypatch):
+@pytest.mark.parametrize("policy", [False, True])
+def test_native_large_comparison_verifies_receipts_and_traffic(tmp_path, monkeypatch, policy):
     batch = 32
     cell = tmp_path / "synthetic/bs32/cohort0"
     oracle = cell / "oracle/serial"
@@ -292,14 +319,23 @@ def test_native_large_comparison_verifies_receipts_and_traffic(tmp_path, monkeyp
             status="measured", page_mode="thp", coverage_min_pct=100, ub_device="adapter",
             numa_pages_overlapping_vmas={"0": 100},
         )))
-        graph, last_window = {None: (100, 0), 2: (120, 27), 1: (108, 15)}[mode]
+        graph, last_window = {None: (100, 0), 2: (120, 27), 1: (108, 15), 3: (103, 10),
+                              4: (110, 17), 0: (104, 11)}[mode]
         prefetch = [2] * batch
         final = [4] * batch
         if mode == 1:
             # First request changes partition only, while second changes total.
             prefetch[0], final[0], final[1] = 1, 5, 5
         call = dict(prefetch=sum(prefetch), final=sum(final), prefetch_by_request=prefetch, final_by_request=final,
-                    window_q1_ready_flags=4 * batch if mode else 0)
+                    window_q1_ready_flags=4 * batch if mode is not None else 0)
+        if policy and mode is not None:
+            if mode == 0:
+                # Two light Q4 rows free the two lanes needed to upgrade one heavy row to Q1.
+                call["window_q_rows_by_width"] = {"1": 1, "2": 29, "4": 2}
+            else:
+                call["window_q_rows_by_width"] = {
+                    str(width): batch if width == {1: 1, 3: 2, 4: 4}[mode] else 0 for width in (1, 2, 4)
+                }
         (output / "packed_result.json").write_text(json.dumps(dict(
             identity=dict(group=0, batch=batch, host="a5-12", native="native-q1-revision", physical_npu=2,
                           sequence_sha256="same"),
@@ -311,20 +347,48 @@ def test_native_large_comparison_verifies_receipts_and_traffic(tmp_path, monkeyp
         )))
 
     monkeypatch.setattr(runner, "run_arm", fake_arm)
-    row = runner.large_q1_cell(None, tmp_path, cell, batch, oracle, [], 0, "0", "0", "adapter")
-    assert modes == [None, 2, 1, 1, 2, None]
-    pair_gain = row["comparisons"]["deferred_q1_vs_deferred_pair"]
-    assert pair_gain["graph_gain_pct"] == 10
+    policy_modes = runner.large_policy_modes(runner.Q_POLICY_CHOICES) if policy else None
+    row = runner.large_q1_cell(None, tmp_path, cell, batch, oracle, [], 0, "0", "0", "adapter",
+                               policy_modes=policy_modes)
+    if policy:
+        assert modes == [None, 1, 3, 4, 0, 0, 4, 3, 1, None]
+        other = "deferred_q2"
+        assert row["window_q_rows_by_width_mean"]["deferred_auto"] == {"1": 1, "2": 29, "4": 2}
+    else:
+        assert modes == [None, 2, 1, 1, 2, None]
+        other = "deferred_pair"
+    pair_gain = row["comparisons"][f"deferred_q1_vs_{other}"]
+    assert pair_gain["graph_gain_pct"] == pytest.approx((-500 / 103) if policy else 10)
     assert pair_gain["changed_request_records"] == 40 and pair_gain["changed_total_records"] == 20
     assert row["comparisons"]["deferred_q1_vs_native"]["graph_gain_pct"] == -8
-    runner.write_large_q1_summary(tmp_path, [row], plan(synthetic=True, large_window_q1_pair=True))
+    q_policies = runner.Q_POLICY_CHOICES if policy else None
+    runner.write_large_q1_summary(tmp_path, [row], plan(synthetic=True, large_window_q1_pair=not policy,
+                                                      q_policies=q_policies))
     with (tmp_path / "summary.csv").open(newline="") as handle:
         summary = list(csv.DictReader(handle))[0]
     assert summary["deferred_q1_vs_native_graph_gain_pct"] == "-8.0"
     assert summary["deferred_q1_last_window_us"] == "15"
+    if policy:
+        assert summary["deferred_auto_mean_rows_q4"] == "2"
     path = cell / "large_window/block1/deferred_q1/packed_result.json"
     data = json.loads(path.read_text())
     data["traffic"][0]["window_q1_ready_flags"] = 0
     path.write_text(json.dumps(data))
     with pytest.raises(ValueError, match="completion|receipts"):
-        runner.read_large_q1_block(cell / "large_window/block1", 0, batch, 0, tmp_path)
+        extra = {"modes": policy_modes, "require_widths": True} if policy else {}
+        runner.read_large_q1_block(cell / "large_window/block1", 0, batch, 0, tmp_path, **extra)
+
+
+def test_last_window_width_receipts_validate_one_wave_budget():
+    from fixed_q4_packed_worker import window_q_rows_by_width
+
+    widths = np.repeat(np.array([1] + [2] * 29 + [4] * 2)[:, None], 4, axis=1)
+    assert window_q_rows_by_width(widths, 0) == {"1": 1, "2": 29, "4": 2}
+    with pytest.raises(ValueError, match="requested fixed Q width"):
+        window_q_rows_by_width(widths, 3)
+    widths[-1, :] = 2
+    with pytest.raises(ValueError, match="one-wave AIV budget"):
+        window_q_rows_by_width(widths, 0)
+    widths[0, 0] = 2
+    with pytest.raises(ValueError, match="request's Q width"):
+        window_q_rows_by_width(widths, 0)

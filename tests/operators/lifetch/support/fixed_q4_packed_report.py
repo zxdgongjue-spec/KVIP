@@ -7,6 +7,7 @@ from pathlib import Path
 from statistics import mean
 
 from fixed_q4_packed_archive import NATIVE, same_production
+from large_batch_pair import LARGE_WINDOW_AIVS, LARGE_WINDOW_FIXED_WIDTHS
 from large_batch_placement import field, placement, same_card
 from reporting import atomic_json
 
@@ -86,12 +87,13 @@ def read_q1_pair(pair, group, batch, cohort, root):
 
 
 LARGE_WINDOW_MODES = dict(native=None, deferred_pair=2, deferred_q1=1)
+LARGE_WINDOW_POLICY_MODES = dict(native=None, deferred_q1=1, deferred_q2=3, deferred_q4=4, deferred_auto=0)
 LARGE_WINDOW_STAGES = (*STAGES, "LI1", "LI23", "last_window")
 
 
-def read_large_q1_block(block, group, batch, cohort, root):
+def read_large_q1_block(block, group, batch, cohort, root, *, modes=LARGE_WINDOW_MODES, require_widths=False):
     rows, contexts, bridges = {}, [], []
-    for arm, mode in LARGE_WINDOW_MODES.items():
+    for arm, mode in modes.items():
         directory = block / arm
         row, times, context = packed_arm(directory, "fused", group, batch, cohort, root)
         if ("large_window_queries_per_worker" not in row or row["large_window_queries_per_worker"] != mode
@@ -111,6 +113,18 @@ def read_large_q1_block(block, group, batch, cohort, root):
         flags = 4 * batch if mode is not None else 0
         if len(traffic) != 10 or any(call.get("window_q1_ready_flags", 0) != flags for call in traffic):
             raise ValueError(f"Missing or unexpected deferred final-window receipts: {directory}")
+        if require_widths and mode is not None:
+            for call in traffic:
+                widths = call.get("window_q_rows_by_width", {})
+                if (widths.keys() != {"1", "2", "4"}
+                        or any(type(count) is not int or count < 0 for count in widths.values())
+                        or sum(widths.values()) != batch):
+                    raise ValueError(f"Invalid deferred final-window width counts: {directory}")
+                if mode == 0:
+                    if sum((4 // int(width)) * count for width, count in widths.items()) > LARGE_WINDOW_AIVS:
+                        raise ValueError(f"Automatic width counts exceed the one-wave AIV budget: {directory}")
+                elif widths[str(LARGE_WINDOW_FIXED_WIDTHS[mode])] != batch:
+                    raise ValueError(f"Requested fixed width disagrees with the final-window receipts: {directory}")
         if any(
             len(call[key + "_by_request"]) != batch or sum(call[key + "_by_request"]) != call[key]
             or any(count < 0 for count in call[key + "_by_request"])

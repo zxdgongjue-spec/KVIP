@@ -171,6 +171,21 @@ bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed-large-q1-pair
 
 容器入口默认使用物理卡 2。若宿主机确认另一张卡空闲且该容器可见，在执行前把 `KVIP_A5_PHYSICAL_NPU` 设为该物理卡号。入口按该卡解析 ACL 设备号、持有同卡锁并写入结果目录，所有 oracle 与三臂仍在同一张卡上。
 
+### 原生大 batch 的 Q1、Q2、Q4 和自动混排
+
+```bash
+bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed-large-q-policy --dry-run
+bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed-large-q-policy
+# 只对照原生、一波 Q2 和自动混排
+bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed-large-q-policy --q-policy q2 auto
+```
+
+遍历 BS20、24、28、32，保持 Q4、H131072/R16384、W4、目标 miss 10%、seed 43、原预取预算和原生整批。每个 Q 独立做 Top2048。固定 Q1、Q2、Q4 表示每个 AIV 分别做 1、2、4 个 Q，每行分别占 4、2、1 个 AIV。Q2 是一波 32 支双 AIV 队伍，原三路入口保留 16 支四 AIV 队伍的后移 2+2 作为可复现对照。每行仍由一个 owner 汇合、去重和发单。
+
+自动混排根据 W3 有效待扫范围估计本行各 Q 的工作量。令单 Q 成本为 `c[q] = 1 + ceil(新增可见 token / 128)`。每行的 Q1、Q2、Q4 选取耗时估计分别为 `max(c)`、`max(c[0]+c[1], c[2]+c[3])`、`sum(c)`。求最小单波尾延迟上界 `L`，每行选择能满足该上界且占核最少的策略，合计用核数不超过 64。若预计尾延迟和全 Q2 相同，沿用全 Q2。该估算未计入真实候选分布和硬件等待，净收益按同卡计时判断。
+
+默认五臂包括原生、Q1、Q2、Q4、auto，按正反顺序执行。四档各一份串行 oracle，40 个计时图，每图十个独立调用，预热四次。逐 Q 回执验证覆盖完整；汇总区分实际 Q 分工、末窗耗时、整链及逐请求预取／最终 Get。标准合成输入各请求同长度，AUTO 可能全部选择 Q2，此时它主要测到规划开销。混排收益需使用有有效长度差异的输入实测。
+
 ## 12 号机 Q1/W2 加倍复测
 
 用两个独立的干净检出目录。MR35 W2 实测版本为 `a9f4fe3b`，主仓基线为 `df8ad259`。

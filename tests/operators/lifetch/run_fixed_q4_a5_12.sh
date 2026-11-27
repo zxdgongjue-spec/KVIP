@@ -20,13 +20,19 @@ case "$mode" in
     packed_input=(--synthetic)
     packed_name=synthetic
     ;;
-  packed-q1-pair|packed-large-q1-pair)
+  packed-q1-pair|packed-large-q1-pair|packed-large-q-policy)
     trial=--window-q1-pair
     packed_name=window-q1
-    if [[ "$mode" == packed-large-q1-pair ]]; then
-      trial=--large-window-q1-pair
-      packed_name=large-window-q1
-    fi
+    case "$mode" in
+      packed-large-q1-pair)
+        trial=--large-window-q1-pair
+        packed_name=large-window-q1
+        ;;
+      packed-large-q-policy)
+        trial=--large-window-q-policy
+        packed_name=large-q-policy
+        ;;
+    esac
     if [[ "${1:-}" == --dry-run ]]; then
       shift
       exec "${KVIP_PYTHON:-python3}" -B "$runner" --dry-run --synthetic "$trial" "$@"
@@ -39,6 +45,7 @@ case "$mode" in
       '  run_fixed_q4_a5_12.sh packed-synthetic [runner options]' \
       '  run_fixed_q4_a5_12.sh packed-q1-pair [runner options]' \
       '  run_fixed_q4_a5_12.sh packed-large-q1-pair [runner options]' \
+      '  run_fixed_q4_a5_12.sh packed-large-q-policy [runner options]' \
       '  run_fixed_q4_a5_12.sh q1-w2 MR35_CHECKOUT MAIN_CHECKOUT' \
       '  run_fixed_q4_a5_12.sh --dry-run'
     if [[ "$mode" == --help || "$mode" == -h ]]; then exit 0; fi
@@ -85,7 +92,7 @@ elif [[ "$mode" == q1-w2 ]]; then
 fi
 
 git -C "$repo" diff --quiet HEAD --
-if [[ "$mode" == packed-q1-pair || "$mode" == packed-large-q1-pair ]]; then
+if [[ "$mode" == packed-q1-pair || "$mode" == packed-large-q1-pair || "$mode" == packed-large-q-policy ]]; then
   git -C "$repo" merge-base --is-ancestor 555e1e51c3639fad47e0132eaab426582cddc543 HEAD
 else
   git -C "$repo" diff --quiet af52a02b97daddadd5d93b9d100f2ff1b03b499d HEAD -- \

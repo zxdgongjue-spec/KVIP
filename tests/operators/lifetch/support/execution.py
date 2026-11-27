@@ -3375,13 +3375,13 @@ class FusedReplayState:
         shape = self.rotating.runtime_shape
         library = self.rotating.library
         supported = getattr(library, "kvip_large_window_final_supported", None)
-        if terminal is None or supported is None or queries_per_worker not in (1, 2):
-            raise ValueError("Deferred large window requires the experimental URMA bridge and Q1 or Q2")
+        if terminal is None or supported is None or queries_per_worker not in (0, 1, 2, 3, 4):
+            raise ValueError("Deferred large window requires the experimental URMA bridge and a supported policy")
         supported.argtypes = [ctypes.POINTER(type(shape))]
         supported.restype = ctypes.c_uint32
         if not supported(ctypes.byref(shape)):
             raise ValueError(f"Deferred large window is unavailable for BS{shape.batch}/W{shape.rounds}")
-        self._attach_window_receipts()
+        self._attach_window_receipts(extra_rows=1)
         terminal.large_window_queries_per_worker = queries_per_worker
         launch = library.kvip_large_window_final_forward
         launch.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_uint32]
@@ -3392,13 +3392,13 @@ class FusedReplayState:
 
         self.forward.terminal_function = launch_with_width
 
-    def _attach_window_receipts(self):
+    def _attach_window_receipts(self, *, extra_rows=0):
         import struct
 
         terminal = self.forward.terminal
         if hasattr(terminal, "window_q1_scratch"):
             raise ValueError("The graph already binds an experimental last window")
-        scratch = self.torch.empty((self.batch, 5, 32), dtype=self.torch.int32, device=self.device)
+        scratch = self.torch.empty((self.batch + extra_rows, 5, 32), dtype=self.torch.int32, device=self.device)
         if scratch.data_ptr() % 128 or terminal.workspace.numel() != 128:
             raise ValueError("Unexpected packed window Q1 binding layout")
         offset = struct.calcsize("<6Q2I5Q")  # terminal_runtime::Binding::reserved[5]

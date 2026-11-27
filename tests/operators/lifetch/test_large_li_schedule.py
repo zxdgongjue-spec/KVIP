@@ -125,6 +125,88 @@ int main() {
     subprocess.run([str(exe)], check=True)
 
 
+def test_large_window_policy_covers_queries_under_lane_budget(tmp_path):
+    compiler = shutil.which("c++")
+    if not compiler:
+        pytest.skip("C++ compiler required for native LI scheduling")
+    include = Path(__file__).resolve().parents[3] / "csrc/operators"
+    source = tmp_path / "window_policy.cpp"
+    source.write_text(r"""
+#include <algorithm>
+#include <cassert>
+#include <initializer_list>
+#include <random>
+#include "lightning_indexer_with_fetch/op_kernel/indexer/large_window_policy.h"
+
+using namespace large_window_policy;
+
+void verify(const Cost* costs, uint32_t rows) {
+    uint32_t assignments[64]{};
+    Plan(costs, rows, assignments);
+    uint32_t widths[32]{}, coverage[32]{}, peak = 0, pairPeak = 0, used = 0;
+    for (uint32_t row = 0; row < rows; ++row) {
+        pairPeak = std::max(pairPeak, costs[row].q2);
+    }
+    for (uint32_t lane : assignments) {
+        if (!lane) continue;
+        const uint32_t row = (lane >> 3) / 4, first = (lane >> 3) % 4, width = lane & 7;
+        assert(row < rows && (width == 1 || width == 2 || width == 4));
+        assert(first % width == 0 && first + width <= 4);
+        const uint32_t mask = ((1U << width) - 1U) << first;
+        assert(!(coverage[row] & mask));
+        assert(!widths[row] || widths[row] == width);
+        widths[row] = width;
+        coverage[row] |= mask;
+        peak = std::max(peak, width == 1 ? costs[row].q1 : width == 2 ? costs[row].q2 : costs[row].q4);
+        ++used;
+    }
+    assert(used <= 64);
+    for (uint32_t row = 0; row < rows; ++row) assert(coverage[row] == 15);
+
+    uint32_t optimum = 0;
+    for (; optimum <= pairPeak; ++optimum) {
+        uint32_t needs = 0;
+        for (uint32_t row = 0; row < rows; ++row) {
+            const auto c = costs[row];
+            needs += c.q4 <= optimum ? 1 : c.q2 <= optimum ? 2 : c.q1 <= optimum ? 4 : 65;
+        }
+        if (needs <= 64) break;
+    }
+    assert(peak == optimum);
+    if (optimum == pairPeak) {
+        for (uint32_t row = 0; row < rows; ++row) assert(widths[row] == 2);
+    }
+}
+
+int main() {
+    Cost costs[32]{};
+    std::minstd_rand rng(43);
+    for (uint32_t rows : {20, 24, 28, 32}) {
+        std::fill_n(costs, rows, Estimate(24, 24, 24, 24));
+        verify(costs, rows);
+        for (uint32_t i = 0; i < 100; ++i) {
+            for (uint32_t row = 0; row < rows; ++row) {
+                const uint32_t q0 = 1 + rng() % 64, q1 = 1 + rng() % 64;
+                const uint32_t q2 = 1 + rng() % 64, q3 = 1 + rng() % 64;
+                costs[row] = Estimate(q0, q1, q2, q3);
+            }
+            verify(costs, rows);
+        }
+    }
+    std::fill_n(costs, 8, Estimate(50, 50, 50, 50));
+    std::fill_n(costs + 8, 24, Estimate(12, 12, 12, 12));
+    verify(costs, 32);
+    uint32_t lanes[64]{};
+    Plan(costs, 32, lanes);
+    assert(std::count_if(lanes, lanes + 64, [](auto lane) { return (lane & 7) == 1; }) == 32);
+    assert(std::count_if(lanes, lanes + 64, [](auto lane) { return (lane & 7) == 4; }) == 24);
+}
+""")
+    binary = tmp_path / "window_policy"
+    subprocess.run([compiler, "-std=c++17", "-I", str(include), str(source), "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)
+
+
 def test_cube_vector_flags_drain_between_rows(tmp_path):
     """Exercise native range start/end around a serializable two-bank MM tile."""
     compiler = shutil.which("c++")

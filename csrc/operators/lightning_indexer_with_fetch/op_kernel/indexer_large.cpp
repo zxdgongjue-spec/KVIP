@@ -7,6 +7,7 @@
 #include "terminal/terminal_runtime_abi.h"
 
 #if defined(__CCE_AICORE__)
+#include "indexer/large_window_policy.h"
 #include "indexer/window_q1.h"
 
 namespace QLIKernel {
@@ -385,7 +386,32 @@ __aicore__ inline void FinishPair(const Inputs& input, const RowPlan& plan, Inde
     vec.PostWindow(epoch, 0);
 }
 
-template<bool DeferLastWindow>
+__aicore__ inline void CaptureLastWindowCost(const Inputs& input, uint32_t row, uint32_t ready) {
+    const uint32_t epoch = input.shape.rounds - 1;
+    const uint32_t end = Min(ready, rotating::Trigger(input.shape.history, input.shape.resident,
+                                                     input.shape.rounds, epoch) * 128);
+    auto headers = reinterpret_cast<__gm__ uint64_t*>(rotating::TopKHeader(input.ctx));
+    auto ends = reinterpret_cast<__gm__ const uint32_t*>(input.ctx->queryEnds);
+    uint32_t cost[4];
+    for (uint32_t q = 0; q < 4; ++q) {
+        const uint32_t query = row * 4 + q;
+        auto header = headers + query * 16;
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(header), 128);
+        const uint32_t prior = uint32_t(reinterpret_cast<__gm__ volatile uint64_t*>(header)[1]);
+        const uint32_t valid = ends ? Min(end, ends[query]) : end;
+        // Even with no new tiles, maintaining/exporting the old winners costs work.
+        cost[q] = 1 + large_li::CeilDiv(valid > prior ? valid - prior : 0, 128);
+    }
+    const auto estimate = large_window_policy::Estimate(cost[0], cost[1], cost[2], cost[3]);
+    auto line = fixed_window_q1::Line(input.deferredReady, row, 0);
+    auto words = reinterpret_cast<__gm__ volatile uint32_t*>(line);
+    words[0] = estimate.q1;
+    words[1] = estimate.q2;
+    words[2] = estimate.q4;
+    kvaf_device::CleanCacheLines(line, 128);
+}
+
+template<bool DeferLastWindow, bool AutoPolicy>
 __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint32_t planCount) {
     JoinThreshold(input, plan.row);
     TPipe pipe;
@@ -399,6 +425,9 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint3
                 for (uint32_t q = 0; q < 4; ++q) {
                     fixed_window_q1::Publish(input.deferredReady, plan.row, q, 0);
                 }
+            }
+            if constexpr (AutoPolicy) {
+                if (!plan.row) fixed_window_q1::Publish(input.deferredReady, input.shape.batch, 0, 0);
             }
             if (input.Trace()) {
                 uint64_t start = GetSystemCycle();
@@ -433,7 +462,14 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint3
             }
             PublishProgress(input, plan.row, input.vecLane * 2, 2, span.end);
             if constexpr (DeferLastWindow) {
-                if (epoch + 1 == input.shape.rounds) break;
+                if (epoch + 1 == input.shape.rounds) {
+                    if constexpr (AutoPolicy) {
+                        // W2 Post has completed for this row and no AIV has
+                        // started to mutate its W3 TopK headers.
+                        if (!input.vecLane) CaptureLastWindowCost(input, plan.row, span.end * 128);
+                    }
+                    break;
+                }
             }
             op.vectorService.AllocEventID();
             op.vectorService.AdvanceLargeWindowPair(plan.row, epoch, span.end * 128);
@@ -477,7 +513,7 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint3
     }
 }
 
-template<bool DeferLastWindow>
+template<bool DeferLastWindow, bool AutoPolicy = false>
 __aicore__ inline void ThresholdCold(GM_ADDR bindings, GM_ADDR terminal) {
     Inputs input(bindings, terminal);
     if constexpr (DeferLastWindow) {
@@ -490,7 +526,7 @@ __aicore__ inline void ThresholdCold(GM_ADDR bindings, GM_ADDR terminal) {
     uint32_t own;
     uint32_t planCount = Plan<true>(input, helper, plans, own);
     if (!helper) {
-        ColdOwner<DeferLastWindow>(input, plans[own], planCount);
+        ColdOwner<DeferLastWindow, AutoPolicy>(input, plans[own], planCount);
     } else {
         // Finish the current window for every assigned row before moving to
         // the next window. Rows with no suffix never wait for this helper.
@@ -511,64 +547,113 @@ __aicore__ inline void ThresholdCold(GM_ADDR bindings, GM_ADDR terminal) {
 }
 
 template<uint32_t Queries>
+__aicore__ inline void FinishDeferredRow(const Inputs& input, uint32_t row, uint32_t first) {
+    constexpr uint32_t rowQueries = large_window_policy::kQueries;
+    const uint32_t epoch = input.shape.rounds - 1;
+    const bool trace = input.Trace();
+    // Every row's two score producers and optional suffix producers have
+    // returned before this launch. All policies use that same cut.
+    auto progress = reinterpret_cast<__gm__ uint32_t*>(input.ctx->progress) + (row * rowQueries + first) * 32;
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(progress), 128);
+    const uint32_t ready = *reinterpret_cast<__gm__ volatile uint32_t*>(progress);
+    TPipe pipe;
+    Indexer op;
+    input.Init(op, pipe, row, false);
+    auto& vec = op.vectorService;
+    vec.AllocEventID();
+    vec.template AdvanceLargeWindowQueries<Queries>(row, epoch, ready, first);
+    if (trace) {
+        auto result = fixed_window_q1::Signal(input.deferredReady, row, first);
+        result->calls = vec.incrementalCalls_;
+        result->scanned = vec.incrementalScanned_;
+        result->candidates = vec.incrementalCandidates_;
+    }
+    for (uint32_t q = first; q < first + Queries; ++q) {
+        fixed_window_q1::Signal(input.deferredReady, row, q)->queriesPerWorker = Queries;
+        if (q) fixed_window_q1::Publish(input.deferredReady, row, q, 1);
+    }
+    if (!first) {
+        for (uint32_t q = Queries; q < rowQueries; q += Queries) {
+            fixed_window_q1::Wait(input.deferredReady, row, q);
+        }
+        if (trace) {
+            uint32_t calls = vec.incrementalCalls_;
+            uint32_t scanned = vec.incrementalScanned_;
+            uint32_t candidates = vec.incrementalCandidates_;
+            for (uint32_t q = Queries; q < rowQueries; q += Queries) {
+                const auto result = fixed_window_q1::Signal(input.deferredReady, row, q);
+                calls += result->calls;
+                scanned += result->scanned;
+                candidates += result->candidates;
+            }
+            auto event = reinterpret_cast<__gm__ rotating::Event*>(input.ctx->events) +
+                epoch * input.shape.serviceLanes + row;
+            auto stamp = reinterpret_cast<__gm__ uint64_t*>(event->pad);
+            stamp[3] = GetSystemCycle();
+            stamp[4] = uint64_t(calls) | (uint64_t(scanned) << 16) | (uint64_t(candidates) << 40);
+            kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event), 128);
+        }
+        vec.PostLargeWindowRow(row, epoch);
+        fixed_window_q1::Publish(input.deferredReady, row, 0, 1);
+    }
+    vec.FreeEventID();
+    pipe.Destroy();
+}
+
+template<uint32_t Queries, uint32_t TeamLanes = large_window_policy::kQueries / Queries>
 __aicore__ inline void FinishDeferredWindow(GM_ADDR bindings, GM_ADDR terminal) {
     Inputs input(bindings, terminal);
     if (!input.deferredReady) return;
-    constexpr uint32_t teamLanes = 4;
-    constexpr uint32_t teams = 16;
+    constexpr uint32_t teams = large_window_policy::kAivs / TeamLanes;
     const uint32_t block = GetBlockIdx();
-    const uint32_t worker = block % teamLanes;
-    const uint32_t first = worker * Queries;
-    if (first >= teamLanes) return;
-    const uint32_t epoch = input.shape.rounds - 1;
-    const bool trace = input.Trace();
-    for (uint32_t row = block / teamLanes; row < input.shape.batch; row += teams) {
-        // Every row's two score producers and optional suffix producers have
-        // returned before this launch. Both partitionings use that same cut.
-        auto progress = reinterpret_cast<__gm__ uint32_t*>(input.ctx->progress) + (row * 4 + first) * 32;
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(progress), 128);
-        const uint32_t ready = *reinterpret_cast<__gm__ volatile uint32_t*>(progress);
-        TPipe pipe;
-        Indexer op;
-        input.Init(op, pipe, row, false);
-        auto& vec = op.vectorService;
-        vec.AllocEventID();
-        vec.template AdvanceLargeWindowQueries<Queries>(row, epoch, ready, first);
-        if (trace) {
-            auto result = fixed_window_q1::Signal(input.deferredReady, row, first);
-            result->calls = vec.incrementalCalls_;
-            result->scanned = vec.incrementalScanned_;
-            result->candidates = vec.incrementalCandidates_;
-        }
-        for (uint32_t q = first; q < first + Queries; ++q) {
-            if (q) fixed_window_q1::Publish(input.deferredReady, row, q, 1);
-        }
-        if (!first) {
-            for (uint32_t q = Queries; q < teamLanes; ++q) {
-                fixed_window_q1::Wait(input.deferredReady, row, q);
-            }
-            if (trace) {
-                uint32_t calls = vec.incrementalCalls_;
-                uint32_t scanned = vec.incrementalScanned_;
-                uint32_t candidates = vec.incrementalCandidates_;
-                for (uint32_t q = Queries; q < teamLanes; q += Queries) {
-                    const auto result = fixed_window_q1::Signal(input.deferredReady, row, q);
-                    calls += result->calls;
-                    scanned += result->scanned;
-                    candidates += result->candidates;
-                }
-                auto event = reinterpret_cast<__gm__ rotating::Event*>(input.ctx->events) +
-                    epoch * input.shape.serviceLanes + row;
-                auto stamp = reinterpret_cast<__gm__ uint64_t*>(event->pad);
-                stamp[3] = GetSystemCycle();
-                stamp[4] = uint64_t(calls) | (uint64_t(scanned) << 16) | (uint64_t(candidates) << 40);
-                kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event), 128);
-            }
-            vec.PostLargeWindowRow(row, epoch);
-            fixed_window_q1::Publish(input.deferredReady, row, 0, 1);
-        }
-        vec.FreeEventID();
-        pipe.Destroy();
+    const uint32_t first = (block % TeamLanes) * Queries;
+    if (first >= large_window_policy::kQueries) return;
+    for (uint32_t row = block / TeamLanes; row < input.shape.batch; row += teams) {
+        FinishDeferredRow<Queries>(input, row, first);
+    }
+}
+
+__aicore__ inline void PlanDeferredWindow(const Inputs& input) {
+    using namespace large_window_policy;
+    Cost costs[kMaxRows];
+    for (uint32_t row = 0; row < input.shape.batch; ++row) {
+        auto line = fixed_window_q1::Line(input.deferredReady, row, 0);
+        kvaf_device::CleanCacheLines(line, 128);
+        auto words = reinterpret_cast<__gm__ volatile uint32_t*>(line);
+        costs[row] = {words[0], words[1], words[2]};
+    }
+    uint32_t lanes[kAivs];
+    Plan(costs, input.shape.batch, lanes);
+    // The extra row keeps its plan lanes separate from the ready marker.
+    // Use lines 2 and 3 for 64 assignments, leaving line 1 for the marker.
+    auto line = fixed_window_q1::Line(input.deferredReady, input.shape.batch, 2);
+    auto words = reinterpret_cast<__gm__ volatile uint32_t*>(line);
+    for (uint32_t lane = 0; lane < kAivs; ++lane) words[lane] = lanes[lane];
+    kvaf_device::CleanCacheLines(line, kAivs * sizeof(uint32_t));
+    fixed_window_q1::Publish(input.deferredReady, input.shape.batch, 0, 1);
+}
+
+__aicore__ inline void FinishDeferredAuto(GM_ADDR bindings, GM_ADDR terminal) {
+    Inputs input(bindings, terminal);
+    if (!input.deferredReady) return;
+    const uint32_t block = GetBlockIdx();
+    if (block == 0) {
+        PlanDeferredWindow(input);
+    } else {
+        fixed_window_q1::Wait(input.deferredReady, input.shape.batch, 0);
+    }
+    auto line = fixed_window_q1::Line(input.deferredReady, input.shape.batch, 2 + block / 32);
+    kvaf_device::CleanCacheLines(line, 128);
+    const uint32_t assignment = reinterpret_cast<__gm__ volatile uint32_t*>(line)[block % 32];
+    const uint32_t width = assignment & 7;
+    const uint32_t query = assignment >> 3;
+    const uint32_t row = query / large_window_policy::kQueries;
+    const uint32_t first = query % large_window_policy::kQueries;
+    switch (width) {
+        case 1: FinishDeferredRow<1>(input, row, first); break;
+        case 2: FinishDeferredRow<2>(input, row, first); break;
+        case 4: FinishDeferredRow<4>(input, row, first); break;
+        default: break;
     }
 }
 } // namespace
@@ -606,10 +691,17 @@ extern "C" __global__ __aicore__ void v9_li_large_deferred_cold(GM_ADDR bindings
 #endif
 }
 
+extern "C" __global__ __aicore__ void v9_li_large_deferred_cold_auto(GM_ADDR bindings, GM_ADDR terminal) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    ThresholdCold<true, true>(bindings, terminal);
+#endif
+}
+
 extern "C" __global__ __aicore__ void v9_li_large_final_pair(GM_ADDR bindings, GM_ADDR terminal) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    if ASCEND_IS_AIV { FinishDeferredWindow<2>(bindings, terminal); }
+    if ASCEND_IS_AIV { FinishDeferredWindow<2, 4>(bindings, terminal); }
 #endif
 }
 
@@ -617,5 +709,26 @@ extern "C" __global__ __aicore__ void v9_li_large_final_q1(GM_ADDR bindings, GM_
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     if ASCEND_IS_AIV { FinishDeferredWindow<1>(bindings, terminal); }
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_li_large_final_pair_dense(GM_ADDR bindings, GM_ADDR terminal) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV { FinishDeferredWindow<2>(bindings, terminal); }
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_li_large_final_q4(GM_ADDR bindings, GM_ADDR terminal) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV { FinishDeferredWindow<4>(bindings, terminal); }
+#endif
+}
+
+extern "C" __global__ __aicore__ void v9_li_large_final_auto(GM_ADDR bindings, GM_ADDR terminal) {
+#if defined(__CCE_AICORE__)
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    if ASCEND_IS_AIV { FinishDeferredAuto(bindings, terminal); }
 #endif
 }

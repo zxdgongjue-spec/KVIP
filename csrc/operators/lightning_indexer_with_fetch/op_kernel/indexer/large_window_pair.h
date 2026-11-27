@@ -1,9 +1,9 @@
 // Included in QLIVector only for the one-request-per-cube large-batch kernel.
-// A vector lane owns one or two disjoint 128-byte TopK headers and winner lists.
+// A vector lane owns one, two or four disjoint 128-byte TopK headers and winner lists.
 // The original single writer still consumes all four lists and updates covered.
 template<uint32_t Queries>
 __aicore__ inline void AdvanceLargeWindowQueries(uint32_t row, uint32_t epoch, uint32_t ready, uint32_t first) {
-    static_assert(Queries == 1 || Queries == 2);
+    static_assert(Queries == 1 || Queries == 2 || Queries == 4);
     auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     auto events = reinterpret_cast<__gm__ rotating::Event*>(ctx->events);
     auto previous = events + (epoch - 1) * runtimeShape_.serviceLanes + row;
