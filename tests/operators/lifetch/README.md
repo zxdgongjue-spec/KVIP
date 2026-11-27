@@ -169,6 +169,8 @@ bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed-large-q1-pair
 
 固定 Q4、H131072/R16384、目标 miss 10%、seed 43。三臂两轮反序，四档共 4 个 oracle 和 24 个计时图，每图十个独立调用。逐请求搬运计数和阶段耗时写入 `RESULT_ROOT/summary.csv` 及 `packed_summary.json`。
 
+容器入口默认使用物理卡 2。若宿主机确认另一张卡空闲且该容器可见，在执行前把 `KVIP_A5_PHYSICAL_NPU` 设为该物理卡号。入口按该卡解析 ACL 设备号、持有同卡锁并写入结果目录，所有 oracle 与三臂仍在同一张卡上。
+
 ## 12 号机 Q1/W2 加倍复测
 
 用两个独立的干净检出目录。MR35 W2 实测版本为 `a9f4fe3b`，主仓基线为 `df8ad259`。

@@ -52,6 +52,15 @@ lidu=${KVIP_LIDU_ROOT:-"$root/KVIP-mr28/csrc/operators/lidu"}
 py=${KVIP_PYTHON:-/usr/local/python3.12.13/bin/python3}
 build="$kvaf/build-npu"
 results=${KVIP_A5_RESULTS:-"$root/results"}
+physical_npu=${KVIP_A5_PHYSICAL_NPU:-2}
+if [[ ! "$physical_npu" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  printf 'KVIP_A5_PHYSICAL_NPU must be a physical NPU number.\n' >&2
+  exit 2
+fi
+if [[ "$mode" == q1-w2 && "$physical_npu" != 2 ]]; then
+  printf 'The historical q1-w2 launcher requires physical NPU 2.\n' >&2
+  exit 2
+fi
 
 if [[ "$mode" == packed ]]; then
   trace=${1:?Pass the prepared real G2 capture directory in the container}
@@ -91,10 +100,10 @@ cann=$(sed -n 's/^ASCEND_CANN_PACKAGE_PATH:[^=]*=//p' "$build/CMakeCache.txt")
 test -n "$cann"
 source "$cann/set_env.sh"
 mkdir -p "$results"
-exec 9>"$results/.lifetch-a5-12-physical2.lock"
-flock -n 9 || { printf 'Another LIFetch run holds the physical NPU 2 lock.\n' >&2; exit 1; }
+exec 9>"$results/.lifetch-a5-12-physical${physical_npu}.lock"
+flock -n 9 || { printf 'Another LIFetch run holds the physical NPU %s lock.\n' "$physical_npu" >&2; exit 1; }
 
-probe=$("$py" - <<'PY'
+probe=$("$py" - "$physical_npu" <<'PY'
 import ctypes as c
 import sys
 
@@ -107,6 +116,7 @@ def check(name, code):
         raise SystemExit(f"{name}: rc={code}\n{msg}")
 
 check("aclInit", acl.aclInit(None))
+requested = int(sys.argv[1])
 count = c.c_uint32()
 check("aclrtGetDeviceCount", acl.aclrtGetDeviceCount(c.byref(count)))
 matches = []
@@ -115,17 +125,17 @@ for device in range(count.value):
     check("user to logical", acl.aclrtGetLogicDevIdByUserDevId(device, c.byref(logical)))
     check("logical to physical", acl.aclrtGetPhyDevIdByLogicDevId(logical.value, c.byref(physical)))
     print(f"device={device} logical={logical.value} physical={physical.value}", file=sys.stderr)
-    if physical.value == 2:
+    if physical.value == requested:
         matches.append(device)
 if len(matches) != 1:
-    raise SystemExit(f"Expected one mapping for physical NPU 2, found {matches}")
-check("aclrtSetDevice on physical NPU 2", acl.aclrtSetDevice(matches[0]))
+    raise SystemExit(f"Expected one mapping for physical NPU {requested}, found {matches}")
+check(f"aclrtSetDevice on physical NPU {requested}", acl.aclrtSetDevice(matches[0]))
 print(f"BENCH_DEVICE={matches[0]}")
 PY
 ) || { printf '%s\n' "$probe" >&2; exit 1; }
 device=$(sed -n 's/^BENCH_DEVICE=//p' <<< "$probe")
 [[ "$device" =~ ^[0-9]+$ ]]
-printf 'ACL OK: physical=2 device=%s\n' "$device"
+printf 'ACL OK: physical=%s device=%s\n' "$physical_npu" "$device"
 
 libs=("$lidu"/_custom_opp/vendors/*/op_api/lib/libcust_opapi.so)
 if [[ ${#libs[@]} -ne 1 || ! -f "${libs[0]}" ]]; then
@@ -149,10 +159,10 @@ print("CANN, KVAF and LIDU OK")
 PY
 
 if [[ "$mode" != q1-w2 ]]; then
-  out=$(mktemp -d "$results/packed-$packed_name-card2.XXXXXX")
+  out=$(mktemp -d "$results/packed-$packed_name-card${physical_npu}.XXXXXX")
   printf 'OUTPUT_PARENT=%s\n' "$out"
   PYTHONPATH="$repo/python:$PYTHONPATH" "$py" -B "$runner" "$@" "${packed_input[@]}" \
-    --device "$device" --physical-npu 2 --kvaf-root "$kvaf" --output "$out/run"
+    --device "$device" --physical-npu "$physical_npu" --kvaf-root "$kvaf" --output "$out/run"
   exit
 fi
 
