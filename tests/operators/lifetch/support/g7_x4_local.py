@@ -76,7 +76,7 @@ def show_local(arm,batch):
     print(f"G7 BS{batch} {MODE} CHECK TopK_score_vs_captured_scores/KV/Index/private_CQ=PASS "
           f"calls=10/10 queries={40*batch}/{40*batch} rows={10*batch}/{10*batch}")
     print(f"G7 BS{batch} {MODE} graph/LI/LI1/LI23/tail_mean_us="+"/".join(f"{t:.2f}" for t in stats(data))+
-          " vs_four_window/serial=UNAVAILABLE no_same_card_archive")
+          " vs_four_window=UNAVAILABLE no_same_card_four_window_archive vs_serial=UNVERIFIED")
 
 if __name__=="__main__":
     p=argparse.ArgumentParser()
