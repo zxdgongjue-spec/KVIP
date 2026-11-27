@@ -58,6 +58,11 @@ def plan(args):
         trace_miss = args.msprof_miss or (15 if 15 in misses else misses[0])
         matrix['msprof_pair'] = dict(batch=4, miss_percent=trace_miss, baseline='fixed_q1',
                                     optimized='overlap_q1', measured_calls_per_arm=1)
+    if getattr(args, 'trace_only', False):
+        trace = matrix['msprof_pair']
+        matrix['cases'] = [case for case in cases if case['miss_percent'] == trace['miss_percent']
+                           and case['arm'] in (trace['baseline'], trace['optimized'])]
+        matrix['trace_only'] = True
     return matrix
 
 
@@ -338,12 +343,17 @@ def main(argv=None):
     parser.add_argument('--pressure', action='store_true',
                         help='compare BS4 Cold P4/P8 and deferred AIC result-bank credit, then capture one msprof pair')
     parser.add_argument('--skip-msprof', action='store_true', help='run only pressure timing')
+    parser.add_argument('--trace-only', action='store_true', help='capture only the two checked staged pressure traces')
     parser.add_argument('--msprof-miss', type=int, choices=MISSES, help='override the paired trace miss rate')
     args = parser.parse_args(argv)
     if args.pressure and args.batch and set(args.batch) != {4}:
         parser.error('--pressure currently requires BS4')
-    if not args.pressure and (args.skip_msprof or args.msprof_miss):
-        parser.error('--skip-msprof and --msprof-miss require --pressure')
+    if not args.pressure and (args.skip_msprof or args.msprof_miss or args.trace_only):
+        parser.error('--skip-msprof, --msprof-miss, and --trace-only require --pressure')
+    if args.trace_only and args.skip_msprof:
+        parser.error('--trace-only and --skip-msprof are mutually exclusive')
+    if args.trace_only and args.msprof_miss is not None and not args.miss_percent:
+        args.miss_percent = [args.msprof_miss]
     if args.msprof_miss and (args.skip_msprof or args.msprof_miss not in (args.miss_percent or (5, 15))):
         parser.error('--msprof-miss must be one of the measured miss rates and requires msprof capture')
     if min(args.warmup, args.device) < 0 or min(args.timeout_seconds, args.iterations) <= 0:
@@ -382,7 +392,7 @@ def main(argv=None):
         return read_arm(worker, case, iterations)
 
     with kvaf_service(args, output):
-        for case in matrix['cases']:
+        for case in (() if args.trace_only else matrix['cases']):
             batch, miss, arm = case['batch'], case['miss_percent'], case['arm']
             worker = output / f'bs{batch}' / f'miss{miss}' / arm
             groups = (f'{case["score_groups"]} Hot/{case["cold_score_groups"]} Cold'
@@ -408,7 +418,8 @@ def main(argv=None):
             write_reports(output, rows, cells)
             print(f"  KV ready {row['kv_ready_us']:.2f} µs, early/final "
                   f"{row['prefetch_per_call']:.2f}/{row['final_get_per_call']:.2f}", flush=True)
-        print(f'Finished {len(rows)} checked arms. Comparisons: {output / "comparison.csv"}', flush=True)
+        if not args.trace_only:
+            print(f'Finished {len(rows)} checked arms. Comparisons: {output / "comparison.csv"}', flush=True)
         trace = matrix.get('msprof_pair')
         if trace:
             from fixed_q4_pressure_msprof import collect_pair

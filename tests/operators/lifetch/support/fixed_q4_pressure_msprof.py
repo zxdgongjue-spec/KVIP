@@ -163,6 +163,13 @@ def _overlay(events, intervals, caption, pid, offset):
                            ts=row['begin_us'] - offset, dur=row['duration_us'], args=row))
 
 
+def _device_handoffs(intervals):
+    transitions = zip(intervals, intervals[1:])
+    return [dict(name=f"{left['name']} to {right['name']}", begin_us=left['end_us'], end_us=right['begin_us'],
+                 duration_us=right['begin_us'] - left['end_us'])
+            for left, right in transitions]
+
+
 def _label_capture(paths, route, caption, case, save):
     failures = {}
     for path in paths:
@@ -178,14 +185,38 @@ def _label_capture(paths, route, caption, case, save):
         while str(pid) in used:
             pid += 1
         _overlay(events, intervals, caption, pid, 0)
+        handoffs = _device_handoffs(intervals)
+        events.append(dict(name='thread_name', ph='M', pid=pid, tid=1,
+                           args={'name': 'Kernel handoffs | CANN device task clock'}))
+        for row in handoffs:
+            if row['duration_us'] > 0:
+                events.append(dict(name=row['name'], cat='KVIP device handoff', ph='X', pid=pid, tid=1,
+                                   ts=row['begin_us'], dur=row['duration_us'], args=row))
         view = dict(vendor) if isinstance(vendor, dict) else {}
         view['traceEvents'] = events
-        trace = route / 'msprof_trace.json'
+        trace = route / 'lifetch_msprof_trace.json'
         save(trace, view)
-        return dict(attribution='VERIFIED', trace=str(trace), intervals=intervals)
+        (route / 'msprof_trace.json').symlink_to(trace.name)
+        return dict(attribution='VERIFIED', trace=str(trace), intervals=intervals, device_handoffs=handoffs)
     # Preserve the vendor trace even if CANN did not expose attributable names.
     return dict(attribution='UNATTRIBUTED', errors=failures)
 
+
+
+def _source_comparison(captures):
+    events = []
+    for index, (label, capture) in enumerate(captures.items()):
+        doc = json.loads(Path(capture['business_trace']).read_text())
+        title = f'{label}: {capture["arm"]}'
+        for event in doc['traceEvents']:
+            remapped = dict(event, pid=event['pid'] + 16 * index)
+            if event['name'] == 'process_name':
+                remapped['args'] = dict(event['args'], name=f"{title} | {event['args']['name']}")
+            events.append(remapped)
+    return dict(traceEvents=events, displayTimeUnit='us',
+                metadata=dict(alignment='Independent staged replay clocks aligned at their first recorded scope',
+                              baseline=captures['baseline']['business_trace'],
+                              optimized=captures['optimized']['business_trace']))
 
 def collect_pair(output, baseline_case, optimized_case, *, launch_case, profiler=None):
     """Run one selected case per route, then publish raw and compared traces."""
@@ -220,11 +251,29 @@ def collect_pair(output, baseline_case, optimized_case, *, launch_case, profiler
         trace_counts.append(read_counters(
             [{'accounting': {'invocation': 0}, 'algorithm': detail['algorithm']}], case, 1
         ))
-        capture['window_cycles'] = str(cycle_report)
+        stage_report = route / 'baseline_stage_report.json'
+        stage_trace = route / 'baseline_stage_trace.json'
+        stage_raw = route / 'baseline_stage_trace.bin'
+        report = json.loads(stage_report.read_text())
+        if (report.get('correctness') != 'PASS' or report.get('execution') != 'COMPLETED'
+                or report.get('traced_invocations') != 1 or not stage_raw.is_file()
+                or (report['total_prefetch'], report['total_final_get']) != (
+                    detail['algorithm']['totals']['prefetch'], detail['algorithm']['totals']['final'])):
+            raise ValueError(f'Unchecked staged capture for {label}, see {stage_report}')
+        business = route / 'lifetch_business_trace.json'
+        shutil.copyfile(stage_trace, business)
+        capture.update(window_cycles=str(cycle_report), business_trace=str(business),
+                       stage_report=str(stage_report), stage_trace=str(stage_trace), stage_raw=str(stage_raw))
         capture.update(_label_capture(timelines, route, label, case, atomic_json))
+        handoff_report = route / 'lifetch_handoff_report.json'
+        atomic_json(handoff_report, dict(source_clock=report['clock'], source_handoffs=report['source_handoffs'],
+                                         device_clock='CANN msprof device task timestamps',
+                                         device_handoffs=capture.get('device_handoffs', [])))
+        capture['handoff_report'] = str(handoff_report)
         captures[label] = capture
         atomic_json(route / 'capture_summary.json', capture)
         path = capture.get('trace', capture['raw'][0])
+        print(f'{label} staged business trace: {business}', flush=True)
         print(f'{label} msprof trace: {path}', flush=True)
 
     for field in ('fixture_sha256', 'library_sha256'):
@@ -234,6 +283,10 @@ def collect_pair(output, baseline_case, optimized_case, *, launch_case, profiler
                    fixture_sha256=rows[0]['fixture_sha256'], library_sha256=rows[0]['library_sha256'],
                    profiler_get_match=match_counts(*trace_counts),
                    unmarked_graph_get_match=match_counts(rows[0]['counts'], rows[1]['counts']), **captures)
+    view = pair / 'comparison_trace.json'
+    atomic_json(view, _source_comparison(captures))
+    summary['comparison_trace'] = str(view)
+    print(f'Open full staged comparison: {view}', flush=True)
     if all(capture['attribution'] == 'VERIFIED' for capture in captures.values()):
         base, optimized = (capture['intervals'] for capture in captures.values())
         comparison = [dict(stage=before['name'], baseline_us=before['duration_us'],
@@ -248,11 +301,13 @@ def collect_pair(output, baseline_case, optimized_case, *, launch_case, profiler
         for pid, (label, capture) in enumerate(captures.items(), 1):
             intervals = capture['intervals']
             _overlay(events, intervals, f'{label}: {capture["arm"]}', pid, intervals[0]['begin_us'])
-        view = pair / 'comparison_trace.json'
-        atomic_json(view, dict(traceEvents=events, displayTimeUnit='us'))
-        summary.update(comparison=comparison, comparison_trace=str(view))
-        print(f'Open aligned msprof comparison: {view}', flush=True)
+        kernel_view = pair / 'kernel_comparison_trace.json'
+        atomic_json(kernel_view, dict(traceEvents=events, displayTimeUnit='us'))
+        summary.update(comparison=comparison, kernel_comparison_trace=str(kernel_view))
     else:
-        print('Raw msprof files saved. At least one replay lacks attributable stages.', flush=True)
+        print('Raw msprof and staged source files saved. At least one CANN replay lacks attributable stages.',
+              flush=True)
     atomic_json(pair / 'comparison.json', summary)
+    if any(capture['attribution'] != 'VERIFIED' for capture in captures.values()):
+        raise ValueError(f'A full capture requires attributable CANN device stages, see {pair / "comparison.json"}')
     return summary

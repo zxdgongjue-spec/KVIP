@@ -9,6 +9,7 @@ set(KVAF_INCLUDE "" CACHE PATH "KVAF device interface headers")
 if(NOT EXISTS "${KVAF_INCLUDE}/kvaf_batch_get_device.h")
   message(FATAL_ERROR "Set KVAF_INCLUDE to the patched KVAF aiv_batch_get/include directory")
 endif()
+option(KVIP_STAGE_TRACE "Enable LIFetch per-core source trace recording" OFF)
 set(KVIP_FUSE_QUERY_WORK ON)
 include(${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
 set(KVIP_OUTPUT_WORKER ON)
@@ -20,7 +21,7 @@ ascendc_library(v9_kernel STATIC op_kernel/indexer.cpp op_kernel/indexer_fixed.c
 ascendc_include_directories(v9_kernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel
   ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/indexer ${KVAF_INCLUDE}
   ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
-ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WORKER=$<BOOL:${KVIP_OUTPUT_WORKER}> -DKVIP_FUSE_QUERY_WORK=$<BOOL:${KVIP_FUSE_QUERY_WORK}> -O2 -g --cce-auto-sync=off
+ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STAGE_TRACE=$<BOOL:${KVIP_STAGE_TRACE}> -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WORKER=$<BOOL:${KVIP_OUTPUT_WORKER}> -DKVIP_FUSE_QUERY_WORK=$<BOOL:${KVIP_FUSE_QUERY_WORK}> -O2 -g --cce-auto-sync=off
   -mllvm -user-reserved-ub-size=223232 -DV9_USER_UB_BYTES=223232
   -DV9_PARTIAL_SCAN_SIMD=1 -DV9_PROBE_EPOCH=0 -DV9_INTERMEDIATE_PROFILING=0
   -DV9_BATCH_POST=2 -DSIM_Q=4 -DSIM_CAPTURE_HITS=1 -DV9_SIMULATION=0 -DROTATION_PUBLISH_TILES=1)
@@ -34,7 +35,8 @@ ascendc_library(parallel_terminal_kernel STATIC op_kernel/terminal/kernel.cpp)
 ascendc_include_directories(parallel_terminal_kernel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/indexer
   ${KVAF_INCLUDE} ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
-ascendc_compile_options(parallel_terminal_kernel PRIVATE -DKVIP_PARALLEL_TERMINAL=1
+ascendc_compile_options(parallel_terminal_kernel PRIVATE
+  -DKVIP_STAGE_TRACE=$<BOOL:${KVIP_STAGE_TRACE}> -DKVIP_PARALLEL_TERMINAL=1
   -O2 -g --cce-auto-sync=off -mllvm -user-reserved-ub-size=223232
   -DV9_USER_UB_BYTES=223232 -DV9_BATCH_POST=2 -DSIM_Q=4 -DSIM_CAPTURE_HITS=1
   -DV9_SIMULATION=0 -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WORKER=1 -DROTATION_PUBLISH_TILES=1)

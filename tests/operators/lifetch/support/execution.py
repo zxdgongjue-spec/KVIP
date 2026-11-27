@@ -3857,6 +3857,7 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
         if profile_path:
             import acl
             from fixed_q4_pressure_msprof import scoped_msprof
+            from fixed_q4_staged_trace import StageBuffer, write_trace
 
             first, inputs = states[0], next(iter(sequence))
             profile_path = Path(profile_path)
@@ -3871,21 +3872,35 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
             unmarked_launch = first.forward.terminal_function
             first.forward.terminal_function = first.forward.pressure_profile_launcher
             try:
+                # Keep the buffer alive if stream completion becomes uncertain.
+                first.pressure_stage_trace = tracker = StageBuffer(first)
+                pending = True
+                tracker.attach()
+                stream.synchronize()
+                pending = False
                 with scoped_msprof(acl.prof, profile_path, config.device) as capture_status:
                     pending = True
                     first.forward()
                     stream.synchronize()
                     pending = False
                 first.validate(inputs)
+                algorithm = algorithm_after(first.rotating, before, admissions=first.forward.events_src.cpu().numpy())
                 sample = dict(device_clock_mhz=first.forward.counter_clock_mhz,
-                              streaming_cycles=first.forward.diagnostic_cycles(),
-                              algorithm=algorithm_after(first.rotating, before,
-                                  admissions=first.forward.events_src.cpu().numpy()))
+                              streaming_cycles=first.forward.diagnostic_cycles(), algorithm=algorithm)
+                write_trace(profile_path.parent, tracker, first.forward.counter_clock_mhz,
+                            first, algorithm, capture_status)
                 atomic_json(profile_path / 'window_cycles.json', sample)
                 atomic_json(profile_path / 'capture.json', dict(capture_status, correctness='PASS',
                                                                 scope='warmed_eager_marked_forward'))
             finally:
                 first.forward.terminal_function = unmarked_launch
+                tracker = getattr(first, 'pressure_stage_trace', None)
+                if tracker is not None and not pending:
+                    pending = True
+                    tracker.detach()
+                    stream.synchronize()
+                    pending = False
+                    first.pressure_stage_trace = None
 
         # Detailed stamps are additional diagnostics, never performance samples.
         if fused and config.mode == 'diagnose' and config.level >= 2:
@@ -4069,7 +4084,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
         logical_addresses = (page_addresses[:, :, None] + np.arange(128, dtype=np.uint64) * np.uint64(width)).reshape(g['batch'], -1)
         if fused:
             if config.transport == 'urma':
-                (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers, soc=soc)
+                (library,) = build_libraries(cache_dir=build / 'lifetch', cann=cann, headers=headers, soc=soc,
+                                             stage_trace=bool(pressure_profile))
             else:
                 shape = UbmemGeometry(g['batch'], g['history'], g['resident'], g['heads'], width,
                                       aics, config.intermediate_fetches, soc)

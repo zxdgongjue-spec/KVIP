@@ -187,3 +187,30 @@ Use the per-arm raw CANN exports and `msprof/window_cycles.json` for further
 inspection. If the CANN export lacks identifiable tasks, the runner retains
 the original trace and reports the attribution error. Use the main
 `comparison.csv` for Graph Event latency and per-request Get comparability.
+
+
+### Complete staged pressure trace
+
+In the same A5 container and with the same KVAF checkout, capture just the
+baseline and deferred-credit arms at BS4, miss 15%:
+
+```bash
+bash tests/operators/lifetch/run_fixed_q4_combo_a5.sh --pressure --trace-only --msprof-miss 15 --warmup 1
+```
+
+Both arms keep 32 Hot and 32 Cold MIX groups, Q4, W4, 128K history and the
+original prefetch thresholds and budget. The runner validates each replay's
+Top2048, KV, Index and Get receipts as well as actual source scope coverage.
+It builds the recorder variant independently of the performance binary and
+attaches the capture buffer only for a separate scoped eager replay.
+
+Under the printed `Run output`, open `msprof_pair/comparison_trace.json`
+for the aligned, full per-core business traces. Each arm also contains
+`baseline_stage_trace.bin`, `baseline_stage_trace.json`,
+`baseline_stage_report.json`, `lifetch_business_trace.json`,
+`lifetch_msprof_trace.json` and `lifetch_handoff_report.json`.
+The CANN timeline preserves the original device tasks and runtime tracks.
+The source timeline records sampled instruction-issue and existing
+synchronization scopes. It uses an independently calibrated device clock.
+Use the unmarked performance matrix for end-to-end latency. The old
+kernel-only comparison is available in `kernel_comparison_trace.json`.

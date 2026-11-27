@@ -67,6 +67,7 @@ def bind(state, arm, library, pressure_mode=None):
         forward.terminal_function = launch
         forward.pressure_profile_launcher = profile_launch
         route.update(pressure_mode=pressure_mode, cold_score_groups=cold_groups, deferred_credit=deferred)
+        forward.fixed_q4_pressure = route
     return route
 
 
