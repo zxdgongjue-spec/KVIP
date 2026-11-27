@@ -977,3 +977,36 @@ candidate MTE2, dedup VF issue and WQE submission. For BS16, the report
 also verifies W0 owner timing before W1 reuse. Use the corresponding
 `lifetch_msprof_trace.json` to inspect vector execution alongside the
 source issue scope.
+
+### W1 query scheduling with grouped workloads
+
+`--window-q-wide` adds three grouped workloads to the five native
+batch sizes. All eight rows have the same four arms as the Q matrix.
+The main P2 and the three W2 variants use the same grouping per size.
+
+| Logical batch | Group forwards in one graph |
+| ---: | --- |
+| 20 | 5 serial BS4 forwards |
+| 24 | 3 serial BS8 forwards |
+| 32 | 2 serial BS16 forwards |
+
+Each forward owns independent graph state and uses the same synthetic
+fixture for its physical batch. The grouped `kv_ready_us`
+is the measured Graph Event from the start to the end of this single
+graph. The output also includes `physical_batch`, `waves`,
+`native_subcall_kv_ready_us` and exact `*_per_group` Get totals. Kernel
+stage times and `*_per_call` Get counts stay in the per-forward unit.
+Use the group rows to compare Q scheduling with the selected serial
+decomposition. Native large-batch kernels use a different schedule.
+
+```bash
+bash "$runner" --window-q-wide --main-root "$main" --warmup 2 --iterations 5
+# Only the grouped workloads
+bash "$runner" --window-q-wide --main-root "$main" \
+  --batch 20 --batch 24 --batch 32 --warmup 2
+```
+
+The `--iterations` value applies to native batch sizes. For grouped
+rows, the documented number of forwards fills each measured device
+graph. All arms write to the run's `summary.csv`. Use
+`--window-q-matrix --trace` for the existing native per-call traces.

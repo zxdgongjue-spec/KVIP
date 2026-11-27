@@ -9,7 +9,7 @@ from pathlib import Path
 import shutil
 from types import SimpleNamespace
 
-from run_mr25_handoff import KVAF, ROOT, bench_arguments, collect, git, read, save
+from run_mr25_handoff import KVAF, ROOT, apply_group_timing, bench_arguments, collect, git, read, save
 from run_mr28_baseline_msprof import capture_route
 from run_mr28_dedicated_service import write_summary
 from kvip.operators.lifetch.geometry import li_geometry
@@ -50,6 +50,7 @@ MAIN = 'df8ad2598e70e4b5e266b15028ab26c601a2bdf2'
 DIRECTION1_MODES = {1: 'cold', 2: 'cold', 4: 'cold', 8: 'windows', 16: 'windows', 32: 'windows'}
 DIRECTION1_MISSES = (5, 10, 15, 20, 25, 30)
 NATIVE_BATCH_LIMIT = 16
+WINDOW_Q_GROUPS = {20: (4, 5), 24: (8, 3), 32: (16, 2)}
 
 
 def balanced_arms(batch):
@@ -66,9 +67,12 @@ def balanced_arms(batch):
 def study_arms(args):
     if args.window_q_matrix:
         baseline = () if args.trace else ('p2',)
-        if args.window_q_matrix == 'all':
+        if args.window_q_matrix != 'q1':
             arms = dict.fromkeys(WINDOW_Q_BATCHES, (*baseline, *P4_WINDOW_Q_WORKERS))
             arms[16] = (*baseline, *P2_WINDOW_Q_WORKERS)
+            if args.window_q_matrix == 'wide':
+                for batch, (physical, _) in WINDOW_Q_GROUPS.items():
+                    arms[batch] = arms[physical]
             return arms
         return dict.fromkeys(WINDOW_Q_BATCHES, (*baseline, 'cold_w2', 'cold_w2_q1'))
     if args.bs2_window_q:
@@ -99,7 +103,9 @@ def plan(args, kvaf):
     for batch in batches:
         physical = min(batch, NATIVE_BATCH_LIMIT)
         waves = batch // physical
-        if waves > 1 and not args.group_bs32:
+        if args.window_q_matrix == 'wide' and batch in WINDOW_Q_GROUPS:
+            physical, waves = WINDOW_Q_GROUPS[batch]
+        elif waves > 1 and not args.group_bs32:
             continue
         if args.direction1_matrix:
             modes = ('p2', DIRECTION1_MODES[batch])
@@ -131,7 +137,10 @@ def plan(args, kvaf):
                 ):
                     arguments[arguments.index(key) + 1] = str(value)
                 arguments.extend(('--prefetch-window-limit', '128'))
-                measurement = 'serial_bs16x2_graph_event' if waves > 1 else 'native'
+                measurement = 'native'
+                if waves > 1:
+                    measurement = ('serial_equal_subbatches_graph_event' if args.window_q_matrix == 'wide'
+                                   else 'serial_bs16x2_graph_event')
                 parts = cold_score_parts(mode, physical)
                 yield dict(batch=batch, physical_batch=physical, waves=waves, miss_percent=miss,
                            measurement_kind=measurement, mode=mode, requested_windows=requested, effective_windows=effective,
@@ -253,14 +262,10 @@ def perf_arm(output, case, config):
         row[f'fixture_miss_percent_q{q}'] = rate
     if case['waves'] > 1:
         (timing,) = result['rounds'].values()
-        if timing['graph_calls'] != case['waves'] or not timing['graph_event_us'] > 0:
-            raise ValueError('Grouped case requires two checked BS16 calls in one device graph')
-        row['native_subcall_kv_ready_us'] = row['kv_ready_us']
-        row['kv_ready_us'] = row['fused_event_us'] = timing['graph_event_us']
-        row.update({f'{field}_per_group': sum(record[field] for record in row['per_call_requests'])
-                    for field in ('prefetch_requests', 'final_get_requests', 'total_get_requests')})
+        apply_group_timing(row, timing, case['waves'])
     row['batch'] = case['batch']
-    timing_label, get_unit = ('2xBS16 graph', 'group') if case['waves'] > 1 else ('KV ready', 'call')
+    timing_label, get_unit = ((f'{case["waves"]}xBS{physical} graph', 'group')
+                              if case['waves'] > 1 else ('KV ready', 'call'))
     early, final = (row[f'{field}_per_{get_unit}'] for field in ('prefetch_requests', 'final_get_requests'))
     print(f'BS{case["batch"]} {case["mode"]}: {timing_label} {row["kv_ready_us"]:.2f} µs, '
           f'prefetch / final Get per {get_unit} {early:.2f} / {final:.2f}', flush=True)
@@ -339,7 +344,7 @@ def summarize(output, rows):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--batch', type=int, choices=tuple(DIRECTION1_MODES), action='append')
+    parser.add_argument('--batch', type=int, choices=(1, 2, 4, 8, 16, *WINDOW_Q_GROUPS), action='append')
     parser.add_argument('--miss-percent', type=int, choices=DIRECTION1_MISSES, action='append',
                         help='select one miss rate for a matrix or granularity study')
     parser.add_argument('--group-bs32', action='store_true',
@@ -366,6 +371,8 @@ def main():
                        help='compare main P2, P4/W2 serial Q4 and four Q1 at BS1/2/4/8')
     route.add_argument('--window-q-matrix', action='store_const', const='all',
                        help='compare main P2 and W2 serial Q4, Q2+Q2 and four Q1 at BS1/2/4/8/16')
+    route.add_argument('--window-q-wide', dest='window_q_matrix', action='store_const', const='wide',
+                       help='add same-graph serial groups BS20 (5x4), BS24 (3x8) and BS32 (2x16)')
     route.add_argument('--adaptive-pw', action='store_true',
                        help='compare native P2, fixed best P/W and adaptive P/W with retired AIV Service')
     route.add_argument('--window-probe', choices=WINDOW_PROBES,
@@ -386,9 +393,14 @@ def main():
     study = study_arms(args)
     if study:
         if args.group_bs32 or any(batch not in study for batch in args.batch or ()):
-            parser.error(f'This study supports only native BS values {tuple(study)}')
-    elif not args.direction1_matrix and (args.miss_percent or args.group_bs32
-                                         or any(batch not in FOLLOW_UP_ARMS for batch in args.batch or ())):
+            parser.error(f'This study supports BS values {tuple(study)}')
+        if args.trace and args.window_q_matrix == 'wide' and any(
+                batch in WINDOW_Q_GROUPS for batch in args.batch or study):
+            parser.error('Grouped Graph Event timing requires a performance run; use --window-q-matrix --trace for native traces')
+    elif args.direction1_matrix:
+        if any(batch not in DIRECTION1_MODES for batch in args.batch or ()):
+            parser.error(f'--direction1-matrix supports BS values {tuple(DIRECTION1_MODES)}')
+    elif args.miss_percent or args.group_bs32 or any(batch not in FOLLOW_UP_ARMS for batch in args.batch or ()):
         parser.error('Expanded batch sizes, miss rates and grouped BS32 require --direction1-matrix')
     if args.group_bs32 and args.trace:
         parser.error('Grouped BS32 uses a two-call graph Event, incompatible with the single-call trace')
@@ -419,7 +431,8 @@ def main():
                     cold_window_matrix=args.cold_window_matrix,
                     bs2_trace_pair=args.bs2_trace_pair,
                     bs2_window_q=args.bs2_window_q, window_q1_matrix=args.window_q_matrix == 'q1',
-                    window_q_matrix=args.window_q_matrix == 'all',
+                    window_q_matrix=args.window_q_matrix in ('all', 'wide'),
+                    window_q_wide=args.window_q_matrix == 'wide',
                     main_root=str(args.main_root.resolve()) if args.main_root else None,
                     adaptive_pw=args.adaptive_pw, window_probe=args.window_probe,
                     granularity_study=args.granularity_study, repeats=args.repeats,
@@ -464,9 +477,10 @@ def main():
             miss = case['miss_percent']
             if args.direction1_matrix or study:
                 run_dir = run_dir / f'miss{miss:g}'
+            group = f" ({case['waves']}xBS{case['physical_batch']} serial graph)" if case['waves'] > 1 else ""
             print(f"Round {repeat}/{args.repeats}, BS{case['batch']} miss{miss:g} "
                   f"{case['mode']} P{case['cold_score_parts']}/W{case['effective_windows']} "
-                  f"({case['cold_score_groups']} Cold MIX groups)", flush=True)
+                  f"({case['cold_score_groups']} Cold MIX groups per call){group}", flush=True)
             if args.window_q_matrix and case['mode'] == 'p2':
                 row = measure_main(args.main_root, run_dir, case, MAIN)
             else:

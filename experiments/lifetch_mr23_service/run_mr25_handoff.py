@@ -5,6 +5,7 @@
 import argparse
 import csv
 import json
+import math
 import os
 from pathlib import Path
 import statistics
@@ -34,6 +35,19 @@ def save(path, payload):
 
 def read(path):
     return json.loads(path.read_text())
+
+
+def apply_group_timing(row, timing, waves):
+    """Report one device graph containing serial, independently checked forwards."""
+    event_us = timing.get('graph_event_us')
+    if (timing.get('measured_graphs') != 1 or timing.get('graph_calls') != waves
+            or not isinstance(event_us, (int, float))
+            or not math.isfinite(event_us) or event_us <= 0):
+        raise ValueError(f'Grouped case requires one measured graph with {waves} calls')
+    row['native_subcall_kv_ready_us'] = row['kv_ready_us']
+    row['kv_ready_us'] = row['fused_event_us'] = event_us
+    for field in COUNT_COLUMNS:
+        row[f'{field}_per_group'] = sum(request[field] for request in row['per_call_requests'])
 
 
 def collect(directory, mode, batch, *, stage_fields=STAGES, miss_percent=10):

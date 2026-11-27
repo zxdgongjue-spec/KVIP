@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Run and verify the unmodified main baseline for the W1 Q1 matrix."""
+"""Run and verify the unmodified main baseline for the W1 query matrix."""
 
 import statistics
 import subprocess
 import sys
 
-from run_mr25_handoff import read
+from run_mr25_handoff import apply_group_timing, read
 from diagnostics import account
 from terminal_handoff import COUNT_COLUMNS, STAGES, fixture_hash, terminal_stages
 
@@ -24,8 +24,9 @@ raise SystemExit(launch(configuration(sys.argv[3:]), sys.argv[2]))
 
 
 def measure_main(root, output, case, commit):
+    logical_batch, waves = case['batch'], case['waves']
     batch, miss = case['physical_batch'], case['miss_percent']
-    worker = output / f'bs{batch}' / 'main_p2'
+    worker = output / f'bs{logical_batch}' / 'main_p2'
     arguments = list(case['arguments'])
     # Native main derives the 128-token window budget from 512 / requested W4.
     option = arguments.index('--prefetch-window-limit')
@@ -77,13 +78,20 @@ def measure_main(root, output, case, commit):
             counts.append(dict(source_round=1, invocation=invocation, request=request['request'],
                                **dict(zip(COUNT_COLUMNS, (early, final, early + final)))))
 
-    row = dict(variant='p2', source_commit=commit, batch=batch, accepted=True, score_parts=2,
+    row = dict(variant='p2', source_commit=commit, batch=logical_batch, accepted=True, score_parts=2,
                cold_score_parts=2, windows=case['effective_windows'],
                service_lanes=2 * case['service_aics'], fixture_sha256=fixture_hash(fixture),
-               kv_ready_us=timing['event_mean_us'], profiler_p50_us=timing['p50_us'],
+               kv_ready_us=timing['event_mean_us'], fused_event_us=timing['event_mean_us'],
+               profiler_p50_us=timing['p50_us'],
                per_call_requests=counts, report=str(folder / 'report.json'),
                **{key: statistics.mean(sample[key] for sample in stages) for key in STAGES},
                **{key + '_per_call': sum(record[key] for record in counts) / calls for key in COUNT_COLUMNS})
-    print(f'BS{batch} main P2: KV ready {row["kv_ready_us"]:.2f} µs, prefetch / final Get per call '
-          f'{row["prefetch_requests_per_call"]:.2f} / {row["final_get_requests_per_call"]:.2f}', flush=True)
+    if waves > 1:
+        apply_group_timing(row, profile['timing'], waves)
+        timing_label, get_unit = f'{waves}xBS{batch} graph KV ready', 'group'
+    else:
+        timing_label, get_unit = 'KV ready', 'call'
+    early, final = (row[f'{field}_per_{get_unit}'] for field in COUNT_COLUMNS[:2])
+    print(f'BS{logical_batch} main P2: {timing_label} {row["kv_ready_us"]:.2f} µs, '
+          f'prefetch / final Get per {get_unit} {early:.2f} / {final:.2f}', flush=True)
     return row
