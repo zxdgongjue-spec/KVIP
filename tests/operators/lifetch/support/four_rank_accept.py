@@ -61,9 +61,10 @@ def cached(root, ref, group, batch, mode):
                     and placement(d / "thp.json") == identity[1]):
                 return d
         return None
-    for path in sorted(
-        root.parent.glob(f"fixed-q4-audit-journal.*/g{group}/bs{batch}/block1/journal/journal.json")
-    ):
+    # A team-schedule sample also captures the ordinary terminal journal in the same eager call.
+    regular = f"fixed-q4-audit-journal.*/g{group}/bs{batch}/block1/journal/journal.json"
+    scheduled = f"fixed-q4-audit-team-schedule.*/g{group}/bs{batch}/block1/team-schedule/journal.json"
+    for path in [*sorted(root.parent.glob(regular)), *sorted(root.parent.glob(scheduled))]:
         folder, archive = path.parent, path.parents[4]
         if not matched(archive, ref) or not (folder / "placement_verified").is_file():
             continue
@@ -288,6 +289,32 @@ def partial_natural(ref, native):
     return max(options)[2] if options else None
 
 
+
+def natural_summary(root, ref):
+    counts = [0, 0, 0]
+    for g, b in CELLS:
+        block = f"g{g}/bs{b}/block1"
+        old, key = observation(ref, ref / block, g, b, "fused")
+        new, live = observation(root, root / block, g, b, "fused")
+        if live != key or not matched(root, ref):
+            raise ValueError(f"G{g} BS{b} has a different input, card, runtime or placement")
+        serial = serial_reference(ref, live, g, b)
+        gain_text = "UNAVAILABLE"
+        if serial is not None:
+            gain = 100 * (1 - new["graph"] / serial["graph"])
+            gain_text = f"{gain:+.2f}%"
+            counts[0] += 1
+            counts[1] += gain >= 15
+            counts[2] += gain >= 20
+        stages = ("graph", "LI", "tail")
+        values = "/".join(f"{new[k]:.2f}" for k in stages)
+        savings = "/".join(f"{old[k]-new[k]:+.2f}" for k in stages)
+        print(f"G{g} BS{b} NATURAL_LI graph/LI/tail_mean_us={values} "
+              f"vs_original_graph/LI/tail_saved_us={savings} vs_same_card_serial={gain_text}")
+    print(f"NATURAL_LI serial_coverage={counts[0]}/{len(CELLS)} "
+          f"at_least_15pct={counts[1]} at_least_20pct={counts[2]}")
+
+
 def serial_summary(ref):
     matches = []
     missing = []
@@ -314,6 +341,7 @@ if __name__ == "__main__":
     q = sub.add_parser("coverage")
     q.add_argument("ref", type=Path)
     q.add_argument("mode", choices=["serial", "journal", "frozen"])
+    q.add_argument("--batches", nargs="+", type=int, choices=[20, 24, 28, 32])
     for action in ("timed", "partial"):
         t = sub.add_parser(action)
         t.add_argument("ref", type=Path)
@@ -322,7 +350,7 @@ if __name__ == "__main__":
     validate.add_argument("path", type=Path)
     validate.add_argument("ref", type=Path)
     validate.add_argument("native")
-    for action in ("cached", "check", "report", "frozen-report"):
+    for action in ("cached", "check", "report", "frozen-report", "natural-summary"):
         q = sub.add_parser(action)
         q.add_argument("root", type=Path)
         q.add_argument("ref", type=Path)
@@ -332,8 +360,9 @@ if __name__ == "__main__":
             q.add_argument("mode", choices=["serial", "journal", "frozen"])
     a = p.parse_args()
     if a.action == "coverage":
-        missing = [(g,b) for g,b in CELLS if not cached(a.ref, a.ref, g, b, a.mode)]
-        print(f"ARCHIVE mode={a.mode} complete={len(CELLS)-len(missing)}/{len(CELLS)}")
+        selected = [(g, b) for g, b in CELLS if not a.batches or b in a.batches]
+        missing = [(g, b) for g, b in selected if not cached(a.ref, a.ref, g, b, a.mode)]
+        print(f"ARCHIVE mode={a.mode} complete={len(selected)-len(missing)}/{len(selected)}")
         raise SystemExit(3 if missing else 0)
     if a.action == "serial-summary":
         raise SystemExit(0 if serial_summary(a.ref) else 3)
@@ -346,6 +375,8 @@ if __name__ == "__main__":
             print(hit)
     elif a.action == "placement":
         print(*placement(a.path))
+    elif a.action == "natural-summary":
+        natural_summary(a.root, a.ref)
     elif a.action == "frozen-report":
         raise SystemExit(0 if frozen_report(a.root, a.ref) else 3)
     elif a.action == "report":

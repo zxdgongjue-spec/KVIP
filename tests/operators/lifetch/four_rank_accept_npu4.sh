@@ -6,7 +6,12 @@ repo=$(cd "${1:?expected KVIP checkout}" && pwd -P)
 reader=$(git -C "$repo" rev-parse --verify "${2:?expected reader commit}^{commit}")
 mode=${3:?expected candidate commit or serial-only}
 extra=${4:-natural}
-[[ $extra == natural || ( $extra == paired-frozen && $mode != serial-only ) ]] || exit 2
+case $extra in
+    full) extra=isolated-all ;;
+    tail) extra=isolated-scheduling ;;
+    bs20) extra=isolated-schedule-focus ;;
+esac
+case $extra in natural) ;; paired-frozen|isolated-li|isolated-tail|isolated-all|isolated-scheduling|isolated-schedule-only|isolated-schedule-focus) [[ $mode != serial-only ]] || exit 2 ;; *) exit 2 ;; esac
 native=
 if [[ $mode != serial-only ]]; then native=$(git -C "$repo" rev-parse --verify "$mode^{commit}"); fi
 base=d0fc5963881bd38fa97eff0f6ef40c757a6e8713
@@ -40,8 +45,25 @@ if ! "$py" -B -c 'import numpy, hashlib; assert hasattr(hashlib, "file_digest")'
 fi
 audit() {
     local timed rc
-    if "$py" -B "$entry/support/four_rank_accept.py" coverage "$3" "$1"; then return 0; else rc=$?; fi
-    (( rc == 3 )) || return "$rc"
+    if [[ $1 == team-schedule ]]; then
+        local group batch complete=1 hit
+        for batch in $FIXED_Q4_BATCHES; do
+            for group in $FIXED_Q4_GROUPS; do
+                hit=$("$py" -B "$entry/support/b24_team_schedule.py" cached "$3" "$3" "$group" "$batch" "$1")
+                if [[ -n $hit ]]; then
+                    "$py" -B "$entry/support/b24_team_schedule.py" show "$hit" "$3" "$group" "$batch" "$1"
+                else
+                    complete=0
+                fi
+            done
+        done
+        if (( complete )); then return 0; fi
+    elif [[ $1 != two-row-* ]]; then
+        local -a batches
+        read -ra batches <<< "$FIXED_Q4_BATCHES"
+        if "$py" -B "$entry/support/four_rank_accept.py" coverage "$3" "$1" --batches "${batches[@]}"; then return 0; else rc=$?; fi
+        (( rc == 3 )) || return "$rc"
+    fi
     timed=$(staged_tree "$2")
     PEER_FOUR_RANK_AUDIT=$1 PEER_TIMED_SOURCE=$timed PEER_AUDIT_REFERENCE=$3 \
         bash "$entry/large_batch_npu4.sh" --four-ranks-candidate-only
@@ -53,8 +75,40 @@ if [[ $mode == serial-only ]]; then
     "$py" -B "$entry/support/four_rank_accept.py" serial-summary "$ref"
     exit 0
 fi
-audit serial "$serial" "$ref"
-audit journal "$base" "$ref"
+# The independent tail experiment keeps the archived LI. With sixteen teams,
+# both rows exist for every team only at BS32.
+tail_only() (
+    export FIXED_Q4_BATCHES=32
+    audit two-row-natural "$base" "$ref"
+    audit journal "$base" "$ref"
+    audit frozen "$base" "$ref"
+    audit two-row-frozen "$base" "$ref"
+)
+if [[ $extra == isolated-* ]]; then
+    if [[ -s /etc/machine-id && -s $ref/machine_id.txt ]]; then
+        cmp -s /etc/machine-id "$ref/machine_id.txt" || { echo 'Archive machine ID mismatch' >&2; exit 2; }
+    else
+        cmp -s /proc/sys/kernel/random/boot_id "$ref/boot_id.txt" || { echo 'Archive boot ID mismatch' >&2; exit 2; }
+    fi
+    exec > >(tee "$stamp/verify.log") 2>&1
+    echo "VERIFY_LOG=$stamp/verify.log"
+    if [[ $extra == isolated-schedule-focus ]]; then
+        FIXED_Q4_GROUPS=7 FIXED_Q4_BATCHES=20 audit team-schedule "$base" "$ref"
+        exit 0
+    fi
+    if [[ $extra == isolated-schedul* || $extra == isolated-all ]]; then
+        FIXED_Q4_BATCHES="20 24 28 32" audit team-schedule "$base" "$ref"
+        if [[ $extra == isolated-schedule-only ]]; then exit 0; fi
+    fi
+    if [[ $extra == isolated-tail || $extra == isolated-scheduling ]]; then tail_only; exit 0; fi
+    # An independently started natural run uses this lock. Let it finish
+    # before checking completed cells, so we reuse its output.
+    lock="$sources/largebs-$(</proc/sys/kernel/random/boot_id)-npu4.lock"
+    ( flock 9 ) 9>"$lock"
+else
+    audit serial "$serial" "$ref"
+    audit journal "$base" "$ref"
+fi
 cached=$("$py" -B "$entry/support/four_rank_accept.py" timed "$ref" "$native")
 if [[ -n $cached ]]; then
     candidate=$cached
@@ -66,6 +120,15 @@ else
     candidate=$(sed -n 's/^RESULT_ROOT=//p' "$stamp/candidate.log")
 fi
 [[ -s $candidate/followup_summary.json && $(<"$candidate/native.txt") == "$native" ]]
+if [[ $extra == isolated-* ]]; then
+    "$py" -B "$entry/support/four_rank_accept.py" natural-summary "$candidate" "$ref"
+    if [[ $extra == isolated-all ]]; then tail_only; fi
+    audit journal "$base" "$ref"
+    audit frozen "$base" "$ref"
+    audit frozen "$native" "$candidate"
+    "$py" -B "$entry/support/four_rank_accept.py" frozen-report "$candidate" "$ref"
+    exit 0
+fi
 audit journal "$native" "$candidate"
 if [[ $extra == natural ]]; then
     "$py" -B "$entry/support/four_rank_accept.py" report "$candidate" "$ref" | tee "$stamp/acceptance.log"

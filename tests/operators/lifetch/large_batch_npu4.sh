@@ -123,7 +123,8 @@ if [[ -n $follow_ref ]]; then
 fi
 audit_mode=${PEER_FOUR_RANK_AUDIT:-}
 if [[ -n $audit_mode ]]; then
-    [[ $audit_mode == serial || $audit_mode == journal || $audit_mode == frozen ]] && (( standalone )) &&
+    case $audit_mode in serial|journal|frozen|team-schedule|two-row-natural|two-row-frozen) ;; *) echo "Unknown audit mode: $audit_mode" >&2; exit 2 ;; esac
+    (( standalone )) &&
         [[ -n ${PEER_AUDIT_REFERENCE:-} && -z $follow_ref && -z ${PEER_PACKED_RESUME:-} && $peer_physical_npu == 4 ]] ||
         { echo "Invalid four-rank audit configuration" >&2; exit 2; }
     prefix="fixed-q4-audit-$audit_mode"
@@ -269,6 +270,8 @@ if (( !resuming )); then
     printf '%s\n' "$sdk_rev" > "$out/kvaf.txt"
 fi
 if [[ -n $audit_mode ]]; then
+    git -C "$controller_root" rev-parse HEAD > "$out/audit_reader.txt"
+    printf '%s\n' "$PEER_AUDIT_REFERENCE" > "$out/audit_reference.txt"
     echo "AUDIT physical_NPU=4 mode=$audit_mode source=$PEER_AUDIT_REFERENCE" >&3
 elif [[ -n $diag_source ]]; then
     echo "CONFIG physical_NPU=$peer_physical_npu mode=$PEER_RANK_DIAG_MODE source=$diag_source timed_calls=0 diagnostic_calls_per_cell=1" >&3
