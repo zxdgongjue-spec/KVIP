@@ -124,11 +124,13 @@ if [[ -n ${PEER_PACKED_RESUME:-} ]]; then
     [[ ${out%/*} == "$(cd "$area" && pwd -P)" && ${out##*/} == "$prefix."* &&
        -f $out/packed_source.txt && $(<"$out/packed_source.txt") == "$packed_archive" &&
        $(<"$out/native.txt") == "$native" && $(<"$out/physical_npu.txt") == "$peer_physical_npu" &&
-       $(<"$out/host.txt") == "$(uname -n)" && $(<"$out/boot_id.txt") == "$(</proc/sys/kernel/random/boot_id)" &&
+       $(<"$out/host.txt") == "$(uname -n)" &&
        $(<"$out/kvaf.txt") == "$sdk_rev" && $(<"$out/kvaf_tree.txt") == "$sdk_tree" ]] ||
-        { echo "Resume source, host, boot, card or SDK mismatch: $out" >&2; exit 2; }
-    if [[ -s $out/machine_id.txt || -s /etc/machine-id ]]; then
+        { echo "Resume source, host, card or SDK mismatch: $out" >&2; exit 2; }
+    if [[ -s $out/machine_id.txt && -s /etc/machine-id ]]; then
         cmp -s "$out/machine_id.txt" /etc/machine-id || { echo "Resume machine ID mismatch: $out" >&2; exit 2; }
+    elif [[ ! -s $out/boot_id.txt || $(<"$out/boot_id.txt") != "$(</proc/sys/kernel/random/boot_id)" ]]; then
+        echo "Cannot identify resume host by machine or boot ID: $out" >&2; exit 2
     fi
     git -C "$root" diff --quiet HEAD -- || { echo "Tracked changes in timed worktree: $root" >&2; exit 2; }
     if (( standalone )); then
@@ -529,7 +531,7 @@ run_group_batches() {
                 mv -- "$prepared_bank" "$donor_backup/"
             fi
             donor_stage=$(mktemp -d "$out/g$group/donors-prepare.XXXXXX")
-            "$PYTHON" -B "$workers/large_batch_input.py" "$trace" "$group" "$donor_stage/bank"
+            "$PYTHON" -B "$controller_root/tests/operators/lifetch/support/large_batch_input.py" "$trace" "$group" "$donor_stage/bank"
             mv "$donor_stage/bank" "$prepared_bank"
             rmdir "$donor_stage"
         fi
