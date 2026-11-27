@@ -191,7 +191,8 @@ def save_packed(args, identity, inputs, proofs, workers, scratch_existed):
         raise ValueError("Packed profile did not contain ten complete invocations")
     summary = dict(identity=identity, arm=args.arm, correctness="PASS", get_workers=workers,
                    checked_queries=checked, checked_rows=CALLS * args.batch, full_KV_Index_checked_calls=CALLS,
-                   serial_oracle=str(args.serial_result.resolve()),
+                   serial_oracle=str(args.serial_result.resolve()) if args.serial_result else None,
+                   selection_oracle="captured_logical_scores" if args.captured_score_oracle else "archived_strong_serial",
                    **proofs)
     if not args.keep_trace:
         trace = args.output / "path/diagnose" / f"round-{inputs.source_round}/trace.json"
@@ -249,7 +250,8 @@ def save_packed(args, identity, inputs, proofs, workers, scratch_existed):
               + f" max_final_per_q={max(s['max_final_per_q'] for s in calls)}"
               + f" private_final_CQEs={np.mean([s['final_cqes'] for s in calls]):.1f}"
               + f" split_rows={np.mean([s['multiphase_rows'] for s in calls]):.1f}")
-    print(f"CHECK G{args.group} BS{args.batch} {args.arm} TopK_score_vs_strong_serial=PASS "
+    oracle_label = "captured_scores" if args.captured_score_oracle else "strong_serial"
+    print(f"CHECK G{args.group} BS{args.batch} {args.arm} TopK_score_vs_{oracle_label}=PASS "
           f"queries={checked}/{checked} exact_ID_sets={proofs['exact_ID_sets']}/{checked} "
           f"KV_and_Index_rows={CALLS * args.batch}/{CALLS * args.batch} get_workers={workers}")
     print(f"TIMING G{args.group} BS{args.batch} {args.arm} graph_calls={CALLS} "

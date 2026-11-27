@@ -8,7 +8,10 @@ reuse_serial=
 archive=
 fixed=0
 fixed_archive=
+packed=0
+standalone=0
 packed_archive=
+ctl=
 packed_candidate=0
 large_cold_windows=${PEER_LARGE_COLD_WINDOWS:-2}
 if [[ $large_cold_windows != 2 && $large_cold_windows != 3 ]]; then
@@ -26,10 +29,18 @@ if (( $# )); then
         archive=$(cd "$2" && pwd)
     elif [[ $# == 2 && $1 == --reuse-g10-bs20-serial ]]; then
         reuse_serial=$2
-    elif [[ $1 == --fixed-q4 && $# -le 2 || ( $1 == --fixed-q4-packed || $1 == --packed-aiv ) && $# == 2 ]]; then
+    elif [[ $1 == --four-ranks-candidate-only && $# == 1 || $1 == --fixed-q4 && $# -le 2 || ( $1 == --fixed-q4-packed || $1 == --packed-aiv ) && $# == 2 ]]; then
         fixed=1
         default_batches="1 2 4 8 16 20 24 28 32"
-        if [[ $1 == --fixed-q4-packed || $1 == --packed-aiv ]]; then
+        if [[ $1 == --four-ranks-candidate-only ]]; then
+            packed=1
+            standalone=1
+            packed_candidate=1
+            four_ranks=1
+            large_cold_windows=3
+            default_batches="32 28 24 20"
+        elif [[ $1 == --fixed-q4-packed || $1 == --packed-aiv ]]; then
+            packed=1
             if [[ $1 == --packed-aiv ]]; then packed_candidate=1; fi
             default_batches="16 32 1 2 4 8 20 24 28"
             if (( packed_candidate )); then default_batches="32 28 24 20 16 8 4 2 1"; fi
@@ -51,13 +62,13 @@ if (( $# )); then
         validate_selection '1 2 4 8 16 20 24 28 32' "${batches[@]}" &&
             validate_selection '10 4 17 7 2' "${groups[@]}" || { echo "Invalid FIXED_Q4_BATCHES/GROUPS" >&2; exit 2; }
     else
-        echo "Usage: $0 [--packed-aiv FIXED_ARCHIVE | --fixed-q4-packed FIXED_ARCHIVE | --fixed-q4 [LARGE_ARCHIVE] | --candidate-only RESULT_ROOT | --reuse-g10-bs20-serial RESULT_ROOT]" >&2
+        echo "Usage: $0 [--four-ranks-candidate-only | --packed-aiv FIXED_ARCHIVE | --fixed-q4-packed FIXED_ARCHIVE | --fixed-q4 [LARGE_ARCHIVE] | --candidate-only RESULT_ROOT | --reuse-g10-bs20-serial RESULT_ROOT]" >&2
         exit 2
     fi
 fi
 packed_blocks=2
 if (( packed_candidate )); then
-    packed_blocks=${PEER_PACKED_BLOCKS:-2}
+    if (( standalone )); then packed_blocks=1; else packed_blocks=${PEER_PACKED_BLOCKS:-2}; fi
     case $packed_blocks in 1|2) ;; *) echo "Expected PEER_PACKED_BLOCKS=1 or 2" >&2; exit 2 ;; esac
 fi
 if [[ -n $bs32_li ]]; then
@@ -154,7 +165,11 @@ exec 8>"$sdk.lock"
 flock 8
 baseline="$work/adaptive-sources/peer-serial-da318bdb"
 clean="$area/KVAF-de4fd37e"
-peer_prepare_node "$root" "$baseline" "$clean" "$work" "$out"
+if (( standalone )); then
+    peer_prepare_node "$root" "$baseline" "$clean" "$work" "$out" fused-only
+else
+    peer_prepare_node "$root" "$baseline" "$clean" "$work" "$out"
+fi
 "$PYTHON" -B -c 'import os; print(os.uname().nodename)' > "$out/host.txt"
 if [[ ! -e "$sdk" ]]; then
     if ! git -C "$clean" cat-file -e "$sdk_rev^{commit}" 2>/dev/null; then
@@ -184,11 +199,14 @@ for target in cpu npu; do
 done
 flock -u 8
 exec 8>&-
-lidu="$baseline/csrc/operators/lidu"
-vendors=("$lidu"/_custom_opp/vendors/*/op_api/lib/libcust_opapi.so)
-[[ ${#vendors[@]} == 1 && -s ${vendors[0]} ]]
-export ASCEND_CUSTOM_OPP_PATH="${vendors[0]%/op_api/lib/libcust_opapi.so}${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
-export PYTHONPATH="$root/python:$sdk/build-npu/python:$lidu/torch_extension${PYTHONPATH:+:$PYTHONPATH}"
+if (( !standalone )); then
+    lidu="$baseline/csrc/operators/lidu"
+    vendors=("$lidu"/_custom_opp/vendors/*/op_api/lib/libcust_opapi.so)
+    [[ ${#vendors[@]} == 1 && -s ${vendors[0]} ]]
+    export ASCEND_CUSTOM_OPP_PATH="${vendors[0]%/op_api/lib/libcust_opapi.so}${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
+    export PYTHONPATH="$lidu/torch_extension${PYTHONPATH:+:$PYTHONPATH}"
+fi
+export PYTHONPATH="$root/python:$sdk/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 export KVAF_BATCH_GET_KERNEL="$sdk/build-npu/bin/kvaf_execute_batch_get_kernels.o"
 export KVAF_BATCH_PUT_KERNEL="$sdk/build-npu/bin/kvaf_execute_batch_put_kernels.o"
 cpu="$sdk/build-cpu/runtime/kvaf_cpu_service"
@@ -202,9 +220,13 @@ printf '%s\n' "$peer_physical_npu" > "$out/physical_npu.txt"
 cat /proc/sys/kernel/random/boot_id > "$out/boot_id.txt"
 printf '%s\n' "$actual" > "$out/kvaf_tree.txt"
 git -C "$sdk" rev-parse HEAD > "$out/kvaf.txt"
-if [[ -n $packed_archive ]]; then
+if (( packed )); then
     printf '%s\n' "$packed_archive" > "$out/packed_source.txt"
-    if (( packed_candidate )); then
+    if (( standalone )); then
+        printf '1\n' > "$out/candidate_blocks.txt"
+        printf 'captured_logical_scores\n' > "$out/selection_oracle.txt"
+        echo "CANDIDATE_ONLY oracle=captured_logical_scores fresh_arms=fused comparisons=unavailable" >&3
+    elif (( packed_candidate )); then
         printf '%s\n' "$packed_blocks" > "$out/candidate_blocks.txt"
         ctl=$("$PYTHON" -B "$workers/fixed_q4_packed_report.py" reference "$out" "$packed_archive" "$root" "${PEER_PACKED_REFERENCE:-}")
         if [[ -f $out/reference.txt && $(<"$out/reference.txt") != "$ctl" ]]; then
@@ -311,8 +333,9 @@ run_arm() (
     args=(--trace "$trace" --group "$group" --batch "$batch" --cohort "$cohort" --arm "$arm" --kvaf-root "$sdk"
           --kvaf-server "127.0.0.1:$port" --output "$dir")
     if (( fixed )); then args+=(--prepared "$prepared_bank"); fi
-    if [[ -n $packed_archive ]]; then
-        args+=(--packed-ten --serial-result "$packed_oracle")
+    if (( packed )); then
+        args+=(--packed-ten)
+        if (( standalone )); then args+=(--captured-score-oracle); else args+=(--serial-result "$packed_oracle"); fi
         if (( packed_candidate )); then args+=(--compare-packed-candidate); fi
         if (( carry_credit )); then args+=(--carry-credit); fi
         if (( packed_candidate && (batch == 32 || four_ranks) )) && [[ ${pair##*/} == block1 ]]; then args+=(--window-density); fi
@@ -380,11 +403,16 @@ run_packed_cohort() {
     local group=$1 batch=$2 trace=$3 cohort=$4 pair=$5
     local block arm ref dir backup packed_oracle placement node adapter result
     local -a order
-    packed_oracle=$("$PYTHON" -B "$workers/fixed_q4_packed_archive.py" oracle-dir "$packed_archive" "$group" "$batch" "$cohort")
-    ref="$packed_oracle/thp.json"
-    placement=$("$PYTHON" -B "$workers/large_batch_placement.py" get "$ref")
-    read -r node adapter <<<"$placement"
-    set_cpu_placement "$node" "$adapter" archived
+    if (( standalone )); then
+        ref=
+        set_cpu_placement "$planned_node" "$planned_adapter"
+    else
+        packed_oracle=$("$PYTHON" -B "$workers/fixed_q4_packed_archive.py" oracle-dir "$packed_archive" "$group" "$batch" "$cohort")
+        ref="$packed_oracle/thp.json"
+        placement=$("$PYTHON" -B "$workers/large_batch_placement.py" get "$ref")
+        read -r node adapter <<<"$placement"
+        set_cpu_placement "$node" "$adapter" archived
+    fi
     for ((block=1; block<=packed_blocks; block++)); do
         dir="$pair/block$block"
         mkdir -p "$dir"
@@ -420,7 +448,17 @@ run_packed_cohort() {
                 { (( packed_candidate && batch == 32 )) && [[ -n $bs32_li ]]; }; then
                 grep '^WINDOWS ' "$result/worker.log" | tee -a "$out/summary.txt" >&3
             fi
-            "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref" "$result/thp.json"
+            if (( standalone )); then
+                placement=$("$PYTHON" -B "$workers/large_batch_placement.py" get "$result/thp.json")
+                read -r node adapter <<<"$placement"
+                [[ $planned_node == auto || $planned_node == "$node" ]] &&
+                    [[ $planned_adapter == auto || $planned_adapter == "$adapter" ]] ||
+                    { echo "Unexpected measured NUMA/UB: $placement, requested: $planned_node $planned_adapter" >&2; return 1; }
+                planned_node=$node
+                planned_adapter=$adapter
+            else
+                "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref" "$result/thp.json"
+            fi
             touch "$result/placement_verified"
         done
     done
@@ -437,7 +475,7 @@ run_group_batches() {
     if (( fixed )); then
         mkdir -p "$out/g$group"
         prepared_bank="$out/g$group/donors"
-        if (( packed_candidate )) && [[ -s $ctl/g$group/donors/source.json ]]; then
+        if (( packed_candidate )) && [[ -n $ctl && -s $ctl/g$group/donors/source.json ]]; then
             prepared_bank="$ctl/g$group/donors"
         elif [[ ! -f $prepared_bank/source.json ]]; then
             donor_stage=$(mktemp -d "$out/g$group/donors-prepare.XXXXXX")
@@ -459,13 +497,15 @@ run_group_batches() {
         for ((cohort=0; cohort<cohorts; cohort++)); do
             pair="$out/g$group/bs$batch"
             if (( cohorts > 1 )); then pair="$pair/cohort$cohort"; fi
-            if [[ -n $packed_archive ]]; then
+            if (( packed )); then
                 run_packed_cohort "$group" "$batch" "$trace" "$cohort" "$pair"
             else
                 run_pair "$group" "$batch" "$trace" "$cohort" "$pair"
             fi
         done
-        if [[ -n $packed_archive ]]; then
+        if (( standalone )); then
+            "$PYTHON" -B "$workers/fixed_q4_candidate_only.py" cell "$out" "$group" "$batch" | tee -a "$out/summary.txt" >&3
+        elif (( packed )); then
             "$PYTHON" -B "$workers/fixed_q4_packed_report.py" cell "$out" "$group" "$batch" | tee -a "$out/summary.txt" >&3
             if (( four_ranks )); then
                 "$PYTHON" -B "$workers/fixed_q4_window_ranks.py" "$out" "$group" "$batch" | tee -a "$out/summary.txt" >&3
@@ -510,7 +550,10 @@ if (( packed_candidate )); then
 else
     for group in "${groups[@]}"; do run_group_batches "$group" "${batches[@]}"; done
 fi
-if [[ -n $packed_archive ]]; then
+if (( standalone )); then
+    "$PYTHON" -B "$workers/fixed_q4_candidate_only.py" summary "$out" --groups "${groups[@]}" --batches "${batches[@]}" | tee -a "$out/summary.txt" >&3
+    target_rc=0
+elif (( packed )); then
     "$PYTHON" -B "$workers/fixed_q4_packed_report.py" summary "$out" --groups "${groups[@]}" --batches "${batches[@]}" | tee -a "$out/summary.txt" >&3
     target_rc=0
 elif (( fixed )); then

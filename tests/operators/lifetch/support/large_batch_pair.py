@@ -25,6 +25,25 @@ CALLS = 10
 WARMUP = 4
 
 
+def captured_score_oracle(inputs):
+    """Get an independent reference set per Q from the frozen logical score keys."""
+    batch = inputs.geometry["batch"]
+    result = np.empty((batch, 4, 2048), dtype=np.int32)
+    for row in range(batch):
+        for q in range(4):
+            end = int(inputs.query_ends[row, q])
+            ids = np.flatnonzero(inputs.logical_score_valid[row, q, :end])
+            if ids.size < 2048:
+                raise ValueError(f"Insufficient captured scores for row {row}, Q{q + 1}")
+            keys = inputs.logical_score_keys[row, q, ids]
+            cutoff = np.partition(keys, keys.size - 2048)[-2048]
+            strict = ids[keys > cutoff]
+            ties = ids[keys == cutoff][:2048 - strict.size]
+            result[row, q] = np.sort(np.concatenate((strict, ties)))
+    inputs.validate_topk(result)
+    return np.broadcast_to(result, (CALLS, *result.shape))
+
+
 def check_scores(inputs, selected, serial):
     # The native oracle is evaluated on this very batch. Independently, both
     # paths' normal validators check every strict winner against the full scores.
@@ -717,7 +736,10 @@ def run(args):
     kernel = args.kvaf_root / "build-npu/bin/kvaf_execute_batch_get_kernels.o"
     with kernel.open("rb") as stream:
         sdk_kernel_sha = hashlib.file_digest(stream, "sha256").hexdigest()
-    if args.arm == "fused" and args.serial_result is None:
+    if args.captured_score_oracle and (args.arm != "fused" or not args.packed_ten
+                                       or args.large_window_policy != "four-ranks" or args.serial_result is not None):
+        raise ValueError("The captured-score oracle requires a standalone four-rank fused packed replay")
+    if args.arm == "fused" and not args.captured_score_oracle and args.serial_result is None:
         raise ValueError("The fused arm requires the matching strong serial result")
     sequence, donors = load(args.trace.resolve(), args.group, args.round, args.batch, args.cohort, args.prepared)
     inputs = sequence.inputs
@@ -750,7 +772,7 @@ def run(args):
         flush=True,
     )
     if args.packed_ten:
-        if args.serial_result is None or args.reuse_serial_archive or args.compare_archived_pair:
+        if (not args.captured_score_oracle and args.serial_result is None) or args.reuse_serial_archive or args.compare_archived_pair:
             raise ValueError("Packed measurements require the matching single-call serial oracle")
         identity["protocol"] = "ten_independent_states_one_graph_one_event_v1"
     if args.reuse_serial_archive:
@@ -763,7 +785,9 @@ def run(args):
     fused = args.arm == "fused"
     serial = None
     previous = None
-    if args.packed_ten:
+    if args.captured_score_oracle:
+        serial = captured_score_oracle(inputs)
+    elif args.packed_ten:
         from fixed_q4_packed_archive import load_archived_oracle
         serial = load_archived_oracle(args.serial_result, identity, repo, candidate=args.compare_packed_candidate)
     elif fused:
@@ -990,6 +1014,7 @@ if __name__ == "__main__":
     parser.add_argument("--reuse-serial-archive", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--serial-result", type=Path)
+    parser.add_argument("--captured-score-oracle", action="store_true")
     parser.add_argument("--compare-archived-pair", action="store_true")
     parser.add_argument(
         "--keep-trace", action="store_true", help="Keep the raw profiler timeline after successful attribution"
