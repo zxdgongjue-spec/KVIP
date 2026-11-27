@@ -159,7 +159,6 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query, uint32_t scanHis
         } else
 #endif
         {
-            KVIP_TRACE_BEGIN(windowScope, traceBase, Cold, LiWindow, epoch, traceLane);
             AdvanceWindow(epoch, sequenceHalfWindow);
         }
 #endif
