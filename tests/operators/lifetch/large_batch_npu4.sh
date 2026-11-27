@@ -121,6 +121,13 @@ if [[ -n $follow_ref ]]; then
         { echo 'Follow-up requires the NPU4 four-rank entry' >&2; exit 2; }
     prefix=fixed-q4-rank-followup
 fi
+audit_mode=${PEER_FOUR_RANK_AUDIT:-}
+if [[ -n $audit_mode ]]; then
+    [[ $audit_mode == serial || $audit_mode == journal ]] && (( standalone )) &&
+        [[ -n ${PEER_AUDIT_REFERENCE:-} && -z $follow_ref && -z ${PEER_PACKED_RESUME:-} && $peer_physical_npu == 4 ]] ||
+        { echo "Invalid four-rank audit configuration" >&2; exit 2; }
+    prefix="fixed-q4-audit-$audit_mode"
+fi
 diag_source=${PEER_RANK_DIAG_SOURCE:-}
 if [[ -n $diag_source ]]; then
     (( standalone )) && [[ $peer_physical_npu == 4 && -z ${PEER_PACKED_RESUME:-} ]] ||
@@ -200,7 +207,7 @@ exec 8>"$sdk.lock"
 flock 8
 baseline="$work/adaptive-sources/peer-serial-da318bdb"
 clean="$area/KVAF-de4fd37e"
-if (( standalone )); then
+if (( standalone )) && [[ $audit_mode != serial ]]; then
     peer_prepare_node "$root" "$baseline" "$clean" "$work" "$out" fused-only
 else
     peer_prepare_node "$root" "$baseline" "$clean" "$work" "$out"
@@ -234,7 +241,7 @@ for target in cpu npu; do
 done
 flock -u 8
 exec 8>&-
-if (( !standalone )); then
+if (( !standalone )) || [[ $audit_mode == serial ]]; then
     lidu="$baseline/csrc/operators/lidu"
     vendors=("$lidu"/_custom_opp/vendors/*/op_api/lib/libcust_opapi.so)
     [[ ${#vendors[@]} == 1 && -s ${vendors[0]} ]]
@@ -257,7 +264,9 @@ if (( !resuming )); then
     printf '%s\n' "$actual" > "$out/kvaf_tree.txt"
     printf '%s\n' "$sdk_rev" > "$out/kvaf.txt"
 fi
-if [[ -n $diag_source ]]; then
+if [[ -n $audit_mode ]]; then
+    echo "AUDIT physical_NPU=4 mode=$audit_mode source=$PEER_AUDIT_REFERENCE" >&3
+elif [[ -n $diag_source ]]; then
     echo "CONFIG physical_NPU=$peer_physical_npu mode=$PEER_RANK_DIAG_MODE source=$diag_source timed_calls=0 diagnostic_calls_per_cell=1" >&3
 elif (( packed )); then
     if (( !resuming )); then printf '%s\n' "$packed_archive" > "$out/packed_source.txt"; fi
@@ -306,7 +315,9 @@ elif (( fixed )); then
 fi
 # Use the same registered CPU memory placement for the serial and fused arms.
 placement="auto auto"
-if [[ -n $follow_ref ]]; then
+if [[ -n $audit_mode ]]; then
+    placement=$("$PYTHON" -B "$controller_root/tests/operators/lifetch/support/large_batch_placement.py" get "$PEER_AUDIT_REFERENCE/g7/bs32/block1/fused/thp.json")
+elif [[ -n $follow_ref ]]; then
     placement=$("$PYTHON" -B "$workers/large_batch_placement.py" get "$follow_ref/g7/bs32/block1/fused/thp.json")
 elif [[ -z $archive && -z $fixed_archive && -z $packed_archive ]]; then
     placement=$("$PYTHON" -B "$workers/large_batch_placement.py" find "$out")
@@ -382,6 +393,14 @@ run_arm() (
     grep -Fq "LISTEN address=127.0.0.1 port=$port" "$dir/cpu.log" || { tail -20 "$dir/cpu.log"; exit 1; }
     "$PYTHON" -B "$helpers/support/peer_thp.py" --unified-sdk --pid "$server" --log "$dir/cpu.log" --output "$dir/thp.json" --timeout 7200 9>&- &
     monitor=$!
+    if [[ -n $audit_mode ]]; then
+        local tool="$controller_root/tests/operators/lifetch/support/four_rank_accept_worker.py"
+        (cd "$dir" && timeout --kill-after=30s 7200s "$PYTHON" -B "$tool" "$audit_mode" "$root"             "$PEER_AUDIT_REFERENCE" "$group" "$batch" "$trace" "$sdk" "127.0.0.1:$port" "$prepared_bank" "$dir") >"$dir/worker.log" 2>&1 || {
+            rc=$?; tail -25 "$dir/worker.log"; exit "$rc"
+        }
+        wait "$monitor"; monitor=
+        return
+    fi
     if [[ -n $diag_source ]]; then
         local tool="$controller_root/tests/operators/lifetch/support/four_rank_diagnostic.py"
         (cd "$dir" && timeout --kill-after=30s 7200s "$PYTHON" -B "$tool" "$root" "$diag_source" "$group" "$batch" "$trace" "$sdk" "127.0.0.1:$port" "$prepared_bank" "$dir") >"$dir/worker.log" 2>&1 || {
@@ -430,6 +449,10 @@ run_arm() (
     wait "$monitor"
     monitor=
 )
+if [[ -n $audit_mode ]]; then
+    source "$controller_root/tests/operators/lifetch/support/four_rank_accept_loop.sh"
+    exit 0
+fi
 if [[ -n $diag_source ]]; then
     count=0
     for group in 7 2 10; do
