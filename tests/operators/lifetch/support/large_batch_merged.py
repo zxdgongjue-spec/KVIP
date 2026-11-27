@@ -89,7 +89,9 @@ def merged_round(refs):
     for ref in refs:
         dp = ref.dp_rank
         rows = slice(dp * 2, dp * 2 + 2)
-        own = owners[rows]
+        # The manifest check above guarantees consecutive owners 1..16.
+        # A basic slice keeps the original read-only .npy mappings alive.
+        own = slice(2 * dp + 1, 2 * dp + 3)
         ids = layout[own].astype(np.int32)
         inverse = np.argsort(ids, axis=1)
         logical = np.take_along_axis(addr[own], inverse, axis=1).reshape(2, -1, 128)

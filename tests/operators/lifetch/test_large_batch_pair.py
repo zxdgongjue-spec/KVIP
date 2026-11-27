@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "support"))
 from large_batch_input import BATCHES, FrozenRound, expand, input_digest, load, save_source
 from fixed_bs16_report import BATCHES as FIXED_BATCHES, PUBLISHED_EVENT_PER_CALL, combined_pass
 from large_batch_pair import check_scores, large_account, last_row_windows, li_intervals, stage_sample, tail_team_intervals, verify_abc, verify_assignments
-from workloads import ReplayPagePlan, ReplayRound
+from workloads import CaptureReference, ReplayPagePlan, ReplayRound, ScoreCapture, assemble_round
 
 
 def fixture():
@@ -93,6 +93,36 @@ class LargeBatchReplay(unittest.TestCase):
         stamps[4, 1, 10] = 0
         with self.assertRaisesRegex(ValueError, "Incomplete"):
             tail_team_intervals(stamps, 2)
+
+    def test_donor_bank_assigns_each_key_to_its_logical_row(self):
+        history = 256
+        rng = np.random.default_rng(721)
+        geometry = dict(batch=2, history=history, heads=32, resident=128, token_bytes=656, output_stride=256)
+        refs = [CaptureReference(rank, 1, 101, 4, Path(str(rank)), (("a", 1), ("b", 2))) for rank in (3, 1)]
+        captures = {}
+        expected_keys, expected_scales = [], []
+        for ref in refs:
+            layout = np.stack([rng.permutation(history) for _ in range(2)]).astype(np.int32)
+            keys = rng.integers(256, size=(2, history, 128), dtype=np.uint8)
+            scales = rng.standard_normal((2, history)).astype(np.float32)
+            arrays = {
+                "pre.logical_ids": layout, "real.keys": keys, "real.key_scales": scales,
+                "pre.row_owners": np.array([1, 2]), "pre.address_valid": np.ones((2, history), np.uint8),
+                "pre.ddr_page_slots": np.array([[0, 1], [0, 2]]),
+                "pre.query_ends": np.full((2, 4), history), "post.score_keys": np.zeros((2, 4, history), np.uint16),
+            }
+            for name in ("real.query", "real.weights", "real.query_scale", "pre.tail_bounds",
+                         "pre.hot_valid", "pre.lru_slots"):
+                arrays[name] = np.zeros((2, 1))
+            captures[ref.dp_rank] = ScoreCapture(ref.manifest_path, dict(real_inputs_saved=True, geometry=geometry), arrays)
+            for row in range(2):
+                inverse = layout[row].argsort()
+                expected_keys.append(keys[row, inverse])
+                expected_scales.append(scales[row, inverse])
+        assembled = assemble_round(refs, captures=captures)
+        self.assertEqual(assembled.logical_keys.tobytes(), np.stack(expected_keys).tobytes())
+        self.assertEqual(assembled.logical_scales.tobytes(), np.stack(expected_scales).tobytes())
+        self.assertEqual([rank for rank, *_ in assembled.identities], [3, 3, 1, 1])
 
     def test_rows_aliases_and_pair_identity(self):
         base = fixture()

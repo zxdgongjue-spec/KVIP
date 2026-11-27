@@ -590,13 +590,16 @@ class ScoreCapture:
     def executable(self):
         return self.manifest['real_inputs_saved']
 
-    def logical_keys(self, row):
+    def logical_keys(self, row, *, out=None):
         """Return LI rows in logical-token order for subsequent layout remapping."""
         if not self.executable:
             raise ValueError('Score-only capture has no executable Q/Index inputs')
         ids = self.arrays['pre.logical_ids'][row]
-        keys = np.empty_like(self.arrays['real.keys'][row])
-        scales = np.empty_like(self.arrays['real.key_scales'][row])
+        if out is None:
+            keys = np.empty_like(self.arrays['real.keys'][row])
+            scales = np.empty_like(self.arrays['real.key_scales'][row])
+        else:
+            keys, scales = out
         keys[ids] = self.arrays['real.keys'][row]
         scales[ids] = self.arrays['real.key_scales'][row]
         return keys, scales
@@ -854,7 +857,10 @@ def assemble_round(references, *, captures=None):
     scheduler_round = references[0].scheduler_round
     if any(ref.source_round != source_round or ref.scheduler_round != scheduler_round for ref in references):
         raise ValueError('DP capture rounds are not aligned')
-    identities, keys, scales, queries, weights, query_scales = [], [], [], [], [], []
+    batch = sum(len(ref.request_signature) for ref in references)
+    if not 1 <= batch <= 16:
+        raise ValueError('Replay requires a batch in 1..16')
+    identities, queries, weights, query_scales = [], [], [], []
     ends, tails, valid, pages, layouts, hot, lru, sources = [], [], [], [], [], [], [], []
     score_keys, score_valid = [], []
     geometry = None
@@ -869,6 +875,8 @@ def assemble_round(references, *, captures=None):
                    ('history', 'resident', 'heads', 'token_bytes', 'output_stride')}
         if geometry is None:
             geometry = current
+            keys = np.empty((batch, current['history'], WIDTH), dtype=np.uint8)
+            scales = np.empty((batch, current['history']), dtype=np.float32)
         if current != geometry:
             raise ValueError('Selected DPs have incompatible replay geometry')
         if len(ref.request_signature) != source_geometry['batch']:
@@ -877,9 +885,8 @@ def assemble_round(references, *, captures=None):
             if int(arrays['pre.row_owners'][row]) != owner:
                 raise ValueError('Captured row owner differs from series request identity')
             identities.append((ref.dp_rank, request, owner))
-            logical_keys, logical_scales = capture.logical_keys(row)
-            keys.append(logical_keys)
-            scales.append(logical_scales)
+            dest = len(identities) - 1
+            capture.logical_keys(row, out=(keys[dest], scales[dest]))
             logical_valid = np.empty(source_geometry['history'], dtype=np.uint8)
             logical_valid[arrays['pre.logical_ids'][row]] = arrays['pre.address_valid'][row]
             valid.append(logical_valid)
@@ -913,7 +920,7 @@ def assemble_round(references, *, captures=None):
         raise ValueError('Replay requires distinct requests and batch <= 16')
     return ReplayRound(
         source_round, scheduler_round, tuple(identities), dict(geometry, batch=len(identities)),
-        np.stack(keys), np.stack(scales), np.concatenate(queries), np.concatenate(weights),
+        keys, scales, np.concatenate(queries), np.concatenate(weights),
         np.concatenate(query_scales), np.concatenate(ends), np.concatenate(tails),
         np.stack(valid), tuple(pages), np.concatenate(layouts), np.concatenate(hot),
         np.concatenate(lru), tuple(sources), np.stack(score_keys), np.stack(score_valid),
