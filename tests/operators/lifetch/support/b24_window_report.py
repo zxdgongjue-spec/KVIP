@@ -67,6 +67,8 @@ def show(path, ref, group, batch, mode):
     else:
         print(f"{tag} same_card_strong_serial=UNAVAILABLE")
     d = r["window_density"]
+    if mode == "window-x4-earned":
+        print(f"{tag} cumulative_row_credit=256/448/640/832/1024 ceilings=256/320/384/448/192")
     print(f"{tag} actual_ranks={r['actual_ranks']} grants={r['window_grants_per_row']} "
           f"diagnostic_posted={[p['posted_tokens'] for p in d['epochs']]} "
           f"diagnostic_used_by_final={[p['used_by_final_topk'] for p in d['epochs']]} "

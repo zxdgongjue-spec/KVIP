@@ -6,10 +6,14 @@ from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
 
-MODES = tuple(f"window-x{x}-{curve}" for x in (2, 3, 4, 8) for curve in ("linear", "early"))
+ADVANCE = "window-x4-earned"
+WINDOW_CEILINGS = (256, 320, 384, 448, 192)
+MODES = (ADVANCE,) + tuple(f"window-x{x}-{curve}" for x in (2, 3, 4, 8) for curve in ("linear", "early"))
 
 
 def policy(mode):
+    if mode == ADVANCE:
+        return policy("window-x4-early")
     if mode not in MODES:
         raise ValueError(f"Unknown LI window policy {mode}")
     _, windows, curve = mode.split("-")
@@ -53,11 +57,29 @@ def stage(source, tree, mode):
     if (rankedEpoch_ == 2) return KVIP_TEST_WINDOW_RANK2;"""
     replace_once(incremental, old, "\n".join(
         f"    if (rankedEpoch_ == {e}) return {r};" for e, r in enumerate(ranks[1:-1], 1)))
-    replace_once(incremental, "limit=ctx->windowLimit/4, minimum=limit/2",
-                 f"limit=rankedEpoch_ == 0 ? 64U : {grants[1] // 4}U, minimum=Min(limit,32U)")
     prefetch = kernel / "prefetch.h"
+    limit = f"rankedEpoch_ == 0 ? 64U : {grants[1] // 4}U"
+    grant = f"epoch == 0 ? 256U : {grants[1]}U"
+    if mode == ADVANCE:
+        # Save the grant before the hot/score ranking functions reuse incrementalOld_.
+        # Both Qs on this lane must use the same committed row count.
+        replace_once(incremental,"uint32_t rankedEpoch_=0;bool windowCoveredEmpty_=false;",
+                     "uint32_t rankedEpoch_=0, earnedQueryLimit_=0;bool windowCoveredEmpty_=false;")
+        pair_native = kernel / "indexer/large_window_pair.h"
+        snapshot = "windowCoveredEmpty_ = incrementalOld_.GetValue(offsetof(rotating::Row, requests) / sizeof(uint32_t)) == 0;"
+        replace_once(pair_native, snapshot,
+                     "const uint32_t used = incrementalOld_.GetValue(offsetof(rotating::Row, requests) / sizeof(uint32_t));\n"
+                     "    windowCoveredEmpty_ = used == 0;\n"
+                     "    earnedQueryLimit_ = lifetch_earned_window::RowLimit(epoch, used) / 4U;")
+        limit = "rankedEpoch_ == 0 ? 64U : earnedQueryLimit_"
+        grant = "lifetch_earned_window::RowLimit(epoch, requests)"
+        shutil.copyfile(Path(__file__).with_name("earned_window_quota.h"),kernel / "earned_window_quota.h")
+        include = '#include "../../common/lifetch/prefetch_budget.h"'
+        replace_once(prefetch, include, include + '\n#include "earned_window_quota.h"')
+    replace_once(incremental, "limit=ctx->windowLimit/4, minimum=limit/2",
+                 f"limit={limit}, minimum=Min(limit,32U)")
     replace_once(prefetch, "if(available>ctx->windowLimit)available=ctx->windowLimit;",
-                 f"const uint32_t grant = epoch == 0 ? 256U : {grants[1]}U;\n"
+                 f"const uint32_t grant = {grant};\n"
                  "        if (available > grant) available = grant;")
 
     # Separate diagnostic image. Rank records use words [0,9) of each 32-word Q.
@@ -75,6 +97,8 @@ def stage(source, tree, mode):
     digest = hashlib.sha256()
     for header in (incremental, prefetch, pair):
         digest.update(header.read_bytes())
+    if mode == ADVANCE:
+        digest.update((kernel / "earned_window_quota.h").read_bytes())
     (experiment / "policy.sha256").write_text(f"{mode}\n{digest.hexdigest()}\n")
     return experiment
 
@@ -91,6 +115,8 @@ def install(module, mode):
         with TemporaryDirectory(prefix="kvip-li-windows-") as folder:
             cold = stage(source, Path(folder), mode)
             launch = original(cold, normal, sdk, soc, policy_name, trace_sibling=trace_sibling)
+        if mode == ADVANCE:
+            launch.window_limit = max(WINDOW_CEILINGS)
         launch.density_mode = mode
         return launch
 

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from b24_window_policy import install, policy, trace_lanes
+from b24_window_policy import ADVANCE, WINDOW_CEILINGS, install, policy, trace_lanes
 
 
 def diagnostic(ex, torch, state, inputs, oracle, mode):
@@ -75,10 +75,18 @@ def run(a):
 
     import os
     local = os.environ.get("PEER_G7_X4_LOCAL") == "1"
-    if local and (a.mode != "window-x4-early" or a.group != 7 or a.batch not in (28, 32)):
+    if local and (a.mode not in ("window-x4-early",ADVANCE) or a.group != 7 or a.batch not in (28, 32)):
         raise ValueError("Unexpected local window shape")
     original = None if local else json.loads((a.ref / f"g{a.group}/bs{a.batch}/block1/fused/packed_result.json").read_bytes())
     install(large_two_cold, a.mode)
+    regular_traffic = large_batch_pair.window_traffic
+    if a.mode == ADVANCE:
+        def earned_traffic(counters, counts, grants=(), *, carry_credit=False):
+            traffic = regular_traffic(counters, counts, grants, carry_credit=True)
+            if grants and np.any(counters[:,7:] > np.asarray(WINDOW_CEILINGS)):
+                raise ValueError("Terminal or intermediate window exceeded its individual ceiling")
+            return traffic
+        large_batch_pair.window_traffic = earned_traffic
     regular_measure = packed.measure_packed
 
     def measure(ex, proof, serial, torch, states, sequence, *rest, **kwargs):
@@ -104,6 +112,7 @@ def run(a):
             serial_result=None, reuse_serial_archive=None, compare_archived_pair=False, keep_trace=False))
     finally:
         packed.measure_packed = regular_measure
+        large_batch_pair.window_traffic = regular_traffic
 
     result = json.loads((a.out / "packed_result.json").read_bytes())
     if ((original and result["identity"] != original["identity"]) or result["correctness"] != "PASS"

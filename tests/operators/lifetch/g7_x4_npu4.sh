@@ -4,6 +4,11 @@ set -euo pipefail
 repo=$(cd "${1:?expected KVIP checkout}" && pwd -P)
 reader=$(git -C "$repo" rev-parse --verify "${2:?expected reader}^{commit}")
 work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold}
+case ${3:-original} in
+    original) window=window-x4-early;;
+    earned) window=window-x4-earned;;
+    *) echo "Expected original or earned" >&2; exit 2;;
+esac
 sources="$work/fused-scan-sources"
 area="$work/peer-baseline"
 mkdir -p "$sources" "$area"
@@ -26,19 +31,23 @@ export FIXED_Q4_GROUPS=7 PEER_FOUR_WINDOW_RANKS=1 PEER_LARGE_COLD_WINDOWS=3 PEER
 unset KVAF_CPU_UB_DEVICE PEER_PACKED_RESUME PEER_RANK_DIAG_SOURCE PEER_FOUR_RANK_FOLLOWUP PEER_BS32_LI
 helper="$entry/support/g7_x4_local.py"
 for batch in 32 28; do
-    selection=$("$py" -B "$helper" choose "$area" "$batch" "$reader")
+    selection=$("$py" -B "$helper" choose "$area" "$batch" "$reader" --mode "$window")
     IFS=$'\t' read -r mode ref hit <<<"$selection"
     echo "G7 BS$batch source=$mode physical_NPU=4"
+    need=0
     case $mode in
-        paired-cache) "$py" -B "$entry/support/b24_window_report.py" show "$hit" "$ref" 7 "$batch" window-x4-early; continue;;
-        local-cache) "$py" -B "$helper" show-local "$hit" "$batch"; continue;;
-        paired-run) export PEER_G7_X4_LOCAL=0;;
-        local-run) export PEER_G7_X4_LOCAL=1; ref=$area;;
+        paired-cache) "$py" -B "$entry/support/b24_window_report.py" show "$hit" "$ref" 7 "$batch" "$window";;
+        local-cache) "$py" -B "$helper" show-local "$hit" "$batch" --mode "$window";;
+        paired-run) export PEER_G7_X4_LOCAL=0; need=1;;
+        local-run) export PEER_G7_X4_LOCAL=1; ref=$area; need=1;;
         *) echo "Unknown local G7 selection: $mode" >&2; exit 1;;
     esac
-    export PEER_TIMED_SOURCE
-    PEER_TIMED_SOURCE=$(stage d0fc5963881bd38fa97eff0f6ef40c757a6e8713)
-    export FIXED_Q4_BATCHES=$batch PEER_G7_X4_ARCHIVE_BATCH=$batch
-    export PEER_FOUR_RANK_AUDIT=window-x4-early PEER_AUDIT_ORIGIN="$ref" PEER_AUDIT_REFERENCE="$ref"
-    bash "$entry/large_batch_npu4.sh" --four-ranks-candidate-only
+    if (( need )); then
+        export PEER_TIMED_SOURCE
+        PEER_TIMED_SOURCE=$(stage d0fc5963881bd38fa97eff0f6ef40c757a6e8713)
+        export FIXED_Q4_BATCHES=$batch PEER_G7_X4_ARCHIVE_BATCH=$batch
+        export PEER_FOUR_RANK_AUDIT="$window" PEER_AUDIT_ORIGIN="$ref" PEER_AUDIT_REFERENCE="$ref"
+        bash "$entry/large_batch_npu4.sh" --four-ranks-candidate-only
+    fi
+    if [[ $window == window-x4-earned ]]; then "$py" -B "$helper" compare "$area" "$batch" "$reader"; fi
 done

@@ -35,6 +35,18 @@ class LocalNaturalGraph(unittest.TestCase):
             (arm/filename).write_text("{}")
         return root
 
+    def test_borrowed_credit_stays_within_both_limits_on_every_call(self):
+        row=[80,265,270,211,173]
+        data={"traffic":[{"row_window_prefetch":[row.copy() for _ in range(28)]} for _ in range(10)]}
+        study.check_earned_limits(data,28)
+        d=data["traffic"][9]["row_window_prefetch"][27]
+        d[:]=[256,193,0,0,0]
+        with self.assertRaises(ValueError):
+            study.check_earned_limits(data,28)
+        d[:]=[0,321,0,0,0]
+        with self.assertRaises(ValueError):
+            study.check_earned_limits(data,28)
+
     def test_each_batch_selects_only_this_host(self):
         self.original("other-host")
         self.assertEqual(study.choose(self.area,32,self.reader)[0],"local-run")

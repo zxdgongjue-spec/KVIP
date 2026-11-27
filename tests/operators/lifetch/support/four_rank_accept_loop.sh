@@ -23,7 +23,7 @@ if [[ ${PEER_G7_X4_LOCAL:-0} == 1 ]]; then
     read -r node adapter <<<"$placement"
     [[ $planned_node == auto || $planned_node == "$node" ]] && [[ $planned_adapter == auto || $planned_adapter == "$adapter" ]] || exit 1
     touch "$arm/local_placement_measured"
-    "$PYTHON" -B "$controller_root/tests/operators/lifetch/support/g7_x4_local.py" show-local "$arm" "$batch" >&3
+    "$PYTHON" -B "$controller_root/tests/operators/lifetch/support/g7_x4_local.py" show-local "$arm" "$batch" --mode "$audit_mode" >&3
     echo "AUDIT_COMPLETE local_candidate_only RESULT_ROOT=$out" >&3
     exit 0
 fi
