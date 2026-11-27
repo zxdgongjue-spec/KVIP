@@ -65,7 +65,7 @@ def check_scores(inputs, selected, serial):
 KERNEL_SUFFIX = r"(?:(?:_[0-9]+)|(?:_mix_ai[cv])|(?:_ai[cv]))*"
 
 
-def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False, expected_li23=None):
+def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False, expected_li23=None, expected_tail=None):
     """Read raw, scope-relative CANN records, including both sides of MIX tasks."""
     from decimal import Decimal
 
@@ -83,6 +83,10 @@ def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False, exp
             "fetch": ("kvafexecutebatchgetaivkernelv2", "kvafexecutebatchgetaivkernelv3"),
         }
     )
+    if expected_tail is not None:
+        if not fused or batch != 32 or expected_tail != "v9_test_two_row_terminal":
+            raise ValueError("The two-row terminal requires the BS32 fused graph")
+        names["tail"] = (expected_tail,)
     if expected_li23 is not None:
         if not fused or batch not in (20, 24, 28, 32):
             raise ValueError("An experimental cold kernel requires a large fused batch")

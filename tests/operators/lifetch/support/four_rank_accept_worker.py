@@ -63,16 +63,9 @@ def canonical_journal(inputs, pages, addresses, sources, slots, epochs, final, s
     return result
 
 
-def terminal_image(s, sdk):
+def compiler_identity(sdk):
     from kvip.runtime.build import kvaf_build_paths
 
-    fwd = s.forward
-    library = Path(s.rotating.library._name).resolve()
-    fun = fwd.terminal_function
-    bound = dict(zip(fun.__code__.co_freevars, (v.cell_contents for v in fun.__closure__)))
-    expected = ctypes.cast(s.rotating.library.aclrtlaunch_v9_parallel_terminal_large, ctypes.c_void_p)
-    if getattr(bound.get("tail"), "value", None) != expected.value:
-        raise ValueError("Cannot verify the bound four-Q terminal launch")
     cann, _ = kvaf_build_paths(sdk / "build-npu")
     compilers = [
         cann / p
@@ -89,14 +82,25 @@ def terminal_image(s, sdk):
     tools = {str(p.resolve()): sha(p) for p in dict.fromkeys(p.resolve() for p in compilers)}
     rules = cann / "compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake"
     tools[str(rules.resolve())] = sha(rules)
+    return tools
+
+
+def terminal_image(s, sdk):
+    fwd = s.forward
+    library = Path(s.rotating.library._name).resolve()
+    fun = fwd.terminal_function
+    bound = dict(zip(fun.__code__.co_freevars, (v.cell_contents for v in fun.__closure__)))
+    expected = ctypes.cast(s.rotating.library.aclrtlaunch_v9_parallel_terminal_large, ctypes.c_void_p)
+    if getattr(bound.get("tail"), "value", None) != expected.value:
+        raise ValueError("Cannot verify the bound four-Q terminal launch")
     return dict(
         tail_text=tail_text(library),
-        compiler_sha256=tools,
+        compiler_sha256=compiler_identity(sdk),
         cold_build=s.large_window_launch.source_fingerprint,
     )
 
 
-def device_journal(s, inputs, pages, counts):
+def device_journal(s, inputs, pages, counts, map_digests=None):
     from large_batch_pair import check_ordered_index
 
     fwd = s.forward
@@ -105,12 +109,19 @@ def device_journal(s, inputs, pages, counts):
     final = counts["row_query_final"]
     if not np.array_equal(stamp[:, :, 20], final):
         raise ValueError("Terminal count and per-Q completed GETs disagree")
+    src = fwd.events_src.cpu().numpy()
+    dst = fwd.events_dst.cpu().numpy()
+    if map_digests is not None:
+        from four_rank_final_map import row_assignment
+        for r, (w, q) in enumerate(zip(counts["row_window_prefetch"], final, strict=True)):
+            n = int(sum(w) + sum(q))
+            map_digests.append(row_assignment(src[r, :n], dst[r, :n]))
     return canonical_journal(
         inputs,
         pages,
         s.logical_addresses,
-        fwd.events_src.cpu().numpy(),
-        fwd.events_dst.cpu().numpy(),
+        src,
+        dst,
         counts["row_window_prefetch"],
         final,
         stamp[:, :, 22],
@@ -121,6 +132,17 @@ def device_journal(s, inputs, pages, counts):
 
 def run(a):
     sys.path.insert(0, str(a.timed / "tests/operators/lifetch/support"))
+    if a.mode == "two-row-natural":
+        if a.batch != 32:
+            raise ValueError("The two-row tail requires BS32")
+        from b24_two_row_natural import run as run_natural
+        return run_natural(a)
+    two_row = a.mode == "two-row-frozen"
+    if two_row:
+        if a.batch != 32:
+            raise ValueError("The two-row tail requires BS32")
+        import b24_two_row_attach
+        b24_two_row_attach.install_profiler()
     import torch
     import torch_npu
     import execution as ex
@@ -246,7 +268,7 @@ def run(a):
             )
             return dict(correctness="PASS", failures=[])
 
-    if a.mode == "frozen":
+    if a.mode == "frozen" or two_row:
         from four_rank_controlled import (GUARD, clear_evidence, controlled_build, evidence, extend_state,
                                           list_digest, validate_bound_addresses, validate_physical_operands, window_inputs)
         import large_two_cold
@@ -264,6 +286,27 @@ def run(a):
         ids, counts = window_inputs(records, a.batch, inputs.geometry["history"])
         validate_physical_operands(records, inputs, pages)
         large_two_cold.build = controlled_build(large_two_cold.build)
+        if two_row:
+            import acl
+            from four_rank_final_map import archived_assignments
+            control_folder = Path(os.environ["PEER_FROZEN_CONTROL"])
+            control = json.loads((control_folder / "frozen.json").read_bytes())
+            if (not (control_folder / "placement_verified").is_file()
+                    or control.get("identity") != old or old["native"] != pinned["native"]
+                    or control.get("arm") != "frozen" or control.get("correctness") != "PASS"
+                    or control.get("calls") != 10 or control.get("get_workers") != 32
+                    or control.get("checked_rows") != 10 * a.batch or control.get("full_KV_Index_checked_calls") != 10
+                    or len(control.get("traffic", [])) != 10 or len(control.get("timed_journal_checks", [])) != 10
+                    or control.get("frozen_journal_sha256") != manifest["journal_sha256"]
+                    or control.get("guard_sha256") != sha(GUARD) or control.get("tail_text") != manifest["tail_text"]
+                    or control.get("compiler_sha256") != manifest["compiler_sha256"]
+                    or control.get("expected_window_sha256") != list_digest(records, "w")
+                    or control.get("expected_final_sha256") != list_digest(records, "q")):
+                raise ValueError("The original controlled arm and ordered GET list do not match this cell")
+            recovered_maps = archived_assignments(records, a.batch)
+            b24_two_row_attach.install(large_two_cold, a.timed, a.sdk / "build-npu", acl.get_soc_name())
+            proof["original_control"] = str(control_folder)
+            proof["original_control_sha256"] = sha(control_folder / "frozen.json")
         kwargs = dict(large_window_policy="four-ranks")
 
         class ControlledState(ex.FusedReplayState):
@@ -284,11 +327,22 @@ def run(a):
         def validate(frozen, state, inp, index):
             base_validate(frozen, state, inp, index)
             count = frozen.traffic[-1]
-            actual = device_journal(state, inp, pages, count)
+            row_maps = []
+            actual = device_journal(state, inp, pages, count, row_maps)
             seen, status = state.frozen_binding[2], state.frozen_binding[4]
             checks.append(evidence(records, actual, np.asarray(count["row_window_prefetch"]),
                                    seen.cpu().numpy(), status[:, :, 0].cpu().numpy()))
-            if index == 0:
+            checks[-1]["index_assignment_by_row"] = row_maps
+            if two_row:
+                checks[-1]["two_row_receipt"] = state.large_two_row_terminal.readback()
+                if not checks[-1]["two_row_receipt"]["accepted"]:
+                    raise ValueError("Measured device rejected a two-row binding")
+                image = b24_two_row_attach.identity(state)
+                if index == 0:
+                    proof.update(image, compiler_sha256=compiler_identity(a.sdk))
+                elif any(proof[k] != value for k, value in image.items()):
+                    raise ValueError("The ten-call graph used different LI or terminal images")
+            elif index == 0:
                 proof.update(terminal_image(state, a.sdk))
 
         FrozenPackedRound.reset, FrozenPackedRound.validate = reset, validate
@@ -314,13 +368,22 @@ def run(a):
             raise ValueError("Expected ten measured journals and identical original tail image and compiler")
         summary["guarded_pass"] = all(c["ordered_match"] for c in checks)
         summary["scope"] = "controlled ten-call graph with guarded GET and tail diagnostics enabled"
-    path = dict(serial="packed_result.json", journal="journal.json", frozen="frozen.json")[a.mode]
+    if two_row:
+        from four_rank_final_map import compare
+        if (proof["cold_build"] != control["cold_build"] or proof["cold_build_fingerprint"] != control["cold_build_fingerprint"]
+                or proof["compiler_sha256"] != control["compiler_sha256"] or proof["original_tail_text"] != control["tail_text"]
+                or proof["tail_text"] == control["tail_text"]):
+            raise ValueError("The controlled pair must share the LI binary and compiler and exercise distinct tail images")
+        summary.update(compare(control, summary, recovered_maps))
+        summary["scope"] = "controlled ten-call graph with guarded GET and terminal journaling on both arms"
+    path = {"serial": "packed_result.json", "journal": "journal.json", "frozen": "frozen.json",
+            "two-row-frozen": "two-row-frozen.json"}[a.mode]
     atomic_json(a.out / path, summary)
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("mode", choices=["journal", "serial", "frozen"])
+    p.add_argument("mode", choices=["journal", "serial", "frozen", "two-row-natural", "two-row-frozen"])
     for name in ("timed", "ref"):
         p.add_argument(name, type=Path)
     for name in ("group", "batch"):

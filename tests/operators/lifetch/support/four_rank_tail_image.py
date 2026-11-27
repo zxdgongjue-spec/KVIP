@@ -44,21 +44,23 @@ def sections(data, machine, file_type):
     return flags, h[4], result
 
 
-def extract(path):
+def extract(path, kernel_tags=None):
+    if kernel_tags is None:
+        kernel_tags = KERNEL_TAGS
     data = path.read_bytes()
     # The host architecture does not affect how ELF wraps the device images.
     _, _, host = sections(data, machine=None, file_type=3)
     found = {}
     for name, header in host:
         parts = name.split(".")
-        if len(parts) != 5 or parts[:3] != ["", "ascend", "kernel"] or parts[4] not in KERNEL_TAGS:
+        if len(parts) != 5 or parts[:3] != ["", "ascend", "kernel"] or parts[4] not in kernel_tags:
             continue
         arch, kernel = parts[3:]
         if kernel in found or header[1] != 1:
             raise ValueError(f"{path}: duplicate or invalid {name}")
         payload = block(data, header[4], header[5])
         version, count = struct.unpack("<II", block(payload, 0, 8))
-        if version != 1 or count != len(KERNEL_TAGS[kernel]):
+        if version != 1 or count != len(kernel_tags[kernel]):
             raise ValueError(f"{path}: unexpected image table for {name}")
         offset = 8
         tags = set()
@@ -66,7 +68,7 @@ def extract(path):
         for _ in range(count):
             tag, disk_size, raw_size = struct.unpack("<III", block(payload, offset, 12))
             offset += 12
-            if tag not in KERNEL_TAGS[kernel] or tag in tags or disk_size != raw_size:
+            if tag not in kernel_tags[kernel] or tag in tags or disk_size != raw_size:
                 raise ValueError(f"{path}: unexpected core tag or image encoding in {name}")
             tags.add(tag)
             image = block(payload, offset, disk_size)
@@ -88,13 +90,13 @@ def extract(path):
         if offset != len(payload):
             raise ValueError(f"{path}: unparsed trailing data in {name}")
         found[kernel] = instructions
-    if found.keys() != KERNEL_TAGS.keys():
-        raise ValueError(f"{path}: missing device kernel(s) {sorted(KERNEL_TAGS.keys() - found.keys())}")
+    if found.keys() != kernel_tags.keys():
+        raise ValueError(f"{path}: missing device kernel(s) {sorted(kernel_tags.keys() - found.keys())}")
     return found
 
 
-def tail_text(library):
+def tail_text(library, kernel="parallel_terminal_kernel"):
     return [
         {"identity": list(k), "bytes": len(code), "sha256": hashlib.sha256(code).hexdigest()}
-        for k, code in sorted(extract(library)["parallel_terminal_kernel"].items())
+        for k, code in sorted(extract(library, {kernel: {1}})[kernel].items())
     ]
