@@ -97,6 +97,25 @@ class PackedAttribution(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "observed per-row"):
                     window_traffic(rows, counts, grants)
 
+    def test_each_row_can_spend_only_earned_credit(self):
+        grants = (256,) * 4
+        rows = np.zeros((2, 11), dtype=np.int32)
+        # Native G7 donor 14 and a row with the entire 1024 remaining at the last window.
+        rows[:, 7:] = [[69, 171, 318, 296], [0, 0, 0, 1024]]
+        rows[:, 0] = rows[:, 7:].sum(axis=1)
+        counts = np.array([[0, 9, 71, 119], [0, 0, 0, 0]])
+        self.assertEqual(window_traffic(rows, counts, grants, carry_credit=True)["largest_row_per_window"],
+                         [69, 171, 318, 1024])
+        with self.assertRaises(ValueError):
+            window_traffic(rows, counts, grants)
+        # At 513, the second window would borrow one token from the future. The row still totals 1024.
+        rows[1, 7:] = [0, 513, 0, 511]
+        with self.assertRaises(ValueError):
+            window_traffic(rows, counts, grants, carry_credit=True)
+        rows[1, 7:] = [0, 512, 0, 511]
+        with self.assertRaises(ValueError):
+            window_traffic(rows, counts, grants, carry_credit=True)
+
     def test_experimental_cold_receipt_checks_all_ten_calls(self):
         symbol = "v9_li_large_bs32_split_role"
         names = ["v9_li_large_hot", symbol, "v9_parallel_terminal_large"]

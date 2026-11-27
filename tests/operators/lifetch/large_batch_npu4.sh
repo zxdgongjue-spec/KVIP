@@ -80,6 +80,13 @@ prefix=largebs-q4
 if (( fixed )); then prefix=fixed-q4; fi
 if [[ -n $packed_archive ]]; then prefix=fixed-q4-packed; fi
 if (( packed_candidate )); then prefix="fixed-q4-aiv-${large_cold_windows}cold"; fi
+carry_credit=${PEER_FOUR_WINDOW_CARRY:-0}
+if [[ $carry_credit != 0 ]]; then
+    [[ $carry_credit == 1 && $packed_candidate == 1 && $large_cold_windows == 3 && -z $bs32_li ]] ||
+        { echo "Four-window carry requires the packed regular four-window candidate" >&2; exit 2; }
+    for batch in "${batches[@]}"; do (( batch > 16 )) || { echo "Four-window carry requires BS>16" >&2; exit 2; }; done
+    prefix=fixed-q4-four-window-carry
+fi
 if [[ -n $bs32_li ]]; then prefix="$prefix-bs32-$bs32_li"; fi
 if [[ -n $packed_archive && -n ${PEER_PACKED_RESUME:-} ]]; then
     out=$(cd "$PEER_PACKED_RESUME" && pwd)
@@ -189,6 +196,9 @@ if [[ -n $packed_archive ]]; then
     else
         "$PYTHON" -B "$workers/fixed_q4_packed_report.py" verify-source "$out" "$packed_archive" "$root"
     fi
+    if (( carry_credit )); then
+        echo "WINDOW_SCHEDULE four-window-carry earned_per_row=256/512/768/1024 independent_private_CQ=1" >&3
+    fi
     if (( packed_candidate && large_cold_windows == 2 )); then
         large_batches=20/24/28/32
         if [[ -n $bs32_li ]]; then large_batches=20/24/28; fi
@@ -285,6 +295,7 @@ run_arm() (
     if [[ -n $packed_archive ]]; then
         args+=(--packed-ten --serial-result "$packed_oracle")
         if (( packed_candidate )); then args+=(--compare-packed-candidate); fi
+        if (( carry_credit )); then args+=(--carry-credit); fi
         if (( packed_candidate && batch == 32 )) && [[ ${pair##*/} == block1 ]]; then args+=(--window-density); fi
         if (( packed_candidate && batch == 32 )) && [[ -n $bs32_li ]]; then
             args+=(--large-window-policy "$bs32_li")
@@ -380,6 +391,9 @@ run_packed_cohort() {
                         grep ' FINAL_PAIR_DIAG ' "$result/worker.log" | tee -a "$out/summary.txt" >&3
                     fi
                 fi
+            fi
+            if (( carry_credit )); then
+                grep '^CREDIT ' "$result/worker.log" | tee -a "$out/summary.txt" >&3
             fi
             if (( packed_candidate && batch > 16 && large_cold_windows == 2 )) ||
                 { (( packed_candidate && batch == 32 )) && [[ -n $bs32_li ]]; }; then

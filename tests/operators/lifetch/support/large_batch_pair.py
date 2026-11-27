@@ -282,7 +282,7 @@ def mutable_snapshots(state, fused):
     return [(target, target.clone()) for target in mutable_buffers(state, fused)]
 
 
-def window_traffic(counters, counts, grants=()):
+def window_traffic(counters, counts, grants=(), *, carry_credit=False):
     """Validate the device row totals and the per-epoch grant before reporting a policy."""
     prefetch, first_window = counters[:, 0], counters[:, 7]
     if np.any(prefetch < 0) or np.any(prefetch > 2048):
@@ -293,15 +293,19 @@ def window_traffic(counters, counts, grants=()):
                    first_prefetch=int(first_window.sum()), first_nonempty_rows=int(np.count_nonzero(first_window)))
     if grants:
         epochs = counters[:, 7:]
-        if (epochs.shape[1] != len(grants) or np.any(epochs < 0) or np.any(epochs > grants)
-                or np.any(prefetch > sum(grants)) or not np.array_equal(epochs.sum(axis=1), prefetch)):
+        if epochs.shape[1] != len(grants) or np.any(epochs < 0):
+            raise ValueError("Invalid per-row window counters")
+        actual = epochs.cumsum(axis=1) if carry_credit else epochs
+        limit = np.cumsum(grants) if carry_credit else grants
+        if (np.any(actual > limit) or np.any(prefetch > sum(grants))
+                or not np.array_equal(epochs.sum(axis=1), prefetch)):
             raise ValueError("Window grants do not match the observed per-row GET counts")
         traffic.update(posted_per_window=epochs.sum(axis=0).tolist(), largest_row_per_window=epochs.max(axis=0).tolist(),
                        row_window_prefetch=epochs.tolist(), row_query_final=counts.tolist())
     return traffic
 
 
-def read_selected(state, inputs, fused):
+def read_selected(state, inputs, fused, *, carry_credit=False):
     """Verify public IDs and the Index slots used by each Q, outside its event."""
     batch = state.batch
     shape = (batch, 4, 2048)
@@ -320,8 +324,17 @@ def read_selected(state, inputs, fused):
         if launch:
             from large_two_cold import WINDOW_GRANTS
             grants = WINDOW_GRANTS[launch.window_policy]
+        if carry_credit:
+            if launch is not None or batch not in (20, 24, 28, 32):
+                raise ValueError("Carry-forward uses the regular four-window large-batch kernel")
+            grants = (256,) * 4
         counters = state.rotating.rows[:, 9:16 + max(1, len(grants))].cpu().numpy()
-        traffic = window_traffic(counters, counts, grants)
+        traffic = window_traffic(counters, counts, grants, carry_credit=carry_credit)
+        if carry_credit:
+            private_status = status[np.asarray(terminal.queue_views)].reshape(batch, 4, -1)
+            traffic["final_cqes"] = int(private_status[:, :, 3].sum())
+            traffic["multiphase_rows"] = int(np.any(private_status[:, :, 3] > 1, axis=1).sum())
+            traffic["max_final_per_q"] = int(counts.max())
         raw = state.workspace.topk.cpu().numpy().reshape(shape)
         unpack = state.workspace.inputs.unpack_indices.cpu().numpy().reshape(-1)
         if np.any(raw < 0) or np.any(raw >= state.history) or not np.array_equal(np.sort(unpack), np.arange(batch * 4)):
@@ -784,7 +797,8 @@ def run(args):
     scratch_existed = (args.output / "export_only_prof_dir").exists()
     if args.packed_ten:
         from fixed_q4_packed_worker import measure_packed, save_packed
-        benchmark = partial(measure_packed, ex, proofs, serial, window_density=args.window_density)
+        benchmark = partial(measure_packed, ex, proofs, serial, window_density=args.window_density,
+                            carry_credit=args.carry_credit)
     else:
         benchmark = partial(measured_replays, ex, proofs, serial)
     result = ex.run_path(cfg, args.output / "path", sequence, pages, fused=fused, measure=benchmark,
@@ -953,6 +967,7 @@ if __name__ == "__main__":
                          help="Measure the isolated three-window large-batch cold kernel")
     windows.add_argument("--large-window-policy", choices=("two-cold", "split-role", "shared-final"),
                          help="Measure the selected large-batch cold kernel in the packed candidate")
+    parser.add_argument("--carry-credit", action="store_true", help="Audit the four-window earned budget and private CQ receipts")
     parser.add_argument("--window-density", action="store_true", help="Collect post timestamps in one separate large-BS call")
     parser.add_argument("--compare-packed-candidate", action="store_true", help="Use the original strong serial selection for a modified fusion kernel")
     parser.add_argument("--packed-ten", action="store_true", help="Capture and time ten independent states in one graph")

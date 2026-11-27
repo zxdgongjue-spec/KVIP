@@ -13,7 +13,8 @@ from reporting import atomic_json
 class FrozenPackedRound:
     """All invocations start with identical contents at distinct writable addresses."""
 
-    def __init__(self, states, inputs, serial, fused):
+    def __init__(self, states, inputs, serial, fused, carry_credit=False):
+        self.carry_credit = carry_credit
         self.inputs = inputs
         self.serial = serial
         self.fused = fused
@@ -63,21 +64,23 @@ class FrozenPackedRound:
     def validate(self, state, inputs, index):
         if inputs is not self.inputs or index != len(self.traffic):
             raise ValueError("Unexpected measured packed invocation")
-        selected, counts = read_selected(state, inputs, self.fused)
+        selected, counts = read_selected(state, inputs, self.fused, carry_credit=self.carry_credit)
         self.exact += check_scores(inputs, selected, self.serial[index])
         state.validate(inputs)
         self.traffic.append(counts)
 
 
-def measure_packed(ex, proofs, serial, torch, states, sequence, config, directory, *, fused, window_density=False):
+def measure_packed(ex, proofs, serial, torch, states, sequence, config, directory, *, fused, window_density=False, carry_credit=False):
     from fixed_q4_packed_timing import profile_fixed_graph_batch
 
     if len(states) != CALLS or len(sequence.rounds) != 1 or config.warmup != WARMUP or config.mode != "bench":
         raise ValueError("Expected a single frozen round, four graph warmups and ten independent measured states")
-    frozen = FrozenPackedRound(states, sequence.inputs, serial, fused)
+    frozen = FrozenPackedRound(states, sequence.inputs, serial, fused, carry_credit)
 
     launch = getattr(states[0], "large_window_launch", None)
-    expected_li23 = None
+    expected_li23 = "v9_li_large_threshold_cold" if carry_credit else None
+    if carry_credit:
+        proofs.update(large_window_policy="four-window-carry", measured_cold_symbol=expected_li23)
     if launch:
         from large_two_cold import COLD_SYMBOL
         if any(getattr(state, "large_window_launch", None) is not launch for state in states):
@@ -141,7 +144,7 @@ def measure_packed(ex, proofs, serial, torch, states, sequence, config, director
             if trace_args:
                 state.large_window_launch = launch
         state.check_completion()
-        ids, traffic = read_selected(state, inputs, True)
+        ids, traffic = read_selected(state, inputs, True, carry_credit=carry_credit)
         check_scores(inputs, ids, serial[0])
         state.validate(inputs)
         check_ordered_index(state, inputs.captured_layout, inputs.captured_hot_valid)
@@ -223,6 +226,14 @@ def save_packed(args, identity, inputs, proofs, workers, scratch_existed):
               f"sibling_rows_arrived_before_previous_end={sibling} sibling_score_span_overlaps_previous_service_rows={scored} "
               f"distinct_row_service_overlap_us={concurrent} "
               f"longest_gap_between_posts_us={gap}{detailed}")
+    if proofs.get("large_window_policy") == "four-window-carry":
+        calls = proofs["traffic"]
+        posted = np.mean([s["posted_per_window"] for s in calls], axis=0)
+        print(f"CREDIT G{args.group} BS{args.batch} posted_per_window=" + "/".join(f"{n:.1f}" for n in posted)
+              + f" final_tokens={np.mean([s['final'] for s in calls]):.1f}"
+              + f" max_final_per_q={max(s['max_final_per_q'] for s in calls)}"
+              + f" private_final_CQEs={np.mean([s['final_cqes'] for s in calls]):.1f}"
+              + f" split_rows={np.mean([s['multiphase_rows'] for s in calls]):.1f}")
     print(f"CHECK G{args.group} BS{args.batch} {args.arm} TopK_score_vs_strong_serial=PASS "
           f"queries={checked}/{checked} exact_ID_sets={proofs['exact_ID_sets']}/{checked} "
           f"KV_and_Index_rows={CALLS * args.batch}/{CALLS * args.batch} get_workers={workers}")
