@@ -1,5 +1,6 @@
 #pragma once
 #include "terminal_runtime_abi.h"
+#include "private_prefix_credit.h"
 #include "large_batch_li.h"
 #include "window_types.h"
 #if defined(__CCE_AICORE__)
@@ -294,7 +295,12 @@ __aicore__ inline void RunTerminalRow(GM_ADDR binding, uint32_t b, uint32_t q){
  }
  ownError|=(indexError<<4);
  if(profile)ts[16]=GetSystemCycle();
- uint64_t cqError=rotating::CompleteTerminalPost(args,post,batches,originalHead);
+ uint64_t cqError;
+ if (LargeBatch && batches.count > 1 && rotating::CanOverlapTerminalPrefixes(args, own)) {
+  cqError=rotating::CompletePairedTerminalPost<false>(args,post,batches,originalHead,nullptr);
+ } else {
+  cqError=rotating::CompleteTerminalPost(args,post,batches,originalHead);
+ }
  if(profile)ts[24]=GetSystemCycle();
  if(q==1)rotating::CompleteTerminalPrefetch(ctx,b);
  ownError|=uint32_t(cqError);

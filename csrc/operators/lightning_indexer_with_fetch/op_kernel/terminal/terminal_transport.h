@@ -92,4 +92,64 @@ __aicore__ inline uint64_t CompleteTerminalPost(
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
     return result.error;
 }
+
+__aicore__ inline bool CanOverlapTerminalPrefixes(
+    const __gm__ KvafExecuteBatchGetKernelArgs* args, uint32_t own) {
+    auto entity = reinterpret_cast<const __gm__ KvafBatchGetDirectUrmaEntity*>(args->channel_entity);
+    // No descriptors from an earlier call remain on this stream-ordered private SQ.
+    // Keep a free slot in both rings, including when a pair crosses the wrap.
+    return entity->cq_depth > 2 && own < entity->sq_depth;
+}
+
+template<bool Trace>
+struct PrivatePrefixQueue {
+    const __gm__ KvafExecuteBatchGetKernelArgs* args;
+    const __gm__ KvafBatchGetDirectUrmaEntity* entity;
+    __gm__ KvafBatchGetQueueState* queue;
+    __gm__ FinalPost* post;
+    const TerminalBatches* batches;
+    uint64_t head;
+    __gm__ uint64_t* clocks;
+
+    __aicore__ inline void Issue(uint32_t index) {
+        const uint32_t end = batches->ends[index];
+        if constexpr (Trace) clocks[8 + 4 * index] = GetSystemCycle();
+        PublishTerminalPrefix(args, entity, head + end);
+        if constexpr (Trace) clocks[9 + 4 * index] = GetSystemCycle();
+        post->count = end;
+    }
+
+    __aicore__ inline terminal_credit::Receipt Consume(uint32_t index) {
+        if constexpr (Trace) clocks[10 + 4 * index] = GetSystemCycle();
+        auto result = DrainQueue(entity, queue, 1);
+        if constexpr (Trace) clocks[11 + 4 * index] = GetSystemCycle();
+        // DrainCq advances the cursor for an observed error CQE as well as for success.
+        return {result.error, result.completed == 1 || result.error == kvaf_device::kCqError};
+    }
+};
+
+template<bool Trace>
+__aicore__ inline uint64_t CompletePairedTerminalPost(
+    const __gm__ KvafExecuteBatchGetKernelArgs* args, __gm__ FinalPost* post,
+    const TerminalBatches& batches, uint64_t head, __gm__ uint64_t* clocks) {
+    auto entity = reinterpret_cast<const __gm__ KvafBatchGetDirectUrmaEntity*>(args->channel_entity);
+    auto queue = reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args->queue_state);
+    if constexpr (Trace) {
+        clocks[0] = batches.count;
+        clocks[5] = 2;
+        for (uint32_t i = 0; i < batches.count; ++i) clocks[1+i] = batches.ends[i];
+    }
+    PrivatePrefixQueue<Trace> port{args, entity, queue, post, &batches, head, clocks};
+    const auto state = terminal_credit::CompletePair(port, batches.count);
+    post->error = uint32_t(state.error);
+    post->pending = state.issued - state.consumed;
+    if (state.error) queue->last_error = state.error;
+    auto status = reinterpret_cast<__gm__ KvafBatchGetCoreStatus*>(args->core_status);
+    kvaf_device::WriteStatus(status,state.error,post->count,state.successful,
+        queue->sq_producer_index,queue->cq_consumer_index,UINT64_MAX,0);
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),sizeof(*queue));
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(status),sizeof(*status));
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(post),sizeof(*post));
+    return state.error;
+}
 #endif

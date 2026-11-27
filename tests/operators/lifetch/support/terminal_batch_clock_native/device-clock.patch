@@ -1,10 +1,15 @@
 --- a/row_kernel.h
 +++ b/row_kernel.h
-@@ -297 +297,4 @@
-- uint64_t cqError=rotating::CompleteTerminalPost(args,post,batches,originalHead);
-+ // The probe binds a second batch*4*32-word area immediately after the native clocks.
+@@ -298,6 +298,8 @@
 + auto extra=reinterpret_cast<__gm__ uint64_t*>(runtime->times)+(s.batch*4+query)*32;
-+ uint64_t cqError=rotating::CompleteTerminalPost(args,post,batches,originalHead,extra);
+  uint64_t cqError;
+  if (LargeBatch && batches.count > 1 && rotating::CanOverlapTerminalPrefixes(args, own)) {
+-  cqError=rotating::CompletePairedTerminalPost<false>(args,post,batches,originalHead,nullptr);
++  cqError=rotating::CompletePairedTerminalPost<true>(args,post,batches,originalHead,extra);
+  } else {
+-  cqError=rotating::CompleteTerminalPost(args,post,batches,originalHead);
++  cqError=rotating::CompleteTerminalPost(args,post,batches,originalHead,extra);
+  }
 + kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(extra),256);
 --- a/terminal_transport.h
 +++ b/terminal_transport.h

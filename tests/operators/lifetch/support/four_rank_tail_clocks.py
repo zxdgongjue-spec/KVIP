@@ -66,18 +66,23 @@ def decode(stamps, detail, mhz):
             require(len(extra) == 32 and extra[0] == len(ends) and extra[1:1+len(ends)] == ends,
                     f"G7 R{r} Q{q+1}: evaluated prefix counts do not match")
             windows = []
+            credit = extra[5] or 1
+            require(credit in (1, 2), "Invalid private SQ credit")
             last = t[16]
             for b, end in enumerate(ends):
                 at = extra[8+4*b:12+4*b]
                 if not b:
                     at = [t[15], t[4], at[2], at[3]]
                 require(at[0] <= at[1] <= at[2] <= at[3] <= t[24] and at[0] > 0
-                        and (last <= at[0] if b else at[1] <= t[26] <= t[16] <= at[2]),
+                        and (last <= at[2] and (b == 0 or t[16] <= at[0]))
+                        and (b < credit or windows[b-credit]["drain_end"] <= at[0])
+                        and (not b or windows[-1]["post_end"] <= at[0])
+                        and (b or at[1] <= t[26] <= t[16] <= at[2]),
                         f"G7 R{r} Q{q+1}: invalid Post/Index/CQ chronology")
                 windows.append(dict(prefix_end=end, post_begin=at[0], post_end=at[1],
                                     drain_begin=at[2], drain_end=at[3]))
                 last = at[3]
-            out.append(dict(row=r, query=q+1, own=own, phases_us={k:v/mhz for k,v in stages.items()},
+            out.append(dict(row=r, query=q+1, own=own, private_credit=credit, phases_us={k:v/mhz for k,v in stages.items()},
                        start_us=(t[0]-origin)/mhz, until_exit_us=(t[10]-origin)/mhz,
                        index_begin=t[26], index_end=t[16], batches=windows,
                        last_final_cq_to_exit_us=(t[10]-last)/mhz if windows else None))

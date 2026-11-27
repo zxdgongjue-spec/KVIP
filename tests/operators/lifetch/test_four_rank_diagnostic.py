@@ -38,6 +38,20 @@ class DiagnosticTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,"chronology"):
             decode([t],[c],1)
 
+    def test_two_prefixes_in_flight_with_in_order_receipts(self):
+        queries = [query(0, []) for _ in range(3)] + [query(320, [20,120,220,320])]
+        stamps, detail = map(list, zip(*queries))
+        extra = detail[-1]
+        extra[5] = 2
+        index_end = stamps[-1][16]
+        extra[12:16] = [index_end, index_end+1, index_end+12, index_end+15]
+        extra[16:20] = [index_end+6, index_end+7, index_end+18, index_end+20]
+        extra[20:24] = [index_end+15, index_end+16, index_end+21, index_end+23]
+        self.assertEqual(decode([stamps], [detail], 1)["qs"][-1]["private_credit"], 2)
+        extra[16] = index_end+3
+        with self.assertRaisesRegex(ValueError, "chronology"):
+            decode([stamps], [detail], 1)
+
     def test_packages_current_and_reused_results(self):
         with tempfile.TemporaryDirectory() as tmp:
             area=Path(tmp)/"peer-baseline"
