@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Audit a baseline and a two-credit arm on the same physical card."""
 import argparse
+from contextlib import ExitStack
 import json
 import tarfile
 from pathlib import Path
@@ -66,15 +67,20 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("old_run",type=Path)
     parser.add_argument("new_run",type=Path)
-    parser.add_argument("old_clock_archive",type=Path)
-    parser.add_argument("new_clock_archive",type=Path)
+    parser.add_argument("old_clock_archive",type=Path,nargs="?")
+    parser.add_argument("new_clock_archive",type=Path,nargs="?")
     args=parser.parse_args()
     check(same_card(args.old_run,args.new_run), "Archive roots differ in physical card or machine")
     before,after=collect(args.old_run), collect(args.new_run)
     expected={(g,b) for g in (2,4,7,10,17) for b in (20,24,28,32)}
     check(set(before)==set(after)==expected,"Expected the 20 four-rank cells in both arms")
+    check(bool(args.old_clock_archive)==bool(args.new_clock_archive), "Expected both diagnostic archives")
+    if not args.old_clock_archive:
+        check(all(x["identity"]["physical_npu"]==3 for x in before.values()),
+              "The NPU4 comparison requires the per-Q diagnostic pair")
     result={}
-    with tarfile.open(args.old_clock_archive) as old, tarfile.open(args.new_clock_archive) as new:
+    with ExitStack() as context:
+        clocks = [context.enter_context(tarfile.open(p)) for p in (args.old_clock_archive,args.new_clock_archive) if p]
         for key in sorted(expected):
             x,y=before[key],after[key]
             compare_rows(x,y)
@@ -90,11 +96,14 @@ def main():
             record=dict(graph_us=[old_us,new_us],graph_reduction_pct=100*(old_us-new_us)/old_us,
                         tail_us=[s["mean_us"]["tail"] for s in (x,y)])
             g,b=key
-            if g==7 and b in (28,32):
+            if clocks and g==7 and b in (28,32):
                 name=f"g7/bs{b}/single_diagnostic.json"
-                samples=[json.load(a.extractfile(name)) for a in (old,new)]
+                samples=[json.load(a.extractfile(name)) for a in clocks]
                 check(all(s["identity"]==t["identity"] for s,t in zip(samples,(x,y))),"Wrong clock archive")
                 record.update(compare_samples(*samples))
+            if not clocks:
+                record["row_query_counts_match"]=True
+                record["ordered_IDs_match"]=None
             result[f"G{g}_BS{b}"]=record
     print(json.dumps(result,indent=2))
 

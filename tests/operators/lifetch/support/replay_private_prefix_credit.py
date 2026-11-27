@@ -6,6 +6,7 @@ import heapq
 import itertools
 import json
 import struct
+import statistics
 import tarfile
 from pathlib import Path
 
@@ -74,7 +75,7 @@ def shapes(sample, formal):
     return rows
 
 
-def run(rows, windows, counts, order, bandwidth, ack, credit, *, fixed_rtt=False):
+def run(rows, windows, counts, order, bandwidth, ack, credit, *, fixed_rtt=False, observed_rtts=None):
     # One FCFS link is shared by four prefetch windows and all final reads. CQ delay is
     # additional, nonblocking propagation. Each Q's CQ remains ordered even if RTTs differ.
     events = []
@@ -88,6 +89,7 @@ def run(rows, windows, counts, order, bandwidth, ack, credit, *, fixed_rtt=False
     begun = {}
     ends = []
     posts = []
+    times = {}
     link = -1e9
     backlog = 0
     queue = iter(order)
@@ -143,6 +145,8 @@ def run(rows, windows, counts, order, bandwidth, ack, credit, *, fixed_rtt=False
             assert i == 0 or now >= index
             issued[key] += 1
             posts.append((r,q,i,plan[i]))
+            if observed_rtts is not None:
+                times[r,q,i] = now
             backlog = max(backlog,sum(issued.values())-sum(retired.values()))
             link = max(link,now)+plan[i]*0.656/bandwidth
             observed = max(link+ack, due[key])
@@ -152,6 +156,9 @@ def run(rows, windows, counts, order, bandwidth, ack, credit, *, fixed_rtt=False
             later(max(index,observed), "receipt", r,q)
         else:
             assert kind == "receipt" and retired[key] < issued[key]
+            if observed_rtts is not None:
+                i = retired[key]
+                observed_rtts[r,q,i] = now - times[r,q,i]
             retired[key] += 1
             if retired[key] == len(plan):
                 later(now, "done", r,q)
@@ -218,15 +225,25 @@ def analyze(diagnostics, formal_archive):
                     if ev[10]:
                         windows.append(((ev[12]-origin)/li["clock_mhz"],r,ev[10]))
             sensitivity=[]
+            cohorts = None
+            if b in captures:
+                cohorts = [[(r,q,i) for r in order[:16] for q in range(4) if len(rows[r]["rtt"][q])>i]
+                           for i in range(4)]
+                case["observed_first_wave_prefix_post_to_CQ_p50"] = [
+                    statistics.median(rows[r]["rtt"][q][i] for r,q,i in cohort) for cohort in cohorts]
             for speed in (10,25,50,100):
                 for delay in (1,4,20,70):
                     for observed in ([False,True] if b in captures else [False]):
-                        old = run(rows,windows,counts,order,speed,delay,1,fixed_rtt=observed)
+                        prediction={} if cohorts else None
+                        old = run(rows,windows,counts,order,speed,delay,1,fixed_rtt=observed,observed_rtts=prediction)
                         new = run(rows,windows,counts,order,speed,delay,2,fixed_rtt=observed)
                         gain=old[0]-new[0]
                         sensitivity.append(dict(GBps=speed,ack_us=delay,archived_rtt_floor=observed,
                             old_us=old[0],new_us=new[0],saved_us=gain,pct_graph=gain*100/case["graph_us"],
                             peak_pending=[old[1],new[1]]))
+                        if cohorts:
+                            sensitivity[-1]["old_first_wave_prefix_post_to_CQ_p50"] = [
+                                statistics.median(prediction[key] for key in cohort) for cohort in cohorts]
             case["models"]=sensitivity
     assert len(out)==20
     return out
