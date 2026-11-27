@@ -29,11 +29,12 @@ COLD_GM_KERNELS = {
     'cold_gm_pipeline': ('v9_li_kernel_hot_cold_gm', 'v9_li_kernel_cold_gm_batch',
                          'v9_parallel_terminal'),
 }
-from small_batch import COLD_KERNELS as SMALL_COLD_KERNELS, PARTITIONED_MODES, RETIRED_KERNELS, TOPK_KERNELS as SMALL_TOPK_KERNELS
+from small_batch import (COLD_KERNELS as SMALL_COLD_KERNELS, P2_WINDOW_Q_WORKERS, PARTITIONED_MODES,
+                         RETIRED_KERNELS, TOPK_KERNELS as SMALL_TOPK_KERNELS)
 
 CHECKED_KERNELS = {**P2_W1_KERNELS, **COLD_GM_KERNELS,
                    **{f'small_{mode}': P2_W1_KERNELS['p2']
-                      for mode in ('p2', 'windows', 'windows_w2', 'windows_early', 'get')},
+                      for mode in ('p2', 'windows', 'windows_w2', 'windows_early', 'get', *P2_WINDOW_Q_WORKERS)},
                    **{f'small_{mode}': SMALL_COLD_KERNELS for mode in PARTITIONED_MODES},
                    'small_adaptive': RETIRED_KERNELS,
                    'small_topk': SMALL_TOPK_KERNELS}

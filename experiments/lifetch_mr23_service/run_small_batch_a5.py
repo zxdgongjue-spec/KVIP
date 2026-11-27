@@ -14,8 +14,8 @@ from run_mr28_baseline_msprof import capture_route
 from run_mr28_dedicated_service import write_summary
 from kvip.operators.lifetch.geometry import li_geometry
 from small_batch import (
-    ADAPTIVE_ROUTES, FULL32_MODES, MODES, PARTITIONED_MODES, SUPPORTED_BATCHES, TRACE_ROUTES,
-    WINDOW_Q_BATCHES, WINDOW_Q_WORKERS,
+    ADAPTIVE_ROUTES, FULL32_MODES, MODES, P2_WINDOW_Q_WORKERS, P4_WINDOW_Q_WORKERS,
+    PARTITIONED_MODES, SUPPORTED_BATCHES, TRACE_ROUTES, WINDOW_Q_BATCHES, WINDOW_Q_WORKERS,
     cold_score_parts, selected_windows,
 )
 from terminal_handoff import CHECKED_KERNELS, COLD_GM_STAGE_FIELDS, STAGES
@@ -65,10 +65,14 @@ def balanced_arms(batch):
 
 def study_arms(args):
     if args.window_q_matrix:
-        arms = tuple(WINDOW_Q_WORKERS) if args.window_q_matrix == 'all' else ('cold_w2', 'cold_w2_q1')
-        return dict.fromkeys(WINDOW_Q_BATCHES, arms if args.trace else ('p2', *arms))
+        baseline = () if args.trace else ('p2',)
+        if args.window_q_matrix == 'all':
+            arms = dict.fromkeys(WINDOW_Q_BATCHES, (*baseline, *P4_WINDOW_Q_WORKERS))
+            arms[16] = (*baseline, *P2_WINDOW_Q_WORKERS)
+            return arms
+        return dict.fromkeys(WINDOW_Q_BATCHES, (*baseline, 'cold_w2', 'cold_w2_q1'))
     if args.bs2_window_q:
-        return {2: tuple(WINDOW_Q_WORKERS)}
+        return {2: tuple(P4_WINDOW_Q_WORKERS)}
     if args.adaptive_pw:
         return ADAPTIVE_ARMS
     if args.window_probe:
@@ -284,7 +288,7 @@ def trace_compare(before, after, *, prefix=''):
             left['prefetch_tokens_in_submit_order_by_window'] == right['prefetch_tokens_in_submit_order_by_window']
             for left, right in zip(base, candidate, strict=True))
     after.update({f'{prefix}{key}': value for key, value in comparison.items()})
-    if after['variant'] in (PARTITIONED_MODES | {'topk'}) and not comparison['resident_seed_match']:
+    if after['variant'] in (PARTITIONED_MODES | WINDOW_Q_WORKERS.keys() | {'topk'}) and not comparison['resident_seed_match']:
         raise ValueError(f"Resident Top2048 seed differs from {before['variant']}")
 
 
@@ -361,7 +365,7 @@ def main():
     route.add_argument('--window-q1-matrix', dest='window_q_matrix', action='store_const', const='q1',
                        help='compare main P2, P4/W2 serial Q4 and four Q1 at BS1/2/4/8')
     route.add_argument('--window-q-matrix', action='store_const', const='all',
-                       help='compare main P2, P4/W2 serial Q4, Q2+Q2 and four Q1 at BS1/2/4/8')
+                       help='compare main P2 and W2 serial Q4, Q2+Q2 and four Q1 at BS1/2/4/8/16')
     route.add_argument('--adaptive-pw', action='store_true',
                        help='compare native P2, fixed best P/W and adaptive P/W with retired AIV Service')
     route.add_argument('--window-probe', choices=WINDOW_PROBES,
@@ -517,7 +521,7 @@ def main():
                       f'Get {row["vs_main_get_count_comparison"]}', flush=True)
             if args.bs2_window_q or args.window_q_matrix:
                 row['w1_topk_workers_per_request'] = WINDOW_Q_WORKERS[row['variant']]
-                if row['variant'] == 'cold_w2':
+                if row['w1_topk_workers_per_request'] == 1:
                     focused_baselines[pair] = row
                 else:
                     before = focused_baselines[pair]

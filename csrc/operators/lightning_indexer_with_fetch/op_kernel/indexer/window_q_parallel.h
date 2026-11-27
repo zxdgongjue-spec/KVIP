@@ -29,7 +29,9 @@ struct Trial {
 __aicore__ inline Trial LoadTrial(GM_ADDR workspace, const rotating::RuntimeShape& shape, uint32_t parts)
 {
     const uint32_t batch = shape.batch;
-    if (!workspace || parts != 4 || (batch != 1 && batch != 2 && batch != 4 && batch != 8) ||
+    const bool p4 = parts == 4 && (batch == 1 || batch == 2 || batch == 4 || batch == 8);
+    const bool p2 = parts == 2 && batch == 16;
+    if (!workspace || (!p4 && !p2) ||
         shape.rounds != 2 ||
         shape.history != 131072 || shape.resident != 16384 || shape.indexHeads != 32 ||
         shape.aicCount != 32 || shape.splitQ != 1 || shape.liCores != 2 * batch ||
@@ -54,10 +56,19 @@ __aicore__ inline Helper ScoreHelper(uint32_t batch, uint32_t aiv)
         // G0 serves W0 and G2 serves W1. Reuse both peers of G1 and one of G3.
         return {0, aiv == 2 ? 1U : aiv == 3 ? 2U : aiv == 6 ? 3U : 0U};
     }
+    const uint32_t group = aiv / 2;
+    if (batch == 16) {
+        // Even groups in the two halves own W0 and W1, respectively.
+        // Reuse the two odd groups first. The W0 owner can help only at the
+        // post-Score hook, after completing its original W0 Service.
+        const uint32_t half = group / batch;
+        const uint32_t row = (group % batch / 2) * 2 + aiv % 2;
+        const uint32_t worker = group % 2 ? 1 + half : (half == 0 ? 3 : 0);
+        return {row, worker};
+    }
     // W0 owns G0, G4, ... in the first half of the Score grid. W1 has
     // its owners in the second half. All other first-half groups have no
     // Service work in W2 and can contribute one helper to each paired row.
-    const uint32_t group = aiv / 2;
     const uint32_t rowPair = group / 4;
     return {2 * rowPair + aiv % 2, rowPair < batch / 2 ? group % 4 : 0};
 }

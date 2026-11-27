@@ -1006,9 +1006,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit(
                 }
             }
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
-            if constexpr (Phase == SequenceLiPhase::Cold && !WaitColdPeers && !RetireService) {
+            if constexpr (Phase == SequenceLiPhase::Cold && !RetireService) {
                 if ASCEND_IS_AIV {
-                    vectorService.RunWindowQHelper(halfTokens);
+                    if (parts == 2 || !WaitColdPeers) vectorService.RunWindowQHelper(halfTokens);
                 }
             }
 #endif

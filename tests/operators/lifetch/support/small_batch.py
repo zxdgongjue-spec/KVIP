@@ -7,12 +7,15 @@ import hashlib
 import numpy as np
 
 ADAPTIVE_ROUTES = {1: 'cold_p8', 2: 'cold_w2', 8: 'cold_full_w2'}
-WINDOW_Q_WORKERS = {'cold_w2': 1, 'cold_w2_q2': 2, 'cold_w2_q1': 4}
+P4_WINDOW_Q_WORKERS = {'cold_w2': 1, 'cold_w2_q2': 2, 'cold_w2_q1': 4}
+P2_WINDOW_Q_WORKERS = {'p2_w2': 1, 'p2_w2_q2': 2, 'p2_w2_q1': 4}
+WINDOW_Q_WORKERS = P4_WINDOW_Q_WORKERS | P2_WINDOW_Q_WORKERS
 WINDOW_Q_BATCHES = (1, 2, 4, 8)
 SUPPORTED_BATCHES = {
     'p2': (1, 2, 4, 8, 16),
     'cold': (1, 2, 4, 8),
-    **dict.fromkeys(WINDOW_Q_WORKERS, WINDOW_Q_BATCHES),
+    **dict.fromkeys(P4_WINDOW_Q_WORKERS, WINDOW_Q_BATCHES),
+    **dict.fromkeys(P2_WINDOW_Q_WORKERS, (16,)),
     'cold_p8': (1,),
     'cold_p8_bulk': (1,),
     'cold_full': (1, 2, 8),
@@ -27,10 +30,11 @@ SUPPORTED_BATCHES = {
 }
 MODES = ('p2', 'cold', 'windows', 'topk', 'get')
 FULL32_MODES = {'cold_full', 'cold_full_w3', 'cold_full_w2'}
-PARTITIONED_MODES = FULL32_MODES | WINDOW_Q_WORKERS.keys() | {'cold', 'cold_p8', 'cold_p8_bulk', 'adaptive'}
+PARTITIONED_MODES = FULL32_MODES | P4_WINDOW_Q_WORKERS.keys() | {'cold', 'cold_p8', 'cold_p8_bulk', 'adaptive'}
 WINDOW_OVERRIDES = {'windows': 3, 'windows_early': 3, 'windows_w2': 2,
                     **dict.fromkeys(WINDOW_Q_WORKERS, 2), 'cold_full_w3': 3, 'cold_full_w2': 2}
 TRACE_ROUTES = dict(p2='p2', **dict.fromkeys(PARTITIONED_MODES, 'small_cold'),
+                    **dict.fromkeys(P2_WINDOW_Q_WORKERS, 'p2'),
                     windows='p2', windows_w2='p2', windows_early='p2', topk='small_topk', get='p2')
 TRACE_ROUTES['adaptive'] = 'small_retired'
 KERNELS = ('v9_li_kernel', 'v9_li_kernel_1', 'v9_li_kernel_2', 'v9_parallel_terminal')
@@ -59,7 +63,7 @@ def cold_score_parts(mode, batch):
     mode = selected_mode(mode, batch)
     if mode in FULL32_MODES:
         return 32 // batch
-    if mode in WINDOW_Q_WORKERS or mode == 'cold':
+    if mode in P4_WINDOW_Q_WORKERS or mode == 'cold':
         return 4
     return 8 if mode in ('cold_p8', 'cold_p8_bulk') else 2
 
@@ -86,7 +90,7 @@ def bind(state, mode):
     symbol_mode = 'cold_full' if mode in FULL32_MODES else mode.removesuffix('_w2').removesuffix('_bulk')
     if retired:
         symbol_mode = 'cold_retired'
-    elif mode in WINDOW_Q_WORKERS:
+    elif mode in P4_WINDOW_Q_WORKERS:
         symbol_mode = 'cold'
     if mode in PARTITIONED_MODES:
         choose = getattr(library, f'kvip_small_batch_{symbol_mode}_parts')

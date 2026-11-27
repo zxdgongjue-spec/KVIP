@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Verify and summarize the P4/W2 vector workers in one source trace."""
+"""Verify and summarize the W2 Top2048 vector workers in one source trace."""
 
 from collections import defaultdict
 
 
+def _p2_w0_aiv(request):
+    return 4 * (request // 2) + request % 2
+
+
 def _owner_aiv(batch, request):
+    if batch == 16:
+        return 32 + _p2_w0_aiv(request)
     if batch == 1:
         return 4 + request
     return 8 * (batch // 2 + request // 2) + request % 2
@@ -13,20 +19,27 @@ def _owner_aiv(batch, request):
 def _worker_aiv(batch, request, worker):
     if worker == 0:
         return _owner_aiv(batch, request)
+    if batch == 16:
+        previous = _p2_w0_aiv(request)
+        return (previous + 2, previous + 34, previous)[worker - 1]
     if batch == 1:
         return (2, 3, 6)[worker - 1]
     return 2 * (4 * (request // 2) + worker) + request % 2
 
 
 def analyze_window_q(source, workers_per_request, batch=2):
-    if batch not in (1, 2, 4, 8) or workers_per_request not in (1, 2, 4):
-        raise ValueError('Unsupported P4/W2 window TopK geometry')
+    if batch not in (1, 2, 4, 8, 16) or workers_per_request not in (1, 2, 4):
+        raise ValueError('Unsupported W2 window TopK geometry')
     phases = defaultdict(list)
+    previous_service = []
     for event in source['traceEvents']:
         args = event.get('args', {})
         if (event.get('ph') == 'X' and args.get('core_type') in ('AIC', 'AIV')
-                and args.get('kernel_id') == 22 and args.get('window_epoch') == 1):
-            phases[args['phase_id']].append(event)
+                and args.get('kernel_id') == 22):
+            if args.get('window_epoch') == 1:
+                phases[args['phase_id']].append(event)
+            elif batch == 16 and args.get('window_epoch') == 0 and args['phase_id'] == 150:
+                previous_service.append(event)
 
     def key(event, field):
         return event['args'][field]
@@ -41,6 +54,12 @@ def analyze_window_q(source, workers_per_request, batch=2):
             or {lane: event['tid'] for lane, event in service_lanes.items()} != expected_lanes):
         raise ValueError('W1 requires one original Service owner per request')
     owners = {row: service_lanes[row] for row in range(batch)}
+    previous_owners = {key(event, 'service_lane'): event for event in previous_service}
+    if batch == 16 and (
+            len(previous_service) != batch
+            or {row: event['tid'] for row, event in previous_owners.items()}
+            != {row: _p2_w0_aiv(row) for row in range(batch)}):
+        raise ValueError('BS16 P2/W2 requires one original W0 Service owner per request')
     posting_phases = {152: 'request_row', 153: 'request_row', 154: 'request_or_service_lane',
                       203: 'request_row', 206: 'request_row'}
     for phase, field in posting_phases.items():
@@ -72,9 +91,11 @@ def analyze_window_q(source, workers_per_request, batch=2):
         score_end = {event['tid']: end_us(event) for event in phases[22]}
         snapshots = {key(event, 'request_row'): end_us(event) for event in phases[251]}
         joins = {key(event, 'request_row'): end_us(event) for event in phases[252]}
-        for (b, _), event in slices.items():
+        for (b, q), event in slices.items():
             if event['tid'] not in score_end or event['ts'] < score_end[event['tid']]:
                 raise ValueError('W1 TopK worker started before finishing its Score scan')
+            if batch == 16 and q // width == 3 and event['ts'] < end_us(previous_owners[b]):
+                raise ValueError('W0 Service owner began W1 TopK before finishing W0 Service')
             if event['ts'] < snapshots[b] or end_us(event) > joins[b]:
                 raise ValueError('W1 TopK worker ran outside the owner snapshot and join')
         for phase, field in posting_phases.items():
@@ -103,6 +124,11 @@ def analyze_window_q(source, workers_per_request, batch=2):
              source_duration_us=event['dur'], details=event['args'])
         for phase in selected_phases for event in phases[phase]
     ]
+    scopes.extend(
+        dict(phase=150, core=event['tid'], source_start_us=event['ts'],
+             source_duration_us=event['dur'], details=event['args'])
+        for event in previous_service
+    )
     def max_owner_total(phase):
         totals = defaultdict(float)
         for event in phases[phase]:
@@ -112,6 +138,7 @@ def analyze_window_q(source, workers_per_request, batch=2):
     return dict(
         w1_topk_worker_aivs=len(slices) if expected else len(owners),
         w1_service_owner_aivs=len(owners),
+        w1_reused_w0_owner_aivs=batch if batch == 16 and workers_per_request == 4 else 0,
         w1_empty_service_lanes=len(service_lanes) - len(owners),
         w1_after_last_aiv_score_scan_us=max(0, latest_service - latest_aiv),
         w1_after_last_aic_qk_scan_us=max(0, latest_service - latest_aic),

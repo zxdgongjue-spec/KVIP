@@ -915,14 +915,22 @@ between prefetch and final Get, so inspect the Get evidence with timing.
 
 ### W1 query scheduling A5 matrix
 
-`--window-q-matrix` runs BS1/2/4/8 at Q4, history 128K, resident 16K
+`--window-q-matrix` runs BS1/2/4/8/16 at Q4, history 128K, resident 16K
 and miss 10%. Each performance comparison includes the unmodified main
-P2 from `df8ad2598e70e4b5e266b15028ab26c601a2bdf2`, P4/W2 serial Q4,
-P4/W2 Q2+Q2 and P4/W2 four-way Q1. Main uses effective W2 for BS1 and
-W4 for BS2/4/8. The P4/W2 arms use 4/8/16/32 Cold MIX groups and the
-same Hot P2. The number of W1 Top2048 AIVs per request is 1/2/4 for
-serial Q4, Q2+Q2 and four-way Q1, respectively.
-All arms preserve the 512/request and 128/window prefetch limits.
+P2 from `df8ad2598e70e4b5e266b15028ab26c601a2bdf2` and three W2
+arms for serial Q4, Q2+Q2 and four-way Q1. Main uses effective W2 for
+BS1 and W4 for BS2/4/8/16. The BS1/2/4/8 study uses P4, which gives
+4/8/16/32 Cold MIX groups. BS16 uses P2/W2 with 32 Cold MIX groups and
+eight Service groups per window. Both windows retain one Service AIV
+per request. Q2+Q2 uses the W1 owner and one finished Score AIV.
+Four-way Q1 adds a second Score AIV and the former W0 owner after both
+its W0 Service and its Cold Score finish. The W1 owner submits WQE
+after joining all query slices.
+
+All arms use Hot P2, the same admission rank and the same prefetch
+limits of 512 per request and 128 per window. W2 has two submission
+opportunities, so its maximum early volume is 256 requests per row.
+Use the same-geometry W2 comparisons to isolate query scheduling.
 
 On the host, fetch and check out the MR branch and prepare a separate
 main checkout in the existing shared directory.
@@ -953,8 +961,9 @@ bash "$runner" --window-q-matrix --main-root "$base/third_party/KVIP-main-df8ad2
 bash "$runner" --window-q-matrix --trace
 ```
 
-Pass `--batch 1`, `--batch 2`, `--batch 4` or `--batch 8` to select
-one batch, or repeat the option to select several. Performance
+Pass `--batch 1`, `--batch 2`, `--batch 4`, `--batch 8` or
+`--batch 16` to select one batch, or repeat the option to select several.
+Performance
 `summary.csv` records Graph Event KV ready, phase durations and Get
 counts, with `vs_main_*` and `vs_serial_q4_*` comparisons. The main
 and experimental workers build in separate checkouts and are matched
@@ -962,8 +971,9 @@ on the fixture hash and per-call request evidence. A comparison with
 different Get counts is recorded as observed timing with its workload
 difference.
 
-The separate trace run captures the three P4/W2 arms. Each
+The separate trace run captures the three fixed-geometry W2 arms. Each
 `window_q_report.json` includes the Score tail, Top2048, owner join,
-candidate MTE2, dedup VF issue and WQE submission. Use the corresponding
+candidate MTE2, dedup VF issue and WQE submission. For BS16, the report
+also verifies W0 owner timing before W1 reuse. Use the corresponding
 `lifetch_msprof_trace.json` to inspect vector execution alongside the
 source issue scope.

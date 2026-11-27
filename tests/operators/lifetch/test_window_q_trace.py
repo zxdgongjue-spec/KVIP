@@ -10,21 +10,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'experiments/lifetc
 from window_q_trace import analyze_window_q  # noqa: E402
 
 
-def span(phase, tid, ts, dur, **detail):
+def span(phase, tid, ts, dur, *, epoch=1, **detail):
     return dict(ph='X', tid=tid, ts=ts, dur=dur, args=dict(
-        core_type='AIC' if tid >= 64 else 'AIV', kernel_id=22, window_epoch=1, phase_id=phase, **detail))
+        core_type='AIC' if tid >= 64 else 'AIV', kernel_id=22, window_epoch=epoch, phase_id=phase, **detail))
 
 
 OWNER_AIVS = {1: (4,), 2: (8, 9), 4: (16, 17, 24, 25),
-              8: (32, 33, 40, 41, 48, 49, 56, 57)}
+              8: (32, 33, 40, 41, 48, 49, 56, 57),
+              16: (32, 33, 36, 37, 40, 41, 44, 45, 48, 49, 52, 53, 56, 57, 60, 61)}
 
 
 def window_trace(workers, batch=2):
-    spans = [span(21, 64, 0, 20), *(span(22, tid, 0, 30) for tid in range(8 * batch))]
+    score_aivs = (4 if batch == 16 else 8) * batch
+    spans = [span(21, 64, 0, 20), *(span(22, tid, 0, 30) for tid in range(score_aivs))]
     if batch == 1:
         spans.append(span(150, 5, 25, 40, service_lane=1))
     width = 4 // workers
     for request, owner in enumerate(OWNER_AIVS[batch]):
+        if batch == 16:
+            spans.append(span(150, owner - 32, 0, 10, epoch=0, service_lane=request))
         spans.extend([
             span(150, owner, 25, 50, service_lane=request),
             span(154, owner, 70, 2, request_or_service_lane=request),
@@ -36,8 +40,12 @@ def window_trace(workers, batch=2):
             ])
         for first in range(0, 4, width):
             slot = first // width
-            peers = (2, 3, 6) if batch == 1 else tuple(
-                8 * (request // 2) + n + request % 2 for n in (2, 4, 6))
+            if batch == 16:
+                peers = (owner - 30, owner + 2, owner - 32)
+            elif batch == 1:
+                peers = (2, 3, 6)
+            else:
+                peers = tuple(8 * (request // 2) + n + request % 2 for n in (2, 4, 6))
             worker = owner if slot == 0 else peers[slot - 1]
             if workers > 1:
                 spans.append(span(253, worker, 35, 12, request_row=request, query=first))
@@ -58,13 +66,14 @@ def test_w1_assignment_and_tail(workers):
     assert metrics['w1_per_q_topk_spans'] == 7
 
 
-@pytest.mark.parametrize('batch', (1, 4, 8))
+@pytest.mark.parametrize('batch', (1, 4, 8, 16))
 @pytest.mark.parametrize('workers', (1, 2, 4))
 def test_w1_matrix_assignments(batch, workers):
     metrics, _ = analyze_window_q(window_trace(workers, batch), workers, batch)
     assert metrics['w1_topk_worker_aivs'] == batch * workers
     assert metrics['w1_service_owner_aivs'] == batch
     assert metrics['w1_empty_service_lanes'] == (batch == 1)
+    assert metrics['w1_reused_w0_owner_aivs'] == (16 if batch == 16 and workers == 4 else 0)
     assert metrics['w1_per_q_topk_spans'] == batch * 4 - 1
 
 
@@ -95,3 +104,11 @@ def test_wqe_waits_for_worker_join():
     next(e for e in source['traceEvents'] if e['args']['phase_id'] == 154)['ts'] = 51
     with pytest.raises(ValueError, match='before the TopK join'):
         analyze_window_q(source, 2)
+
+
+def test_bs16_w0_owner_must_finish_before_helping_w1():
+    source = window_trace(4, 16)
+    w0 = next(e for e in source['traceEvents'] if e['args']['window_epoch'] == 0)
+    w0['dur'] = 40
+    with pytest.raises(ValueError, match='before finishing W0 Service'):
+        analyze_window_q(source, 4, 16)
