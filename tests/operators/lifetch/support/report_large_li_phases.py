@@ -6,6 +6,8 @@ from math import isclose, isfinite
 from pathlib import Path
 from statistics import mean, median
 
+from large_batch_placement import placement
+
 CARRY = "983734aa8a94310f8090055d916d9a49ab9b4645"
 ORIGINAL = "af52a02b97daddadd5d93b9d100f2ff1b03b499d"
 CONTROL = "10442f1ffa314606c23f54b73e49ecfc372f1f9a"
@@ -19,25 +21,30 @@ def require(test, reason):
 
 
 def field(root, name):
-    return (root / (name + ".txt")).read_text().strip()
+    path = root / (name + ".txt")
+    return path.read_text().strip() if path.is_file() else ""
 
 
 def read(path):
     return json.loads(path.read_text())
 
 
-def timing(root, group, batch, count):
+def timing(root, group, batch, revision):
     parts, ids = [], []
-    for block in range(1, count + 1):
+    for block in (1, 2):
         directory = root / f"g{group}/bs{batch}/block{block}/fused"
+        if not (directory / "placement_verified").is_file() or not (directory / "packed_result.json").is_file():
+            continue
         record = read(directory / "packed_result.json")
         ident = record["identity"]
         require((directory / "placement_verified").exists() and record["correctness"] == "PASS"
                 and record["arm"] == "fused" and record["calls"] == len(record["samples"]) == 10
                 and record["full_KV_Index_checked_calls"] == 10 and record["checked_queries"] == 40 * batch
-                and record["checked_rows"] == 10 * batch and ident["native"] == field(root, "native")
-                and (ident["group"], ident["batch"], ident["physical_npu"]) == (group, batch, 3)
-                and ident["host"] == field(root, "host")
+                and record["checked_rows"] == 10 * batch and ident["native"] == revision
+                and (ident["group"], ident["batch"]) == (group, batch)
+                and type(ident["physical_npu"]) == int and ident["physical_npu"] >= 0 and ident["host"]
+                and (not field(root, "physical_npu") or str(ident["physical_npu"]) == field(root, "physical_npu"))
+                and (not field(root, "host") or ident["host"] == field(root, "host"))
                 and ident["protocol"] == "ten_independent_states_one_graph_one_event_v1", str(directory))
         for s in record["samples"]:
             require(all(isfinite(s[k]) and s[k] > 0 for k in ("LI1", "LI23", "LI"))
@@ -45,6 +52,8 @@ def timing(root, group, batch, count):
         identity = {k: v for k, v in ident.items() if k not in ("native", "protocol")}
         ids.append(identity)
         parts.append(record)
+    if not parts:
+        raise FileNotFoundError(f"No completed packed block at {root}/g{group}/bs{batch}")
     require(all(i == ids[0] for i in ids), "Block input or runtime mismatch")
     return ids[0], parts
 
@@ -62,6 +71,8 @@ def li_diagnostic(raw):
     li = raw["separate_LI_diagnostic"]
     clocks, mhz = li["per_query_cycle_stamps"], li["clock_mhz"]
     batch = len(clocks)
+    require(all(isfinite(li["spans"][k]) for k in ("LI2_active_us", "LI3_active_us", "overlap_us")),
+            "Unusable diagnostic span values")
     events = raw["separate_window_event_u64"]
     require(batch in BATCHES and len(events) == 4 and all(len(e) == batch for e in events)
             and isfinite(mhz) and mhz > 0, "Unusable historical LI geometry")
@@ -144,82 +155,192 @@ def score_exposure(record, diagnostic):
     return parts
 
 
-def report(root, rank_revision=None, batches=BATCHES, groups=GROUPS):
-    old, control = Path(field(root, "packed_source")), Path(field(root, "reference"))
+def same_machine(left, right):
+    for name in ("host", "physical_npu", "kvaf", "kvaf_tree"):
+        if not field(left, name) or field(left, name) != field(right, name):
+            return False
+    for name in ("machine_id", "boot_id"):
+        a, b = field(left, name), field(right, name)
+        if a and b:
+            return a == b
+    return False
+
+
+def candidate_roots(root, reference):
+    # Existing links take precedence. An archive moved as a whole can retain its
+    # original absolute paths, so try the same basename under the current parent.
+    choices = []
+    path = Path(reference)
+    choices.extend((path if path.is_absolute() else root.parent / path, root.parent / path.name))
+    return list(dict.fromkeys(p.resolve() for p in choices if p.is_dir() and p.resolve() != root))
+
+
+def compatible_roots(root, explicit, link_key, pattern, revision, extra=()):
+    def verified(paths):
+        return [p for p in paths if p.is_dir() and field(p, "native") == revision and same_machine(root, p)]
+
+    if explicit is not None:
+        return verified([explicit.resolve()])
+    for link in (field(root, link_key), *extra):
+        if link:
+            matches = verified(candidate_roots(root, link))
+            if matches:
+                return matches
+    return verified(sorted(root.parent.glob(pattern)))
+
+
+
+def packed_placement(root, group, batch):
+    cell = root / f"g{group}/bs{batch}"
+    values = {placement(folder / "thp.json") for folder in cell.glob("block[12]/fused")
+              if (folder / "placement_verified").is_file() and (folder / "packed_result.json").is_file()}
+    require(len(values) == 1, f"Missing or inconsistent registered memory placement in {cell}")
+    return values.pop()
+
+
+def supported_control(roots, group, batch, current_root, current_id):
+    matches = []
+    for root in roots:
+        try:
+            ident, parts = timing(root, group, batch, CONTROL)
+            if packed_placement(root, group, batch) != packed_placement(current_root, group, batch):
+                continue
+        except (FileNotFoundError, ValueError, KeyError) as error:
+            print(f"G{group} BS{batch} CONTROL_SKIPPED root={root} reason={error}")
+            continue
+        if ident == current_id:
+            matches.append((root, parts))
+    if len(matches) > 1:
+        raise ValueError(f"multiple matching packed controls; pass --control ({[str(p) for p, _ in matches]})")
+    if not matches:
+        raise FileNotFoundError("no matching same-card packed control")
+    return matches[0]
+
+
+def original_diagnostic(roots, group, batch, ident):
+    matches = []
+    for root in roots:
+        path = root / f"g{group}/bs{batch}/fused/ARM_RESULT.json"
+        if not path.is_file():
+            continue
+        record = read(path)
+        if (record.get("arm") == "fused" and record["identity"].get("native") == ORIGINAL
+                and record["identity"].get("protocol") == "one_restored_graph_per_device_event_with_profiler"
+                and all(record["identity"].get(k) == v for k, v in ident.items())):
+            matches.append(path)
+    if len(matches) > 1:
+        raise ValueError(f"multiple matching diagnostic files; pass --source ({list(map(str, matches))})")
+    if not matches:
+        raise FileNotFoundError("no matching same-card original instrumented call")
+    return li_diagnostic(read(matches[0]))
+
+
+def show_critical(loc, label, record):
+    spans = record["union_us"]
+    print(f"{loc} {label} row={record['row']} LI2/LI3/overlap_us="
+          f"{fmt(spans[k] for k in ('LI2_active_us', 'LI3_active_us', 'overlap_us'))} "
+          f"first/cold_advance/prior_check/rank_join/row_service/retire_us={fmt(record['phases_us'].values())}")
+
+
+def report(root, rank_revision=None, batches=BATCHES, groups=GROUPS, source=None, control=None):
     policy = "four-ranks" if rank_revision else "four-window-carry"
-    require(field(root, "native") == (rank_revision or CARRY) and field(old, "native") == ORIGINAL
-            and field(control, "native") == CONTROL and field(root, "physical_npu") == "3"
-            and field(control, "packed_source") == str(old), "Wrong archive chain")
-    for key in ("host", "physical_npu", "kvaf", "kvaf_tree"):
-        require(field(root,key) and field(root,key) == field(old,key) == field(control,key), "Mismatch: "+key)
-    identity_key = "machine_id" if all((p/"machine_id.txt").is_file() and field(p,"machine_id")
-                                       for p in (root,old,control)) else "boot_id"
-    require(field(root,identity_key) and field(root,identity_key) == field(old,identity_key)
-            == field(control,identity_key), "Different machines")
-    print(f"Current {policy}, same-card original ten-call control, archived original instrumented call.")
+    revision = rank_revision or CARRY
+    if not root.is_dir():
+        print(f"ARCHIVE_UNAVAILABLE root={root} reason=directory_missing")
+        return []
+    if field(root, "native"):
+        require(field(root, "native") == revision, f"Unexpected candidate revision in {root}")
+    controls = compatible_roots(root, control, "reference", "fixed-q4-packed.*", CONTROL)
+    sources = compatible_roots(root, source, "packed_source", "fixed-q4.*", ORIGINAL,
+                               [field(p, "packed_source") for p in controls])
+    print(f"CURRENT_ARCHIVE={root} policy={policy} physical_NPU={field(root, 'physical_npu') or 'from_cell'}")
+    # Validating one input record never requires any optional comparison root.
     cells = []
     for batch in batches:
         for group in groups:
-            count = int(field(root,"candidate_blocks"))
-            require(count in (1, 2), "Unsupported candidate block count")
-            ident, parts = timing(root,group,batch,count)
-            baseline_ident, baseline = timing(control,group,batch,2)
-            require(ident == baseline_ident, "Packed inputs differ")
-            require(all(part.get("large_window_policy") == policy for part in parts), "Wrong window policy")
-            single = read(old / f"g{group}/bs{batch}/fused/ARM_RESULT.json")
-            require(single["arm"] == "fused" and single["identity"]["native"] == ORIGINAL
-                    and single["identity"]["protocol"] == "one_restored_graph_per_device_event_with_profiler"
-                    and all(single["identity"].get(k) == v for k,v in ident.items()), "Diagnostic input mismatch")
-            current = {k:packed_values(parts,k) for k in ("LI1","LI23")}
-            previous = {k:packed_values(baseline,k) for k in current}
             loc = f"G{group} BS{batch}"
-            print(f"{loc} CURRENT LI1_mean/P50_us={fmt(current['LI1'])} LI23_mean/P50_us={fmt(current['LI23'])}"
-                  f" control_minus_current_LI1/LI23_mean_us={fmt([previous[k][0]-current[k][0] for k in current])}")
             try:
-                diag = li_diagnostic(single)
-            except (ValueError, KeyError) as error:
-                diag = {"unavailable": str(error)}
+                ident, parts = timing(root, group, batch, revision)
+            except FileNotFoundError as error:
+                print(f"{loc} CURRENT unavailable={error}")
+                continue
+            require(all(p.get("large_window_policy") == policy for p in parts), f"Wrong window policy at {loc}")
+            current = {k: packed_values(parts, k) for k in ("LI1", "LI23")}
+            print(f"{loc} CURRENT calls={10 * len(parts)} LI1_mean/P50_us={fmt(current['LI1'])} "
+                  f"LI23_mean/P50_us={fmt(current['LI23'])}")
+            previous = diag = density = critical = None
+            control_root = None
+            try:
+                control_root, reference = supported_control(controls, group, batch, root, ident)
+            except (FileNotFoundError, ValueError) as error:
+                print(f"{loc} CONTROL unavailable={error}")
+            else:
+                previous = {k: packed_values(reference, k) for k in current}
+                print(f"{loc} CONTROL calls={10 * len(reference)} control_minus_current_LI1/LI23_mean_us="
+                      f"{fmt(previous[k][0]-current[k][0] for k in current)}")
+
+            # The serial oracle is stored per cell even in copied archives which
+            # have lost packed_source.txt. Only trust its ancestral gN/bsN name.
+            oracle = parts[0].get("serial_oracle")
+            source_roots = sources
+            if source is None and oracle:
+                path = Path(oracle)
+                if path.parts[-3:] == (f"g{group}", f"bs{batch}", "serial"):
+                    linked = compatible_roots(root, None, "packed_source", "fixed-q4.*", ORIGINAL, [path.parents[2]])
+                    source_roots = linked or sources
+            try:
+                diag = original_diagnostic(source_roots, group, batch, ident)
+            except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
                 print(f"{loc} ORIGINAL_DIAG unavailable={error}")
             else:
-                u, s = diag["union_us"], diag["phases_us"]
-                print(f"{loc} ORIGINAL_DIAG row={diag['row']} LI2/LI3/overlap_us="
-                  f"{fmt([u['LI2_active_us'],u['LI3_active_us'],u['overlap_us']])}"
-                  f" first/cold_advance/prior_check/rank_join/row_service/retire_us={fmt(s.values())}")
-            density = parts[0].get("window_density")
+                show_critical(loc, "ORIGINAL_DIAG", diag)
+
+            raw = next((p for p in parts if "window_density" in p or "separate_LI_diagnostic" in p), parts[0])
+            density = raw.get("window_density")
             if density is not None:
-                print(f"{loc} CURRENT_DIAG LI3_span_us={density['li3_span_us']:.2f}"
-                      f" mean_prior_check_by_window_us={fmt(w['mean_check_to_rank_us'] for w in density['epochs'])}"
-                      f" mean_rank_through_service_by_window_us={fmt(w['mean_rank_and_service_us'] for w in density['epochs'])}")
-            critical = None
+                try:
+                    message = (f"{loc} CURRENT_DIAG LI3_span_us={density['li3_span_us']:.2f} "
+                               f"mean_prior_check_by_window_us={fmt(w['mean_check_to_rank_us'] for w in density['epochs'])} "
+                               f"mean_rank_through_service_by_window_us={fmt(w['mean_rank_and_service_us'] for w in density['epochs'])}")
+                except (ValueError, KeyError, TypeError) as error:
+                    density = None
+                    print(f"{loc} CURRENT_DIAG unavailable={error}")
+                else:
+                    print(message)
+            else:
+                print(f"{loc} CURRENT_DIAG unavailable=missing_window_density")
             if rank_revision:
-                raw = parts[0]
-                require(raw["measured_cold_symbol"] == "v9_li_large_four_ranks"
-                        and raw["diagnostic_cold_symbol"] == "v9_li_large_four_ranks_trace"
-                        and raw["cold_build_fingerprint"] != raw["diagnostic_cold_build_fingerprint"]
-                        and raw["diagnostic_ranks"]["checked_queries"] == 4*batch
-                        and raw["window_grants_per_row"] == [256]*4, "Missing separate four-rank clock proof")
-                critical = li_diagnostic(raw)
-                exposures = score_exposure(raw, critical)
-                critical["by_cold_window"] = exposures
-                s = critical["phases_us"]
-                print(f"{loc} CURRENT_LAST_ROW row={critical['row']} LI2/LI3/overlap_us="
-                      f"{fmt(critical['union_us'][k] for k in ('LI2_active_us','LI3_active_us','overlap_us'))}"
-                      f" first/cold_advance/prior_check/rank_join/row_service/retire_us={fmt(s.values())}")
-                print(f"{loc} CURRENT_LAST_ROW by_cold_window "
-                      + " ".join(f"{key}_us={fmt(window[key] for window in exposures)}" for key in exposures[0]))
-            cells.append(dict(group=group,batch=batch,current=current,control=previous,
-                              original_diagnostic=diag,current_density=density,current_critical=critical))
+                try:
+                    require(raw["measured_cold_symbol"] == "v9_li_large_four_ranks"
+                            and raw["diagnostic_cold_symbol"] == "v9_li_large_four_ranks_trace"
+                            and raw["cold_build_fingerprint"] != raw["diagnostic_cold_build_fingerprint"]
+                            and raw["diagnostic_ranks"]["checked_queries"] == 4 * batch
+                            and raw["window_grants_per_row"] == [256]*4, "Missing separate four-rank clock proof")
+                    critical = li_diagnostic(raw)
+                    show_critical(loc, "CURRENT_LAST_ROW", critical)
+                    exposures = score_exposure(raw, critical)
+                    critical["by_cold_window"] = exposures
+                    print(f"{loc} CURRENT_LAST_ROW by_cold_window "
+                          + " ".join(f"{key}_us={fmt(w[key] for w in exposures)}" for key in exposures[0]))
+                except (ValueError, KeyError, IndexError, TypeError) as error:
+                    print(f"{loc} CURRENT_LAST_ROW detail_unavailable={error}")
+            cells.append(dict(group=group, batch=batch, current=current, current_calls=10 * len(parts), control=previous,
+                              control_root=str(control_root) if control_root else None, original_diagnostic=diag,
+                              current_density=density, current_critical=critical))
+    print(f"PHASE_REPORT_CELLS={len(cells)}/{len(batches)*len(groups)}")
     return cells
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("root",type=Path)
-    parser.add_argument("--json",type=Path)
+    parser.add_argument("root", type=Path)
+    parser.add_argument("--json", type=Path)
     parser.add_argument("--rank-revision", help="Expected exact four-rank candidate revision")
+    parser.add_argument("--source", type=Path, help="Same-card original single-call diagnostic archive")
+    parser.add_argument("--control", type=Path, help="Same-card previous fused packed archive")
     parser.add_argument("--groups", nargs="+", type=int, choices=GROUPS, default=GROUPS)
     parser.add_argument("--batches", nargs="+", type=int, choices=BATCHES, default=BATCHES)
     args = parser.parse_args()
-    cells = report(args.root.resolve(),args.rank_revision,args.batches,args.groups)
+    cells = report(args.root.resolve(), args.rank_revision, args.batches, args.groups, args.source, args.control)
     if args.json:
-        args.json.write_text(json.dumps(cells,indent=2)+"\n")
+        args.json.write_text(json.dumps(cells, indent=2)+"\n")

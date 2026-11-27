@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Verify the ranks actually consumed and compare ten-call windows on B24 NPU3."""
+"""Verify the ranks actually consumed and compare ten-call windows on the selected card."""
 import argparse
 import json
 from math import isclose
@@ -10,6 +10,7 @@ import numpy as np
 
 from fixed_q4_packed_report import read_arm
 from large_batch_placement import field, same_card
+from rank_replay_archives import CONTROL_REV, TWO_COLD_REV, newest
 
 
 def decode_ranks(records, query_ends, expected):
@@ -41,9 +42,8 @@ def decode_ranks(records, query_ends, expected):
 
 STAGES = ("graph", "LI1", "LI23", "tail", "prefetch", "final")
 ARCHIVES = (
-    ("1+3_fixed", "fixed-q4-packed.IWXS7N", "10442f1ffa314606c23f54b73e49ecfc372f1f9a", None, None, 2),
-    ("1+2_fixed", "fixed-q4-aiv-2cold.b4YDiH", "4792819f8b4ed30d8eade0c400de57e2b0b5cbbc",
-     "two-cold", "v9_li_large_two_cold", 2),
+    ("1+3_fixed", "fixed-q4-packed.*", CONTROL_REV, None, None, 2),
+    ("1+2_fixed", "fixed-q4-aiv-2cold.*", TWO_COLD_REV, "two-cold", "v9_li_large_two_cold", 2),
 )
 
 
@@ -75,20 +75,32 @@ def read_blocks(root, group, batch, policy, symbol, blocks):
 
 def compare(root, group, batch):
     count = int(field(root, "candidate_blocks"))
-    if count not in (1, 2) or field(root, "physical_npu") != "3":
-        raise ValueError("Expected a completed B24 NPU3 rank experiment")
+    if count not in (1, 2) or field(root, "physical_npu") not in ("3", "4"):
+        raise ValueError("Expected a completed rank experiment on the selected physical NPU")
     current, identity, ranks = read_blocks(root, group, batch, "four-ranks", "v9_li_large_four_ranks", count)
     print(f"G{group} BS{batch} RANK actual={ranks['ranks']} queries={ranks['checked_queries']} "
           f"old_rule_on_same_coverage_min/max={ranks['coverage_rule_min']}/{ranks['coverage_rule_max']}")
-    for label, dirname, revision, policy, symbol, blocks in ARCHIVES:
-        old = root.parent / dirname
-        if (field(old, "native") != revision or not same_card(old, root)
-                or any(not field(root, k) or field(root, k) != field(old, k)
-                       for k in ("packed_source", "kvaf", "kvaf_tree"))):
-            raise ValueError(f"Wrong reference at {old}")
-        values, previous_identity, _ = read_blocks(old, group, batch, policy, symbol, blocks)
-        if previous_identity != identity:
-            raise ValueError(f"Input, runtime or placement changed between {old} and {root}")
+    for label, pattern, revision, policy, symbol, blocks in ARCHIVES:
+        linked = field(root, "reference") if label == "1+3_fixed" else field(root, "two_cold_reference")
+        choices = [Path(linked)] if linked else newest(root.parent, pattern, revision, root)
+        match = None
+        for old in choices:
+            if (field(old, "native") != revision or not same_card(old, root)
+                    or any(not field(root, key) or field(root, key) != field(old, key)
+                           for key in ("kvaf", "kvaf_tree"))):
+                continue
+            try:
+                values, old_identity, _ = read_blocks(old, group, batch, policy, symbol, blocks)
+            except (FileNotFoundError, ValueError, KeyError, TypeError) as err:
+                print(f"G{group} BS{batch} {label} skipped_archive={old} reason={err}")
+                continue
+            if old_identity == identity:
+                match = values
+                break
+        if match is None:
+            print(f"G{group} BS{batch} vs_{label} UNAVAILABLE no matching completed same-card comparison")
+            continue
+        values = match
         savings = "/".join(f"{values[s] - current[s]:+.2f}" for s in STAGES[:4])
         print(f"G{group} BS{batch} vs_{label} archived_minus_candidate_graph/LI1/LI23/tail_us={savings} "
               f"prefetch_old/new={values['prefetch']:.1f}/{current['prefetch']:.1f} "

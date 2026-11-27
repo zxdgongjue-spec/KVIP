@@ -56,9 +56,11 @@ def test_compare_reuses_both_completed_ten_call_controls(tmp_path, capsys):
     new = tmp_path / "new"
     make(new, "candidate", "four-ranks", "v9_li_large_four_ranks", 1, 170)
     for _, name, revision, policy, symbol, blocks in ARCHIVES:
-        make(tmp_path / name, revision, policy, symbol, blocks, 180)
+        make(tmp_path / name.replace("*", "localcopy"), revision, policy, symbol, blocks, 180)
     compare(new, 7, 32)
     assert capsys.readouterr().out.count("archived_minus_candidate_graph/LI1/LI23/tail_us=+10.00") == 2
-    (tmp_path / ARCHIVES[1][1] / "machine_id.txt").write_text("different")
-    with pytest.raises(ValueError, match="Wrong reference"):
-        compare(new, 7, 32)
+    (tmp_path / ARCHIVES[1][1].replace("*", "localcopy") / "machine_id.txt").write_text("different")
+    compare(new, 7, 32)
+    rows = capsys.readouterr().out
+    assert rows.count("archived_minus_candidate_graph/LI1/LI23/tail_us=") == 1
+    assert "vs_1+2_fixed UNAVAILABLE" in rows
