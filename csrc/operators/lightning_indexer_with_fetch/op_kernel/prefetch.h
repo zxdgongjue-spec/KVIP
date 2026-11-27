@@ -644,7 +644,12 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         const uint32_t lower=ctx->lruSlots?0:rt_resident;
         uint32_t candidateCount=0;
         uint32_t available=requests<ctx->prefetchLimit?ctx->prefetchLimit-requests:0;
-        if(available>ctx->windowLimit)available=ctx->windowLimit;
+#if KVIP_LARGE_FOUR_WINDOW_CREDIT
+        const uint32_t windowLimit=large_li::WindowGrant(rt_rounds,epoch,ctx->windowLimit,ctx->prefetchLimit,requests);
+#else
+        const uint32_t windowLimit=ctx->windowLimit;
+#endif
+        if(available>windowLimit)available=windowLimit;
         V9_FETCH_PROFILE(scanBegin=GetSystemCycle();)
         // Counts occupy spare incremental metadata, exported alongside TopK.
         GlobalTensor<uint32_t> metadata,compact;

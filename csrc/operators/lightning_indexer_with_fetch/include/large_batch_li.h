@@ -16,6 +16,15 @@ LARGE_LI_DEVICE constexpr uint32_t CeilDiv(uint32_t x, uint32_t n) {
     return x / n + uint32_t(x % n != 0);
 }
 
+// Each of the four windows earns 256 GETs for its request. Only unused
+// credit carries forward. Callers separately enforce the total row budget.
+LARGE_LI_DEVICE constexpr uint32_t WindowGrant(uint32_t rounds, uint32_t epoch, uint32_t step,
+                                              uint32_t rowLimit, uint32_t used) {
+    if (rounds != 4 || step != 256 || rowLimit != 1024) return step;
+    const uint32_t earned = (epoch + 1) * step;
+    return used < earned ? earned - used : 0;
+}
+
 // LI2 writes 1 to the query's own readiness line. After the final window a
 // producer may publish the exact number of compact IDs (including zero).
 constexpr uint32_t kStagedBase = 2;

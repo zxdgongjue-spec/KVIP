@@ -2,6 +2,9 @@
 // translation unit. Each block is a resident group of one cube and two vectors.
 #define KVIP_URMA_WINDOW_LI 1
 #define KVIP_LARGE_BATCH_LI 1
+#if !KVIP_BS32_SCORE_WINDOW_ROLES
+#define KVIP_LARGE_FOUR_WINDOW_CREDIT 1
+#endif
 #include "large_batch_li.h"
 #include "terminal/window_types.h"
 #include "terminal/terminal_runtime_abi.h"

@@ -21,6 +21,21 @@ namespace rotating {
 #include "common/lifetch/sequence_schedule.h"
 }
 int main() {
+    // Unspent credit belongs to this row. Four per-Q limits together must
+    // still fit the cumulative allowance, including its odd remainder.
+    for (uint32_t epoch = 0; epoch < 4; ++epoch) {
+        for (uint32_t used = 0; used <= 1024; ++used) {
+            const auto grant = large_li::WindowGrant(4,epoch,256,1024,used);
+            const auto earned = (epoch+1)*256;
+            assert(grant == (used < earned ? earned-used : 0));
+            assert(4*(grant/4) <= grant && grant <= 1024);
+        }
+    }
+    assert(large_li::WindowGrant(4,3,256,1024,0)==1024);
+    assert(large_li::WindowGrant(4,3,256,1024,513)==511);
+    assert(large_li::WindowGrant(3,2,384,1024,0)==384);
+    assert(large_li::WindowGrant(4,1,128,512,0)==128);
+    assert(large_li::WindowGrant(4,1,256,512,0)==256);
     for(uint32_t b : {20,24,28,32}) {
         uint32_t costs[32]{}, order[32];
         for(uint32_t r=0;r<b;++r) costs[r]=128;

@@ -59,6 +59,9 @@ bool mappedExport_=false;uint32_t mappedValid_=0;
 // QLIVector member: called after ID recovery while the complete Q is in UB.
 bool exportWindowCold_=false;bool rankTrace_=false;
 uint32_t rankedEpoch_=0;bool windowCoveredEmpty_=false;
+#if KVIP_LARGE_FOUR_WINDOW_CREDIT
+uint32_t windowQueryGrant_=0;
+#endif
 __aicore__ inline uint32_t WindowRank(__gm__ rotating::Context* ctx, uint32_t valid,
     uint32_t end0, uint32_t end1, uint32_t half, kvip_recent_index::Range recent, uint32_t& covered) const {
     const auto resident = runtimeShape_.resident;
@@ -94,6 +97,10 @@ __aicore__ inline void ExportWindowCold(uint32_t query, uint32_t cutoff = 0) {
         ctx->incremental,runtimeShape_.batch,runtimeShape_.history,b));
     uint64_t rankClocks[5];
     uint32_t bitmapLength=runtimeShape_.history, limit=ctx->windowLimit/4, minimum=limit/2, rankCut=UINT32_MAX;
+#if KVIP_LARGE_FOUR_WINDOW_CREDIT
+    // Keep the same score rank and minimum exploration when the limit grows.
+    if (rankedEpoch_ && rankedEpoch_ < runtimeShape_.rounds) limit = windowQueryGrant_;
+#endif
 #if defined(KVIP_EXPERIMENT_TWO_COLD)
     // Four Qs share this row's first-window grant; later grants use windowLimit.
     if (rankedEpoch_ == 0 && limit > 64) {
