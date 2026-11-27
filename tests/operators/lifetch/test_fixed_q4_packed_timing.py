@@ -143,6 +143,16 @@ class PackedAttribution(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires BS32"):
             packed_account(events, "scope", 1000, batch=24, fused=True, expected_li23=symbol)
 
+    def test_credit_profile_requires_all_ten_dedicated_cold_launches(self):
+        name = "v9_li_large_four_window_credit"
+        events = fixture(["v9_li_large_hot", name, "v9_parallel_terminal_large"])
+        for batch in (20, 24, 28, 32):
+            with self.subTest(batch=batch):
+                self.assertEqual(packed_account(events, "scope", 1000, batch=batch, fused=True, expected_li23=name)["calls"], 10)
+        next(e for e in events if e["name"].startswith(name))["name"] = "v9_li_large_threshold_cold"
+        with self.assertRaisesRegex(ValueError, "Unattributed"):
+            packed_account(events, "scope", 1000, batch=32, fused=True, expected_li23=name)
+
     def test_stage_p50_uses_the_ten_observed_spans(self):
         events = fixture(["v9_li_large_hot", "v9_li_large_threshold_cold", "v9_parallel_terminal_large"])
         tails = [e for e in events if e["name"].startswith("v9_parallel_terminal")]

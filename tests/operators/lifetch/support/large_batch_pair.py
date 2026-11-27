@@ -56,7 +56,7 @@ def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False, exp
     base = Decimal(str(spans[0]["ts"]))
     duration = float(spans[0]["dur"])
     names = (
-        {"LI1": ("v9_li_large_hot",), "LI23": ("v9_li_large_threshold_cold", "v9_li_large_two_cold"), "tail": ("v9_parallel_terminal_large",)}
+        {"LI1": ("v9_li_large_hot",), "LI23": ("v9_li_large_threshold_cold", "v9_li_large_four_window_credit", "v9_li_large_two_cold"), "tail": ("v9_parallel_terminal_large",)}
         if fused
         else {
             "li": ("quantlightningindexer",),
