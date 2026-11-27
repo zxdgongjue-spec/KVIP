@@ -49,7 +49,7 @@ static void run(int fault,aclrtStream stream){
             e.sq_db_va=m.put(nullptr,128);e.cq_db_va=m.put(nullptr,128);
             std::array<uint32_t,8*16> cq{};
             for(unsigned k=0;k<8;++k){auto pos=tiny::cursor+k;
-                bool ready=j==4 && which==0 && k<2;
+                bool ready=(j==4 && which==0 && k<2) || (fault==3 && which==0 && j==0 && !k);
                 cq[pos%8*16]=uint32_t((pos/8&1)^ready)<<2;}
             e.cq_va=m.put(cq);
             args.queue_state=m.put(queue);args.channel_entity=m.put(e);args.core_status=m.put(KvafBatchGetCoreStatus{});
@@ -78,13 +78,19 @@ static void run(int fault,aclrtStream stream){
     ck(aclrtSynchronizeStream(stream));
     auto schedule=m.read<terminal_runtime::TerminalRowSchedule>(sched);
     req(schedule.ready==0 && schedule.finishedTeams==16 && schedule.next==33,"four-core scheduler failed to retire");
-    uint64_t lastThird=0,minBell=UINT64_MAX;uint64_t tokens=0;
+    const bool parked=fault!=3;
+    req(schedule.arrivals[tiny::first]==(parked?0U:4U) &&
+        schedule.successor[tiny::first]==(parked?0U:tiny::second+1) &&
+        schedule.arrivals[tiny::second]==4 && schedule.successor[tiny::second]==33,
+        "early and completed claims were duplicated or did not use four arrivals");
+    uint64_t lastReturn=0,firstOrdinary=UINT64_MAX,lastThird=0,minBell=UINT64_MAX;uint64_t tokens=0;
     for(unsigned which=0;which<2;++which){unsigned row=which?tiny::second:tiny::first;
         for(unsigned q=0;q<4;++q){auto ref=refs[which][q];auto id=row*4+q;
             auto tr=m.read<tiny::Trace>(trace+id*sizeof(tiny::Trace));
             auto post=m.read<rotating::FinalPost>(posts+id*sizeof(rotating::FinalPost));
             auto queue=m.read<KvafBatchGetQueueState>(ref.state);auto status=m.read<KvafBatchGetCoreStatus>(ref.status);
-            const bool failed=fault&&(which || q==3);const bool held=fault&&which;
+            const bool errorCase=fault==1 || fault==2;
+            const bool failed=errorCase&&(which || q==3);const bool held=errorCase&&which;
             const unsigned published=held?0:4;
             const unsigned consumed=held?0:(!which&&q==3&&fault==2?2:4);
             const unsigned successful=consumed-(!which&&q==3&&fault==1);
@@ -98,10 +104,14 @@ static void run(int fault,aclrtStream stream){
             req(post.count==requested&&post.pending==published-consumed&&queue.sq_producer_index==tiny::head+requested,"SQ protocol");
             req(queue.cq_consumer_index==tiny::cursor+consumed&&queue.completed_batch_count==successful&&bool(queue.poisoned)==failed,"CQ protocol");
             req(status.completed_batch_count==successful&&status.processed_request_count==requested&&bool(status.result)==failed,"KVAF private status");
-            if(!which){req(tr.atPark==2,"park did not hold two unseen markers");lastThird=std::max(lastThird,tr.parentThird);}
-            else if(fault){req(!tr.firstChild&&!tr.mask,"child doorbell after fault");}
+            if((!parked || which) && q==(parked?3u:2u))
+                req(tr.forcedFourth==1 && tr.expectedArrival==3,"wrong worker won normal ownership");
+            if(!which && !parked)lastReturn=std::max(lastReturn,tr.returnTick);
+            if(which && !parked)firstOrdinary=std::min(firstOrdinary,tr.ordinaryStart);
+            if(!which){req(tr.atPark==(parked?2u:0u),"park did not hold two unseen markers");lastThird=std::max(lastThird,tr.parentThird);}
+            else if(errorCase || !parked){req(!tr.firstChild&&!tr.mask,"child doorbell after fault");}
             else{req(tr.firstChild&&tr.mask==15,"child doorbell before all q reached third");minBell=std::min(minBell,tr.firstChild);}
-            req(q==1?(tr.q2Start==(which?7:9)&&tr.q2End==9&&tr.earlyQ2==!which):
+            req(q==1?(tr.q2Start==(!which&&parked?9:7)&&tr.q2End==9&&tr.earlyQ2==(!which&&parked)):
                        (!tr.earlyQ2&&!tr.q2Start&&!tr.q2End),"prefetch consumed by wrong owner/twice");
             tokens+=post.count;
         }
@@ -110,10 +120,14 @@ static void run(int fault,aclrtStream stream){
         req(pq.cq_consumer_index==9&&pq.completed_batch_count==2&&ps.completed_batch_count==2,"prefetch CQ not fully consumed");
     }
     if(!fault)req(lastThird>0&&minBell>=lastThird&&tokens==619,"early doorbell or lost tokens");
+    if(!parked)req(lastReturn>0 && firstOrdinary>=lastReturn && tokens==619,"next row began before fourth query returned");
+    std::printf("NORMAL_JOIN fault=%d parent_arrivals=%u child_arrivals=%u forced_fourth_Q=%u last_parent_return=%llu next_prepare=%llu\n",
+                fault,schedule.arrivals[tiny::first],schedule.arrivals[tiny::second],parked?4U:3U,
+                (unsigned long long)lastReturn,(unsigned long long)(parked?0:firstOrdinary));
     std::printf("PASS fault=%d two_rows=7,29 four_AIV=4 source_lists=%llu last_third=%llu first_next=%llu\n",
                 fault,(unsigned long long)tokens,(unsigned long long)lastThird,(unsigned long long)(fault?0:minBell));
 }
 int main(){try{ck(aclInit(nullptr));ck(aclrtSetDevice(0));aclrtStream s;ck(aclrtCreateStream(&s));
-    for(int fault=0;fault<3;++fault)run(fault,s);
+    for(int fault=0;fault<4;++fault)run(fault,s);
     ck(aclrtDestroyStream(s));ck(aclrtResetDevice(0));ck(aclFinalize());std::puts("JOINT_TWO_ROW_CAMODEL=PASS");return 0;
 }catch(const std::exception&e){std::fprintf(stderr,"FAIL %s\n",e.what());return 1;}}

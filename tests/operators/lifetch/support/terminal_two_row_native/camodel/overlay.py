@@ -24,6 +24,20 @@ __aicore__ inline void Work('''),
         }'''),
 ('PostOne(old,p);PollOne(old,p);','PostOne(old,p);Supply(old,p);PollOne(old,p);'),
 ('PollOne(child,p2);','Supply(child,p2);PollOne(child,p2);'),
+('row=NextAfterRetirement(sched,pair?other:row);',
+ '''uint32_t retired=pair?other:row;
+        auto& port=pair?p2:p;
+        auto tr=reinterpret_cast<__gm__ tiny::Trace*>(port.args->indices);
+        // Force Q3 for the non-park case, Q4 for the parked case to be the fourth arrival.
+        const uint32_t slow=port.args->table_capacity==3?2:3;
+        if(q==slow){
+            while(LoadScheduleWord(sched->arrivals+retired)!=3){}
+            tr->forcedFourth=1;
+        }
+        tr->expectedArrival=LoadScheduleWord(sched->arrivals+retired);
+        tr->returnTick=GetSystemCycle();
+        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(tr),sizeof(*tr));
+        row=NextAfterRetirement(sched,retired);'''),
 ('v9_test_two_row_terminal(', 'two_row_camodel(')
 ])
 install("device.h",[

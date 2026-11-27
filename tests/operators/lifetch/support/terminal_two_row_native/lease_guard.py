@@ -100,6 +100,41 @@ def checked_workspace(fwd, counter_mhz=None):
     if not isfinite(hz) or hz<=0:raise ValueError("Invalid device counter calibration")
     return work,ceil(32*hz)
 
+def decode_schedule(words,batch,pairs=()):
+    """Follow real physical row IDs. The paired parent's next row came from early admission."""
+    if batch!=32 or len(words)!=4 or any(len(row)!=32 for row in words):
+        raise ValueError("Invalid terminal schedule geometry")
+    meta,order,arrivals,successors=words
+    order=order[:batch]
+    if meta[0]!=0 or meta[2]!=16 or sorted(order)!=list(range(batch)):
+        raise ValueError("Unfinished terminal schedule or invalid order")
+    early=dict(pairs)
+    if len(early)!=len(pairs) or len(set(early.values()))!=len(pairs):
+        raise ValueError("Duplicate early assignment")
+    seen=set();teams=[];joins=0
+    for root in order[:16]:
+        chain=[];row=root
+        while row!=batch:
+            if not 0<=row<batch or row in seen:
+                raise ValueError("Missing or duplicated queue row")
+            seen.add(row);chain.append(row)
+            if row in early:
+                if arrivals[row] or successors[row]:
+                    raise ValueError("Early row also took ordinary work")
+                row=early[row]
+            else:
+                if arrivals[row]!=4 or not 1<=successors[row]<=batch+1:
+                    raise ValueError("Normal successor was not published by all four arrivals")
+                row=successors[row]-1
+                joins+=row!=batch
+        teams.append(chain)
+    if len(seen)!=batch or joins+len(early)!=batch-16 or meta[1]<16+batch:
+        raise ValueError("Incomplete four-worker schedule")
+    return dict(team_rows=teams,normal_handoffs=joins,early_handoffs=len(early),final_next_rank=meta[1])
+
+def schedule_readback(forward,pairs=()):
+    return decode_schedule(forward.terminal.row_schedule.cpu().tolist(),forward.batch,pairs)
+
 class BoundJointTerminal:
     """Explicit test entry for a caller that has already issued LI for this same binding."""
     def __init__(self, forward, library, counter_mhz=None):
@@ -134,7 +169,7 @@ class BoundJointTerminal:
         if len({r for pair in pairs for r in pair})!=2*len(pairs):
             raise ValueError("A terminal row was prepared twice")
         return dict(accepted=True,parked_rows=len(pairs),ordered_pairs=pairs,
-                    guard_ticks=self.guard_ticks)
+                    guard_ticks=self.guard_ticks,**schedule_readback(self.fwd,pairs))
 
 
     def launch(self):

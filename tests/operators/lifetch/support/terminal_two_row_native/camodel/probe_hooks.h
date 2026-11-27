@@ -11,6 +11,7 @@ __aicore__ inline void PrepareFixture(__gm__ terminal_runtime::Binding* r,__gm__
     auto p=Bind(r,c,row,q);auto tr=reinterpret_cast<__gm__ tiny::Trace*>(p.args->indices);
     if(!Begin(s,row,q))return;
     ++tr->prepare;
+    if(row==tiny::second && !defer)tr->ordinaryStart=GetSystemCycle();
     const uint32_t n=p.args->token_bytes;
     auto cuts=rotating::PlanTerminalBatches(n,row==tiny::first?302:317,0);
     const auto sq=p.Producer();tr->initialSq=sq;

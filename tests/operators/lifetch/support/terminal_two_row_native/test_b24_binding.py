@@ -2,7 +2,7 @@
 import struct
 import unittest
 from types import SimpleNamespace as NS
-from lease_guard import checked_workspace, BoundJointTerminal
+from lease_guard import checked_workspace, BoundJointTerminal, decode_schedule
 
 class Tensor:
     def __init__(self,addr,shape=(1,),size=4,blob=None):
@@ -80,13 +80,35 @@ class Verify(unittest.TestCase):
             def cpu(self):return self
             def tolist(self):return list(self)
         words=WS([0]*833)
-        bound=NS(workspace=words,fwd=NS(torch=NS(int64=1)),guard_ticks=1632)
+        class Schedule(list):
+            def cpu(self):return self
+            def tolist(self):return list(self)
+        # Actual row order can be a permutation. Give one team three rows and one team one.
+        sched=Schedule([[0,48,16]+[0]*29,list(range(32)),[4]*32,[33]*32])
+        paths=[[i] for i in range(16)]
+        for i in range(16):paths[i].append(16+i)
+        paths[2].append(paths[3].pop())
+        for path in paths:
+            for a,b in zip(path,path[1:]):sched[3][a]=b+1
+        fwd=NS(batch=32,torch=NS(int64=1),terminal=NS(row_schedule=sched))
+        bound=NS(workspace=words,fwd=fwd,guard_ticks=1632)
         with self.assertRaisesRegex(ValueError,"did not accept"):BoundJointTerminal.readback(bound)
         words[0]=1
         self.assertEqual(BoundJointTerminal.readback(bound)["parked_rows"],0)
         v=1+7*26
+        # Early 7->29, ordinary 13->23, preserving one-use ownership of both donor rows.
         words[v+4:v+24]=[1]*20;words[v+24]=30
+        sched[2][7]=0;sched[3][7]=0;sched[3][13]=24
         self.assertEqual(BoundJointTerminal.readback(bound)["ordered_pairs"],[(7,29)])
+        proof=BoundJointTerminal.readback(bound);self.assertEqual(proof["team_rows"][7],[7,29])
+        self.assertEqual((proof["normal_handoffs"],proof["early_handoffs"]),(15,1))
+        sched[2][29]=3
+        with self.assertRaisesRegex(ValueError,"four arrivals"):BoundJointTerminal.readback(bound)
+        sched[2][29]=4;sched[2][7]=4
+        with self.assertRaisesRegex(ValueError,"also took"):BoundJointTerminal.readback(bound)
+        sched[2][7]=0;sched[3][29]=7+1
+        with self.assertRaisesRegex(ValueError,"duplicated"):BoundJointTerminal.readback(bound)
+        sched[3][29]=33
         words[v+13]=2
         with self.assertRaisesRegex(ValueError,"Incomplete"):BoundJointTerminal.readback(bound)
 if __name__=="__main__":unittest.main()

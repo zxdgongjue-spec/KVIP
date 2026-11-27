@@ -34,6 +34,14 @@ __aicore__ inline uint32_t Next(__gm__ TerminalRowSchedule* sched,__gm__ Word* d
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);}
     return uint32_t(Wait(dest)-1);
 }
+// A group has released every live row only after all four query owners have returned.
+// Use the identical fourth-arriver primitive as the production large-batch tail.
+__aicore__ inline uint32_t NextAfterRetirement(__gm__ TerminalRowSchedule* sched,uint32_t row){
+    Simt::VF_CALL<AssignTerminalSuccessor>(Simt::Dim3{32,1,1},sched,row,32);
+    SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+    uint32_t next;do{next=LoadScheduleWord(sched->successor+row);}while(!next);
+    return next-1;
+}
 __aicore__ inline void Work(GM_ADDR binding,__gm__ Workspace* ws,uint64_t guardTicks,
                             uint32_t team,uint32_t q){
     auto r=reinterpret_cast<__gm__ terminal_runtime::Binding*>(binding);
@@ -56,10 +64,7 @@ __aicore__ inline void Work(GM_ADDR binding,__gm__ Workspace* ws,uint64_t guardT
         __gm__ Mailbox* m=&ws->rows[row];
         if(!direct){
             RunTerminalRow<true>(binding,row,q);
-            Simt::VF_CALL<AssignTerminalSuccessor>(Simt::Dim3{32,1,1},sched,row,32);
-            SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
-            uint32_t next;do{next=LoadScheduleWord(sched->successor+row);}while(!next);
-            row=next-1;continue;
+            row=NextAfterRetirement(sched,row);continue;
         }
         Saved old{},child{};
         RunTerminalRow<true,true>(binding,row,q,&old,false);
@@ -124,7 +129,7 @@ __aicore__ inline void Work(GM_ADDR binding,__gm__ Workspace* ws,uint64_t guardT
         }
         Retire(r,a,c,old,p);
         if(pair)Retire(r,a,c,child,p2);
-        row=Next(sched,&m->next,q);
+        row=NextAfterRetirement(sched,pair?other:row);
     }
     if(!q){
         Simt::VF_CALL<RetireTerminalTeam>(Simt::Dim3{32,1,1},sched);
