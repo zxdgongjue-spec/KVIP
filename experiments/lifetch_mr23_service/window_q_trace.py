@@ -19,8 +19,7 @@ def _worker_aiv(batch, request, worker):
 
 
 def analyze_window_q(source, workers_per_request, batch=2):
-    if batch not in (1, 2, 4, 8) or workers_per_request not in (1, 2, 4) or (
-            workers_per_request == 2 and batch != 2):
+    if batch not in (1, 2, 4, 8) or workers_per_request not in (1, 2, 4):
         raise ValueError('Unsupported P4/W2 window TopK geometry')
     phases = defaultdict(list)
     for event in source['traceEvents']:

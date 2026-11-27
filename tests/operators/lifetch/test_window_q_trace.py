@@ -59,7 +59,7 @@ def test_w1_assignment_and_tail(workers):
 
 
 @pytest.mark.parametrize('batch', (1, 4, 8))
-@pytest.mark.parametrize('workers', (1, 4))
+@pytest.mark.parametrize('workers', (1, 2, 4))
 def test_w1_matrix_assignments(batch, workers):
     metrics, _ = analyze_window_q(window_trace(workers, batch), workers, batch)
     assert metrics['w1_topk_worker_aivs'] == batch * workers

@@ -913,13 +913,15 @@ clock. Use `vs_serial_q4_*` in the summary for paired deltas. Changes in
 worker timing can change the observed ready frontier and the split
 between prefetch and final Get, so inspect the Get evidence with timing.
 
-### W1 Q1 A5 matrix
+### W1 query scheduling A5 matrix
 
-`--window-q1-matrix` runs BS1/2/4/8 at Q4, history 128K, resident 16K
+`--window-q-matrix` runs BS1/2/4/8 at Q4, history 128K, resident 16K
 and miss 10%. Each performance comparison includes the unmodified main
-P2 from `df8ad2598e70e4b5e266b15028ab26c601a2bdf2`, P4/W2 serial Q4 and
-P4/W2 four-way Q1. Main uses effective W2 for BS1 and W4 for BS2/4/8.
-The two P4/W2 arms use 4/8/16/32 Cold MIX groups and the same Hot P2.
+P2 from `df8ad2598e70e4b5e266b15028ab26c601a2bdf2`, P4/W2 serial Q4,
+P4/W2 Q2+Q2 and P4/W2 four-way Q1. Main uses effective W2 for BS1 and
+W4 for BS2/4/8. The P4/W2 arms use 4/8/16/32 Cold MIX groups and the
+same Hot P2. The number of W1 Top2048 AIVs per request is 1/2/4 for
+serial Q4, Q2+Q2 and four-way Q1, respectively.
 All arms preserve the 512/request and 128/window prefetch limits.
 
 On the host, fetch and check out the MR branch and prepare a separate
@@ -945,10 +947,10 @@ If needed, run the existing host `--prepare-deps` and container
 base=/home/w00568585/vLLM-DSA
 export KVIP_A5_DEVICE=0
 export KVIP_KVAF_ROOT="$base/third_party/KVAF-unified-813f1750"
-export KVIP_AB_OUTPUT="$base/results/lifetch-window-q1-matrix"
+export KVIP_AB_OUTPUT="$base/results/lifetch-window-q-matrix"
 runner="$base/third_party/KVIP-mr32/experiments/lifetch_mr23_service/run_full32_a5.sh"
-bash "$runner" --window-q1-matrix --main-root "$base/third_party/KVIP-main-df8ad259" --warmup 2 --iterations 5
-bash "$runner" --window-q1-matrix --trace
+bash "$runner" --window-q-matrix --main-root "$base/third_party/KVIP-main-df8ad259" --warmup 2 --iterations 5
+bash "$runner" --window-q-matrix --trace
 ```
 
 Pass `--batch 1`, `--batch 2`, `--batch 4` or `--batch 8` to select
@@ -960,7 +962,7 @@ on the fixture hash and per-call request evidence. A comparison with
 different Get counts is recorded as observed timing with its workload
 difference.
 
-The separate trace run captures the two P4/W2 arms. Each
+The separate trace run captures the three P4/W2 arms. Each
 `window_q_report.json` includes the Score tail, Top2048, owner join,
 candidate MTE2, dedup VF issue and WQE submission. Use the corresponding
 `lifetch_msprof_trace.json` to inspect vector execution alongside the

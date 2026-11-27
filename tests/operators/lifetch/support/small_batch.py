@@ -12,9 +12,7 @@ WINDOW_Q_BATCHES = (1, 2, 4, 8)
 SUPPORTED_BATCHES = {
     'p2': (1, 2, 4, 8, 16),
     'cold': (1, 2, 4, 8),
-    'cold_w2': WINDOW_Q_BATCHES,
-    'cold_w2_q2': (2,),
-    'cold_w2_q1': WINDOW_Q_BATCHES,
+    **dict.fromkeys(WINDOW_Q_WORKERS, WINDOW_Q_BATCHES),
     'cold_p8': (1,),
     'cold_p8_bulk': (1,),
     'cold_full': (1, 2, 8),
