@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Authenticate completed four-rank cells before using an interrupted timing matrix."""
+from contextlib import redirect_stdout
 from dataclasses import fields
 from types import SimpleNamespace
 import argparse
@@ -43,6 +44,7 @@ def validate(directory, timed_source, helpers, work, sdk_kernel):
     sys.path.insert(0, str(timed_source / "tests/operators/lifetch/support"))
     from fixed_q4_candidate_only import cell
     from large_batch_input import mapped_source, read_source
+    from report_large_li_phases import li_diagnostic, score_exposure, show_critical
 
     with sdk_kernel.open("rb") as binary:
         sdk_sha = hashlib.file_digest(binary, "sha256").hexdigest()
@@ -79,6 +81,16 @@ def validate(directory, timed_source, helpers, work, sdk_kernel):
         if fingerprint != row["source_sha256"]:
             raise ValueError(f"Current inputs differ from stored ten-call graph at {marker}")
         print(f"RESUME_VERIFIED G{group} BS{batch} calls=10 source_sha256={fingerprint}", file=sys.stderr, flush=True)
+        # Expose the measurements already on disk while the rest of the matrix is pending.
+        try:
+            critical = li_diagnostic(record)
+            with redirect_stdout(sys.stderr):
+                show_critical(f"G{group} BS{batch}", "ARCHIVED_LAST_ROW", critical)
+            exposure = score_exposure(record, critical)
+            print(f"G{group} BS{batch} ARCHIVED_LAST_ROW owner_score_call_by_cold_window_us="
+                  + "/".join(f"{w['owner_score_call']:.2f}" for w in exposure), file=sys.stderr)
+        except (KeyError, IndexError, ValueError, TypeError) as error:
+            print(f"G{group} BS{batch} ARCHIVED_LAST_ROW detail_unavailable={error}", file=sys.stderr)
     if previous is not None:
         print(f"placement\t{previous[0]} {previous[1]}")
 
