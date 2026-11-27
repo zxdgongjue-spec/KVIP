@@ -13,6 +13,7 @@ import shutil
 from pathlib import Path
 from statistics import mean, median
 import subprocess
+import sys
 
 import numpy as np
 
@@ -604,7 +605,60 @@ def measured_replays(ex, proofs, serial, torch, states, sequence, config, direct
     return dict(correctness="PASS", failures=[], rounds={inputs.source_round: timing}, all_rounds=timing)
 
 
+def verify_physical_device(device, expected):
+    """Ask ACL to resolve the process-visible ordinal without opening the device."""
+    import ctypes as c
+
+    acl = c.CDLL("libascendcl.so")
+    acl.aclGetRecentErrMsg.restype = c.c_char_p
+
+    def check(name, status):
+        if status != 0:
+            message = (acl.aclGetRecentErrMsg() or b"").decode(errors="replace")
+            raise RuntimeError(f"{name}: rc={status} {message}")
+
+    check("aclInit", acl.aclInit(None))
+    logical, physical = c.c_int32(), c.c_int32()
+    check(
+        "aclrtGetLogicDevIdByUserDevId",
+        acl.aclrtGetLogicDevIdByUserDevId(device, c.byref(logical)),
+    )
+    check(
+        "aclrtGetPhyDevIdByLogicDevId",
+        acl.aclrtGetPhyDevIdByLogicDevId(logical.value, c.byref(physical)),
+    )
+    if physical.value != expected:
+        raise ValueError(
+            f"CANN device {device} (logical {logical.value}) maps to physical NPU {physical.value}, "
+            f"expected {expected}"
+        )
+    print(f"DEVICE user={device} logical={logical.value} physical={physical.value}", flush=True)
+
+
+def selected_device(device, physical_npu):
+    if device is None and physical_npu is None:
+        npu = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+        if npu not in ("0", "3", "4") or os.environ.get("PEER_PHYSICAL_NPU", npu) != npu:
+            raise ValueError("Set PEER_PHYSICAL_NPU and ASCEND_RT_VISIBLE_DEVICES to the selected physical NPU")
+        return 0, int(npu)
+    if device is None or physical_npu is None or device < 0 or physical_npu < 0:
+        raise ValueError("Pass both --device and --physical-npu with nonnegative IDs")
+    # Keep the probe's ACL initialization lifetime separate from torch_npu's.
+    subprocess.run(
+        [
+            sys.executable, "-B", "-c",
+            "from large_batch_pair import verify_physical_device; "
+            "import sys; verify_physical_device(int(sys.argv[1]), int(sys.argv[2]))",
+            str(device), str(physical_npu),
+        ],
+        cwd=Path(__file__).resolve().parent,
+        check=True,
+    )
+    return device, physical_npu
+
+
 def run(args):
+    device, physical_npu = selected_device(args.device, args.physical_npu)
     import execution as ex
     from functools import partial
     import kvaf
@@ -612,9 +666,6 @@ def run(args):
     import torch
     import torch_npu
 
-    npu = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
-    if npu not in ("0", "3", "4") or os.environ.get("PEER_PHYSICAL_NPU", npu) != npu:
-        raise ValueError("Set PEER_PHYSICAL_NPU and ASCEND_RT_VISIBLE_DEVICES to the selected physical NPU")
     repo = Path(__file__).resolve().parents[4]
     revision = subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip()
     if subprocess.check_output(["git", "-C", repo, "status", "--porcelain", "-uno"], text=True).strip():
@@ -633,16 +684,19 @@ def run(args):
     inputs = sequence.inputs
     pages = ReplayPagePlan(sequence)
     fingerprint = input_digest(inputs, pages, donors)
+    if args.device is not None:
+        # Establish the checked device before get_device_name can lazily initialize Torch NPU.
+        torch.npu.set_device(device)
     identity = dict(
         group=args.group,
         batch=args.batch,
         native=revision,
         sequence_sha256=fingerprint,
-        physical_npu=int(npu),
+        physical_npu=physical_npu,
         host=os.uname().nodename,
         calls=CALLS,
         warmup=WARMUP,
-        hardware=torch.npu.get_device_name(torch.device("npu:0")),
+        hardware=torch.npu.get_device_name(torch.device(f"npu:{device}")),
         torch=str(torch.__version__),
         torch_npu=str(torch_npu.__version__),
         cann=str(getattr(torch.version, "cann", "")),
@@ -710,7 +764,7 @@ def run(args):
             "--round-range",
             "1:1",
             "--device",
-            "0",
+            str(device),
             "--kvaf-root",
             str(args.kvaf_root),
             "--kvaf-server",
@@ -894,6 +948,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch", type=int, choices=FIXED_BATCHES, required=True)
     parser.add_argument("--cohort", type=int, default=0)
     parser.add_argument("--prepared", type=Path)
+    parser.add_argument("--device", type=int, help="CANN user-visible device ordinal for this worker")
+    parser.add_argument("--physical-npu", type=int, help="Required physical NPU for the selected ordinal")
     parser.add_argument("--kvaf-root", type=Path, required=True)
     parser.add_argument("--kvaf-server")
     parser.add_argument("--reuse-serial-archive", type=Path)

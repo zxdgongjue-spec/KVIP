@@ -118,3 +118,26 @@ python tests/operators/lifetch/test_lifetch.py bench --input real \
 ```
 
 每次运行结果由唯一目录保存，失败也保留已完成 case。
+
+## 12 号机 G2 Fixed Q4 配对
+
+在 `kvaf_vllm_ascend` 中复用现有 CANN、KVAF `813f1750` 和 LIDU。生产树固定为 `af52a02b`，并使用 `10442f1f` 的 packed worker。宿主机执行 `npu-smi info` 确认物理卡 2 空闲。容器启动脚本用 ACL 核验物理卡 2 对应的进程设备号。
+
+```bash
+# G2_TRACE 是容器内已准备好的真实 G2 回放目录，如 case00002-r2-g2。
+bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed "$G2_TRACE"
+```
+
+覆盖 BS1、2、4、8、16、20、24、28、32，每档 cohort 0。先在同卡为九档生成新的双 GET worker 串行 TopK oracle，再逐档按串行→融合、融合→串行测量。每个计时图包含十次独立状态，整图预热四次。保留 packed 预取预算 1024、W4、rank 1024。每个调用完整校验 TopK、KV 和 Index。CPU service 使用 THP，记录实际 NUMA、UB adapter，并核对 oracle 和两臂的放置。从 `RESULT_ROOT` 下的 `packed_summary.json`、`summary.csv` 读取九档结果。需要保留原始 trace 时追加 `--keep-trace`。若容器已固定 NUMA 或 UB adapter，可传 `--cpu-numa N` 和 `--cpu-ub-device NAME`。
+
+`bash tests/operators/lifetch/run_fixed_q4_a5_12.sh --dry-run` 枚举九个 oracle 和 36 个计时图。每档一个 cohort 的结果用于分核趋势筛查。
+
+## 12 号机 Q1/W2 加倍复测
+
+用两个独立的干净检出目录。MR35 W2 实测版本为 `a9f4fe3b`，主仓基线为 `df8ad259`。
+
+```bash
+bash tests/operators/lifetch/run_fixed_q4_a5_12.sh q1-w2 "$Q1_CHECKOUT" "$MAIN_CHECKOUT"
+```
+
+保留 24 号机的合成输入、原生 P2 与 W2 Q4/Q2/Q1 四臂、512/128 预取预算、rank 1024、预热两次与五次计时。两轮共 64 臂，保持原矩阵的分组规则。BS20 为 5×BS4，BS24 为 3×BS8，BS32 为 2×BS16。结果放在 `results/q1-w2-card2` 下各次打印的 `Run output`，与真实 G2 的原生大 batch 数据分别解读。

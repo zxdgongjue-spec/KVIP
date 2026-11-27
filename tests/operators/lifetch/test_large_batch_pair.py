@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU regressions for the large-batch input identity and profiler accounting."""
 
+import ctypes
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import Mock, patch
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "support"))
 from large_batch_input import BATCHES, FrozenRound, expand, input_digest, load, save_source
 from fixed_bs16_report import BATCHES as FIXED_BATCHES, PUBLISHED_EVENT_PER_CALL, combined_pass
-from large_batch_pair import check_scores, large_account, last_row_windows, li_intervals, stage_sample, tail_team_intervals, verify_abc, verify_assignments
+from large_batch_pair import check_scores, large_account, last_row_windows, li_intervals, selected_device, stage_sample, tail_team_intervals, verify_abc, verify_assignments, verify_physical_device
 from workloads import ReplayPagePlan, ReplayRound
 
 
@@ -45,6 +48,38 @@ def fixture():
 
 
 class LargeBatchReplay(unittest.TestCase):
+    def test_portable_device_keeps_ordinal_separate_from_legacy_mask(self):
+        with patch.dict(os.environ, {"ASCEND_RT_VISIBLE_DEVICES": "3", "PEER_PHYSICAL_NPU": "3"}, clear=True):
+            with patch("large_batch_pair.subprocess.run") as probe:
+                self.assertEqual(selected_device(None, None), (0, 3))
+                probe.assert_not_called()
+                with self.assertRaisesRegex(ValueError, "Pass both"):
+                    selected_device(1, None)
+                with self.assertRaisesRegex(ValueError, "nonnegative IDs"):
+                    selected_device(-1, 2)
+                self.assertEqual(selected_device(1, 2), (1, 2))
+                self.assertEqual(probe.call_args.args[0][-2:], ["1", "2"])
+                self.assertTrue(probe.call_args.kwargs["check"])
+
+    def test_portable_device_checks_physical_mapping_without_set_device(self):
+        def respond(value):
+            def write(device, result):
+                ctypes.cast(result, ctypes.POINTER(ctypes.c_int32)).contents.value = value
+                return 0
+            return write
+
+        acl = Mock()
+        acl.aclInit.return_value = 0
+        acl.aclrtGetLogicDevIdByUserDevId.side_effect = respond(4)
+        acl.aclrtGetPhyDevIdByLogicDevId.side_effect = respond(2)
+        with patch("ctypes.CDLL", return_value=acl):
+            verify_physical_device(1, 2)
+            with self.assertRaisesRegex(ValueError, "maps to physical NPU 2, expected 5"):
+                verify_physical_device(1, 5)
+        self.assertEqual(acl.aclrtGetLogicDevIdByUserDevId.call_args.args[0], 1)
+        self.assertEqual(acl.aclrtGetPhyDevIdByLogicDevId.call_args.args[0], 4)
+        acl.aclrtSetDevice.assert_not_called()
+
     def test_packed_and_single_event_gates_are_independent(self):
         cells = [dict(group=g, batch=b, serial_graph_us=100, fused_graph_us=80)
                  for g in PUBLISHED_EVENT_PER_CALL for b in FIXED_BATCHES]
