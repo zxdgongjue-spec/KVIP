@@ -662,7 +662,15 @@ class BenchPool:
             self.torch.npu.synchronize()
             for table, _ in self.tables.values():
                 self.runtime.release_access_table(table)
-            self.runtime.shutdown()
+            try:
+                self.runtime.shutdown()
+            except RuntimeError as error:
+                if (not os.environ.get('KVIP_FIXED_Q4_COMBO_ARM')
+                        or str(error) != 'Put transport teardown failed; resources retained'):
+                    raise
+                print(f'BENCH POOL SHUTDOWN retry 1/1 after {error}', flush=True)
+                self.runtime.shutdown()
+                print('BENCH POOL SHUTDOWN recovered', flush=True)
             self.runtime = None
 
 
@@ -3477,7 +3485,10 @@ class FusedReplayState:
             raise RuntimeError(f'Replay Index/Fetch completion failed: {status.tolist()}')
 
     def validate(self, inputs):
+        from fixed_q4_combo import validate_query_join
+
         self.check_completion()
+        validate_query_join(self.forward)
         terminal = self.forward.terminal
         if terminal is not None:
             counts = self.rotating.final_posts[:, :, 0].cpu().numpy()
@@ -3940,6 +3951,13 @@ def measure_replay_batch(torch, states, sequence, config, directory, *, fused):
 
 
 def run_path(config, directory, sequence, pages, *, fused, round_check=None, shared_pool=None):
+    from fixed_q4_combo import ARMS, bind as bind_combo
+
+    combo_arm = os.environ.get('KVIP_FIXED_Q4_COMBO_ARM')
+    if combo_arm and (combo_arm not in ARMS or config.mode != 'diagnose'
+                      or config.input != 'synthetic' or config.transport != 'urma' or not fused):
+        raise ValueError('Fixed-Q4 comparison requires a known arm and synthetic fused URMA diagnose')
+    combo = None
     import acl
     import kvaf
     import torch
@@ -4018,6 +4036,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                 transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                 prefetch_tokens=config.prefetch_tokens, soc=soc,
                 prefetch_rank_start=getattr(config, "prefetch_rank_start", 1024))
+            if combo_arm:
+                combo = bind_combo(state, combo_arm, library)
         else:
             state = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
         if config.mode in ('bench', 'diagnose') and g.get('sparse_mode') == 0 and not fused:
@@ -4064,6 +4084,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
                         transport=config.transport, device=device, aics=aics, windows=config.intermediate_fetches,
                         prefetch_tokens=config.prefetch_tokens, soc=soc,
                         prefetch_rank_start=getattr(config, 'prefetch_rank_start', 1024), lease=state.lease)
+                    if combo_arm and bind_combo(replica, combo_arm, library) != combo:
+                        raise RuntimeError('Fixed-Q4 arm changed between graph inputs')
                     replica.failure_directory = directory
                 else:
                     replica = NativeReplayState(torch, torch_npu, runtime, expanded, initial, pages, device=device)
@@ -4076,6 +4098,8 @@ def run_path(config, directory, sequence, pages, *, fused, round_check=None, sha
             result.update(transport=config.transport, path='fused' if fused else 'serial',
                           runtime_workers=shared_pool.workers if borrowed else workers, geometry=g,
                           input_paths=[str(ref.manifest_path) for refs in sequence.rounds for ref in refs])
+            if combo is not None:
+                result['combo'] = combo
             atomic_json(directory / 'path_result.json', result)
             return result
         state.reset()
@@ -4216,6 +4240,14 @@ def run_synthetic_batch(config, directory, *, shared_pool=None):
             pages.token_payload = lambda row, ids: payload(row, np.asarray(ids))
             folder = directory / f'case-b{batch}'
             results = {}
+            if os.environ.get('KVIP_FIXED_Q4_COMBO_ARM'):
+                result = run_path(config, folder / 'fused', sequence, pages, fused=True, shared_pool=pool)
+                report = dict(batch=batch, miss_percent=config.miss_percent, input='synthetic',
+                              correctness=result['correctness'], execution='COMPLETED',
+                              timing={'prototype_with_update': result['all_rounds']})
+                atomic_json(folder / 'report.json', report)
+                failed |= report['correctness'] != 'PASS'
+                continue
             for name in ('serial', 'fused'):
                 results[name] = run_path(config, folder / name, sequence, pages,
                                          fused=name == 'fused', shared_pool=pool)

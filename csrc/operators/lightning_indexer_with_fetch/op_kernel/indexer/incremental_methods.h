@@ -620,6 +620,94 @@ __aicore__ inline void DrainWindowCopies() {
         WaitFlag<HardEvent::MTE3_V>(EVENT_ID6);incrementalOutputPending_=false;
     }
 }
+#if KVIP_URMA_WINDOW_LI && !KVIP_LARGE_BATCH_LI
+GM_ADDR fixedWindowScratch_ = nullptr;
+
+__aicore__ inline void BindFixedWindowQ() {
+    if (uint32_t(blockId_) < runtimeShape_.liCores * 2)
+        fixedWindowScratch_ = fixed_window_q::Scratch(streamingWorkspace_, runtimeShape_);
+}
+
+__aicore__ inline void RunFixedWindowQuery(uint32_t row, uint32_t q, uint32_t half, uint32_t epoch) {
+    auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+    GlobalTensor<uint64_t> metadata;
+    metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(rotating::TopKHeader(ctx)));
+    const uint32_t offset = row * 64 + q * 16;
+    auto snapshot = fixed_window_q::Frontier(fixedWindowScratch_, row);
+    if (q) {
+        DataCopy(incrementalMetadata_[q * 16], metadata[offset], 16);
+        SetFlag<HardEvent::MTE2_S>(EVENT_ID5); WaitFlag<HardEvent::MTE2_S>(EVENT_ID5);
+        kvaf_device::CleanCacheLines(fixed_window_q::Line(fixedWindowScratch_, row, 0), fixed_window_q::kLineBytes);
+        windowCoveredEmpty_ = snapshot->coveredEmpty != 0;
+    }
+    const uint64_t ready = q ? snapshot->frontier[q] : incrementalMetadata_.GetValue(4);
+    const uint32_t cap = rotating::SequenceWindowEnd(runtimeShape_.history, runtimeShape_.resident, half, epoch);
+    rankReady_ = ready;
+    rankHalf_ = half;
+    exportWindowCold_ = true;
+    rankTrace_ = streamingWorkspace_ &&
+        (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U);
+    rankedEpoch_ = epoch;
+    incrementalCalls_ = incrementalScanned_ = incrementalCandidates_ = 0;
+    incrementalMetadataActive_ = true;
+    incrementalMetadataIndex_ = q;
+    incrementalMetadata_.SetValue(q * 16 + 4, ready);
+    const uint32_t end0 = Min(uint32_t(ready), cap);
+    const uint32_t end1 = Min(uint32_t(ready >> 32), cap);
+    if (end0 >= runtimeShape_.resident) AdvanceIncremental(row * 4 + q, end0, end1, half);
+    DrainWindowCopies();
+
+    // Each AIV publishes a separate query header and winner/candidate range.
+    SetFlag<HardEvent::S_MTE3>(EVENT_ID5); WaitFlag<HardEvent::S_MTE3>(EVENT_ID5);
+    DataCopy(metadata[offset], incrementalMetadata_[q * 16], 16);
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID5); WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
+    incrementalMetadataActive_ = false;
+    exportWindowCold_ = false;
+}
+
+__aicore__ inline void HelpFixedWindowQ() {
+    if (!fixedWindowScratch_) return;
+    const auto task = fixed_window_q::Helper(runtimeShape_, blockId_);
+    if (!task.query) return;
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID5); WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
+    fixed_window_q::Wait(fixedWindowScratch_, task.row, 0);
+    auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
+    auto ends = reinterpret_cast<__gm__ const uint32_t*>(ctx->queryEnds);
+    const uint32_t scan = rotating::ActiveScanHistory(runtimeShape_, ends, task.row);
+    const uint32_t half = rotating::SequenceHalfWindow(runtimeShape_, scan);
+    RunFixedWindowQuery(task.row, task.query, half, runtimeShape_.rounds - 1);
+    auto done = fixed_window_q::Signal(fixedWindowScratch_, task.row, task.query);
+    done->calls = incrementalCalls_;
+    done->scanned = incrementalScanned_;
+    done->candidates = incrementalCandidates_;
+    fixed_window_q::Publish(fixedWindowScratch_, task.row, task.query, 1);
+}
+
+__aicore__ inline void JoinFixedWindowQueries(uint32_t row, uint32_t epoch, uint32_t half, bool empty) {
+    auto snapshot = fixed_window_q::Frontier(fixedWindowScratch_, row);
+    for (uint32_t q = 0; q < 4; ++q) snapshot->frontier[q] = incrementalMetadata_.GetValue(q * 16 + 4);
+    windowCoveredEmpty_ = empty;
+    snapshot->coveredEmpty = empty;
+    kvaf_device::CleanCacheLines(fixed_window_q::Line(fixedWindowScratch_, row, 0), fixed_window_q::kLineBytes);
+    fixed_window_q::Publish(fixedWindowScratch_, row, 0, 1);
+    RunFixedWindowQuery(row, 0, half, epoch);
+    for (uint32_t q = 1; q < 4; ++q) {
+        fixed_window_q::Wait(fixedWindowScratch_, row, q);
+        auto done = fixed_window_q::Signal(fixedWindowScratch_, row, q);
+        incrementalCalls_ += done->calls;
+        incrementalScanned_ += done->scanned;
+        incrementalCandidates_ += done->candidates;
+    }
+}
+#endif
+
+__aicore__ inline void RecordWindowAdvance(__gm__ rotating::Context* ctx, uint32_t epoch,
+                                            uint32_t lane, uint64_t begin) {
+    auto event=reinterpret_cast<__gm__ rotating::Event*>(ctx->events)+epoch*runtimeShape_.serviceLanes+lane;
+    auto stamp=reinterpret_cast<__gm__ uint64_t*>(event->pad);
+    stamp[2]=begin;stamp[3]=GetSystemCycle();stamp[4]=uint64_t(incrementalCalls_) | (uint64_t(incrementalScanned_)<<16) | (uint64_t(incrementalCandidates_)<<40);
+    kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event),128);
+}
 __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     auto ctx=reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     uint32_t lane=rotating::ServiceLane(runtimeShape_.batch,runtimeShape_.splitQ,
@@ -666,6 +754,13 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
         for(uint32_t i=0;i<ownedQueries;++i)
             incrementalMetadata_.SetValue(i*16+4,uint64_t(incrementalOld_.GetValue(i*32))|(uint64_t(incrementalOld_.GetValue(i*32+16))<<32));
     }
+#if KVIP_URMA_WINDOW_LI && !KVIP_LARGE_BATCH_LI
+    if (fixedWindowScratch_ && ownedQueries == 4 && epoch + 1 == runtimeShape_.rounds) {
+        JoinFixedWindowQueries(lane, epoch, half, requests0 == 0);
+        if (trace) RecordWindowAdvance(ctx, epoch, lane, begin);
+        return true;
+    }
+#endif
     uint32_t cap=half?rotating::SequenceWindowEnd(runtimeShape_.history,runtimeShape_.resident,half,epoch):
         rotating::Trigger(runtimeShape_.history,runtimeShape_.resident,runtimeShape_.rounds,epoch)*128;
     for(uint32_t b=lane;b<runtimeShape_.batch;b+=runtimeShape_.serviceLanes) for(uint32_t q=0;q<4;++q) {
@@ -706,12 +801,7 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half) {
     // The producer's progress lookup table shares the TopK score buffer.
     // Rebuild it before LI resumes; otherwise score bytes become fake progress.
     PrepareRotationProgress();
-    if(trace) {
-        auto event=reinterpret_cast<__gm__ rotating::Event*>(ctx->events)+epoch*runtimeShape_.serviceLanes+lane;
-        auto stamp=reinterpret_cast<__gm__ uint64_t*>(event->pad);
-        stamp[2]=begin;stamp[3]=GetSystemCycle();stamp[4]=uint64_t(incrementalCalls_) | (uint64_t(incrementalScanned_)<<16) | (uint64_t(incrementalCandidates_)<<40);
-        kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(event),128);
-    }
+    if (trace) RecordWindowAdvance(ctx, epoch, lane, begin);
     return true;
 }
 __aicore__ inline void FinalIncremental(uint32_t query,uint32_t valid,bool sequenceSplit) {

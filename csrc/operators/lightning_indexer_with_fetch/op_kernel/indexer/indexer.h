@@ -879,6 +879,9 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
                 }
 #endif
                 vectorService.LoadSequenceSplitThresholds(batch);
+#if KVIP_URMA_WINDOW_LI && !KVIP_LARGE_BATCH_LI
+                vectorService.BindFixedWindowQ();
+#endif
 #if KVIP_FIXED_SCORE_SHARDS
                 // The original half-owner can publish its own contiguous
                 // prefix tile by tile. Helpers never expose a hole.
@@ -922,6 +925,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
                     if (serviceEpoch == epoch) vectorService.RotateFetch(epoch, serviceHalf);
                 }
             }
+#if KVIP_URMA_WINDOW_LI && !KVIP_LARGE_BATCH_LI
+            // Helpers join only after the last MTE3 completion and half
+            // publication, and after any Service already owned by this lane.
+            if ASCEND_IS_AIV { vectorService.HelpFixedWindowQ(); }
+#endif
         }
 
         if ASCEND_IS_AIV {

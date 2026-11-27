@@ -41,6 +41,11 @@ __aicore__ inline void RunLi(GM_ADDR bindings
     if constexpr (Phase != SequenceLiPhase::Hot) {
         if (!splitSequence) return;
     }
+#if KVIP_URMA_WINDOW_LI && !KVIP_LARGE_BATCH_LI
+    if constexpr (Phase == SequenceLiPhase::Threshold) {
+        if ASCEND_IS_AIV { fixed_window_q::Reset(P(15), shape, GetBlockIdx()); }
+    }
+#endif
 #if KVIP_FIXED_SCORE_SHARDS
     uint32_t physical = GetBlockIdx();
     if ASCEND_IS_AIV { physical /= 2; }

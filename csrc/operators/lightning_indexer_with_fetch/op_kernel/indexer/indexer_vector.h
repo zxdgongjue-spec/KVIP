@@ -34,6 +34,9 @@
 #include "window_fast_vector.h"
 #if KVIP_URMA_WINDOW_LI
 #include "window_rank_pair.h"
+#if !KVIP_LARGE_BATCH_LI
+#include "fixed_window_q.h"
+#endif
 #endif
 #endif
 

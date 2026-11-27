@@ -210,3 +210,78 @@ int main() {
     subprocess.run([compiler, "-std=c++17", "-O2", "-I", str(operators / "lightning_indexer_with_fetch/include"),
                     "-I", str(operators / "common/lifetch"), str(source), "-o", str(exe)], check=True)
     subprocess.run([str(exe)], check=True, timeout=5)
+
+
+def test_fixed_last_window_uses_only_logical_score_lanes(tmp_path):
+    operator = Path(__file__).resolve().parents[3] / "csrc/operators/lightning_indexer_with_fetch"
+    compiler = shutil.which("c++")
+    if not compiler:
+        pytest.skip("C++ compiler required for fixed Q4 window mapping")
+    source = tmp_path / "combo.cpp"
+    source.write_text(
+        """
+#include "fixed_score_groups.h"
+#include <array>
+#include <cassert>
+#define __aicore__
+#define __gm__
+using GM_ADDR = uint8_t*;
+namespace pipeline_ab { struct Args { uint64_t words[32]; }; }
+namespace kvaf_device { void CleanCacheLines(GM_ADDR, uint32_t) {} }
+namespace rotating {
+uint32_t ServiceRank(uint32_t batch, uint32_t split, uint32_t g) {
+    return split ? (g % 2) * batch + g / 2 : g;
+}
+uint32_t ServiceLane(uint32_t b, uint32_t split, uint32_t g, uint32_t core, uint32_t sub) {
+    return ServiceRank(b, split, core) % g * 2 + sub;
+}
+}
+#include "fixed_window_q.h"
+
+int main() {
+    alignas(128) std::array<uint8_t, 8 * 5 * 128> mailbox{};
+    alignas(128) std::array<uint64_t, 32> workspace{};
+    auto args = reinterpret_cast<GM_ADDR>(workspace.data());
+    for (uint32_t batch : {1U, 2U, 4U, 8U}) {
+        rotating::RuntimeShape s{};
+        s.batch = batch;
+        s.history = 131328;
+        s.resident = 16384;
+        s.aicCount = s.indexHeads = 32;
+        s.finalWorkers = 4;
+        s.splitQ = 1;
+        s.liCores = 2 * batch;
+        s.rounds = batch == 1 ? 2 : 4;
+        s.serviceAics = (batch + 1) / 2;
+        s.serviceLanes = 2 * s.serviceAics;
+        s.tokenBytes = 656;
+        auto &option = workspace[fixed_window_q::kScratchOffset / 8];
+        assert(!fixed_window_q::Scratch(args, s));
+        option = reinterpret_cast<uint64_t>(mailbox.data());
+        auto scratch = fixed_window_q::Scratch(args, s);
+        assert(scratch == mailbox.data());
+        std::array<std::array<unsigned, 4>, 8> assigned{};
+        for (uint32_t aiv = 0; aiv < 2 * fixed_score::LaunchGroups(s); ++aiv) {
+            auto [row, q] = fixed_window_q::Helper(s, aiv);
+            if (aiv >= s.liCores * 2) { assert(q == 0); continue; }
+            assert(row < batch && q < 4);
+            if (q) ++assigned[row][q];
+            fixed_window_q::Publish(scratch, aiv / 4, aiv % 4, 1);
+        }
+        for (uint32_t aiv = 0; aiv < s.liCores * 2; ++aiv) {
+            fixed_window_q::Reset(args, s, aiv);
+            assert(fixed_window_q::Signal(scratch, aiv / 4, aiv % 4)->ready == 0);
+        }
+        for (uint32_t row = 0; row < batch; ++row)
+            assert((assigned[row] == std::array<unsigned, 4>{0, 1, 1, 1}));
+        ++s.rounds;
+        assert(!fixed_window_q::Scratch(args, s));
+        option = 0;
+    }
+}
+"""
+    )
+    binary = tmp_path / "combo"
+    subprocess.run([compiler, "-std=c++17", "-I", str(operator / "include"),
+                    "-I", str(operator / "op_kernel/indexer"), str(source), "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)
