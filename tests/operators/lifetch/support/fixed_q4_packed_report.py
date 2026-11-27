@@ -76,50 +76,55 @@ def read_arm(pair, group, batch, cohort, root, arm, *, traffic=False):
     return times, (identity, placement(directory / 'thp.json'))
 
 
-def read_pair(pair, group, batch, cohort, root, control=None):
-    rows = {}
-    identities = []
-    measurements = [('serial', 'serial', control or root), ('fused', 'fused', root)]
-    if control:
-        measurements.append(('previous_fused', 'fused', control))
-    for label, arm, source in measurements:
-        rows[label], ident = read_arm(source / pair.relative_to(root), group, batch, cohort, source, arm,
-                                     traffic=control is not None and arm == 'fused')
-        identities.append(ident)
-    if any(ident != identities[0] for ident in identities[1:]):
-        raise ValueError(f'Serial and fused inputs, runtime or memory placement differ: {pair}')
-    return rows
-
-
 def cell_summary(root, group, batch):
-    cell = root / f'g{group}/bs{batch}'
     reference = field(root, 'reference')
     control = Path(reference) if reference else None
-    observations = []
+    candidate_blocks = int(field(root, 'candidate_blocks') or '2')
+    if candidate_blocks not in (1, 2) or (candidate_blocks == 1 and control is None):
+        raise ValueError('Single-block timing requires a two-block archived control')
+    sources = {'serial': (control or root, 'serial', 2), 'fused': (root, 'fused', candidate_blocks)}
+    if control:
+        sources['previous_fused'] = (control, 'fused', 2)
+
+    observations = {label: [] for label in sources}
+    block_graphs = {label: [[] for _ in range(count)] for label, (_, _, count) in sources.items()}
     cohort_count = max(1, 16 // batch)
     for cohort in range(cohort_count):
-        directory = cell if cohort_count == 1 else cell / f'cohort{cohort}'
-        for block in (1, 2):
-            observations.append(read_pair(directory / f'block{block}', group, batch, cohort, root, control))
-    times = {arm: {s: mean(r[arm][s] for r in observations) for s in STAGES}
-             for arm in observations[0]}
+        relative = Path(f'g{group}/bs{batch}')
+        if cohort_count > 1:
+            relative /= f'cohort{cohort}'
+        expected = None
+        for label, (source, arm, count) in sources.items():
+            for block in range(1, count + 1):
+                directory = source / relative / f'block{block}'
+                values, identity = read_arm(directory, group, batch, cohort, source, arm,
+                                            traffic=control is not None and arm == 'fused')
+                if expected is not None and identity != expected:
+                    raise ValueError(f'Serial and fused inputs, runtime or memory placement differ: {directory}')
+                expected = identity
+                observations[label].append(values)
+                block_graphs[label][block - 1].append(values['graph'])
+    times = {arm: {s: mean(r[s] for r in rows) for s in STAGES} for arm, rows in observations.items()}
     saved = {s: times['serial'][s] - times['fused'][s] for s in STAGES}
     gain = 100 * saved['graph'] / times['serial']['graph']
-    result = dict(group=group, batch=batch, cohorts=cohort_count, blocks=2, calls_per_graph=10,
-                mean_us=times, saved_us=saved, graph_gain_pct=gain,
-                reached_20pct=times['fused']['graph'] <= 0.8 * times['serial']['graph'])
+    calls = {arm: 10 * len(rows) for arm, rows in observations.items()}
+    result = dict(group=group, batch=batch, cohorts=cohort_count, blocks=candidate_blocks, calls_per_graph=10,
+                  calls_by_arm=calls, mean_us=times, saved_us=saved, graph_gain_pct=gain,
+                  reached_20pct=times['fused']['graph'] <= 0.8 * times['serial']['graph'])
     if control:
         delta = {k: times['previous_fused'][k] - times['fused'][k] for k in STAGES}
-        result['tokens_per_call'] = {arm: {key: mean(o[arm][key] for o in observations)
+        result['tokens_per_call'] = {arm: {key: mean(r[key] for r in observations[arm])
                                            for key in ('prefetch', 'final')}
                                      for arm in ('previous_fused', 'fused')}
-        if all('first_prefetch' in o['fused'] for o in observations):
-            result['first_window'] = {k: mean(o['fused'][k] for o in observations)
+        if all('first_prefetch' in r for r in observations['fused']):
+            result['first_window'] = {k: mean(r[k] for r in observations['fused'])
                                       for k in ('first_prefetch', 'first_nonempty_rows')}
-        # Cohorts are nested outside the two blocks. Keep both block deltas visible.
-        result['graph_saved_vs_previous_by_block_us'] = [
-            mean(o['previous_fused']['graph'] - o['fused']['graph'] for o in observations[block::2])
-            for block in range(2)]
+        previous = [mean(block) for block in block_graphs['previous_fused']]
+        if candidate_blocks == 2:
+            result['graph_saved_vs_previous_by_block_us'] = [
+                old - mean(new) for old, new in zip(previous, block_graphs['fused'])]
+        else:
+            result['previous_graph_by_block_us'] = previous
         graph = times['fused']['graph']
         serial = times['serial']['graph']
         result.update(saved_vs_previous_us=delta, reached_15pct=graph <= 0.85 * serial,
@@ -129,9 +134,14 @@ def cell_summary(root, group, batch):
 
 
 def report_cell(row):
-    calls = row['cohorts'] * row['blocks'] * row['calls_per_graph']
-    print(f"G{row['group']} BS{row['batch']} CHECK TopK_score/KV/Index=PASS "
-          f"calls_per_arm={calls} queries_per_arm={4 * row['batch'] * calls}")
+    calls = row['calls_by_arm']
+    if row['blocks'] == 1:
+        counts = (f"candidate_calls={calls['fused']} archived_calls_per_arm={calls['serial']} "
+                  f"candidate_queries={4 * row['batch'] * calls['fused']} "
+                  f"archived_queries_per_arm={4 * row['batch'] * calls['serial']}")
+    else:
+        counts = f"calls_per_arm={calls['fused']} queries_per_arm={4 * row['batch'] * calls['fused']}"
+    print(f"G{row['group']} BS{row['batch']} CHECK TopK_score/KV/Index=PASS {counts}")
     for arm, values in row['mean_us'].items():
         print(f"G{row['group']} BS{row['batch']} {arm} graph_mean_us={values['graph']:.2f} "
               f"LI_mean_us={values['LI']:.2f} tail_mean_us={values['tail']:.2f}")
@@ -139,7 +149,12 @@ def report_cell(row):
     if 'saved_vs_previous_us' in row:
         delta = row['saved_vs_previous_us']
         old, new = (row['tokens_per_call'][arm] for arm in ('previous_fused', 'fused'))
-        b1, b2 = row['graph_saved_vs_previous_by_block_us']
+        if row['blocks'] == 1:
+            b1, b2 = row['previous_graph_by_block_us']
+            block_text = f"previous_graph_block1/block2_us={b1:.2f}/{b2:.2f}"
+        else:
+            b1, b2 = row['graph_saved_vs_previous_by_block_us']
+            block_text = f"previous_minus_new_block1/block2_us={b1:+.2f}/{b2:+.2f}"
         first = row.get('first_window')
         first_text = (f" first_window_GETs/active_rows={first['first_prefetch']:.1f}/"
                       f"{first['first_nonempty_rows']:.1f}" if first else '')
@@ -148,7 +163,7 @@ def report_cell(row):
               f"gap_to_15/20_us={row['gap_to_15_us']:+.2f}/{row['gap_to_20_us']:+.2f} "
               f"previous_minus_new_graph/LI/tail_us={delta['graph']:+.2f}/{delta['LI']:+.2f}/{delta['tail']:+.2f} "
               f"no_slowdown={'PASS' if row['no_slowdown'] else 'MISS'} "
-              f"previous_minus_new_block1/block2_us={b1:+.2f}/{b2:+.2f} "
+              f"{block_text} "
               f"prefetch_old/new={old['prefetch']:.1f}/{new['prefetch']:.1f} "
               f"final_old/new={old['final']:.1f}/{new['final']:.1f}{first_text}")
         return
@@ -188,7 +203,9 @@ def main():
         cells = [cell_summary(args.out, g, b) for g in args.groups for b in args.batches]
         passed = sum(row['reached_20pct'] for row in cells)
         path = args.out / 'packed_summary.json'
-        payload = dict(protocol='ten_independent_calls_one_device_event', blocks=2, cells=cells)
+        payload = dict(protocol='ten_independent_calls_one_device_event', blocks=cells[0]['blocks'], cells=cells)
+        if field(args.out, 'reference'):
+            payload['archived_blocks_per_arm'] = 2
         archive = Path(field(args.out, 'packed_source'))
         old_path = archive / 'fixed_q4_acceptance.json'
         if 16 in args.batches and old_path.is_file():

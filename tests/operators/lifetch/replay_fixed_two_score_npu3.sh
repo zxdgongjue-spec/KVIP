@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Replay only the large-batch candidate against the B24 ten-call archive.
+# Screen the candidate with one ten-call graph per cell. Pass 2 as the fourth
+# argument to repeat the candidate while still using both archived control blocks.
 set -euo pipefail
 repo=${1:?expected KVIP checkout}
 rev=${2:?expected replay revision}
 mode=${3:-two-cold}
+export PEER_PACKED_BLOCKS=${4:-1}
 case $mode in
     two-cold) export PEER_LARGE_COLD_WINDOWS=2 PEER_FOUR_WINDOW_CARRY=0
               batches='28 24 32 20'; groups='2 10 7 4 17' ;;
@@ -12,6 +14,7 @@ case $mode in
               batches='32 28 24 20'; groups='7 2 10 4 17' ;;
     *) echo "Expected two-cold or carry" >&2; exit 2 ;;
 esac
+case $PEER_PACKED_BLOCKS in 1|2) ;; *) echo "Expected one or two candidate blocks" >&2; exit 2 ;; esac
 work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold}
 archive="$work/peer-baseline/fixed-q4.ygIfRl"
 control="$work/peer-baseline/fixed-q4-packed.IWXS7N"

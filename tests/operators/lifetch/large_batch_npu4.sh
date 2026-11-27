@@ -54,6 +54,11 @@ if (( $# )); then
         exit 2
     fi
 fi
+packed_blocks=2
+if (( packed_candidate )); then
+    packed_blocks=${PEER_PACKED_BLOCKS:-2}
+    case $packed_blocks in 1|2) ;; *) echo "Expected PEER_PACKED_BLOCKS=1 or 2" >&2; exit 2 ;; esac
+fi
 if [[ -n $bs32_li ]]; then
     if (( !packed_candidate )); then echo "$bs32_li requires --packed-aiv" >&2; exit 2; fi
     if [[ ! -s $root/csrc/operators/lightning_indexer_with_fetch/op_kernel/indexer_large_dualrole.cpp ]]; then
@@ -88,11 +93,17 @@ if [[ $carry_credit != 0 ]]; then
     prefix=fixed-q4-four-window-carry
 fi
 if [[ -n $bs32_li ]]; then prefix="$prefix-bs32-$bs32_li"; fi
+if (( packed_blocks == 1 )); then prefix="$prefix-one-block"; fi
 if [[ -n $packed_archive && -n ${PEER_PACKED_RESUME:-} ]]; then
     out=$(cd "$PEER_PACKED_RESUME" && pwd)
     [[ $out == "$area/$prefix."* && $(<"$out/packed_source.txt") == "$packed_archive" &&
        $(<"$out/native.txt") == "$(git -C "$root" rev-parse HEAD)" &&
        $(<"$out/physical_npu.txt") == "$peer_physical_npu" ]] || { echo "Wrong packed resume directory: $out" >&2; exit 2; }
+    if (( packed_candidate )); then
+        saved_blocks=2
+        if [[ -f $out/candidate_blocks.txt ]]; then saved_blocks=$(<"$out/candidate_blocks.txt"); fi
+        [[ $saved_blocks == "$packed_blocks" ]] || { echo "Candidate block count differs from archived run" >&2; exit 2; }
+    fi
 else
     out=$(mktemp -d "$area/$prefix.XXXXXX")
 fi
@@ -187,6 +198,7 @@ git -C "$sdk" rev-parse HEAD > "$out/kvaf.txt"
 if [[ -n $packed_archive ]]; then
     printf '%s\n' "$packed_archive" > "$out/packed_source.txt"
     if (( packed_candidate )); then
+        printf '%s\n' "$packed_blocks" > "$out/candidate_blocks.txt"
         ctl=$("$PYTHON" -B "$workers/fixed_q4_packed_report.py" reference "$out" "$packed_archive" "$root" "${PEER_PACKED_REFERENCE:-}")
         if [[ -f $out/reference.txt && $(<"$out/reference.txt") != "$ctl" ]]; then
             echo "Cannot resume against a different packed reference" >&2; exit 1
@@ -207,7 +219,7 @@ if [[ -n $packed_archive ]]; then
     if [[ -n $bs32_li ]]; then
         echo "WINDOW_SCHEDULE BS32 policy=$bs32_li first=256 cold=256,256,256 row_limit=1024" >&3
     fi
-    echo "CONFIG packed_calls=10 blocks=2 groups=${groups[*]} batches=${batches[*]} physical_NPU=$peer_physical_npu archive=$packed_archive" >&3
+    echo "CONFIG packed_calls=10 blocks=$packed_blocks groups=${groups[*]} batches=${batches[*]} physical_NPU=$peer_physical_npu archive=$packed_archive" >&3
 elif (( fixed )); then
     args=("$out")
     if [[ -n $fixed_archive ]]; then args+=("$fixed_archive"); fi
@@ -364,7 +376,7 @@ run_packed_cohort() {
     placement=$("$PYTHON" -B "$workers/large_batch_placement.py" get "$ref")
     read -r node adapter <<<"$placement"
     set_cpu_placement "$node" "$adapter" archived
-    for block in 1 2; do
+    for ((block=1; block<=packed_blocks; block++)); do
         dir="$pair/block$block"
         mkdir -p "$dir"
         order=(serial fused)

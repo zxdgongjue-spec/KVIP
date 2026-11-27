@@ -6,7 +6,7 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'support'))
-from fixed_q4_packed_report import cell_summary
+from fixed_q4_packed_report import cell_summary, main, report_cell
 
 
 def write_block(root, cohort, block, *, wrong_input=False):
@@ -91,3 +91,45 @@ def test_new_kernel_reuses_only_archived_times_and_checks_each_block(tmp_path):
     result = cell_summary(fresh, 17, 8)
     assert result['reached_15pct'] and not result['no_slowdown']
     assert result['graph_saved_vs_previous_by_block_us'] == [5, -15]
+
+
+def test_one_candidate_block_uses_both_measured_control_blocks(tmp_path, capsys, monkeypatch):
+    control, fresh = tmp_path / 'control', tmp_path / 'fresh'
+    for root in (control, fresh):
+        root.mkdir()
+        for key, value in [('native', 'reader'), ('host', 'test'), ('physical_npu', '3')]:
+            (root / (key + '.txt')).write_text(value)
+    (fresh / 'reference.txt').write_text(str(control))
+    (fresh / 'candidate_blocks.txt').write_text('1')
+    for cohort in (0, 1):
+        for block in (1, 2):
+            write_block(control, cohort, block)
+        write_block(fresh, cohort, 1)
+        serial = fresh / f'g17/bs8/cohort{cohort}/block1/serial/packed_result.json'
+        serial.unlink()
+
+    row = cell_summary(fresh, 17, 8)
+    assert row['mean_us']['serial']['graph'] == 412
+    assert row['mean_us']['previous_fused']['graph'] == 312
+    assert row['mean_us']['fused']['graph'] == 310
+    assert row['saved_vs_previous_us']['graph'] == 2
+    assert 'graph_saved_vs_previous_by_block_us' not in row
+    assert row['previous_graph_by_block_us'] == [310, 314]
+    assert row['blocks'] == 1
+    assert row['calls_by_arm'] == {'serial': 40, 'previous_fused': 40, 'fused': 20}
+    report_cell(row)
+    output = capsys.readouterr().out
+    assert 'candidate_calls=20 archived_calls_per_arm=40 candidate_queries=640 archived_queries_per_arm=1280' in output
+    assert 'previous_minus_new_block1/block2' not in output
+    monkeypatch.setattr(sys, 'argv', ['report', 'summary', str(fresh), '--groups', '17', '--batches', '8'])
+    main()
+    summary = json.loads((fresh / 'packed_summary.json').read_text())
+    assert (summary['blocks'], summary['archived_blocks_per_arm']) == (1, 2)
+
+    # A mismatched archived second block cannot silently enter the comparison.
+    path = control / 'g17/bs8/cohort0/block2/fused/packed_result.json'
+    data = json.loads(path.read_text())
+    data['identity']['sequence_sha256'] = 'other'
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match='inputs, runtime or memory placement'):
+        cell_summary(fresh, 17, 8)
