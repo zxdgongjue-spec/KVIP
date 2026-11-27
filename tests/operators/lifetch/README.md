@@ -118,3 +118,44 @@ python tests/operators/lifetch/test_lifetch.py bench --input real \
 ```
 
 每次运行结果由唯一目录保存，失败也保留已完成 case。
+
+## Fixed score and last-window Q1 on A5
+
+`run_fixed_q4_combo_a5.sh` compares four fused routes in the same bridge, built
+from an experimental branch of `perf/lifetch-fixed-q4-bs1-32` at `af52a02b`.
+The four routes independently enable fixed history sharding and four single-Q
+workers for the final Cold window. Extra physical score producers publish their
+existing readiness and retire. The original logical AIV lanes perform the Q1
+work after score retirement. The original window owner joins the query headers
+and keeps responsibility for cross-Q deduplication and WQE submission.
+
+The default is BS1/W2 and BS4/W4 at miss 5% and 15%, with Q4, 128K history, 16K
+resident, and prefetch caps of 512 per request and 128 per window. The runner
+requests W4 in every arm. BS1 clamps to W2 and retains the 128-entry window cap.
+The two knobs leave the earlier windows, thresholds, rank selection and
+Terminal policy intact. BS2/W4 and BS8/W4 can be selected using `--batch`.
+Miss 10% and 20% are also supported. `--batch` and `--miss-percent` are repeatable.
+
+Prepare the existing KVAF checkout pinned at
+`813f1750a50b7e6c92d5f5397f2fbc05befef6da` on the host and build it with the
+container's CANN toolchain. The comparison uses synthetic fused-only URMA
+replay and validates Top2048, KV, Index and Get receipts. The runner uses the
+configured KVAF service, or starts a temporary CPU service when its loopback
+endpoint is free.
+
+```bash
+bash tests/operators/lifetch/run_fixed_q4_combo_a5.sh --dry-run
+export KVIP_KVAF_ROOT=/path/to/KVAF-unified-813f1750
+export KVIP_A5_DEVICE=0
+bash tests/operators/lifetch/run_fixed_q4_combo_a5.sh \
+  --batch 1 --miss-percent 5 --warmup 1 --iterations 2
+bash tests/operators/lifetch/run_fixed_q4_combo_a5.sh --warmup 2 --iterations 5
+```
+
+The printed output directory contains the manifest, raw profiler traces,
+`arms.csv` with Graph Event, kernel stage times and Get counts, and
+`comparison.csv` with marginal and combined savings. Positive savings indicate
+less time. `q1_savings_on_fixed_us` measures the Q1 increment after fixed Score,
+and `interaction_savings_us` subtracts the Q1 saving measured with P2 Score
+from that increment. Check each row's Get-match field before using raw timing
+to infer work saved.
