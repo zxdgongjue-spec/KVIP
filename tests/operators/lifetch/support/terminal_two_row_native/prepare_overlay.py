@@ -27,19 +27,22 @@ __aicore__ inline void RunTerminalRow(GM_ADDR binding, uint32_t b, uint32_t q,
          """if constexpr(Suspend) {
   rotating::CommitTerminalPost(args,originalHead,(defer || !transportSafe)?0:batches.ends[0],post);
  } else { rotating::CommitTerminalPost(args,originalHead,batches.ends[0],post); }""")
-    once(" uint64_t cqError;\n",''' if constexpr(Suspend) {
+    plain=" uint64_t cqError=rotating::CompleteTerminalPost(args,post,batches,originalHead);\n"
+    paired=" uint64_t cqError;\n"
+    anchor=plain if plain in text else paired
+    once(anchor,''' if constexpr(Suspend) {
   saved->owner=owner;saved->generation=generation;saved->total=total;saved->first=first;
   saved->n=n;saved->scan=scanHistory;saved->topError=topkError;saved->packError=packError;
   saved->indexError=indexError;
   bool ok=joint_tail::Arm(*saved,originalHead,queue->cq_consumer_index,own?batches.count:0,
-         batches.ends,own,own&&!defer&&transportSafe,own&&rotating::CanOverlapTerminalPrefixes(args,own)?2:1,args->queue_state);
+         batches.ends,own,own&&!defer&&transportSafe,own && reinterpret_cast<__gm__ KvafBatchGetDirectUrmaEntity*>(args->channel_entity)->cq_depth>2 ? 2 : 1,args->queue_state);
   if(!ok || !transportSafe){saved->phase=joint_tail::Phase::Prepared;saved->error=kvaf_device::kInvalidArgs;saved->stop=true;}
   // MTE3 public outputs have already joined, all WQEs are in the private SQ and Index is done.
   pipe.Destroy();return;
  }
- uint64_t cqError;
-''')
-    once("if (LargeBatch && batches.count > 1 && rotating::CanOverlapTerminalPrefixes(args, own))",
+'''+anchor)
+    if anchor==paired:
+        once("if (LargeBatch && batches.count > 1 && rotating::CanOverlapTerminalPrefixes(args, own))",
          "if (false /* unmodified single-credit fallback in this experiment-only TU */)")
     (out / "row_kernel.h").write_text(text)
 

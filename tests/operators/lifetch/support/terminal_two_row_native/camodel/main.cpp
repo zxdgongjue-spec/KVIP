@@ -53,7 +53,7 @@ static void run(int fault,aclrtStream stream){
                 cq[pos%8*16]=uint32_t((pos/8&1)^ready)<<2;}
             e.cq_va=m.put(cq);
             args.queue_state=m.put(queue);args.channel_entity=m.put(e);args.core_status=m.put(KvafBatchGetCoreStatus{});
-            args.table_capacity=fault;args.request_capacity=row;
+            args.output_rows=33*16896;args.table_capacity=fault;args.request_capacity=row;
             args.indices=trace+(row*4+j)*sizeof(tiny::Trace);args.offsets=gates;
             if(j<4)args.token_bytes=counts[which][j];
             refs[which][j]={args.queue_state,args.core_status,args.channel_entity,e.sq_db_va,e.cq_db_va};
@@ -63,9 +63,10 @@ static void run(int fault,aclrtStream stream){
     rotating::Context c{};c.shape.batch=32;c.shape.history=131072;c.shape.resident=16384;c.outputStride=16896;
     c.selected=m.put(nullptr,128*2048*4);c.locations=m.put(nullptr,128*2048*4);
     auto posts=m.put(nullptr,rows*qs*sizeof(rotating::FinalPost));c.owners=posts;
+    preArgs[0].output_rows=33*16896;
     c.rows=m.put(rowstate);c.args=m.put(preArgs);
     std::array<uint32_t,32> owners{};std::array<int64_t,128> src{},active{};
-    for(unsigned i=0;i<128;++i){owners[i/4]=i/4;src[i]=i;active[i]=1;}
+    for(unsigned i=0;i<128;++i){owners[i/4]=1+i/4;src[i]=i;active[i]=1;}
     c.rowOwners=m.put(owners);
     std::array<uint64_t,28> update{};update[7]=c.shape.history;update[9]=c.rowOwners;update[20]=m.put(src);
     update[21]=m.put(active);update[22]=c.selected;update[23]=c.locations;

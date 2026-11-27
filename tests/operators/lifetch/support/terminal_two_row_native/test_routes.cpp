@@ -25,6 +25,11 @@ int main(){
     ++u[23];assert(!ok());u[23]=c.locations;
     u[22]=u[23];assert(!ok());u[22]=c.selected;
     --u[7];assert(!ok());++u[7];c.rowOwners+=4;assert(!ok());c.rowOwners-=4;
-    u[23]=0x22000000;assert(ok());c.shape.batch=28;assert(!ok());
+    u[23]=0x22000000;assert(ok());
+    KvafExecuteBatchGetKernelArgs args{};c.args=uintptr_t(&args);
+    for(auto&owner:owners)++owner;
+    args.output_rows=32*16896;assert(!ok());
+    args.output_rows=33*16896;assert(ok());owners[8]=8;assert(!ok());owners[8]=9;
+    c.shape.batch=28;assert(!ok());
     std::cout<<"PASS live ownership, remapped source query, padding, partial/checkpoint output aliases, stride, batch scope\n";
 }

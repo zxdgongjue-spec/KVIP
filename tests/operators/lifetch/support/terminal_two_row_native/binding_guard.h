@@ -18,8 +18,14 @@ __aicore__ inline bool DirectRows(__gm__ pipeline_ab::Args* a,__gm__ rotating::C
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(u[9]),32*4);
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(u[20]),128*8);
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(u[21]),128*8);
+    const int32_t first=owner[0];
+    if(first!=0 && first!=1)return false;
+    if(first==1){
+        auto args=reinterpret_cast<__gm__ KvafExecuteBatchGetKernelArgs*>(ctx->args);
+        if(!args || uint64_t(args->output_rows)<33*uint64_t(ctx->outputStride))return false;
+    }
     for(uint32_t r=0;r<32;++r) {
-        if(owner[r]!=int32_t(r)) return false;
+        if(owner[r]!=int32_t(r)+first) return false;
         for(uint32_t q=0;q<4;++q)if(!valid[r*4+q] || unpack[r*4+q]!=int64_t(r*4+q)) return false;
     }
     return true;

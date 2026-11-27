@@ -1,6 +1,7 @@
 """Pre-capture lease check for the isolated, fixed-shape BS32 trial."""
 import ctypes
 import struct
+import weakref
 from math import ceil, isfinite
 
 def disjoint(spans):
@@ -46,10 +47,11 @@ def span(t,name):
         raise ValueError(f"Expected contiguous fixed-batch buffer {name}")
     return t.data_ptr(),t.numel()*t.element_size(),name
 
-def checked_workspace(fwd):
+def checked_workspace(fwd, counter_mhz=None):
     """Call once outside graph capture. Workspace and lease must live through graph completion."""
     rot=fwd.rotating;term=fwd.terminal;torch=rot.torch
-    if fwd.batch!=32 or fwd.q_workers!=4 or term.rotating is not rot:
+    if (fwd.batch!=32 or term is None or term.rotating is not rot or
+        rot.runtime_shape.finalWorkers!=4 or len(term.queue_views)!=128):
         raise ValueError("Expected fixed BS32 Q4 direct lease")
     stream=rot.owner.lease.check_stream();stream.synchronize()
     raw=rot.owner.device_args[:160].cpu().contiguous().numpy().tobytes()
@@ -66,8 +68,15 @@ def checked_workspace(fwd):
     stride=rot.output_stride if hasattr(rot,"output_stride") else None
     if not isinstance(stride,int) or stride <= 0:
         raise ValueError("Missing verified per-owner output stride")
-    ports,hbm,sources=check_lease(e.cpu().numpy().tobytes(),raw,32*stride,rot.owner.abi_sizes["status"])
+    output_rows=struct.unpack_from("<I",raw,88)[0]
+    if output_rows not in (32*stride,33*stride) or any(
+        struct.unpack_from("<I",raw,112*i+88)[0]!=output_rows for i in range(160)):
+        raise ValueError("Fixed BS32 requires exactly 32 or 33 registered owner rows")
+    ports,hbm,sources=check_lease(e.cpu().numpy().tobytes(),raw,output_rows,rot.owner.abi_sizes["status"])
     keys,scales,addresses,logical=fwd.update.storage[:4]
+    owner_count=output_rows//stride
+    if any(t.shape[0]!=owner_count for t in (keys,scales,addresses,logical,rot.hot_valid)):
+        raise ValueError("Owner allocation differs between Index, resident bitmap and KV")
     # Partial aliases crossing row boundaries invalidate parking. The two documented exact
     # output aliases are safe only for the identity routes rechecked on each device invocation.
     buffers=[span(v,k) for k,v in (
@@ -87,19 +96,46 @@ def checked_workspace(fwd):
     disjoint(ports+buffers+[span(work,"scheduling mailbox"),(hbm[0],hbm[1],"registered HBM")])
     for remote,size in sources:
         disjoint(buffers+[(remote,size,"remote source"),span(work,"scheduling mailbox")])
-    hz=fwd.calibrate_counter_mhz()
+    hz=fwd.calibrate_counter_mhz() if counter_mhz is None else counter_mhz
     if not isfinite(hz) or hz<=0:raise ValueError("Invalid device counter calibration")
     return work,ceil(32*hz)
 
 class BoundJointTerminal:
     """Explicit test entry for a caller that has already issued LI for this same binding."""
-    def __init__(self, forward, library):
-        self.fwd=forward
-        self.workspace,self.guard_ticks=checked_workspace(forward)
+    def __init__(self, forward, library, counter_mhz=None):
+        self.fwd=weakref.proxy(forward)
+        self.workspace,self.guard_ticks=checked_workspace(forward, counter_mhz)
         self.library=library
         self.function=library.kvip_test_two_rows
         self.function.argtypes=[ctypes.c_uint32,ctypes.c_void_p,ctypes.c_void_p,ctypes.c_void_p,ctypes.c_uint64]
         self.function.restype=ctypes.c_uint32
+        self.pipeline=library.kvip_test_forward_two_rows
+        self.pipeline.argtypes=[ctypes.c_void_p]*7+[ctypes.c_uint64]
+        self.pipeline.restype=ctypes.c_uint32
+        self.library_path=library._name
+
+    def forward(self, launch, hot, bindings, terminal, stream, shape):
+        """Record the original hot/LI cold launches, followed by this binding's private two-row tail."""
+        return self.pipeline(bindings,terminal,stream,shape,launch,hot,self.workspace.data_ptr(),self.guard_ticks)
+
+    def readback(self):
+        """Read after graph completion and the full output checks, once per individual bound state."""
+        words=self.workspace.view(self.fwd.torch.int64).reshape(-1,16)[:,0].cpu().tolist()
+        if words[0]!=1:
+            raise ValueError(f"Two-row kernel did not accept the live owner/output route (mode={words[0]})")
+        pairs=[]
+        for row in range(32):
+            box=words[1+row*26:1+(row+1)*26]
+            child=box[24]
+            if 1<=child<=32:
+                if child==row+1 or any(v!=1 for v in box[4:24]):
+                    raise ValueError(f"Incomplete Q1–Q4 handoff from {row} to {child-1}: {box}")
+                pairs.append((row,child-1))
+        if len({r for pair in pairs for r in pair})!=2*len(pairs):
+            raise ValueError("A terminal row was prepared twice")
+        return dict(accepted=True,parked_rows=len(pairs),ordered_pairs=pairs,
+                    guard_ticks=self.guard_ticks)
+
 
     def launch(self):
         stream=self.fwd.rotating.owner.lease.check_stream()
