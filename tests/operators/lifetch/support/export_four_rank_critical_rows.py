@@ -140,20 +140,72 @@ def assemble(destination, serial, produce, priority=PRIORITY, limit=LIMIT):
     return target, accepted
 
 
+def valid_bundle(path):
+    if not path.is_file() or path.stat().st_size > LIMIT:
+        return False
+    try:
+        with zipfile.ZipFile(path) as package:
+            info = json.loads(package.read("summary.json"))
+            rows = info["rows"]
+            if info["native"] != ORIGIN or not rows:
+                return False
+            pairs = [(r["group"], r["donor"]) for r in rows]
+            if pairs != [p for p in PRIORITY if p in pairs]:
+                return False
+            for row in rows:
+                name = f"g{row['group']}-donor{row['donor']}.npz"
+                if row["name"] != name or package.getinfo(name).file_size != row["bytes"]:
+                    return False
+                with package.open(name) as f:
+                    if hashlib.file_digest(f, "sha256").hexdigest() != row["sha256"]:
+                        return False
+            return len(info["serial"]) == len(CELLS)
+    except (KeyError, TypeError, ValueError, OSError, zipfile.BadZipFile):
+        return False
+
+
+def publish(path, work):
+    alias = work / "li3-b24.zip"
+    try:
+        os.link(path, alias)
+    except FileExistsError:
+        if not alias.is_file() or (not os.path.samefile(alias, path) and sha256(alias) != sha256(path)):
+            # An existing file belongs to a different export. Keep both original locations.
+            alias = path
+    except OSError:
+        alias = path
+    print(f"RETURN_DIR={alias.parent}")
+    print(f"RETURN_NAME={alias.name}")
+    print(f"RETURN_FILE={alias}")
+    print(f"BYTES={alias.stat().st_size}")
+    print(f"SHA256={sha256(alias)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
-    root = parser.parse_args().archive.resolve(strict=True)
+    parser.add_argument("--recover", action="store_true", help="use an existing verified ZIP first")
+    args = parser.parse_args()
+    root = args.archive.resolve(strict=True)
     if ((root / "physical_npu.txt").read_text().strip() != "4" or (root / "native.txt").read_text().strip() != ORIGIN
             or (root / "host.txt").read_text().strip() != os.uname().nodename):
         raise SystemExit("Expected the B24 four-window archive from physical NPU4")
+    work = root.parents[1]
+    if args.recover:
+        candidates = sorted(work.glob("li-critical-rows.*/li-critical-rows.zip"),
+                            key=lambda p: p.stat().st_mtime_ns, reverse=True)
+        for path in [*candidates, work / "li3-b24.zip"]:
+            if valid_bundle(path):
+                print("REUSED_ARCHIVE=1")
+                publish(path, work)
+                return
     serial = serial_results(root)
     dest = Path(tempfile.mkdtemp(prefix="li-critical-rows.", dir=root.parents[1]))
     target, rows = assemble(dest, serial, lambda g, r, p: extract(root, g, r, p))
     for row in rows:
         print(f"G{row['group']} original_donor={row['donor']} bytes={row['bytes']}")
     print(f"ARCHIVED_SERIAL={sum(r['serial'] is not None for r in serial)}/{len(serial)}")
-    print(f"RETURN_FILE={target} bytes={target.stat().st_size} sha256={sha256(target)}")
+    publish(target, work)
 
 
 if __name__ == "__main__":
