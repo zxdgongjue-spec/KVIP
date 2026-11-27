@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Replay only the large-batch candidate against the B24 ten-call archive.
+set -euo pipefail
+repo=${1:?expected KVIP checkout}
+rev=${2:?expected replay revision}
+work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold}
+archive="$work/peer-baseline/fixed-q4.ygIfRl"
+control="$work/peer-baseline/fixed-q4-packed.IWXS7N"
+if [[ ! -s "$control/packed_summary.json" || ! -s "$archive/native.txt" ||
+      $(<"$control/native.txt") != 10442f1ffa314606c23f54b73e49ecfc372f1f9a ||
+      $(<"$control/physical_npu.txt") != 3 ]]; then
+    echo "Expected the completed B24 NPU3 archive at $control and its inputs at $archive" >&2
+    exit 1
+fi
+mkdir -p "$work/fused-scan-sources"
+runner=$(mktemp -d "$work/fused-scan-sources/two-score-npu3.XXXXXX")
+git -C "$repo" worktree add -q --detach "$runner" "$rev"
+export PEER_G2_WORK="$work" PEER_LOCAL_ONLY=1
+export PEER_PHYSICAL_NPU=3 ASCEND_RT_VISIBLE_DEVICES=3
+export PEER_PACKED_REFERENCE="$control" PEER_LARGE_COLD_WINDOWS=2
+export FIXED_Q4_BATCHES='28 24 32 20' FIXED_Q4_GROUPS='2 10 7 4 17'
+unset PEER_BS32_LI PEER_PACKED_RESUME KVAF_CPU_UB_DEVICE
+exec bash "$runner/tests/operators/lifetch/large_batch_npu4.sh" --packed-aiv "$archive"
