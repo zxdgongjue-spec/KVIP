@@ -61,7 +61,7 @@ def report(doc):
         for t, n, group, count in posts:
             phase = (t + offset) % (4 * width)
             start = group * width
-            delay = 0 if count != 4 or start <= phase < start + width else (start - phase) % (4 * width)
+            delay = 0 if count != 4 or start <= phase < start + width - 1024 else (start - phase) % (4 * width)
             shifted.append((t + delay, n))
         gated.append(peak(shifted, 4 * mhz))
     print(f"G7 BS{ident['batch']} diagnostic first/later_drain_P50_us={median(drains[0]):.2f}/{median(drains[1]):.2f} "

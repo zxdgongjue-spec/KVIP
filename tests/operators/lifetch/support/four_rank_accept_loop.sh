@@ -11,7 +11,9 @@ esac
 for group in "${groups[@]}"; do
     trace=
     for batch in "${batches[@]}"; do
-        if [[ -n $extra_report ]]; then
+        if [[ $audit_mode == stagger-pair ]]; then
+            old=
+        elif [[ -n $extra_report ]]; then
             old=$("$PYTHON" -B "$extra_report" cached "$out" "$ref" "$group" "$batch" "$audit_mode")
         else
             old=$("$PYTHON" -B "$report" cached "$out" "$ref" "$group" "$batch" "$audit_mode")
@@ -41,7 +43,7 @@ for group in "${groups[@]}"; do
         placement=$("$PYTHON" -B "$report" placement "$thp")
         read -r node adapter <<<"$placement"
         set_cpu_placement "$node" "$adapter" archived
-        if [[ $audit_mode == frozen || $audit_mode == two-row-frozen ]]; then
+        if [[ $audit_mode == frozen || $audit_mode == two-row-frozen || $audit_mode == stagger-pair ]]; then
             PEER_FROZEN_LIST=$("$PYTHON" -B "$report" cached "$out" "$PEER_AUDIT_ORIGIN" "$group" "$batch" journal)
             [[ -n $PEER_FROZEN_LIST && -s $PEER_FROZEN_LIST/journal.npz ]]
             export PEER_FROZEN_LIST
@@ -50,6 +52,16 @@ for group in "${groups[@]}"; do
                 [[ -n $PEER_FROZEN_CONTROL && -s $PEER_FROZEN_CONTROL/frozen.json ]]
                 export PEER_FROZEN_CONTROL
             fi
+        fi
+        if [[ $audit_mode == stagger-pair ]]; then
+            for gate in 0 1; do
+                echo "COLLECT G$group BS$batch private_gate=$gate" >&3
+                PEER_STAGGER_ENABLE=$gate run_arm "$group" "$batch" "$trace" "gate$gate" "$pair"
+                "$PYTHON" -B "$controller_root/tests/operators/lifetch/support/large_batch_placement.py" compare "$thp" "$pair/gate$gate/thp.json"
+                touch "$pair/gate$gate/placement_verified"
+            done
+            "$PYTHON" -B "$controller_root/tests/operators/lifetch/support/terminal_stagger_result.py" "$pair" >&3
+            continue
         fi
         echo "COLLECT G$group BS$batch $audit_mode" >&3
         run_arm "$group" "$batch" "$trace" "$audit_mode" "$pair"

@@ -141,6 +141,15 @@ def run(a):
         from b24_two_row_natural import run as run_natural
         return run_natural(a)
     two_row = a.mode == "two-row-frozen"
+    stagger = a.mode == "stagger-pair"
+    if stagger:
+        import b24_two_row_attach
+        import terminal_stagger_attach
+        flag = os.environ["PEER_STAGGER_ENABLE"]
+        if flag not in ("0", "1"):
+            raise ValueError("Invalid terminal gate setting")
+        enabled = flag == "1"
+        b24_two_row_attach.install_profiler("v9_terminal_stagger")
     if two_row:
         if a.batch != 32:
             raise ValueError("The two-row tail requires BS32")
@@ -279,7 +288,7 @@ def run(a):
             )
             return dict(correctness="PASS", failures=[])
 
-    if a.mode == "frozen" or two_row:
+    if a.mode == "frozen" or two_row or stagger:
         from four_rank_controlled import (GUARD, clear_evidence, controlled_build, evidence, extend_state,
                                           list_digest, validate_bound_addresses, validate_physical_operands, window_inputs)
         import large_two_cold
@@ -318,6 +327,9 @@ def run(a):
             b24_two_row_attach.install(large_two_cold, a.timed, a.sdk / "build-npu", acl.get_soc_name())
             proof["original_control"] = str(control_folder)
             proof["original_control_sha256"] = sha(control_folder / "frozen.json")
+        if stagger:
+            import acl
+            terminal_stagger_attach.install(large_two_cold, a.timed, a.sdk / "build-npu", acl.get_soc_name(), enabled)
         kwargs = dict(large_window_policy="four-ranks")
 
         class ControlledState(ex.FusedReplayState):
@@ -353,6 +365,12 @@ def run(a):
                     proof.update(image, compiler_sha256=compiler_identity(a.sdk))
                 elif any(proof[k] != value for k, value in image.items()):
                     raise ValueError("The ten-call graph used different LI or terminal images")
+            elif stagger:
+                image = terminal_stagger_attach.identity(state, enabled)
+                if index == 0:
+                    proof.update(image, compiler_sha256=compiler_identity(a.sdk))
+                elif any(proof[k] != v for k, v in image.items()):
+                    raise ValueError("Frozen graph mixed different gate settings or binaries")
             elif index == 0:
                 proof.update(terminal_image(state, a.sdk))
 
@@ -390,14 +408,14 @@ def run(a):
     if a.mode == "team-schedule":
         atomic_json(a.out / "journal.json", dict(summary, arm="journal"))
     path = {"team-schedule": "team-schedule.json", "serial": "packed_result.json", "journal": "journal.json", "frozen": "frozen.json",
-            "two-row-frozen": "two-row-frozen.json"}[a.mode]
+            "two-row-frozen": "two-row-frozen.json", "stagger-pair": "stagger.json"}[a.mode]
     atomic_json(a.out / path, summary)
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     from b24_window_policy import MODES
-    p.add_argument("mode", choices=[*MODES, "journal", "serial", "frozen", "two-row-natural", "two-row-frozen", "team-schedule"])
+    p.add_argument("mode", choices=[*MODES, "journal", "serial", "frozen", "two-row-natural", "two-row-frozen", "stagger-pair", "team-schedule"])
     for name in ("timed", "ref"):
         p.add_argument(name, type=Path)
     for name in ("group", "batch"):

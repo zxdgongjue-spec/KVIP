@@ -84,8 +84,9 @@ def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False, exp
         }
     )
     if expected_tail is not None:
-        if not fused or batch != 32 or expected_tail != "v9_test_two_row_terminal":
-            raise ValueError("The two-row terminal requires the BS32 fused graph")
+        allowed = {"v9_test_two_row_terminal": (32,), "v9_terminal_stagger": (20, 24, 28, 32)}
+        if not fused or batch not in allowed.get(expected_tail, ()):
+            raise ValueError("Unexpected experimental terminal or batch")
         names["tail"] = (expected_tail,)
     if expected_li23 is not None:
         if not fused or batch not in (20, 24, 28, 32):

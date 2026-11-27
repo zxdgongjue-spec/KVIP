@@ -10,7 +10,7 @@ from four_rank_tail_image import tail_text
 KERNEL = "v9_test_two_row_terminal"
 
 
-def install_profiler():
+def install_profiler(kernel=KERNEL):
     """Keep the original graph timer and require the candidate's real hardware task."""
     import fixed_q4_packed_timing as timing
 
@@ -19,7 +19,7 @@ def install_profiler():
     spec = importlib.util.spec_from_file_location("b24_two_row_stage_parser", Path(__file__).with_name("large_batch_pair.py"))
     parser = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(parser)
-    timing.fixed_stage_records = partial(parser.fixed_stage_records, expected_tail=KERNEL)
+    timing.fixed_stage_records = partial(parser.fixed_stage_records, expected_tail=kernel)
 
 
 def install(large_two_cold, repo, sdk_build, soc):
