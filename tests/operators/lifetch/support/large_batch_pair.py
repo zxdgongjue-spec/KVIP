@@ -43,6 +43,20 @@ def check_scores(inputs, selected, serial):
     return exact
 
 
+def captured_score_reference(inputs):
+    """Use the frozen full scores for correctness when collecting only tail clocks."""
+    batch = inputs.geometry["batch"]
+    top = np.empty((batch, 4, 2048), dtype=np.int32)
+    for row in range(batch):
+        for query in range(4):
+            valid = np.flatnonzero(inputs.logical_score_valid[row, query])
+            keys = inputs.logical_score_keys[row, query, valid]
+            positions = np.argpartition(keys, -2048)[-2048:]
+            top[row, query] = np.sort(valid[positions])
+    inputs.validate_topk(top)
+    return np.broadcast_to(top, (CALLS, *top.shape))
+
+
 def large_account(events, scope, elapsed, *, fused=True, batch=32):
     """Recognize CANN device names and task types in one restored graph."""
     from decimal import Decimal
@@ -588,7 +602,11 @@ def run(args):
     import torch_npu
 
     npu = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
-    if npu not in ("0", "3", "4") or os.environ.get("PEER_PHYSICAL_NPU", npu) != npu:
+    clock_run = args.g7_tail_clocks
+    if clock_run and (npu != "7" or args.arm != "fused" or args.group != 7 or args.batch not in (20, 24, 28, 32)
+                      or args.serial_result or args.compare_archived_pair or args.reuse_serial_archive):
+        raise ValueError("G7 clocks mode requires physical NPU7, one fused arm and a supported large batch")
+    if (not clock_run and npu not in ("0", "3", "4")) or os.environ.get("PEER_PHYSICAL_NPU", npu) != npu:
         raise ValueError("Set PEER_PHYSICAL_NPU and ASCEND_RT_VISIBLE_DEVICES to the selected physical NPU")
     repo = Path(__file__).resolve().parents[4]
     revision = subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip()
@@ -602,7 +620,7 @@ def run(args):
     kernel = args.kvaf_root / "build-npu/bin/kvaf_execute_batch_get_kernels.o"
     with kernel.open("rb") as stream:
         sdk_kernel_sha = hashlib.file_digest(stream, "sha256").hexdigest()
-    if args.arm == "fused" and args.serial_result is None:
+    if args.arm == "fused" and not clock_run and args.serial_result is None:
         raise ValueError("The fused arm requires the matching strong serial result")
     sequence, donors = load(args.trace.resolve(), args.group, args.round, args.batch, args.cohort, args.prepared)
     inputs = sequence.inputs
@@ -634,6 +652,11 @@ def run(args):
         f"Q_ends_min/max={inputs.query_ends.min()}/{inputs.query_ends.max()}",
         flush=True,
     )
+    if clock_run:
+        production = "af52a02b97daddadd5d93b9d100f2ff1b03b499d"
+        subprocess.run(["git", "-C", repo, "diff", "--exit-code", "--quiet", production, revision,
+                        "--", ".", ":(exclude)tests/operators/lifetch/**"], check=True)
+        identity["native"] = production
     if args.reuse_serial_archive:
         if args.arm != "serial":
             raise ValueError("Only the completed serial arm can be reused")
@@ -644,7 +667,10 @@ def run(args):
     fused = args.arm == "fused"
     serial = None
     previous = None
-    if fused:
+    reference = None
+    if clock_run:
+        serial = captured_score_reference(inputs)
+    elif fused:
         base = identity
         if args.compare_archived_pair:
             base, previous = compute_reference(args.serial_result.parent, identity, args.output)
@@ -728,7 +754,10 @@ def run(args):
         checks="per-call TopK and output-slot Index; complete selected KV bytes on first measured call",
         **proofs,
     )
-    if fused:
+    if clock_run:
+        summary["measurement_reader"] = revision
+        summary["score_oracle"] = "captured_full_scores"
+    elif fused:
         if reference is not None:
             summary["serial_reference"] = reference
         summary["vs_strong_serial_saved_mean_p50_us"] = {
@@ -773,7 +802,7 @@ def run(args):
         f"CHECK {tag} TopK_score=PASS queries={checked}/{checked} Index_slots=PASS "
         f"rows={CALLS * args.batch}/{CALLS * args.batch} full_KV_Index=PASS full_KV_rows={args.batch}/{args.batch}"
         + (
-            f" vs_strong_serial_score=PASS exact_ID_sets={proofs['exact']}/{checked} ordered_Index_diagnostic={proofs['ordered_Index_diagnostic_rows']}/{args.batch}"
+            f" vs_{'captured_scores' if clock_run else 'strong_serial_score'}=PASS exact_ID_sets={proofs['exact']}/{checked} ordered_Index_diagnostic={proofs['ordered_Index_diagnostic_rows']}/{args.batch}"
             if fused
             else ""
         )
@@ -827,6 +856,8 @@ def run(args):
                 f"row_mean/max_us={teams['row_mean_us']:.2f}/{teams['row_max_us']:.2f} "
                 f"last_row={teams['last_row']} last_Q={teams['last_q']}"
             )
+        if clock_run:
+            return
         print(
             f"SAVED {tag} vs_strong_serial",
             *(
@@ -861,6 +892,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--serial-result", type=Path)
     parser.add_argument("--compare-archived-pair", action="store_true")
+    parser.add_argument("--g7-tail-clocks", action="store_true")
     parser.add_argument(
         "--keep-trace", action="store_true", help="Keep the raw profiler timeline after successful attribution"
     )

@@ -10,6 +10,15 @@ fixed=0
 fixed_archive=
 batches=(20 24 28 32)
 groups=(10 4 17 7 2)
+tail_clocks=0
+native=af52a02b97daddadd5d93b9d100f2ff1b03b499d
+if [[ $# == 1 && $1 == --g7-npu7-clocks ]]; then
+    tail_clocks=1
+    export PEER_PHYSICAL_NPU=7 ASCEND_RT_VISIBLE_DEVICES=7
+    export FIXED_Q4_GROUPS=7 FIXED_Q4_BATCHES='20 24 28 32'
+    unset KVAF_CPU_UB_DEVICE
+    set -- --fixed-q4
+fi
 if (( $# )); then
     if [[ $# == 2 && $1 == --candidate-only ]]; then
         archive=$(cd "$2" && pwd)
@@ -41,7 +50,7 @@ fi
 peer_physical_npu=4
 if (( fixed )); then
     peer_physical_npu=${PEER_PHYSICAL_NPU:-${ASCEND_RT_VISIBLE_DEVICES:-4}}
-    if [[ $peer_physical_npu != 3 && $peer_physical_npu != 4 ]] ||
+    if { [[ $peer_physical_npu != 3 && $peer_physical_npu != 4 ]] && (( !tail_clocks )); } ||
         [[ -n ${ASCEND_RT_VISIBLE_DEVICES:-} && $ASCEND_RT_VISIBLE_DEVICES != "$peer_physical_npu" ]]; then
         echo "Select one matching physical card (3 or 4) for PEER_PHYSICAL_NPU and ASCEND_RT_VISIBLE_DEVICES" >&2
         exit 2
@@ -56,6 +65,31 @@ sources="$work/fused-scan-sources"
 mkdir -p "$area" "$sources"
 prefix=largebs-q4
 if (( fixed )); then prefix=fixed-q4; fi
+if (( tail_clocks )); then
+    prefix=fixed-q4-g7-npu7-clocks
+    reader=$(git -C "$root" rev-parse HEAD)
+    git -C "$root" diff --quiet "$native" "$reader" -- . ':(exclude)tests/operators/lifetch/**'
+    git -C "$root" diff --quiet HEAD
+    scan=(python3 -B "$root/tests/operators/lifetch/support/b24_g7_clocks.py" "$area")
+    report=$("${scan[@]}")
+    if [[ $report == *'DIAGNOSTIC_READ cells=4/4' ]]; then
+        printf '%s\n' "$report"
+        exit 0
+    fi
+    exec 9>"$sources/largebs-$(</proc/sys/kernel/random/boot_id)-npu7.lock"
+    if ! flock -n 9; then
+        echo "WAITING_FOR_CARD physical_NPU=7"
+        flock 9
+    fi
+    report=$("${scan[@]}")
+    if [[ $report == *'DIAGNOSTIC_READ cells=4/4' ]]; then
+        printf '%s\n' "$report"
+        exit 0
+    fi
+    mapfile -t batches < <(awk '$1 == "MISSING" {print $2}' <<<"$report")
+    (( ${#batches[@]} > 0 ))
+    echo "G7 physical_NPU=7 MEASURE_BS=${batches[*]}"
+fi
 out=$(mktemp -d "$area/$prefix.XXXXXX")
 echo "RESULT_ROOT=$out"
 log="$out/run.log"
@@ -86,10 +120,13 @@ git -C "$root" archive "$support_rev" tests/operators/lifetch/{peer_g2_input.sh,
 helpers="$host_tools/tests/operators/lifetch"
 source "$helpers/support/peer_node_prepare.sh"
 # Protect this run against a second invocation using the same physical card.
-exec 9>"$sources/largebs-$(</proc/sys/kernel/random/boot_id)-npu$peer_physical_npu.lock"
-flock -n 9 || { echo "A large-batch replay is already running on NPU$peer_physical_npu"; exit 1; }
+if (( !tail_clocks )); then
+    exec 9>"$sources/largebs-$(</proc/sys/kernel/random/boot_id)-npu$peer_physical_npu.lock"
+    flock -n 9 || { echo "A large-batch replay is already running on NPU$peer_physical_npu"; exit 1; }
+fi
 exec 8>"$sdk.lock"
 flock 8
+if (( tail_clocks )); then sdk="$sdk-g7-npu7"; fi
 baseline="$work/adaptive-sources/peer-serial-da318bdb"
 clean="$area/KVAF-de4fd37e"
 peer_prepare_node "$root" "$baseline" "$clean" "$work" "$out"
@@ -134,13 +171,18 @@ if [[ $ASCEND_RT_VISIBLE_DEVICES != "$peer_physical_npu" || $PEER_PHYSICAL_NPU !
     echo "Dependency setup changed the selected physical card" >&2
     exit 1
 fi
-printf '%s\n' "$(git -C "$root" rev-parse HEAD)" > "$out/native.txt"
+if (( tail_clocks )); then
+    printf '%s\n' "$reader" > "$out/reader.txt"
+    printf '%s\n' "$native" > "$out/native.txt"
+else
+    git -C "$root" rev-parse HEAD > "$out/native.txt"
+fi
 if [[ -r /etc/machine-id ]]; then cat /etc/machine-id > "$out/machine_id.txt"; fi
 printf '%s\n' "$peer_physical_npu" > "$out/physical_npu.txt"
 cat /proc/sys/kernel/random/boot_id > "$out/boot_id.txt"
 printf '%s\n' "$actual" > "$out/kvaf_tree.txt"
 git -C "$sdk" rev-parse HEAD > "$out/kvaf.txt"
-if (( fixed )); then
+if (( fixed && !tail_clocks )); then
     args=("$out")
     if [[ -n $fixed_archive ]]; then args+=("$fixed_archive"); fi
     fixed_archive=$("$PYTHON" -B "$workers/large_batch_placement.py" archive "${args[@]}")
@@ -225,7 +267,9 @@ run_arm() (
           --kvaf-server "127.0.0.1:$port" --output "$dir")
     if (( fixed )); then args+=(--prepared "$out/g$group/donors"); fi
     if [[ $arm == fused ]]; then
-        if [[ -n $archive ]]; then
+        if (( tail_clocks )); then
+            args+=(--g7-tail-clocks)
+        elif [[ -n $archive ]]; then
             args+=(--serial-result "$archive/g$group/bs$batch/serial" --compare-archived-pair)
         else
             args+=(--serial-result "$pair/serial")
@@ -239,6 +283,11 @@ run_pair() {
     local group=$1 batch=$2 trace=$3 cohort=$4 pair=$5
     mkdir -p "$pair"
     echo "CASE_BEGIN G$group BS$batch cohort=$cohort" >&3
+    if (( tail_clocks )); then
+        run_arm "$group" "$batch" "$trace" fused "$pair" "$cohort"
+        grep -E '^CHECK ' "$pair/fused/worker.log" | tee -a "$out/summary.txt" >&3
+        return
+    fi
     if [[ -n $archive ]]; then
         ref="$archive/g$group/bs$batch"
         "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref/serial/thp.json" "$ref/fused/thp.json"
@@ -327,6 +376,12 @@ for group in "${groups[@]}"; do
     done
     if (( fixed )); then rm -rf -- "$out/g$group/donors"; fi
 done
+if (( tail_clocks )); then
+    "${scan[@]}" | tee "$out/last_row_clocks.txt" >&3
+    grep -Fxq 'DIAGNOSTIC_READ cells=4/4' "$out/last_row_clocks.txt"
+    printf 'REPORT=%s\n' "$out/last_row_clocks.txt" >&3
+    exit 0
+fi
 if (( fixed )); then
     "$PYTHON" -B "$workers/fixed_q4_summary.py" "$out" --batches "${batches[@]}" --groups "${groups[@]}" | tee -a "$out/summary.txt" >&3
     target_rc=0
