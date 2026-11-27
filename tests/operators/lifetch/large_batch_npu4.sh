@@ -322,8 +322,11 @@ elif (( fixed )); then
 fi
 # Use the same registered CPU memory placement for the serial and fused arms.
 placement="auto auto"
-if [[ -n $audit_mode ]]; then
-    placement=$("$PYTHON" -B "$controller_root/tests/operators/lifetch/support/large_batch_placement.py" get "$PEER_AUDIT_REFERENCE/g7/bs32/block1/fused/thp.json")
+if [[ ${PEER_G7_X4_LOCAL:-0} == 1 ]]; then
+    [[ $audit_mode == window-x4-early && ${groups[*]} == 7 && ${#batches[@]} == 1 ]] || exit 2
+    placement=$("$PYTHON" -B "$workers/large_batch_placement.py" find "$out")
+elif [[ -n $audit_mode ]]; then
+    placement=$("$PYTHON" -B "$controller_root/tests/operators/lifetch/support/large_batch_placement.py" get "$PEER_AUDIT_REFERENCE/g7/bs${PEER_G7_X4_ARCHIVE_BATCH:-32}/block1/fused/thp.json")
 elif [[ -n $follow_ref ]]; then
     placement=$("$PYTHON" -B "$workers/large_batch_placement.py" get "$follow_ref/g7/bs32/block1/fused/thp.json")
 elif [[ -z $archive && -z $fixed_archive && -z $packed_archive ]]; then

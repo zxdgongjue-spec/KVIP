@@ -8,6 +8,25 @@ case $audit_mode in
     window-x*) extra_report="$controller_root/tests/operators/lifetch/support/b24_window_report.py" ;;
     team-schedule) extra_report="$controller_root/tests/operators/lifetch/support/b24_team_schedule.py" ;;
 esac
+if [[ ${PEER_G7_X4_LOCAL:-0} == 1 ]]; then
+    batch=${batches[0]}
+    prepared_bank="$out/g7/donors"
+    mkdir -p "$out/g7"
+    trace=$(bash "$helpers/peer_g2_input.sh" "$work" 7)
+    "$PYTHON" -B "$controller_root/tests/operators/lifetch/support/large_batch_input.py" "$trace" 7 "$prepared_bank"
+    pair="$out/g7/bs$batch/block1"
+    mkdir -p "$pair"
+    echo "COLLECT G7 BS$batch natural five windows, local candidate only" >&3
+    run_arm 7 "$batch" "$trace" "$audit_mode" "$pair"
+    arm="$pair/$audit_mode"
+    placement=$("$PYTHON" -B "$workers/large_batch_placement.py" get "$arm/thp.json")
+    read -r node adapter <<<"$placement"
+    [[ $planned_node == auto || $planned_node == "$node" ]] && [[ $planned_adapter == auto || $planned_adapter == "$adapter" ]] || exit 1
+    touch "$arm/local_placement_measured"
+    "$PYTHON" -B "$controller_root/tests/operators/lifetch/support/g7_x4_local.py" show-local "$arm" "$batch" >&3
+    echo "AUDIT_COMPLETE local_candidate_only RESULT_ROOT=$out" >&3
+    exit 0
+fi
 for group in "${groups[@]}"; do
     trace=
     for batch in "${batches[@]}"; do

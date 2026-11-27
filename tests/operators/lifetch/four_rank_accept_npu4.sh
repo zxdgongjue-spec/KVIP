@@ -6,16 +6,16 @@ repo=$(cd "${1:?expected KVIP checkout}" && pwd -P)
 reader=$(git -C "$repo" rev-parse --verify "${2:?expected reader commit}^{commit}")
 mode=${3:?expected candidate commit or serial-only}
 extra=${4:-natural}
+if [[ $mode == window-study && $extra == windows-g7-x4 ]]; then
+    git -C "$repo" show "${reader}:tests/operators/lifetch/g7_x4_npu4.sh" | bash -s -- "$repo" "$reader"
+    exit
+fi
 case $extra in
     full) extra=isolated-all ;;
     tail) extra=isolated-scheduling ;;
     bs20) extra=isolated-schedule-focus ;;
 esac
-case $extra in windows-focus|windows-all|windows-g7-x4) [[ $mode == window-study ]] || exit 2 ;; natural) ;; paired-frozen|isolated-li|isolated-tail|isolated-all|isolated-scheduling|isolated-schedule-only|isolated-schedule-focus) [[ $mode != serial-only ]] || exit 2 ;; *) exit 2 ;; esac
-if [[ $extra == windows-g7-x4 ]]; then
-    # Use exactly the worker that produced the BS32 archive, including its cache key.
-    reader=$(git -C "$repo" rev-parse --verify 'e602ff4a688a733664aaabe84aa30732b9e68062^{commit}')
-fi
+case $extra in windows-focus|windows-all) [[ $mode == window-study ]] || exit 2 ;; natural) ;; paired-frozen|isolated-li|isolated-tail|isolated-all|isolated-scheduling|isolated-schedule-only|isolated-schedule-focus) [[ $mode != serial-only ]] || exit 2 ;; *) exit 2 ;; esac
 native=
 if [[ $mode != serial-only && $mode != window-study ]]; then native=$(git -C "$repo" rev-parse --verify "$mode^{commit}"); fi
 base=d0fc5963881bd38fa97eff0f6ef40c757a6e8713
@@ -84,13 +84,7 @@ if [[ $mode == window-study ]]; then
     fi
     exec > >(tee "$stamp/windows.log") 2>&1
     echo "WINDOW_LOG=$stamp/windows.log"
-    if [[ $extra == windows-g7-x4 ]]; then
-        # Keep the existing BS32 timing offline and test only a missing shape.
-        for batch in 32 28; do
-            FIXED_Q4_GROUPS=7 FIXED_Q4_BATCHES=$batch audit window-x4-early "$base" "$ref"
-        done
-        exit 0
-    elif [[ $extra == windows-focus ]]; then
+    if [[ $extra == windows-focus ]]; then
         # The low-miss shortfall and the busy link give opposite predictions.
         FIXED_Q4_GROUPS=2 FIXED_Q4_BATCHES="28 32" audit window-x2-early "$base" "$ref"
         FIXED_Q4_GROUPS="10 7" FIXED_Q4_BATCHES=32 audit window-x2-early "$base" "$ref"

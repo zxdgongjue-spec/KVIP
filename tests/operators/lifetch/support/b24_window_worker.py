@@ -73,7 +73,11 @@ def run(a):
     from reporting import atomic_json
     import json
 
-    original = json.loads((a.ref / f"g{a.group}/bs{a.batch}/block1/fused/packed_result.json").read_bytes())
+    import os
+    local = os.environ.get("PEER_G7_X4_LOCAL") == "1"
+    if local and (a.mode != "window-x4-early" or a.group != 7 or a.batch not in (28, 32)):
+        raise ValueError("Unexpected local window shape")
+    original = None if local else json.loads((a.ref / f"g{a.group}/bs{a.batch}/block1/fused/packed_result.json").read_bytes())
     install(large_two_cold, a.mode)
     regular_measure = packed.measure_packed
 
@@ -81,7 +85,7 @@ def run(a):
         if kwargs.get("window_density") or not kwargs["fused"]:
             raise ValueError("Expected a natural timed ten-call graph")
         image = terminal_image(states[0], a.sdk)
-        if (image["cold_build"].split("/")[0] != original["cold_build_fingerprint"].split("/")[0]
+        if original and (image["cold_build"].split("/")[0] != original["cold_build_fingerprint"].split("/")[0]
                 or image["cold_build"] == original["cold_build_fingerprint"]):
             raise ValueError("Expected the archived regular library with a distinct isolated LI23 image")
         result = regular_measure(ex, proof, serial, torch, states, sequence, *rest, **kwargs)
@@ -102,10 +106,10 @@ def run(a):
         packed.measure_packed = regular_measure
 
     result = json.loads((a.out / "packed_result.json").read_bytes())
-    if (result["identity"] != original["identity"] or result["correctness"] != "PASS"
+    if ((original and result["identity"] != original["identity"]) or result["correctness"] != "PASS"
             or result["checked_queries"] != 40*a.batch or result["checked_rows"] != 10*a.batch
             or result["get_workers"] != 32 or result["calls"] != 10 or result["full_KV_Index_checked_calls"] != 10
             or result["window_grants_per_row"] != list(policy(a.mode)[1])
             or not isclose(10 * result["graph_mean_us"], result["graph_event_us"], rel_tol=1e-8)):
         raise ValueError("Input, geometry, budget, correctness or timing protocol differs from the original")
-    atomic_json(a.out / "window-study.json", dict(mode=a.mode, reference=str(a.ref)))
+    atomic_json(a.out / "window-study.json", dict(mode=a.mode, reference=None if local else str(a.ref)))
