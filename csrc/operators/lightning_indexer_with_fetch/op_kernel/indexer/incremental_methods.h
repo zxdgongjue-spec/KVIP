@@ -59,6 +59,9 @@ bool mappedExport_=false;uint32_t mappedValid_=0;
 // QLIVector member: called after ID recovery while the complete Q is in UB.
 bool exportWindowCold_=false;bool rankTrace_=false;
 uint32_t rankedEpoch_=0;bool windowCoveredEmpty_=false;
+#if defined(KVIP_TEST_WINDOW_RANK1)
+bool widenThirdWindow_ = false;
+#endif
 #if KVIP_LARGE_FOUR_WINDOW_CREDIT
 uint32_t windowQueryGrant_=0;
 #endif
@@ -107,6 +110,9 @@ __aicore__ inline void ExportWindowCold(uint32_t query, uint32_t cutoff = 0) {
         ctx->incremental,runtimeShape_.batch,runtimeShape_.history,b));
     uint64_t rankClocks[5];
     uint32_t bitmapLength=runtimeShape_.history, limit=ctx->windowLimit/4, minimum=limit/2, rankCut=UINT32_MAX;
+#if defined(KVIP_TEST_WINDOW_RANK1)
+    if (widenThirdWindow_) limit = 148;
+#endif
 #if KVIP_LARGE_FOUR_WINDOW_CREDIT
     // Keep the same score rank and minimum exploration when the limit grows.
     if (rankedEpoch_ && rankedEpoch_ < runtimeShape_.rounds) limit = windowQueryGrant_;

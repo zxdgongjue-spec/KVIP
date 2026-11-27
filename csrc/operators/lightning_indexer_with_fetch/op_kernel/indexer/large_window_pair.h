@@ -54,7 +54,14 @@ __aicore__ inline void AdvanceLargeWindowPair(uint32_t row, uint32_t epoch, uint
     header.SetGlobalBuffer(IncrementalMeta(row * 4 + first));
     GlobalTensor<uint32_t> rows;
     rows.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rows) + row * sizeof(rotating::Row) / 4);
+#if defined(KVIP_TEST_WINDOW_RANK1)
+    // The previous window publishes its per-row count before complete.
+    // Load that count alongside requests, in the same DMA as the row header.
+    static_assert(offsetof(rotating::Row, epochCount) / sizeof(uint32_t) + 1 < 24);
+    DataCopy(incrementalOld_, rows, 24);
+#else
     DataCopy(incrementalOld_, rows, 16);
+#endif
     DataCopy(incrementalMetadata_, header, 32);
     SetFlag<HardEvent::MTE2_S>(EVENT_ID5);
     WaitFlag<HardEvent::MTE2_S>(EVENT_ID5);
@@ -65,6 +72,15 @@ __aicore__ inline void AdvanceLargeWindowPair(uint32_t row, uint32_t epoch, uint
                                                ctx->prefetchLimit, used) / 4;
 #else
     windowCoveredEmpty_ = incrementalOld_.GetValue(offsetof(rotating::Row, requests) / sizeof(uint32_t)) == 0;
+#endif
+#if defined(KVIP_TEST_WINDOW_RANK1)
+    if (epoch == 2) {
+        const uint32_t previousPosts =
+            incrementalOld_.GetValue(offsetof(rotating::Row, epochCount) / sizeof(uint32_t) + 1);
+        // Let a busy Q nominate more if the preceding 256-token row grant
+        // was at most half used. The posting owner still admits at most 256.
+        widenThirdWindow_ = ctx->windowLimit == 256 && previousPosts <= 128;
+    }
 #endif
     incrementalMetadataActive_ = true;
     exportWindowCold_ = true;
@@ -93,6 +109,9 @@ __aicore__ inline void AdvanceLargeWindowPair(uint32_t row, uint32_t epoch, uint
     WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
     incrementalMetadataActive_ = false;
     exportWindowCold_ = false;
+#if defined(KVIP_TEST_WINDOW_RANK1)
+    widenThirdWindow_ = false;
+#endif
 #if KVIP_BS32_SHARE_FINAL && KVIP_TEST_SPLIT_ROLE_TRACE
     if (trace && first) {
 #else
