@@ -14,7 +14,7 @@ from run_mr28_baseline_msprof import capture_route
 from run_mr28_dedicated_service import write_summary
 from kvip.operators.lifetch.geometry import li_geometry
 from small_batch import (
-    ADAPTIVE_ROUTES, FULL32_MODES, MODES, P2_WINDOW_Q_WORKERS, P4_WINDOW_Q_WORKERS,
+    ADAPTIVE_ROUTES, FULL32_MODES, MODES, NATIVE_P2_BATCHES, P2_WINDOW_Q_WORKERS, P4_WINDOW_Q_WORKERS,
     PARTITIONED_MODES, SUPPORTED_BATCHES, TRACE_ROUTES, WINDOW_Q_BATCHES, WINDOW_Q_WORKERS,
     cold_score_parts, selected_windows,
 )
@@ -52,6 +52,8 @@ DIRECTION1_MISSES = (5, 10, 15, 20, 25, 30)
 NATIVE_BATCH_LIMIT = 16
 WINDOW_Q_GROUPS = {20: (4, 5), 24: (8, 3), 32: (16, 2)}
 BS16_W4_Q1_MISSES = (5, 10, 15)
+W4_Q1_WIDE_MISSES = (*BS16_W4_Q1_MISSES, 20)
+W4_Q1_ARMS = ('p2', 'p2_w4_q1', 'p2_w2_q1')
 
 
 def balanced_arms(batch):
@@ -67,7 +69,10 @@ def balanced_arms(batch):
 
 def study_arms(args):
     if args.bs16_w4_q1:
-        return {16: ('p2', 'p2_w4_q1', 'p2_w2_q1')}
+        return {16: W4_Q1_ARMS}
+    if args.w4_q1_wide:
+        batches = NATIVE_P2_BATCHES if args.trace else (*NATIVE_P2_BATCHES, *WINDOW_Q_GROUPS)
+        return {batch: ('p2', 'p2_w2_q1') if batch == 1 else W4_Q1_ARMS for batch in batches}
     if args.window_q_matrix:
         baseline = () if args.trace else ('p2',)
         if args.window_q_matrix != 'q1':
@@ -101,14 +106,17 @@ def plan(args, kvaf):
     default_batches = (DIRECTION1_MODES if args.direction1_matrix else
                        study or FOLLOW_UP_ARMS)
     batches = tuple(dict.fromkeys(args.batch or default_batches))
-    default_misses = (BS16_W4_Q1_MISSES if args.bs16_w4_q1 else
+    default_misses = (W4_Q1_WIDE_MISSES if args.w4_q1_wide else
+                      BS16_W4_Q1_MISSES if args.bs16_w4_q1 else
                       DIRECTION1_MISSES if args.direction1_matrix else (10,))
     misses = tuple(dict.fromkeys(args.miss_percent or default_misses))
     selected = set(args.variant or (SUPPORTED_BATCHES if study else MODES)) | {'p2'}
+    w4_comparison = args.bs16_w4_q1 or args.w4_q1_wide
+    grouped_window_q = args.window_q_matrix == 'wide' or args.w4_q1_wide
     for batch in batches:
         physical = min(batch, NATIVE_BATCH_LIMIT)
         waves = batch // physical
-        if args.window_q_matrix == 'wide' and batch in WINDOW_Q_GROUPS:
+        if grouped_window_q and batch in WINDOW_Q_GROUPS:
             physical, waves = WINDOW_Q_GROUPS[batch]
         elif waves > 1 and not args.group_bs32:
             continue
@@ -144,19 +152,19 @@ def plan(args, kvaf):
                 arguments.extend(('--prefetch-window-limit', '128'))
                 measurement = 'native'
                 if waves > 1:
-                    measurement = ('serial_equal_subbatches_graph_event' if args.window_q_matrix == 'wide'
+                    measurement = ('serial_equal_subbatches_graph_event' if grouped_window_q
                                    else 'serial_bs16x2_graph_event')
                 parts = cold_score_parts(mode, physical)
                 yield dict(batch=batch, physical_batch=physical, waves=waves, miss_percent=miss,
                            measurement_kind=measurement, mode=mode, requested_windows=requested, effective_windows=effective,
                            hot_score_parts=2, hot_score_aic=2 * physical, hot_score_aiv=4 * physical,
                            service_aics=service_aics, cold_score_parts=parts, cold_score_groups=physical * parts,
-                           service_owner_groups=(service_aics * effective if args.window_q_matrix or args.bs16_w4_q1
+                           service_owner_groups=(service_aics * effective if args.window_q_matrix or w4_comparison
                                                  else 2 * physical),
                            service_group_slots=service_aics * effective,
                            max_requests_per_service_aiv=(physical + 2 * service_aics - 1) // (2 * service_aics),
                            window_probe=args.window_probe,
-                           window_q=args.bs16_w4_q1 or (
+                           window_q=w4_comparison or (
                                bool(args.bs2_window_q or args.window_q_matrix) and mode in WINDOW_Q_WORKERS),
                            arguments=arguments, kernels=CHECKED_KERNELS[f'small_{mode}'])
 
@@ -207,7 +215,9 @@ def trace_arm(output, case, config, profiler):
         if [(body['logical_aic_lanes'], body['logical_aiv_lanes']) for body in bodies] != [(groups, 2 * groups)]:
             raise ValueError(f'{cold_entry} trace does not show the planned {groups} MIX groups')
         manifest['status'] = 'PASS'
+        pool = read(case_output / 'worker/pool.json')
         row = dict(
+            put_shutdown_retries=pool.get('shutdown_retries', 0),
             variant=case['mode'], batch=case['batch'], accepted=True, windows=report['windows'],
             cold_score_parts=report['cold_parts'], service_lanes=report['service_lanes'],
             source=manifest['business_trace'], msprof=manifest['msprof_business_trace'],
@@ -232,7 +242,8 @@ def trace_arm(output, case, config, profiler):
 
             windows = case['effective_windows']
             metrics, scopes = analyze_window_q(
-                capture['source'], WINDOW_Q_WORKERS.get(case['mode'], 1), case['physical_batch'], windows=windows)
+                capture['source'], WINDOW_Q_WORKERS.get(case['mode'], 1), case['physical_batch'],
+                windows=windows, parts=case['cold_score_parts'])
             window_gets = window_prefetch_get_counts(report['requests'], windows)
             if sum(window_gets.values()) != report['total_prefetch']:
                 raise ValueError('Window Get counters do not match total prefetch')
@@ -267,6 +278,7 @@ def perf_arm(output, case, config):
     miss_dir = case_output / config.mr25_handoff / f'miss{miss:g}'
     result = read(miss_dir / f'case-b{physical}' / 'fused/path_result.json')
     row['per_call_requests'] = result['pipeline_counts']
+    row['put_shutdown_retries'] = read(miss_dir.parent / 'pool.json').get('shutdown_retries', 0)
     if case['window_q']:
         from window_q_trace import window_prefetch_get_counts
 
@@ -395,6 +407,8 @@ def main():
                        help='add same-graph serial groups BS20 (5x4), BS24 (3x8) and BS32 (2x16)')
     route.add_argument('--bs16-w4-q1', action='store_true',
                        help='compare BS16 P2/W4 baseline, W4 last-window Q1 and W2 last-window Q1')
+    route.add_argument('--w4-q1-wide', action='store_true',
+                       help='compare P2/W4, W4 last-window Q1 and W2 Q1 for BS1–32 and miss 5/10/15/20')
     route.add_argument('--adaptive-pw', action='store_true',
                        help='compare native P2, fixed best P/W and adaptive P/W with retired AIV Service')
     route.add_argument('--window-probe', choices=WINDOW_PROBES,
@@ -414,6 +428,11 @@ def main():
         parser.error('The W1 query trials use the miss 10% fixture')
     if args.bs16_w4_q1 and any(miss not in BS16_W4_Q1_MISSES for miss in args.miss_percent or ()):
         parser.error(f'--bs16-w4-q1 supports miss rates {BS16_W4_Q1_MISSES}')
+    if args.w4_q1_wide and any(miss not in W4_Q1_WIDE_MISSES for miss in args.miss_percent or ()):
+        parser.error(f'--w4-q1-wide supports miss rates {W4_Q1_WIDE_MISSES}')
+    if args.w4_q1_wide and args.trace and any(batch in WINDOW_Q_GROUPS for batch in args.batch or ()):
+        parser.error('Grouped batches use Graph Event timing; select their physical BS4/8/16 for a trace')
+    w4_comparison = args.bs16_w4_q1 or args.w4_q1_wide
     study = study_arms(args)
     if study:
         if args.group_bs32 or any(batch not in study for batch in args.batch or ()):
@@ -447,6 +466,12 @@ def main():
                             status='UNSUPPORTED_NATIVE',
                             reason='BS1 static rotation has two Service owner groups; all Cold parts use effective W2')
                        for miss in dict.fromkeys(args.miss_percent or (10,))]
+    if args.w4_q1_wide and 1 in (args.batch or study):
+        unsupported = [dict(batch=1, physical_batch=1, waves=1, miss_percent=miss,
+                            variant='p2_w4_q1', requested_windows=4, effective_windows=2,
+                            accepted=False, status='UNSUPPORTED_NATIVE',
+                            reason='P2 at BS1 has two MIX groups and cannot execute W3')
+                       for miss in dict.fromkeys(args.miss_percent or W4_Q1_WIDE_MISSES)]
     manifest = dict(status='NOT_RUN', commit=git(ROOT, 'rev-parse', 'HEAD'), main_commit=MAIN,
                     worktree_dirty=bool(git(ROOT, 'status', '--porcelain', '--untracked-files=normal')),
                     kvaf_commit=KVAF, measurement='marked_msprof' if args.trace else 'graph_event',
@@ -457,8 +482,8 @@ def main():
                     bs2_window_q=args.bs2_window_q, window_q1_matrix=args.window_q_matrix == 'q1',
                     window_q_matrix=args.window_q_matrix in ('all', 'wide'),
                     window_q_wide=args.window_q_matrix == 'wide',
-                    bs16_w4_q1=args.bs16_w4_q1,
-                    trace_control=('same_mr_p2_option_disabled' if args.bs16_w4_q1 and args.trace else None),
+                    bs16_w4_q1=args.bs16_w4_q1, w4_q1_wide=args.w4_q1_wide,
+                    trace_control=('same_mr_p2_option_disabled' if w4_comparison and args.trace else None),
                     main_root=str(args.main_root.resolve()) if args.main_root else None,
                     adaptive_pw=args.adaptive_pw, window_probe=args.window_probe,
                     granularity_study=args.granularity_study, repeats=args.repeats,
@@ -472,7 +497,7 @@ def main():
         return 0
     if not cases:
         parser.error('No runnable scenario selected; BS32 requires --group-bs32')
-    uses_main_p2 = bool(args.window_q_matrix or args.bs16_w4_q1)
+    uses_main_p2 = bool(args.window_q_matrix or w4_comparison)
     if uses_main_p2 and not args.trace:
         if args.main_root is None:
             parser.error('Window query matrix performance requires --main-root')
@@ -514,14 +539,15 @@ def main():
                 row = trace_arm(run_dir, case, config, profiler) if args.trace else perf_arm(run_dir, case, config)
                 if uses_main_p2:
                     row['source_commit'] = manifest['commit']
-            if args.bs16_w4_q1:
+            if w4_comparison:
                 if case['mode'] == 'p2':
                     row['source_role'] = 'same_mr_p2_option_disabled' if args.trace else 'unmodified_main_p2'
                 else:
                     row['source_role'] = 'mr_last_window_q1'
             row.update(repeat=repeat, miss_percent=miss, physical_batch=case['physical_batch'],
-                       waves=case['waves'],
-                       hot_score_parts=case['hot_score_parts'], hot_score_aic=case['hot_score_aic'],
+                       waves=case['waves'], requested_windows=case['requested_windows'],
+                       effective_windows=case['effective_windows'], hot_score_parts=case['hot_score_parts'],
+                       hot_score_aic=case['hot_score_aic'],
                        hot_score_aiv=case['hot_score_aiv'],
                        measurement_kind=case['measurement_kind'], cold_score_groups=case['cold_score_groups'],
                        cold_score_aic=case['cold_score_groups'], cold_score_aiv=2 * case['cold_score_groups'],
@@ -565,14 +591,14 @@ def main():
                 row['vs_main_raw_kv_ready_delta_us'] = row['kv_ready_us'] - main['kv_ready_us']
                 print(f'  KV ready / main: {row["vs_main_raw_kv_ready_ratio"]:.4f}x, '
                       f'Get {row["vs_main_get_count_comparison"]}', flush=True)
-            if args.bs16_w4_q1:
+            if w4_comparison:
                 if args.trace:
                     if row['variant'] == 'p2':
                         bases[pair] = row
                     else:
                         before = bases[pair]
-                        compare_stage_trace(before, row, 'vs_mr_p2_w4_')
-                        if row['windows'] == before['windows']:
+                        compare_stage_trace(before, row, f'vs_mr_p2_w{before["windows"]}_')
+                        if row['windows'] == before['windows'] == 4:
                             for metric in ('w3_after_last_aiv_score_scan_us', 'w3_max_owner_service_us',
                                            'w3_max_request_topk_elapsed_us', 'w3_max_owner_topk_join_us'):
                                 row[f"vs_mr_p2_w4_{metric.removesuffix('_us')}_delta_us"] = row[metric] - before[metric]

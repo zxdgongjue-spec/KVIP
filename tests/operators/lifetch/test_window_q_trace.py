@@ -114,10 +114,11 @@ def test_bs16_w0_owner_must_finish_before_helping_w1():
         analyze_window_q(source, 4, 16)
 
 
-def bs16_four_window_trace(workers):
-    spans = [span(21, 64, 35, 12, epoch=3), *(span(22, tid, 36, 12, epoch=3) for tid in range(64))]
-    for row, w1_owner in enumerate(OWNER_AIVS[16]):
-        cores = (w1_owner - 32, w1_owner, w1_owner - 30, w1_owner + 2)
+def four_window_trace(workers, batch=16):
+    spans = [span(21, 64, 35, 12, epoch=3), *(span(22, tid, 36, 12, epoch=3) for tid in range(4 * batch))]
+    for row in range(batch):
+        w0_owner = 4 * (row // 2) + row % 2
+        cores = (w0_owner, w0_owner + 2 * batch, w0_owner + 2, w0_owner + 2 * batch + 2)
         for epoch, core in enumerate(cores):
             start = 12 * epoch if epoch < 3 else 49
             duration = 8 if epoch < 3 else 41
@@ -143,7 +144,7 @@ def bs16_four_window_trace(workers):
 
 @pytest.mark.parametrize('workers', (1, 4))
 def test_bs16_w4_last_window_workers_and_waits(workers):
-    metrics, scopes = analyze_window_q(bs16_four_window_trace(workers), workers, 16, windows=4)
+    metrics, scopes = analyze_window_q(four_window_trace(workers), workers, 16, windows=4)
     assert metrics['w3_topk_worker_aivs'] == workers * 16
     assert metrics['w3_reused_earlier_owner_aivs'] == (48 if workers == 4 else 0)
     assert metrics['w3_after_last_aic_qk_scan_us'] == 43
@@ -160,7 +161,7 @@ def test_bs16_w4_last_window_workers_and_waits(workers):
 
 @pytest.mark.parametrize('phase', (251, 252, 253))
 def test_bs16_w4_cannot_split_earlier_window(phase):
-    source = bs16_four_window_trace(4)
+    source = four_window_trace(4)
     next(e for e in source['traceEvents'] if e['args']['phase_id'] == phase)['args']['window_epoch'] = 2
     with pytest.raises(ValueError, match='only in W3'):
         analyze_window_q(source, 4, 16, windows=4)
@@ -168,7 +169,7 @@ def test_bs16_w4_cannot_split_earlier_window(phase):
 
 @pytest.mark.parametrize('epoch', (0, 1, 2))
 def test_bs16_w4_helpers_wait_for_original_service(epoch):
-    source = bs16_four_window_trace(4)
+    source = four_window_trace(4)
     service = next(e for e in source['traceEvents']
                    if e['args']['phase_id'] == 150 and e['args']['window_epoch'] == epoch)
     service['dur'] = 60
@@ -184,3 +185,32 @@ def test_window_prefetch_counts_keep_effective_windows():
     }
     with pytest.raises(ValueError, match='invalid window prefetch'):
         window_prefetch_get_counts(records, 4)
+
+
+@pytest.mark.parametrize('batch', (2, 4, 8))
+@pytest.mark.parametrize('workers', (1, 4))
+def test_native_p2_w4_small_batch(batch, workers):
+    metrics, _ = analyze_window_q(four_window_trace(workers, batch), workers, batch, windows=4, parts=2)
+    assert metrics['w3_topk_worker_aivs'] == batch * workers
+    assert metrics['w3_reused_earlier_owner_aivs'] == (3 * batch if workers == 4 else 0)
+
+
+@pytest.mark.parametrize('complete_empty_lane', (True, False))
+def test_native_p2_w2_bs1(complete_empty_lane):
+    spans = [span(21, 64, 0, 20), *(span(22, core, 10, 20) for core in range(4))]
+    for lane in range(2):
+        spans.extend([span(150, lane, 1, 5, epoch=0, service_lane=lane),
+                      span(150, 2 + lane, 25, (50, 6 if complete_empty_lane else 15)[lane], service_lane=lane)])
+    spans.extend([span(251, 2, 31, 3, request_row=0), span(252, 2, 40, 12, request_row=0),
+                  span(154, 2, 60, 2, request_or_service_lane=0)])
+    for query, core in enumerate((2, 0, 1, 3)):
+        spans.extend([span(253, core, 35, 5, request_row=0, query=query),
+                      span(155, core, 35, 5, request_row=0, query=query)])
+    source = {'traceEvents': spans}
+    if complete_empty_lane:
+        metrics, _ = analyze_window_q(source, 4, 1, parts=2)
+        assert metrics['w1_topk_worker_aivs'] == 4
+        assert metrics['w1_empty_service_lanes'] == 1
+    else:
+        with pytest.raises(ValueError, match='before finishing inactive Service'):
+            analyze_window_q(source, 4, 1, parts=2)

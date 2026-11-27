@@ -8,21 +8,26 @@ def _p2_w0_aiv(request):
     return 4 * (request // 2) + request % 2
 
 
-def _owner_aiv(batch, request, epoch):
-    if batch == 16:
-        return (0, 32, 2, 34)[epoch] + _p2_w0_aiv(request)
+def _owner_aiv(batch, request, epoch, parts):
+    if parts == 2:
+        rank = epoch * ((batch + 1) // 2) + request // 2
+        group = 2 * (rank % batch) + rank // batch
+        return 2 * group + request % 2
     if batch == 1:
         return 4 + request
     return 8 * (batch // 2 + request // 2) + request % 2
 
 
-def _worker_aiv(batch, request, worker, epoch):
+def _worker_aiv(batch, request, worker, epoch, parts):
     if worker == 0:
-        return _owner_aiv(batch, request, epoch)
-    if batch == 16:
+        return _owner_aiv(batch, request, epoch, parts)
+    if parts == 2:
+        if epoch == 3:
+            return _owner_aiv(batch, request, worker - 1, parts)
+        if batch == 1:
+            return (0, 1, 3)[worker - 1]
         previous = _p2_w0_aiv(request)
-        offsets = (0, 32, 2) if epoch == 3 else (2, 34, 0)
-        return previous + offsets[worker - 1]
+        return previous + (2, 2 * batch + 2, 0)[worker - 1]
     if batch == 1:
         return (2, 3, 6)[worker - 1]
     return 2 * (4 * (request // 2) + worker) + request % 2
@@ -41,9 +46,13 @@ def window_prefetch_get_counts(requests, windows, *, calls=1):
             for epoch, count in enumerate(totals)}
 
 
-def analyze_window_q(source, workers_per_request, batch=2, *, windows=2):
-    if (batch not in (1, 2, 4, 8, 16) or workers_per_request not in (1, 2, 4)
-            or windows not in (2, 4) or (windows == 4 and (batch != 16 or workers_per_request == 2))):
+def analyze_window_q(source, workers_per_request, batch=2, *, windows=2, parts=None):
+    if parts is None:
+        parts = 2 if batch == 16 else 4
+    if (batch not in (1, 2, 4, 8, 16) or parts not in (2, 4)
+            or workers_per_request not in (1, 2, 4) or windows not in (2, 4)
+            or (parts == 4 and batch == 16)
+            or (windows == 4 and (parts != 2 or batch == 1 or workers_per_request == 2))):
         raise ValueError('Unsupported window TopK geometry')
     last = windows - 1
     window = f'W{last}'
@@ -64,16 +73,19 @@ def analyze_window_q(source, workers_per_request, batch=2, *, windows=2):
     def end_us(event):
         return event['ts'] + event['dur']
 
-    owners_by_epoch = {}
-    for epoch in range(windows) if batch == 16 else (last,):
+    owners_by_epoch, inactive_service = {}, {}
+    for epoch in range(windows) if parts == 2 else (last,):
         bodies = by_epoch[epoch][150]
         service_lanes = {key(event, 'service_lane'): event for event in bodies}
         # The inactive BS1 Service lane still publishes its completion event.
-        expected_lanes = {lane: _owner_aiv(batch, lane, epoch) for lane in range(max(2, batch))}
+        expected_lanes = {lane: _owner_aiv(batch, lane, epoch, parts) for lane in range(max(2, batch))}
         if (len(bodies) != len(expected_lanes)
                 or {lane: event['tid'] for lane, event in service_lanes.items()} != expected_lanes):
             raise ValueError(f'W{epoch} requires one original Service owner per request')
         owners_by_epoch[epoch] = {row: service_lanes[row] for row in range(batch)}
+        if parts == 2 and batch == 1:
+            inactive = service_lanes[1]
+            inactive_service[inactive['tid']] = inactive
     owners = owners_by_epoch[last]
     posting_phases = {152: 'request_row', 153: 'request_row', 154: 'request_or_service_lane',
                       203: 'request_row', 206: 'request_row'}
@@ -92,7 +104,7 @@ def analyze_window_q(source, workers_per_request, batch=2, *, windows=2):
         raise ValueError(f'Incomplete or duplicate {window} TopK worker slices')
     for (b, q), event in slices.items():
         worker = q // width
-        if event['tid'] != _worker_aiv(batch, b, worker, last):
+        if event['tid'] != _worker_aiv(batch, b, worker, last, parts):
             raise ValueError(f'{window} TopK ran on an unexpected Score AIV')
     for phase in (251, 252):
         if workers_per_request > 1:
@@ -115,6 +127,9 @@ def analyze_window_q(source, workers_per_request, batch=2, *, windows=2):
                 earlier = earlier_owners[b]
                 if event['tid'] == earlier['tid'] and event['ts'] < end_us(earlier):
                     raise ValueError(f'W{epoch} Service owner began {window} TopK before finishing W{epoch} Service')
+            empty = inactive_service.get(event['tid'])
+            if empty is not None and event['ts'] < end_us(empty):
+                raise ValueError(f'{window} TopK helper started before finishing inactive Service')
             if event['ts'] < snapshots[b] or end_us(event) > joins[b]:
                 raise ValueError(f'{window} TopK worker ran outside the owner snapshot and join')
         for phase, field in posting_phases.items():
@@ -152,7 +167,8 @@ def analyze_window_q(source, workers_per_request, batch=2, *, windows=2):
     metrics = dict(
         topk_worker_aivs=len(slices) if expected else len(owners),
         service_owner_aivs=len(owners),
-        reused_w0_owner_aivs=batch if batch == 16 and workers_per_request == 4 else 0,
+        reused_w0_owner_aivs=sum(event['tid'] == owners_by_epoch[0][b]['tid']
+                                 for (b, _), event in slices.items()) if 0 in owners_by_epoch else 0,
         empty_service_lanes=len(phases[150]) - len(owners),
         after_last_aiv_score_scan_us=max(0, latest_service - latest_aiv),
         after_last_aic_qk_scan_us=max(0, latest_service - latest_aic),

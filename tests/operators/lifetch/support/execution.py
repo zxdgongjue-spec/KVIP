@@ -267,6 +267,7 @@ def run_config(path, shared_pool=None):
             pool.close()
             stats = dict(transport=config.transport, max_batch=max(config.batches),
                          cases=pool.borrows, runtime_workers=pool.workers,
+                         shutdown_retries=pool.shutdown_retries,
                          put_bytes=max(config.batches) * config.history * 656,
                          additional_case_put_bytes=0, initialization_seconds=pool.phase_times)
             atomic_json(path.parent / 'pool.json', stats)
@@ -568,6 +569,7 @@ class BenchPool:
         self.runtime = None
         self.table = None
         self.active = False
+        self.shutdown_retries = 0
         self.borrows = 0
         self.tables = {}
         self.phase_times = {}
@@ -665,7 +667,17 @@ class BenchPool:
             self.torch.npu.synchronize()
             for table, _ in self.tables.values():
                 self.runtime.release_access_table(table)
-            self.runtime.shutdown()
+            try:
+                self.runtime.shutdown()
+            except RuntimeError as error:
+                if str(error) != 'Put transport teardown failed; resources retained':
+                    raise
+                # KVAF retains partially released Put handles for shutdown retry.
+                # Access tables and application work have already been retired.
+                self.shutdown_retries = 1
+                print(f'BENCH POOL SHUTDOWN retry 1/1 after {error}', flush=True)
+                self.runtime.shutdown()
+                print('BENCH POOL SHUTDOWN recovered', flush=True)
             self.runtime = None
 
 

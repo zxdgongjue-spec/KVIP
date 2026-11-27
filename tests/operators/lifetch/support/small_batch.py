@@ -12,11 +12,14 @@ P2_WINDOW_Q_WORKERS = {'p2_w2': 1, 'p2_w2_q2': 2, 'p2_w2_q1': 4}
 P2_W4_WINDOW_Q_WORKERS = {'p2_w4_q1': 4}
 WINDOW_Q_WORKERS = P4_WINDOW_Q_WORKERS | P2_WINDOW_Q_WORKERS | P2_W4_WINDOW_Q_WORKERS
 WINDOW_Q_BATCHES = (1, 2, 4, 8)
+NATIVE_P2_BATCHES = (*WINDOW_Q_BATCHES, 16)
+P2_W4_BATCHES = NATIVE_P2_BATCHES[1:]
 SUPPORTED_BATCHES = {
-    'p2': (1, 2, 4, 8, 16),
+    'p2': NATIVE_P2_BATCHES,
     'cold': (1, 2, 4, 8),
     **dict.fromkeys(P4_WINDOW_Q_WORKERS, WINDOW_Q_BATCHES),
-    **dict.fromkeys(P2_WINDOW_Q_WORKERS | P2_W4_WINDOW_Q_WORKERS, (16,)),
+    **dict.fromkeys(P2_WINDOW_Q_WORKERS, NATIVE_P2_BATCHES),
+    **dict.fromkeys(P2_W4_WINDOW_Q_WORKERS, P2_W4_BATCHES),
     'cold_p8': (1,),
     'cold_p8_bulk': (1,),
     'cold_full': (1, 2, 8),

@@ -93,7 +93,7 @@ public:
 
     __aicore__ inline void RunWindowQHelper(uint32_t half) {
         if (!windowQTrial_.scratch) return;
-        const auto [row, worker] = kvip_window_q::ScoreHelper(runtimeShape_, blockId_);
+        const auto [row, worker] = kvip_window_q::ScoreHelper(runtimeShape_, blockId_, windowQTrial_.parts);
         if (worker == 0 || worker >= windowQTrial_.workers) return;
         DrainColdPublication();
         kvip_window_q::Wait(windowQTrial_.scratch, row, 0);

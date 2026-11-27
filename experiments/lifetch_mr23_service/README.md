@@ -1070,3 +1070,36 @@ The W3 experiment targets the last Service tail. Earlier windows
 retain their original handoff and credit dependencies. Independent
 Service and dynamic Score scheduling are separate comparisons in
 [MR 36](https://gitcode.com/CacheOS/KVIP/merge_requests/36).
+
+### BS1–32 P2 last-window Q1 comparison
+
+Use `run_full32_a5.sh --w4-q1-wide --main-root <pinned-main-checkout>` for the
+performance matrix. The defaults are BS1/2/4/8/16/20/24/32 and miss 5/10/15/20%.
+`--batch` and `--miss-percent` are repeatable filters. The main checkout must
+be clean at `df8ad2598e70e4b5e266b15028ab26c601a2bdf2`. Use the unified KVAF
+checkout at `813f1750a50b7e6c92d5f5397f2fbc05befef6da` built in the A5
+container's CANN environment.
+
+Each pair uses the same sparse-Q4 fixture (128K history, 16K resident) and
+P2 Hot and Cold score partitioning. The three arms are main P2 with W4
+requested, P2/W4 with four Q1 workers only in W3, and P2/W2 with four Q1 workers
+only in W1. The main P2 BS1 arm executes the native effective W2 with the
+same 128-entry per-window cap. The BS1 W3 arm is recorded as
+`UNSUPPORTED_NATIVE`. The 96 requested combinations therefore contain 92
+timed arms and four unsupported rows.
+
+The grouped BS20/24/32 arms use 5×BS4, 3×BS8 and 2×BS16 forwards in one
+measured graph, respectively. All compared arms use the same grouping.
+`--iterations` controls the number of forwards for native measurements.
+The group size determines this count for grouped measurements. For repeated
+independent measurements of the complete group use `--repeats`.
+
+Run `--w4-q1-wide --trace` to capture physical BS1/2/4/8/16 with the same
+filters. It compares three routes from the instrumented MR build with the
+Q1 option disabled for the P2 control. For a grouped timing point, use the
+physical sub-batch trace. The CSV and JSON include early and final Get
+counts, count matching per request and invocation, stage times, and the
+raw ratio. A matched-count ratio is emitted when both early and final Get
+counts match. A recovered KVAF Put shutdown is recorded in
+`put_shutdown_retries`; a second failure remains a failed run. To retry
+the original failed trace cell, select `--batch 16 --miss-percent 15 --trace`.
