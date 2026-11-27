@@ -9,7 +9,7 @@ work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-thres
 sources="$work/fused-scan-sources"
 mkdir -p "$sources"
 stage() (
-    local sha=$1 dir="$sources/stagger-$1"
+    local sha=$1 dir="$sources/first-cq-$1"
     exec 8>"$dir.lock"; flock 8
     if [[ -d $dir && $(git -C "$dir" rev-parse HEAD 2>/dev/null) == "$sha" && -z $(git -C "$dir" status --porcelain -uno) ]]; then
         echo "$dir"; return
@@ -24,7 +24,7 @@ entry="$controller/tests/operators/lifetch"
 export PEER_G2_WORK="$work" PEER_PHYSICAL_NPU=4 ASCEND_RT_VISIBLE_DEVICES=4 PEER_LOCAL_ONLY=1
 export PYTHONDONTWRITEBYTECODE=1 PEER_TIMED_SOURCE="$timed"
 export PEER_FOUR_WINDOW_RANKS=1 PEER_LARGE_COLD_WINDOWS=3 PEER_FOUR_WINDOW_CARRY=0
-export FIXED_Q4_GROUPS="${PEER_STAGGER_GROUPS:-7 2}" FIXED_Q4_BATCHES="${PEER_STAGGER_BATCHES:-32}"
+export FIXED_Q4_GROUPS="${PEER_STAGGER_GROUPS:-7}" FIXED_Q4_BATCHES="${PEER_STAGGER_BATCHES:-32 28}"
 unset PEER_RANK_DIAG_SOURCE PEER_BS32_LI PEER_PACKED_RESUME PEER_PACKED_REFERENCE KVAF_CPU_UB_DEVICE
 unset PEER_FOUR_RANK_AUDIT PEER_FOUR_RANK_FOLLOWUP PEER_AUDIT_REFERENCE PEER_AUDIT_ORIGIN
 find_ref() {
@@ -56,4 +56,4 @@ else
 fi
 export PEER_AUDIT_ORIGIN="$ref" PEER_AUDIT_REFERENCE="$ref"
 echo "REFERENCE=$ref G=$FIXED_Q4_GROUPS BS=$FIXED_Q4_BATCHES NPU=4"
-PEER_FOUR_RANK_AUDIT=stagger-pair bash "$entry/large_batch_npu4.sh" --four-ranks-candidate-only
+PEER_FOUR_RANK_AUDIT=first-receipt-pair bash "$entry/large_batch_npu4.sh" --four-ranks-candidate-only

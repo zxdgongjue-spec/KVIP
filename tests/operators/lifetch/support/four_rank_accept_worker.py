@@ -135,13 +135,16 @@ def run(a):
     if a.mode.startswith("window-x"):
         from b24_window_worker import run as run_windows
         return run_windows(a)
+    if a.mode == "stagger-natural":
+        from terminal_stagger_natural import measure
+        return measure(a)
     if a.mode == "two-row-natural":
         if a.batch != 32:
             raise ValueError("The two-row tail requires BS32")
         from b24_two_row_natural import run as run_natural
         return run_natural(a)
     two_row = a.mode == "two-row-frozen"
-    stagger = a.mode == "stagger-pair"
+    stagger = a.mode == "first-receipt-pair"
     if stagger:
         import b24_two_row_attach
         import terminal_stagger_attach
@@ -149,7 +152,7 @@ def run(a):
         if flag not in ("0", "1"):
             raise ValueError("Invalid terminal gate setting")
         enabled = flag == "1"
-        b24_two_row_attach.install_profiler("v9_terminal_stagger")
+        b24_two_row_attach.install_profiler("v9_terminal_first_cq")
     if two_row:
         if a.batch != 32:
             raise ValueError("The two-row tail requires BS32")
@@ -167,7 +170,7 @@ def run(a):
     from workloads import configuration, ReplayPagePlan
 
     ref_path = a.ref / f"g{a.group}/bs{a.batch}/block1/fused/packed_result.json"
-    local_journal = a.mode in ("stagger-journal", "stagger-pair") and not ref_path.is_file()
+    local_journal = a.mode in ("stagger-journal", "first-receipt-pair") and not ref_path.is_file()
     rec = {} if local_journal else json.loads(ref_path.read_bytes())
     old = {"native":"d0fc5963881bd38fa97eff0f6ef40c757a6e8713"} if local_journal else rec["identity"]
     rev = subprocess.check_output(["git", "-C", a.timed, "rev-parse", "HEAD"], text=True).strip()
@@ -354,7 +357,10 @@ def run(a):
             base_reset(frozen, state)
             clear_evidence(state)
 
+        mhz = None
+
         def validate(frozen, state, inp, index):
+            nonlocal mhz
             base_validate(frozen, state, inp, index)
             count = frozen.traffic[-1]
             row_maps = []
@@ -381,6 +387,18 @@ def run(a):
                 checks[-1]["final_destinations_bad"] = sum(
                     not np.array_equal(actual[k][:,4], records[k][:,4]) for k in final_keys)
                 image = terminal_stagger_attach.identity(state, enabled)
+                permits = state.first_cq_permits[:, :, 0].cpu().tolist()
+                expected = [[int(enabled and sum(row) >= 256)]*2 for row in count["row_query_final"]]
+                if permits != expected:
+                    raise ValueError("Actual first-CQ permissions differ from the measured row GET counts")
+                checks[-1]["pilot_pairs_confirmed"] = sum(map(sum, permits))
+                if mhz is None:
+                    mhz = state.forward.calibrate_counter_mhz()
+                from terminal_first_cq_clocks import measure_first
+                shape = (a.batch, 4, 32)
+                stamps = state.forward.terminal.times.cpu().numpy().reshape(shape)
+                order = state.forward.terminal.row_schedule.cpu().numpy().reshape(4,32)[1,:a.batch]
+                checks[-1]["first_CQ"] = measure_first(stamps, count["row_query_final"], order, mhz, enabled)
                 if index == 0:
                     proof.update(image, compiler_sha256=compiler_identity(a.sdk))
                 elif any(proof[k] != v for k, v in image.items()):
@@ -422,14 +440,14 @@ def run(a):
     if a.mode == "team-schedule":
         atomic_json(a.out / "journal.json", dict(summary, arm="journal"))
     path = {"team-schedule": "team-schedule.json", "serial": "packed_result.json", "journal": "journal.json", "frozen": "frozen.json",
-            "two-row-frozen": "two-row-frozen.json", "stagger-pair": "stagger.json", "stagger-journal": "journal.json"}[a.mode]
+            "two-row-frozen": "two-row-frozen.json", "first-receipt-pair": "stagger.json", "stagger-journal": "journal.json"}[a.mode]
     atomic_json(a.out / path, summary)
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     from b24_window_policy import MODES
-    p.add_argument("mode", choices=[*MODES, "journal", "serial", "frozen", "two-row-natural", "two-row-frozen", "stagger-pair", "stagger-journal", "team-schedule"])
+    p.add_argument("mode", choices=[*MODES, "journal", "serial", "frozen", "two-row-natural", "two-row-frozen", "first-receipt-pair", "stagger-journal", "stagger-natural", "team-schedule"])
     for name in ("timed", "ref"):
         p.add_argument(name, type=Path)
     for name in ("group", "batch"):

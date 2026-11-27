@@ -84,7 +84,7 @@ def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False, exp
         }
     )
     if expected_tail is not None:
-        allowed = {"v9_test_two_row_terminal": (32,), "v9_terminal_stagger": (20, 24, 28, 32)}
+        allowed = {"v9_test_two_row_terminal": (32,), "v9_terminal_first_cq": (20, 24, 28, 32)}
         if not fused or batch not in allowed.get(expected_tail, ()):
             raise ValueError("Unexpected experimental terminal or batch")
         names["tail"] = (expected_tail,)

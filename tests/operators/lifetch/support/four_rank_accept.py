@@ -64,7 +64,11 @@ def cached(root, ref, group, batch, mode):
     # A team-schedule sample also captures the ordinary terminal journal in the same eager call.
     regular = f"fixed-q4-audit-journal.*/g{group}/bs{batch}/block1/journal/journal.json"
     scheduled = f"fixed-q4-audit-team-schedule.*/g{group}/bs{batch}/block1/team-schedule/journal.json"
-    for path in [*sorted(root.parent.glob(regular)), *sorted(root.parent.glob(scheduled))]:
+    local_journals = [
+        f"{prefix}.*/g{group}/bs{batch}/block1/stagger-journal/journal.json"
+        for prefix in ("fixed-q4-audit-stagger-pair", "fixed-q4-audit-first-receipt-pair")
+    ]
+    for path in (p for pattern in (regular, scheduled, *local_journals) for p in sorted(root.parent.glob(pattern))):
         folder, archive = path.parent, path.parents[4]
         if not matched(archive, ref) or not (folder / "placement_verified").is_file():
             continue

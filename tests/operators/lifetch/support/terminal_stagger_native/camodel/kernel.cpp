@@ -18,7 +18,7 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(32) inline void TestReservation(
     asc_threadfence();
 }
 #endif
-extern "C" __global__ __aicore__ void gate_camodel(GM_ADDR argbuf, GM_ADDR results, uint32_t enabled,uint32_t offset,GM_ADDR plans,GM_ADDR scratch) {
+extern "C" __global__ __aicore__ void gate_camodel(GM_ADDR argbuf, GM_ADDR results, uint32_t enabled,uint32_t offset,GM_ADDR plans,GM_ADDR scratch,GM_ADDR permits) {
 #if defined(__CCE_AICORE__)
  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
  if ASCEND_IS_AIV {
@@ -27,17 +27,25 @@ extern "C" __global__ __aicore__ void gate_camodel(GM_ADDR argbuf, GM_ADDR resul
     auto out=reinterpret_cast<__gm__ uint64_t*>(results)+idx*64;
     auto post=reinterpret_cast<__gm__ rotating::FinalPost*>(out+32);
     const auto cuts=rotating::PlanTerminalBatches(own,idx<4 || idx>=8?320:52,0);
-    const uint32_t group=enabled&&cuts.count==4?(idx/4+q)&3U:rotating::kGateDisabled;
+    const bool heavy=(enabled & 1U) && (idx<4 || idx>=8), pilot=((idx/4 ^ q) & 1) == 0;
+    auto word = reinterpret_cast<__gm__ uint32_t*>(permits) + (idx/4*2 + q/2)*32;
+    auto waitFor = heavy && !pilot && own ? word : nullptr;
+    if (heavy && pilot && !own) rotating::PublishFirstReceipt(word, true);
     const uint64_t head=93;
-    TPipe pipe;TBuf<TPosition::VECCALC> buffer;pipe.InitBuffer(buffer,128);
-    Simt::VF_CALL<TestReservation>(Simt::Dim3{32,1,1},reinterpret_cast<__gm__ uint32_t*>(plans)+idx*kPrivateFinalWords,
-         reinterpret_cast<__gm__ uint32_t*>(scratch),reinterpret_cast<__gm__ uint32_t*>(out+48),
-         reinterpret_cast<__ubuf__ uint32_t*>(buffer.Get<uint32_t>().GetPhyAddr()),q,1+offset/4);
-    SetFlag<HardEvent::V_S>(EVENT_ID1);WaitFlag<HardEvent::V_S>(EVENT_ID1);
+    // Receipt-only mode runs all twelve independent queues in one launch.
+    // The full fixture also replays reservations in their original generation order.
+    if (!(enabled & 2U)) {
+        TPipe pipe;TBuf<TPosition::VECCALC> buffer;pipe.InitBuffer(buffer,128);
+        Simt::VF_CALL<TestReservation>(Simt::Dim3{32,1,1},reinterpret_cast<__gm__ uint32_t*>(plans)+idx*kPrivateFinalWords,
+             reinterpret_cast<__gm__ uint32_t*>(scratch),reinterpret_cast<__gm__ uint32_t*>(out+48),
+             reinterpret_cast<__ubuf__ uint32_t*>(buffer.Get<uint32_t>().GetPhyAddr()),q,1+offset/4);
+        SetFlag<HardEvent::V_S>(EVENT_ID1);WaitFlag<HardEvent::V_S>(EVENT_ID1);
+    }
     out[0]=GetSystemCycle();
-    rotating::CommitTerminalPost(args,head,cuts.ends[0],post,group);
-    const auto err=rotating::CompleteTerminalPost(args,post,cuts,head,group);
-    out[1]=GetSystemCycle();out[2]=err;out[3]=cuts.count;out[4]=group;
+    rotating::CommitTerminalPost(args,head,waitFor ? 0 : cuts.ends[0],post);
+    if (!waitFor && own) out[27]=GetSystemCycle();
+    const auto err=rotating::CompleteTerminalPost(args,post,cuts,head,heavy && pilot && own ? word : nullptr,waitFor,out+27);
+    out[1]=GetSystemCycle();out[2]=err;out[3]=cuts.count;out[4]=heavy&&!pilot&&own;
     for(uint32_t i=0;i<cuts.count;++i)out[5+i]=cuts.ends[i];
     kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(out),512);
  }

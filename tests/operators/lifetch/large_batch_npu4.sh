@@ -123,7 +123,7 @@ if [[ -n $follow_ref ]]; then
 fi
 audit_mode=${PEER_FOUR_RANK_AUDIT:-}
 if [[ -n $audit_mode ]]; then
-    case $audit_mode in serial|journal|frozen|team-schedule|two-row-natural|two-row-frozen|stagger-pair|window-x[2348]-linear|window-x[2348]-early) ;; *) echo "Unknown audit mode: $audit_mode" >&2; exit 2 ;; esac
+    case $audit_mode in serial|journal|frozen|team-schedule|two-row-natural|two-row-frozen|first-receipt-pair|window-x[2348]-linear|window-x[2348]-early) ;; *) echo "Unknown audit mode: $audit_mode" >&2; exit 2 ;; esac
     (( standalone )) &&
         [[ -n ${PEER_AUDIT_REFERENCE:-} && -z $follow_ref && -z ${PEER_PACKED_RESUME:-} && $peer_physical_npu == 4 ]] ||
         { echo "Invalid four-rank audit configuration" >&2; exit 2; }
@@ -322,7 +322,7 @@ elif (( fixed )); then
 fi
 # Use the same registered CPU memory placement for the serial and fused arms.
 placement="auto auto"
-if [[ $audit_mode == stagger-pair && ${PEER_STAGGER_LOCAL:-0} == 1 ]]; then
+if [[ $audit_mode == first-receipt-pair && ${PEER_STAGGER_LOCAL:-0} == 1 ]]; then
     placement=$("$PYTHON" -B "$workers/large_batch_placement.py" find "$out")
 elif [[ -n $audit_mode ]]; then
     placement=$("$PYTHON" -B "$controller_root/tests/operators/lifetch/support/large_batch_placement.py" get "$PEER_AUDIT_REFERENCE/g7/bs32/block1/fused/thp.json")
@@ -408,7 +408,9 @@ run_arm() (
     if [[ -n $audit_mode ]]; then
         local tool="$controller_root/tests/operators/lifetch/support/four_rank_accept_worker.py"
         local worker_mode=$audit_mode
-        if [[ $audit_mode == stagger-pair && $arm == stagger-journal ]]; then worker_mode=stagger-journal; fi
+        if [[ $audit_mode == first-receipt-pair ]]; then
+            case $arm in stagger-journal) worker_mode=stagger-journal ;; fused) worker_mode=stagger-natural ;; esac
+        fi
         (cd "$dir" && timeout --kill-after=30s 7200s "$PYTHON" -B "$tool" "$worker_mode" "$root"             "$PEER_AUDIT_REFERENCE" "$group" "$batch" "$trace" "$sdk" "127.0.0.1:$port" "$prepared_bank" "$dir") >"$dir/worker.log" 2>&1 || {
             rc=$?; tail -25 "$dir/worker.log"; exit "$rc"
         }

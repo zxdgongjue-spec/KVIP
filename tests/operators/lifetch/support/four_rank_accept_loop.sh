@@ -8,7 +8,7 @@ case $audit_mode in
     window-x*) extra_report="$controller_root/tests/operators/lifetch/support/b24_window_report.py" ;;
     team-schedule) extra_report="$controller_root/tests/operators/lifetch/support/b24_team_schedule.py" ;;
 esac
-if [[ $audit_mode == stagger-pair ]]; then
+if [[ $audit_mode == first-receipt-pair ]]; then
     source "$controller_root/tests/operators/lifetch/support/terminal_stagger_loop.sh"
     return 0
 fi

@@ -23,7 +23,7 @@ struct Device {
     }
     ~Device() { for(auto p:blocks) aclrtFree(p); }
 };
-static void run(aclrtStream stream,uint32_t enabled,bool fault) {
+static void run(aclrtStream stream,uint32_t enabled,unsigned fault,bool protocolOnly=false) {
     constexpr unsigned n=12, cursor=7, head=93;
     Device m; std::array<KvafExecuteBatchGetKernelArgs,n> args{};
     auto data=m.alloc(n*64*8);
@@ -34,7 +34,7 @@ static void run(aclrtStream stream,uint32_t enabled,bool fault) {
         std::array<uint32_t,8*16> cq{};
         for(unsigned k=0;k<8;++k) {
             auto at=cursor+k;
-            cq[at%8*16]=((1U^((at/8)&1U))<<2) | (fault && i==3 && k==1 ? (1U<<16) : 0U);
+            cq[at%8*16]=((1U^((at/8)&1U))<<2) | (((fault==1 && i==3 && k==1) || (fault==2 && i==2 && k==0)) ? (1U<<16) : 0U);
         }
         ent.cq_va=m.copy(cq);
         args[i].queue_state=m.copy(state);args[i].core_status=m.copy(KvafBatchGetCoreStatus{});
@@ -52,23 +52,27 @@ static void run(aclrtStream stream,uint32_t enabled,bool fault) {
     auto table=m.alloc(plans.size()*4,plans.data());
     std::array<uint32_t,32+1024> shared{};shared[0]=127;
     auto scratch=m.copy(shared);
-    for (unsigned offset: {0U, 4U, 8U}) {
+    auto permits=m.alloc(3*2*32*sizeof(uint32_t));
+    const unsigned blocks=protocolOnly?n:4U;
+    for (unsigned offset=0; offset<n; offset+=blocks) {
         std::printf("START enabled=%u fault=%u offset=%u\n",enabled,unsigned(fault),offset);
-        ck(ACLRT_LAUNCH_KERNEL(gate_camodel)(4,stream,(void*)argbuf,(void*)data,enabled,offset,(void*)table,(void*)scratch));
+        ck(ACLRT_LAUNCH_KERNEL(gate_camodel)(blocks,stream,(void*)argbuf,(void*)data,enabled|(protocolOnly?2U:0U),offset,(void*)table,(void*)scratch,(void*)permits));
         ck(aclrtSynchronizeStream(stream));
     }
     for(unsigned i=0;i<n;++i) {
         auto result=m.read<std::array<uint64_t,64>>(data+i*64*8);
-        const auto observed=reinterpret_cast<const uint32_t*>(result.data()+48);
-        const auto query=i%4;
-        const uint32_t prior=i/4*13+127, expected[4]={prior+3,0,prior+7,prior};
-        std::printf("Reservation queue=%u base=%u expected=%u source_guard=%u first=%u\n",i,observed[0],expected[query],observed[8],observed[1]);
-        require(observed[0]==expected[query],"wrong archived Q reservation predecessor");
-        for(unsigned j=0;j<count[query];++j){
-            unsigned want=i==8?(j==0?777:500+j):i==6?(j==1?520:520+j):500+query*10+count[query]-1-j;
-            require(observed[j+1]==want,"ordered final list or bad-member fallback");
+        if (!protocolOnly) {
+            const auto observed=reinterpret_cast<const uint32_t*>(result.data()+48);
+            const auto query=i%4;
+            const uint32_t prior=i/4*13+127, expected[4]={prior+3,0,prior+7,prior};
+            std::printf("Reservation queue=%u base=%u expected=%u source_guard=%u first=%u\n",i,observed[0],expected[query],observed[8],observed[1]);
+            require(observed[0]==expected[query],"wrong archived Q reservation predecessor");
+            for(unsigned j=0;j<count[query];++j){
+                unsigned want=i==8?(j==0?777:500+j):i==6?(j==1?520:520+j):500+query*10+count[query]-1-j;
+                require(observed[j+1]==want,"ordered final list or bad-member fallback");
+            }
+            require(observed[8]==(i==9?5U:(i==8||i==6)?2U:1U),"guard or bounded fallback");
         }
-        require(observed[8]==(i==9?5U:(i==8||i==6)?2U:1U),"guard or bounded fallback");
         auto bells=m.read<std::array<uint64_t,16>>(args[i].indices);
         auto state=m.read<KvafBatchGetQueueState>(args[i].queue_state);
         auto status=m.read<KvafBatchGetCoreStatus>(args[i].core_status);
@@ -79,29 +83,38 @@ static void run(aclrtStream stream,uint32_t enabled,bool fault) {
             if(end<own && (ends.empty()||ends.back()!=end)) ends.push_back(end);
         }
         ends.push_back(own);
-        const bool bad=fault&&i==3;
-        const unsigned issued=bad?2:own?ends.size():0;
-        const unsigned group=enabled&&ends.size()==4?(i/4+q)&3U:4U;
-        require(result[3]==ends.size() && result[4]==group, "gate selection/count");
+        const bool suppressed=enabled && fault==2 && i==3;
+        const bool first_error=fault==2 && i==2;
+        const bool later_error=fault==1 && i==3;
+        const bool bad=suppressed||first_error||later_error;
+        const unsigned issued=suppressed?0U:first_error?1U:later_error?2U:own?ends.size():0U;
+        const bool hold=enabled && (i<4 || i>=8) && ((i/4^q)&1U) && own;
+        require(result[3]==ends.size() && bool(result[4])==hold, "first receipt policy");
         require(bool(result[2])==bad && bells[0]==issued,"transport error or extra doorbell");
         unsigned last=0;
         for(unsigned j=0;j<issued;++j) {
             require(bells[2+j*2]==head+ends[j],"private prefix changed");
-            if(group<4) {
-                auto clk=bells[3+j*2], delta=(clk - (group<<12)) & 16383U;
-                std::printf("group=%u prefix=%u issued_at=%llu quarter_offset=%llu\n",group,j,
-                            (unsigned long long)clk,(unsigned long long)delta);
-                require(delta < 4096+256,"doorbell outside its quarter");
-            }
             last=ends[j];
         }
+        if(hold && !suppressed && (i^1U)!=0){
+            auto peer=m.read<std::array<uint64_t,64>>(data+(i^1U)*64*8);
+            require(peer[29]>0 && result[27]>=peer[29],"issued before paired receipt");
+        }
         require(state.sq_producer_index==head+last && state.cq_consumer_index==cursor+issued, "private SQ/CQ cursor");
-        require(status.processed_request_count==last && status.completed_batch_count==issued-bad && bool(status.result)==bad,"private status");
+        require(status.processed_request_count==last && status.completed_batch_count==issued-unsigned(first_error||later_error) && bool(status.result)==bad,"private status");
     }
     std::printf("PASS enabled=%u CQ_error=%u queues=12 zero_short_long=covered\n",enabled,unsigned(fault));
 }
-int main() { try {
+int main(int argc,char** argv) { try {
     ck(aclInit(nullptr)); ck(aclrtSetDevice(0)); aclrtStream stream; ck(aclrtCreateStream(&stream));
-    for(bool fault: {false,true}) for(unsigned enabled: {0U,1U}) run(stream,enabled,fault);
+    const bool protocolOnly=argc>1 && std::string(argv[1])=="--receipt-only";
+    if (argc>1) require(protocolOnly && argc<=4,"usage: probe [--receipt-only [fault [enabled]]]");
+    if (argc>=3) require(std::stoul(argv[2])<=2,"fault must be 0, 1, or 2");
+    if (argc>=4) require(std::stoul(argv[3])<=1,"enabled must be 0 or 1");
+    for(unsigned fault: {0U,1U,2U}) for(unsigned enabled: {0U,1U}) {
+        if (argc>=3 && std::stoul(argv[2])!=fault) continue;
+        if (argc>=4 && std::stoul(argv[3])!=enabled) continue;
+        run(stream,enabled,fault,protocolOnly);
+    }
     ck(aclrtDestroyStream(stream));ck(aclrtResetDevice(0));ck(aclFinalize());return 0;
 } catch(const std::exception& e){std::fprintf(stderr,"FAIL %s\n",e.what());return 1;} }
