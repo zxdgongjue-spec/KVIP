@@ -27,7 +27,7 @@ ascendc_compile_options(v9_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WO
 add_library(v9_bridge SHARED op_host/launch.cpp)
 target_include_directories(v9_bridge PRIVATE ${KVAF_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/include ${_base}/include)
 target_compile_definitions(v9_bridge PRIVATE KVIP_OUTPUT_WORKER=$<BOOL:${KVIP_OUTPUT_WORKER}>)
-target_link_libraries(v9_bridge PRIVATE v9_kernel host_intf_pub ascendcl)
+target_link_libraries(v9_bridge PRIVATE v9_kernel host_intf_pub ascendcl msprofiler)
 
 # Independent compile options preserve the retained four-AIV terminal code.
 ascendc_library(parallel_terminal_kernel STATIC op_kernel/terminal/kernel.cpp)

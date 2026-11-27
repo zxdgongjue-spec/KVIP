@@ -159,3 +159,31 @@ less time. `q1_savings_on_fixed_us` measures the Q1 increment after fixed Score,
 and `interaction_savings_us` subtracts the Q1 saving measured with P2 Score
 from that increment. Check each row's Get-match field before using raw timing
 to infer work saved.
+
+### BS4 Cold width and Service backpressure
+
+`run_fixed_q4_combo_a5.sh --pressure` uses MR40 fixed Score plus last-window Q1
+as the reference. BS4/W4 is fixed. Hot continues to launch 32 MIX groups. Cold
+uses 32 groups (P8) or 16 groups (P4). Each width is measured with or without
+deferred result-bank credit.
+
+Deferred credit applies to the first three tiles of W2/W3 on the group whose
+AIV owned W1/W2 Service. It can issue the next K/Q loads and MMAD into AIC-local
+storage sooner. Both AIV credits are still required before the first Fixpipe
+write to the result bank. The bank count, score progress, rotating Service
+order, W3 Q1 ownership and prefetch budgets are preserved.
+
+The default runs four checked Graph Event arms at each of miss 5% and 15%.
+Once all eight pass, it captures one checked, warmed eager msprof invocation
+per arm at miss 15% for the P8 control and the P8 deferred-credit route. The
+same Cold width makes this pair useful for analyzing credit placement. The
+regular matched rate can be selected with `--msprof-miss`. Use `--skip-msprof`
+for timing only or repeat `--miss-percent` to restrict the run.
+
+Open `msprof_pair/comparison_trace.json` in Perfetto for the four labeled
+kernel stages. `msprof_pair/comparison.csv` contains their durations and
+`msprof_pair/comparison.json` records trace attribution and Get-count matching.
+Use the per-arm raw CANN exports and `msprof/window_cycles.json` for further
+inspection. If the CANN export lacks identifiable tasks, the runner retains
+the original trace and reports the attribution error. Use the main
+`comparison.csv` for Graph Event latency and per-request Get comparability.

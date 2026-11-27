@@ -189,7 +189,7 @@ def _label_capture(paths, route, caption, case, save):
 
 def collect_pair(output, baseline_case, optimized_case, *, launch_case, profiler=None):
     """Run one selected case per route, then publish raw and compared traces."""
-    from fixed_q4_combo_a5 import match_counts
+    from fixed_q4_combo_a5 import match_counts, read_counters
     from reporting import atomic_json
 
     profiler = profiler or shutil.which(os.environ.get('KVIP_MSPROF', 'msprof'))
@@ -201,7 +201,7 @@ def collect_pair(output, baseline_case, optimized_case, *, launch_case, profiler
         raise ValueError('msprof pair requires the same fixture and launch geometry')
     pair = Path(output).resolve() / 'msprof_pair'
     pair.mkdir()
-    captures, rows = {}, []
+    captures, rows, trace_counts = {}, [], []
     for label, case in (('baseline', baseline_case), ('optimized', optimized_case)):
         route = pair / label
         raw = route / 'msprof'
@@ -216,8 +216,11 @@ def collect_pair(output, baseline_case, optimized_case, *, launch_case, profiler
         timelines = _export(profiler, raw, route / 'msprof-export.log')
         capture = dict(arm=case['arm'], receipt=str(receipt), raw=[str(path) for path in timelines])
         cycle_report = raw / 'window_cycles.json'
-        if cycle_report.is_file():
-            capture['window_cycles'] = str(cycle_report)
+        detail = json.loads(cycle_report.read_text())
+        trace_counts.append(read_counters(
+            [{'accounting': {'invocation': 0}, 'algorithm': detail['algorithm']}], case, 1
+        ))
+        capture['window_cycles'] = str(cycle_report)
         capture.update(_label_capture(timelines, route, label, case, atomic_json))
         captures[label] = capture
         atomic_json(route / 'capture_summary.json', capture)
@@ -229,7 +232,8 @@ def collect_pair(output, baseline_case, optimized_case, *, launch_case, profiler
             raise ValueError(f'msprof routes used different {field}')
     summary = dict(batch=baseline_case['batch'], miss_percent=baseline_case['miss_percent'],
                    fixture_sha256=rows[0]['fixture_sha256'], library_sha256=rows[0]['library_sha256'],
-                   profiler_get_match=match_counts(rows[0]['counts'], rows[1]['counts']), **captures)
+                   profiler_get_match=match_counts(*trace_counts),
+                   unmarked_graph_get_match=match_counts(rows[0]['counts'], rows[1]['counts']), **captures)
     if all(capture['attribution'] == 'VERIFIED' for capture in captures.values()):
         base, optimized = (capture['intervals'] for capture in captures.values())
         comparison = [dict(stage=before['name'], baseline_us=before['duration_us'],
