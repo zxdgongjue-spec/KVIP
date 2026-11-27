@@ -1,0 +1,44 @@
+--- a/row_kernel.h
++++ b/row_kernel.h
+@@ -227,6 +227,8 @@
+  if(profile)ts[15]=GetSystemCycle();
+  rotating::CommitTerminalPost(args,originalHead,batches.ends[0],post);
+  if(profile)ts[4]=GetSystemCycle();
++ auto firstFinal=ts+uint64_t(s.batch)*4*32*3;
++ if (post->pending) rotating::ObserveAfterFirstPost(args,firstFinal);
+ 
+  op.FreeEventID();
+  if(profile)ts[5]=GetSystemCycle();
+@@ -299,7 +301,8 @@
+  auto extra=reinterpret_cast<__gm__ uint64_t*>(runtime->times)+(s.batch*4+query)*32;
+  auto probes=q==1?extra+uint64_t(s.batch)*4*32:nullptr;
+  if(probes)rotating::ObservePrefetch(ctx,b,args,probes);
+- uint64_t cqError=rotating::CompleteTerminalPost(args,post,batches,originalHead,extra,ctx,b,probes);
++ uint64_t cqError=rotating::CompleteTerminalPost(args,post,batches,originalHead,extra,ctx,b,probes,firstFinal);
++ kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(firstFinal),256);
+  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(extra),256);
+  if(profile)ts[24]=GetSystemCycle();
+  if(q==1){
+--- a/terminal_transport.h
++++ b/terminal_transport.h
+@@ -105,9 +105,10 @@
+     }
+     dest[4]=status;dest[1]=GetSystemCycle();
+ }
++#include "first_final_observer.h"
+ __aicore__ inline uint64_t CompleteTerminalPost(
+     const __gm__ KvafExecuteBatchGetKernelArgs* args, __gm__ FinalPost* post,
+-    const TerminalBatches& batches, uint64_t head, __gm__ uint64_t* clocks, __gm__ Context* ctx, uint32_t row, __gm__ uint64_t* probes) {
++    const TerminalBatches& batches, uint64_t head, __gm__ uint64_t* clocks, __gm__ Context* ctx, uint32_t row, __gm__ uint64_t* probes, __gm__ uint64_t* firstFinal) {
+     auto entity = reinterpret_cast<const __gm__ KvafBatchGetDirectUrmaEntity*>(args->channel_entity);
+     auto queue = reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args->queue_state);
+     const bool nonempty = post->pending != 0;
+@@ -116,7 +117,7 @@
+         for (uint32_t i = 0; i < batches.count; ++i) clocks[1+i] = batches.ends[i];
+         clocks[8+2] = GetSystemCycle();
+     }
+-    auto result = DrainQueue(entity, queue, post->pending);
++    auto result = ObserveFirstFinalDrain(entity, queue, post->pending, firstFinal);
+     if (nonempty) {
+         clocks[8+3] = GetSystemCycle();
+         if(probes)ObservePrefetch(ctx,row,args,probes+5);

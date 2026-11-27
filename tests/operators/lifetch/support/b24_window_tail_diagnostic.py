@@ -7,7 +7,16 @@ from b24_window_policy import install, policy
 from b24_window_report import CONTROL, cached, values
 
 STUDY_READER = "e602ff4a688a733664aaabe84aa30732b9e68062"
-CELLS = {"window-tail-x2": (7,10), "window-tail-x4": (7,), "window-tail-x3": (10,)}
+CELLS = {"window-tail-x2": (7,10), "window-tail-x4": (7,), "window-tail-x3": (10,), "window-tail-x3-g7": (7,)}
+
+
+def policy_name(mode):
+    return CONTROL if mode == "window-tail-x3-g7" else mode.replace("window-tail-x", "window-x") + "-early"
+
+
+def supported(mode, group, batch):
+    batches = (28,32) if mode == "window-tail-x3-g7" else (32,)
+    return group in CELLS.get(mode, ()) and batch in batches
 
 
 class MissingNaturalPolicy(FileNotFoundError):
@@ -15,9 +24,9 @@ class MissingNaturalPolicy(FileNotFoundError):
 
 
 def bind(mode, reference, group, batch):
-    if mode not in CELLS or group not in CELLS[mode] or batch != 32:
-        raise ValueError("Unexpected policy or BS32 window-tail diagnostic")
-    name = mode.replace("window-tail-x", "window-x") + "-early"
+    if not supported(mode, group, batch):
+        raise ValueError("Unsupported window-tail diagnostic shape or policy")
+    name = policy_name(mode)
     control = reference / f"g{group}/bs{batch}/block1/fused"
     if name == CONTROL:
         arm = control
@@ -30,6 +39,9 @@ def bind(mode, reference, group, batch):
             not record.get("cold_build_fingerprint") or
             (name != CONTROL and not record.get("tail_text"))):
         raise ValueError(f"Missing natural timing/provenance at {arm}")
+    if (record.get("correctness") != "PASS" or record.get("full_KV_Index_checked_calls") != 10
+            or (record.get("checked_queries"), record.get("checked_rows")) != (batch*40,batch*10)):
+        raise ValueError(f"Missing checked natural ten-call graph at {arm}")
     ordinary_tail = record.get("tail_text")
     if name == CONTROL:
         # The old four-window archive predates the per-stage ELF digest.
@@ -131,14 +143,17 @@ def witness(tail):
                             for q in streams])
 
 
-def origin(area):
+def origin(area, mode):
     from large_batch_placement import field
     from portable_two_row_audit import local, local_identity
     host=local_identity()
+    cells = [(7,28),(7,32)] if mode == "window-tail-x3-g7" else [(7,32),(10,32)]
     for path in sorted(area.glob("fixed-q4-four-ranks-one-block.*"),key=lambda p:p.stat().st_mtime_ns,reverse=True):
         if (local(path,host) and field(path,"native")=="d0fc5963881bd38fa97eff0f6ef40c757a6e8713"
+                and field(path,"kvaf")=="813f1750a50b7e6c92d5f5397f2fbc05befef6da"
+                and field(path,"kvaf_tree")=="1de18e8315137d7a0227c3ae4c82afd45b5fe743"
                 and field(path,"selection_oracle")=="captured_logical_scores" and (path/"packed_summary.json").is_file()
-                and all((path/f"g{group}/bs32/block1/fused/placement_verified").is_file() for group in (7,10))):
+                and all((path/f"g{group}/bs{batch}/block1/fused/placement_verified").is_file() for group,batch in cells)):
             return path
     return "LOCAL"
 
@@ -147,4 +162,6 @@ if __name__ == "__main__":
     import argparse
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument("--origin",type=Path,required=True)
-    print(origin(p.parse_args().origin))
+    p.add_argument("--mode", required=True, choices=tuple(CELLS))
+    args=p.parse_args()
+    print(origin(args.origin,args.mode))

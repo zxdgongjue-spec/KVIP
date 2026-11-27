@@ -30,11 +30,11 @@ def run(args):
     local_only = window_mode and args.archive == Path("LOCAL")
     binding, previous, path = None, None, None
     if window_mode:
-        from b24_window_tail_diagnostic import CELLS, MissingNaturalPolicy, bind, select_policy
+        from b24_window_tail_diagnostic import MissingNaturalPolicy, bind, policy_name, select_policy, supported
         import large_two_cold
-        if args.group not in CELLS.get(mode, ()) or args.batch != 32:
+        if not supported(mode,args.group,args.batch):
             raise ValueError("Unexpected local window policy or group")
-        name=mode.replace("window-tail-x","window-x")+"-early"
+        name=policy_name(mode)
         oracle_name="captured_logical_scores"
         if not local_only:
             try:
@@ -86,7 +86,8 @@ def run(args):
         elif not bound.get("tail_text") or not bound.get("cold_build"):
             raise ValueError("Original LI/terminal code missing in local unpaired sample")
         proof["ordinary_images"] = bound
-        proof["tail"] = collect(state, args.output, args.timed, prefetch_ready=True, profile_only_terminal=True)
+        proof["tail"] = collect(state, args.output, args.timed, prefetch_ready=True, profile_only_terminal=True,
+                                final_ready=mode == "window-tail-x3-g7")
 
     def benchmark(torch_mod, states, seq, config, directory, *, fused):
         if not fused or len(states) != 1 or (previous is not None and
@@ -165,6 +166,7 @@ def cached(source, group, batch, controller):
     if not ((int(group) == 7 and int(batch) in (28,32)) or (int(group) in (2,10) and int(batch) == 32)):
         raise ValueError("Unexpected diagnostic cell")
     mode = os.getenv("PEER_RANK_DIAG_MODE", "")
+    from b24_window_tail_diagnostic import policy_name
     window_mode=mode.startswith("window-tail-x")
     local_sample=window_mode and source==Path("LOCAL")
     area=Path(os.environ["PEER_G2_WORK"])/"peer-baseline" if local_sample else source.parent
@@ -201,7 +203,8 @@ def cached(source, group, batch, controller):
                 placement(path.parent/"thp.json")
             if ((path.parent/"placement_verified").is_file() and (path.parent/"worker.log").is_file()
                     and (observed.get("window_policy_archive") == binding)
-                    and (not window_mode or observed.get("window_policy")==mode.replace("window-tail-x","window-x")+"-early")
+                    and (not window_mode or observed.get("window_policy")==policy_name(mode))
+                    and ((mode == "window-tail-x3-g7") == ("first_final_private_cq" in observed.get("tail",{})))
                     and ((mode == "prefetch-ready" or window_mode) ==
                          ("prefetch_cq_checkpoints" in observed.get("tail", {})))
                     and observed.get("input_archive") == (str(packed_path) if packed_path is not None else None)

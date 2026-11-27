@@ -13,7 +13,7 @@ import tempfile
 from b24_tail_archive import query_spans, require
 
 
-def build_probe(repo, normal_library, sdk_build, soc, prefetch_ready=False):
+def build_probe(repo, normal_library, sdk_build, soc, prefetch_ready=False, final_ready=False):
     from kvip.runtime.build import build_failure, kvaf_build_paths
     cann, headers = kvaf_build_paths(sdk_build)
     op = repo / "csrc/operators/lightning_indexer_with_fetch"
@@ -23,7 +23,13 @@ def build_probe(repo, normal_library, sdk_build, soc, prefetch_ready=False):
     if prefetch_ready:
         digest.update(b"window CQ visibility v1")
         digest.update(resume.read_bytes())
+    if final_ready:
+        if not prefetch_ready:
+            raise ValueError("Final visibility needs the original per-batch timeline")
+        digest.update(b"first final owner and commit v1")
     for file in sorted(src.iterdir()):
+        if file.name in ("first-final.patch", "first_final_observer.h") and not final_ready:
+            continue
         if file.is_file() and (file.name != "prefetch-ready.patch" or prefetch_ready):
             digest.update(file.read_bytes())
     folder = normal_library.parent / ("terminal-private-clock-" + digest.hexdigest()[:16])
@@ -43,6 +49,9 @@ def build_probe(repo, normal_library, sdk_build, soc, prefetch_ready=False):
                 if prefetch_ready:
                     shutil.copyfile(resume, stage / "resume.h")
                     patches.append(src / "prefetch-ready.patch")
+                if final_ready:
+                    shutil.copyfile(src / "first_final_observer.h", stage / "first_final_observer.h")
+                    patches.append(src / "first-final.patch")
                 for command in (
                     *(["patch", "--batch", "--fuzz=0", "-p1", "-i", str(p)] for p in patches),
                     ["cmake", "-S", ".", "-B", "build", f"-DOP={op}", f"-DSOC_VERSION={soc}",
@@ -99,17 +108,17 @@ def decode(stamps, detail, mhz):
                 terminal_span_us=(stamps[last_row][last_q][10]-origin)/mhz)
 
 
-def collect(state, directory, repo, prefetch_ready=False, profile_only_terminal=False):
+def collect(state, directory, repo, prefetch_ready=False, profile_only_terminal=False, final_ready=False):
     import torch
     from large_batch_pair import check_ordered_index
     launch = state.large_window_launch
     _, normal, sdk_build, soc, policy = state.large_window_build_args
     require(policy == "four-ranks" and not launch.trace_only, "Expected original timed LI")
-    lib = build_probe(repo, normal, sdk_build, soc, prefetch_ready)
+    lib = build_probe(repo, normal, sdk_build, soc, prefetch_ready, final_ready)
     tail = ctypes.cast(lib.kvip_test_terminal_clocks, ctypes.c_void_p)
     hot = ctypes.cast(state.rotating.library.aclrtlaunch_v9_li_large_hot, ctypes.c_void_p)
     fwd, terminal = state.forward, state.forward.terminal
-    words = torch.zeros((3 if prefetch_ready else 2, state.batch, 4, 32), dtype=torch.int64, device=state.device)
+    words = torch.zeros((4 if final_ready else 3 if prefetch_ready else 2, state.batch, 4, 32), dtype=torch.int64, device=state.device)
     pointer = torch.tensor(list(struct.pack("<Q", words.data_ptr())), dtype=torch.uint8, device=state.device)
     mhz = fwd.calibrate_counter_mhz()
     stream = torch.npu.current_stream(state.device)
@@ -183,5 +192,31 @@ def collect(state, directory, repo, prefetch_ready=False, profile_only_terminal=
                 print(f"PREFETCH_CQ BS{state.batch} Q2 {name} "
                       f"all_window_CQEs_visible={sum(v['all_visible'] for v in pending)}/{len(pending)} "
                       f"no_window_CQE_due={len(snapshot)-len(pending)}")
+    if final_ready:
+        from four_rank_first_final import decode as decode_first_final
+        scheduler = extra["original_team_schedule"]
+        samples = decode_first_final(stamps, detail, visibility[1], scheduler, mhz)
+        extra["first_final_private_cq"] = samples
+        extra["first_final_observer_words"] = visibility[1]
+        slow = sorted(samples, key=lambda x:x["original_first_drain_us"], reverse=True)[:3]
+        parent = scheduler["rows"][r]["predecessor"]
+        print(f"FINAL_FIRST_CQ BS{state.batch} last_row={r} predecessor={parent} "
+              f"nonempty_Q={len(samples)} after_post_visible={sum(x['after_post_owner_status']=='success' for x in samples)} "
+              f"visible_at_first_drain={sum(x['first_drain_owner_status']=='success' for x in samples)}")
+        if parent is not None:
+            chain = scheduler["teams"][scheduler["rows"][r]["team"]]
+            for row_id in (parent, r):
+                row_info = scheduler["rows"][row_id]
+                print(f"FINAL_FIRST_CQ BS{state.batch} team={row_info['team']} actual_chain={chain} row={row_id} "
+                      f"role={'last' if row_id==r else 'direct_predecessor'} "
+                      f"enter/exit_us={row_info['enter_us']:.2f}/{row_info['exit_us']:.2f} "
+                      f"parent_exit_to_enter_us={row_info.get('parent_exit_to_child_entry_us')}")
+        for x in samples:
+            if x in slow or x["row"] in (r,parent):
+                print(f"FINAL_FIRST_CQ BS{state.batch} row={x['row']} Q={x['query']} wave={x['wave']} "
+                      f"first_batch_tokens={x['first_prefix_tokens']} after_post={x['after_post_owner_status']} "
+                      f"first_drain={x['first_drain_owner_status']} polls={x['poll_count']} "
+                      f"visibility_bounds_us={x['availability_lower_upper_us']} commit_bounds_us={x['consumer_commit_begin_end_us']} "
+                      f"drain_to_seen_us={x['drain_to_observed_us']} first_seen_to_commit_us={x['first_observed_to_commit_us']}")
     return dict(**extra, clock_mhz=mhz, separate_terminal_query_stamps=stamps, prefix_clock_words=detail,
                 decoded=report, final_index_assignments_by_row=final_assignments, ordered_Index_rows=state.batch)
