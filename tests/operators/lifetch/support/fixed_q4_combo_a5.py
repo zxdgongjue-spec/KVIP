@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Four fused arms for fixed-score and last-window Q1 at unchanged geometry."""
+"""Run fixed-Q4/Q1 and Cold scheduling comparisons on Ascend A5."""
 
 import argparse
 from contextlib import contextmanager
@@ -18,29 +18,50 @@ import time
 
 ROOT = Path(__file__).resolve().parents[4]
 BASE = 'af52a02b97daddadd5d93b9d100f2ff1b03b499d'
+PRESSURE_BASE = '20d3b82601b48d5986b8b83d5359eaf0d5619168'
 ARMS = ('p2_q4', 'fixed_q4', 'p2_q1', 'fixed_q1')
+PRESSURE_ARMS = (
+    ('fixed_q1', 'baseline', 32),
+    ('cold_p4_q1', 'cold_p4', 16),
+    ('overlap_q1', 'overlap', 32),
+    ('cold_p4_overlap_q1', 'combined', 16),
+)
 FIXED_GROUPS_PER_REQUEST = {1: 8, 2: 8, 4: 8, 8: 4}
 MISSES = (5, 10, 15, 20)
 
 
 def plan(args):
     cases = []
-    for batch in dict.fromkeys(args.batch or (1, 4)):
+    misses = tuple(dict.fromkeys(args.miss_percent or (5, 15)))
+    batches = dict.fromkeys(args.batch or ((4,) if args.pressure else (1, 4)))
+    for batch in batches:
         windows = 2 if batch == 1 else 4
         service_lanes = 2 if batch == 1 else batch
-        for miss in dict.fromkeys(args.miss_percent or (5, 15)):
+        for miss in misses:
+            if args.pressure:
+                for arm, mode, cold_score_groups in PRESSURE_ARMS:
+                    cases.append(dict(batch=batch, miss_percent=miss, arm=arm, windows=windows,
+                                      score_groups=32, cold_score_groups=cold_score_groups,
+                                      service_lanes=service_lanes, q_workers=4, pressure_mode=mode))
+                continue
             for arm in ARMS:
                 cases.append(dict(batch=batch, miss_percent=miss, arm=arm, windows=windows,
                                   score_groups=batch * (FIXED_GROUPS_PER_REQUEST[batch]
                                                         if arm.startswith('fixed_') else 2),
                                   service_lanes=service_lanes, q_workers=4 if arm.endswith('_q1') else 1))
-    return dict(base_commit=BASE, cases=cases, device=args.device, history=131072, resident=16384,
-                queries=4, index_heads=32, requested_windows=4, prefetch_tokens=512,
-                prefetch_window_limit=128, prefetch_rank_start=1024, seed=43,
-                warmup=args.warmup, iterations=args.iterations, timeout_seconds=args.timeout_seconds)
+    matrix = dict(base_commit=PRESSURE_BASE if args.pressure else BASE,
+                  cases=cases, device=args.device, history=131072, resident=16384, queries=4,
+                  index_heads=32, requested_windows=4, prefetch_tokens=512, prefetch_window_limit=128,
+                  prefetch_rank_start=1024, seed=43, warmup=args.warmup, iterations=args.iterations,
+                  timeout_seconds=args.timeout_seconds)
+    if args.pressure and not args.skip_msprof:
+        trace_miss = args.msprof_miss or (15 if 15 in misses else misses[0])
+        matrix['msprof_pair'] = dict(batch=4, miss_percent=trace_miss, baseline='fixed_q1',
+                                    optimized='overlap_q1', measured_calls_per_arm=1)
+    return matrix
 
 
-def native_arguments(args, case):
+def native_arguments(args, case, *, iterations):
     return [
         'diagnose', '--input', 'synthetic', '--transport', 'urma', '--level', '1',
         '--kvaf-root', str(args.kvaf_root), '--kvaf-server', args.kvaf_server,
@@ -49,7 +70,7 @@ def native_arguments(args, case):
         '--history', '131072', '--resident', '16384', '--queries', '4', '--index-heads', '32',
         '--seed', '43', '--prefetch-tokens', '512', '--prefetch-rank-start', '1024',
         # The native runtime clamps BS1 to W2 after deriving the W4 request's 128-entry cap.
-        '--intermediate-fetches', '4', '--warmup', str(args.warmup), '--iterations', str(args.iterations),
+        '--intermediate-fetches', '4', '--warmup', str(args.warmup), '--iterations', str(iterations),
     ]
 
 
@@ -133,9 +154,13 @@ def read_arm(worker, case, iterations):
             or result['correctness'] != 'PASS'):
         raise ValueError(f'Unchecked benchmark result: {path}')
     route = result['combo']
-    for field in ('arm', 'score_groups', 'windows', 'service_lanes', 'q_workers'):
-        if route[field] != case[field]:
-            raise ValueError(f"Unexpected {field} {route[field]!r} for {case['arm']}")
+    expected = {key: case[key] for key in ('arm', 'score_groups', 'windows', 'service_lanes', 'q_workers')}
+    if 'pressure_mode' in case:
+        expected.update(arm='fixed_q1', pressure_mode=case['pressure_mode'],
+                        cold_score_groups=case['cold_score_groups'])
+    for field, value in expected.items():
+        if route[field] != value:
+            raise ValueError(f"Unexpected {field} {route[field]!r} for {case['arm']}, expected {value!r}")
     timing = result['all_rounds']
     event = timing['event_mean_us']
     if (timing['graph_calls'] != iterations or timing['measured_graphs'] != 1
@@ -179,11 +204,15 @@ def match_counts(left, right):
     return 'different_request_totals'
 
 
-def compare_cell(arms):
-    p2_q4, fixed_q4, p2_q1, fixed_q1 = (arms[arm] for arm in ARMS)
+def verify_cell(arms):
     for field in ('fixture_sha256', 'library_sha256'):
         if len({value[field] for value in arms.values()}) != 1:
             raise ValueError(f'The four arms used different {field}')
+
+
+def compare_cell(arms):
+    verify_cell(arms)
+    p2_q4, fixed_q4, p2_q1, fixed_q1 = (arms[arm] for arm in ARMS)
     a, b, c, d = (row['kv_ready_us'] for row in (p2_q4, fixed_q4, p2_q1, fixed_q1))
     return dict(batch=p2_q4['batch'], miss_percent=p2_q4['miss_percent'],
                 fixed_score_savings_us=a - b, q1_savings_on_p2_us=a - c,
@@ -193,6 +222,52 @@ def compare_cell(arms):
                 q1_on_fixed_get_match=match_counts(fixed_q4['counts'], fixed_q1['counts']),
                 fixed_score_get_match=match_counts(p2_q4['counts'], fixed_q4['counts']),
                 combined_get_match=match_counts(p2_q4['counts'], fixed_q1['counts']))
+
+
+def compare_pressure_cell(arms):
+    verify_cell(arms)
+    baseline, cold_p4, overlap, combined = (arms[arm] for arm, _, _ in PRESSURE_ARMS)
+    base_us = baseline['kv_ready_us']
+    comparison = dict(batch=baseline['batch'], miss_percent=baseline['miss_percent'],
+                      fixed_q1_kv_ready_us=base_us)
+    for stem, row in (('cold_p4', cold_p4), ('overlap', overlap), ('combined', combined)):
+        savings = base_us - row['kv_ready_us']
+        comparison.update({
+            f'{stem}_kv_ready_us': row['kv_ready_us'],
+            f'{stem}_savings_us': savings,
+            f'{stem}_savings_percent': 100 * savings / base_us,
+            f'{stem}_cold_service_savings_us': baseline['cold_service_us'] - row['cold_service_us'],
+            f'{stem}_terminal_savings_us': baseline['terminal_us'] - row['terminal_us'],
+            f'{stem}_get_match': match_counts(baseline['counts'], row['counts']),
+        })
+    comparison['overlap_savings_on_cold_p4_us'] = cold_p4['kv_ready_us'] - combined['kv_ready_us']
+    comparison['interaction_savings_us'] = (
+        comparison['overlap_savings_on_cold_p4_us'] - comparison['overlap_savings_us']
+    )
+    return comparison
+
+
+@contextmanager
+def case_environment(case, extra=None):
+    # The existing subprocess launcher inherits its environment.
+    options = dict(KVIP_FIXED_Q4_COMBO_ARM='fixed_q1' if 'pressure_mode' in case else case['arm'],
+                   KVIP_FIXED_Q4_PRESSURE_MODE=case.get('pressure_mode'),
+                   KVIP_FIXED_Q4_PRESSURE_PROFILE=None)
+    options.update(extra or {})
+    saved = {key: os.environ.get(key) for key in options}
+    try:
+        for key, value in options.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def write_reports(output, arms, cells):
@@ -260,7 +335,17 @@ def main(argv=None):
     parser.add_argument('--kvaf-server', default=os.environ.get('KVIP_KVAF_SERVER', '127.0.0.1:28986'))
     parser.add_argument('--output', type=Path, default=os.environ.get('KVIP_AB_OUTPUT', ROOT / 'tests/results/lifetch-combo'))
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--pressure', action='store_true',
+                        help='compare BS4 Cold P4/P8 and deferred AIC result-bank credit, then capture one msprof pair')
+    parser.add_argument('--skip-msprof', action='store_true', help='run only pressure timing')
+    parser.add_argument('--msprof-miss', type=int, choices=MISSES, help='override the paired trace miss rate')
     args = parser.parse_args(argv)
+    if args.pressure and args.batch and set(args.batch) != {4}:
+        parser.error('--pressure currently requires BS4')
+    if not args.pressure and (args.skip_msprof or args.msprof_miss):
+        parser.error('--skip-msprof and --msprof-miss require --pressure')
+    if args.msprof_miss and (args.skip_msprof or args.msprof_miss not in (args.miss_percent or (5, 15))):
+        parser.error('--msprof-miss must be one of the measured miss rates and requires msprof capture')
     if min(args.warmup, args.device) < 0 or min(args.timeout_seconds, args.iterations) <= 0:
         parser.error('device and warmup must be nonnegative; iterations and timeout must be positive')
     try:
@@ -288,30 +373,49 @@ def main(argv=None):
     kvaf = subprocess.check_output(['git', '-C', str(args.kvaf_root), 'rev-parse', 'HEAD'], text=True).strip()
     atomic_json(output / 'manifest.json', dict(matrix, commit=commit, kvaf_commit=kvaf))
     rows, cells, arms = [], [], {}
+
+    def launch_case(case, worker, *, env=None, iterations=1):
+        config = configuration(native_arguments(args, case, iterations=iterations))
+        with case_environment(case, env):
+            if launch(config, worker):
+                raise RuntimeError(f'Failed arm {case["arm"]}. See {worker / "summary.log"}')
+        return read_arm(worker, case, iterations)
+
     with kvaf_service(args, output):
         for case in matrix['cases']:
             batch, miss, arm = case['batch'], case['miss_percent'], case['arm']
             worker = output / f'bs{batch}' / f'miss{miss}' / arm
-            print(f'BS{batch} miss{miss} {arm}: {case["score_groups"]} MIX, W{case["windows"]}', flush=True)
-            os.environ['KVIP_FIXED_Q4_COMBO_ARM'] = arm
-            code = launch(configuration(native_arguments(args, case)), worker)
-            if code:
-                raise RuntimeError(f'Failed arm {arm}. See {worker / "summary.log"}')
-            row = read_arm(worker, case, args.iterations)
+            groups = (f'{case["score_groups"]} Hot/{case["cold_score_groups"]} Cold'
+                      if args.pressure else case['score_groups'])
+            print(f'BS{batch} miss{miss} {arm}: {groups} MIX, W{case["windows"]}', flush=True)
+            row = launch_case(case, worker, iterations=args.iterations)
             if rows and rows[0]['library_sha256'] != row['library_sha256']:
                 raise ValueError('The benchmark library changed within the matrix')
             arms[arm] = row
             rows.append(row)
             if len(arms) == len(ARMS):
-                cell = compare_cell(arms)
+                cell = compare_pressure_cell(arms) if args.pressure else compare_cell(arms)
                 cells.append(cell)
-                print(f"  Combined {cell['combined_savings_percent']:+.2f}% ({cell['combined_get_match']}), "
-                      f"Q1 on fixed {cell['q1_savings_on_fixed_us']:+.2f} µs", flush=True)
+                if args.pressure:
+                    print(f"  Cold P4 {cell['cold_p4_savings_us']:+.2f} µs, "
+                          f"deferred credit {cell['overlap_savings_us']:+.2f} µs, "
+                          f"combined {cell['combined_savings_us']:+.2f} µs ({cell['combined_get_match']})",
+                          flush=True)
+                else:
+                    print(f"  Combined {cell['combined_savings_percent']:+.2f}% ({cell['combined_get_match']}), "
+                          f"Q1 on fixed {cell['q1_savings_on_fixed_us']:+.2f} µs", flush=True)
                 arms = {}
             write_reports(output, rows, cells)
             print(f"  KV ready {row['kv_ready_us']:.2f} µs, early/final "
                   f"{row['prefetch_per_call']:.2f}/{row['final_get_per_call']:.2f}", flush=True)
-    print(f'Finished {len(rows)} checked arms. Comparisons: {output / "comparison.csv"}', flush=True)
+        print(f'Finished {len(rows)} checked arms. Comparisons: {output / "comparison.csv"}', flush=True)
+        trace = matrix.get('msprof_pair')
+        if trace:
+            from fixed_q4_pressure_msprof import collect_pair
+
+            match = {case['arm']: case for case in matrix['cases']
+                     if case['batch'] == trace['batch'] and case['miss_percent'] == trace['miss_percent']}
+            collect_pair(output, match[trace['baseline']], match[trace['optimized']], launch_case=launch_case)
     return 0
 
 
