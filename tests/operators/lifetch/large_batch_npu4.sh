@@ -115,6 +115,12 @@ if [[ -n $bs32_li ]]; then prefix="$prefix-bs32-$bs32_li"; fi
 if (( packed_blocks == 1 )); then prefix="$prefix-one-block"; fi
 sdk_rev=813f1750a50b7e6c92d5f5397f2fbc05befef6da
 sdk_tree=1de18e8315137d7a0227c3ae4c82afd45b5fe743
+diag_source=${PEER_RANK_DIAG_SOURCE:-}
+if [[ -n $diag_source ]]; then
+    (( standalone )) && [[ $peer_physical_npu == 4 && -z ${PEER_PACKED_RESUME:-} ]] ||
+        { echo 'Single-call diagnostics require the standalone NPU4 candidate' >&2; exit 2; }
+    prefix=four-rank-diagnostic
+fi
 native=$(git -C "$root" rev-parse HEAD)
 resuming=0
 if [[ -n ${PEER_PACKED_RESUME:-} ]]; then
@@ -245,7 +251,9 @@ if (( !resuming )); then
     printf '%s\n' "$actual" > "$out/kvaf_tree.txt"
     printf '%s\n' "$sdk_rev" > "$out/kvaf.txt"
 fi
-if (( packed )); then
+if [[ -n $diag_source ]]; then
+    echo "CONFIG physical_NPU=$peer_physical_npu mode=$PEER_RANK_DIAG_MODE source=$diag_source timed_calls=0 diagnostic_calls_per_cell=1" >&3
+elif (( packed )); then
     if (( !resuming )); then printf '%s\n' "$packed_archive" > "$out/packed_source.txt"; fi
     if (( standalone )); then
         if (( !resuming )); then
@@ -358,6 +366,15 @@ run_arm() (
     grep -Fq "LISTEN address=127.0.0.1 port=$port" "$dir/cpu.log" || { tail -20 "$dir/cpu.log"; exit 1; }
     "$PYTHON" -B "$helpers/support/peer_thp.py" --unified-sdk --pid "$server" --log "$dir/cpu.log" --output "$dir/thp.json" --timeout 7200 9>&- &
     monitor=$!
+    if [[ -n $diag_source ]]; then
+        local tool="$controller_root/tests/operators/lifetch/support/four_rank_diagnostic.py"
+        (cd "$dir" && timeout --kill-after=30s 7200s "$PYTHON" -B "$tool" "$root" "$diag_source" "$group" "$batch" "$trace" "$sdk" "127.0.0.1:$port" "$prepared_bank" "$dir") >"$dir/worker.log" 2>&1 || {
+            rc=$?; tail -25 "$dir/worker.log"; exit "$rc"
+        }
+        wait "$monitor"
+        monitor=
+        return
+    fi
     if [[ $arm == candidate || $arm == pr30_reference ]]; then
         (cd "$dir" && timeout --kill-after=30s 7200s bash "$root/tests/operators/lifetch/fixed_bs16_pr30.sh" \
             "$root" "$work" "$out" "$group" "$trace" "$sdk" "127.0.0.1:$port" "$dir" "$arm") >"$dir/worker.log" 2>&1 || { tail -25 "$dir/worker.log"; exit 1; }
@@ -397,6 +414,50 @@ run_arm() (
     wait "$monitor"
     monitor=
 )
+if [[ -n $diag_source ]]; then
+    count=0
+    for group in 7 2 10; do
+        case $group:${PEER_RANK_DIAG_MODE:?} in 7:li|2:tail|10:tail) continue ;; esac
+        trace=
+        mkdir -p "$out/g$group"
+        prepared_bank="$out/g$group/donors"
+        shapes=(32)
+        if [[ $group == 7 ]]; then shapes+=(28); fi
+        for batch in "${shapes[@]}"; do
+            pair="$out/g$group/bs$batch"
+            mkdir -p "$pair"
+            ref="$diag_source/g$group/bs$batch/block1/fused"
+            [[ -f $ref/placement_verified && -s $ref/packed_result.json ]]
+            cached=$("$PYTHON" -B "$controller_root/tests/operators/lifetch/support/four_rank_diagnostic.py" \
+                --cached "$diag_source" "$group" "$batch" "$controller_root")
+            if [[ -n $cached ]]; then
+                printf '%s\n' "$cached" > "$pair/diagnostic_source.txt"
+                echo "DIAGNOSTIC_REUSED G$group BS$batch source=$cached" >&3
+                grep -E "^(SINGLE_DIAGNOSTIC |BATCH_CLOCK |LAST_TEAM |LI_COUNTER)" "$cached/worker.log" | tee -a "$out/summary.txt" >&3
+                count=$((count+1))
+                continue
+            fi
+            if [[ -z $trace ]]; then
+                trace=$(bash "$helpers/peer_g2_input.sh" "$work" "$group")
+                "$PYTHON" -B "$controller_root/tests/operators/lifetch/support/large_batch_input.py" "$trace" "$group" "$prepared_bank"
+            fi
+            placement=$("$PYTHON" -B "$workers/large_batch_placement.py" get "$ref/thp.json")
+            read -r planned_node planned_adapter <<<"$placement"
+            set_cpu_placement "$planned_node" "$planned_adapter" archived
+            printf 'DIAGNOSTIC_BEGIN G%s BS%s mode=%s\n' "$group" "$batch" "$PEER_RANK_DIAG_MODE" >&3
+            run_arm "$group" "$batch" "$trace" fused "$pair"
+            "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref/thp.json" "$pair/fused/thp.json"
+            touch "$pair/fused/placement_verified"
+            printf '%s\n' "$pair/fused" > "$pair/diagnostic_source.txt"
+            grep -E "^(SINGLE_DIAGNOSTIC |BATCH_CLOCK |LAST_TEAM |LI_COUNTER)" "$pair/fused/worker.log" | tee -a "$out/summary.txt" >&3
+            count=$((count+1))
+        done
+        rm -rf -- "$out/g$group/donors"
+    done
+    "$PYTHON" -B "$controller_root/tests/operators/lifetch/support/four_rank_diagnostic.py" --package "$out" >&3
+    echo "DIAGNOSTICS_COMPLETE cells=$count RESULT_ROOT=$out" >&3
+    exit 0
+fi
 run_pair() {
     local group=$1 batch=$2 trace=$3 cohort=$4 pair=$5
     mkdir -p "$pair"
