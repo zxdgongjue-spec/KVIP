@@ -8,11 +8,12 @@ from tempfile import TemporaryDirectory
 
 ADVANCE = "window-x4-earned"
 WINDOW_CEILINGS = (256, 320, 384, 448, 192)
-MODES = (ADVANCE,) + tuple(f"window-x{x}-{curve}" for x in (2, 3, 4, 8) for curve in ("linear", "early"))
+MEDIUM = "window-x4-earned-medium"
+MODES = (ADVANCE, MEDIUM) + tuple(f"window-x{x}-{curve}" for x in (2, 3, 4, 8) for curve in ("linear", "early"))
 
 
 def policy(mode):
-    if mode == ADVANCE:
+    if mode in (ADVANCE, MEDIUM):
         return policy("window-x4-early")
     if mode not in MODES:
         raise ValueError(f"Unknown LI window policy {mode}")
@@ -37,6 +38,8 @@ def replace_once(path, old, new):
 
 def stage(source, tree, mode):
     """Only the cold/threshold test image is rebuilt. Keep its relative includes intact."""
+    if mode == MEDIUM:
+        mode = ADVANCE
     ranks, grants = policy(mode)
     source = source.resolve()
     active = source.parents[4]

@@ -7,7 +7,8 @@ work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-thres
 case ${3:-original} in
     original) window=window-x4-early;;
     earned) window=window-x4-earned;;
-    *) echo "Expected original or earned" >&2; exit 2;;
+    medium) window=window-x4-earned-medium;;
+    *) echo "Expected original, earned or medium" >&2; exit 2;;
 esac
 sources="$work/fused-scan-sources"
 area="$work/peer-baseline"
@@ -30,7 +31,15 @@ export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export FIXED_Q4_GROUPS=7 PEER_FOUR_WINDOW_RANKS=1 PEER_LARGE_COLD_WINDOWS=3 PEER_FOUR_WINDOW_CARRY=0
 unset KVAF_CPU_UB_DEVICE PEER_PACKED_RESUME PEER_RANK_DIAG_SOURCE PEER_FOUR_RANK_FOLLOWUP PEER_BS32_LI
 helper="$entry/support/g7_x4_local.py"
-for batch in 32 28; do
+batches=(32 28)
+if [[ $window == window-x4-earned-medium ]]; then
+    case ${4:-32} in
+        32|28) batches=("${4:-32}");;
+        both) batches=(32 28);;
+        *) echo "Expected medium-tail batch 32, 28 or both" >&2; exit 2;;
+    esac
+fi
+for batch in "${batches[@]}"; do
     selection=$("$py" -B "$helper" choose "$area" "$batch" "$reader" --mode "$window")
     IFS=$'\t' read -r mode ref hit <<<"$selection"
     echo "G7 BS$batch source=$mode physical_NPU=4"
@@ -49,5 +58,6 @@ for batch in 32 28; do
         export PEER_FOUR_RANK_AUDIT="$window" PEER_AUDIT_ORIGIN="$ref" PEER_AUDIT_REFERENCE="$ref"
         bash "$entry/large_batch_npu4.sh" --four-ranks-candidate-only
     fi
+    if [[ $window == window-x4-earned-medium ]]; then "$py" -B "$helper" compare-medium "$area" "$batch" "$reader"; fi
     if [[ $window == window-x4-earned ]]; then "$py" -B "$helper" compare "$area" "$batch" "$reader"; fi
 done

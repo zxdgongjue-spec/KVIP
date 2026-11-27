@@ -44,4 +44,7 @@ foreach(terminal IN ITEMS parallel_terminal_kernel fixed_terminal_kernel)
     -DV9_USER_UB_BYTES=223232 -DV9_BATCH_POST=2 -DSIM_Q=4 -DSIM_CAPTURE_HITS=1
     -DV9_SIMULATION=0 -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WORKER=1 -DROTATION_PUBLISH_TILES=1)
 endforeach()
+if(KVIP_TEST_MEDIUM_TAIL_BATCHES)
+  ascendc_compile_options(parallel_terminal_kernel PRIVATE -DKVIP_TEST_MEDIUM_TAIL_BATCHES=1)
+endif()
 target_link_libraries(v9_bridge PRIVATE parallel_terminal_kernel fixed_terminal_kernel)

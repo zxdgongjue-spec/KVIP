@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 
-from b24_window_policy import ADVANCE, WINDOW_CEILINGS, policy
+from b24_window_policy import ADVANCE, MEDIUM, WINDOW_CEILINGS, policy
 from b24_window_report import cached, stats
 from large_batch_placement import field, placement
 
@@ -47,7 +47,7 @@ def valid_local(arm,batch,mode=MODE):
             or data["checked_queries"] != 40*batch or data["checked_rank_queries"] != 4*batch
             or data["actual_ranks"] != list(ranks) or data["window_grants_per_row"] != list(grants)):
         raise ValueError(f"Invalid local G7 BS{batch} evidence: {arm}")
-    if mode == ADVANCE:
+    if mode in (ADVANCE, MEDIUM):
         check_earned_limits(data,batch)
     return data
 
@@ -71,8 +71,10 @@ def check_earned_limits(result,batch):
                     raise ValueError("Measured grant exceeds its cumulative or local ceiling")
 
 def known_readers(reader,mode):
-    if mode == ADVANCE:
+    if mode == MEDIUM:
         return (reader,)
+    if mode == ADVANCE:
+        return ("fe37fdc78a3292eef34b71334437dd768380f583", reader)
     return (ORIGINAL, "a3970e5fc8b9e29bdde38ffc8b047746653db00c",
             "24e402be219f4b16f17b67bb5a56208939574e82", reader)
 
@@ -87,8 +89,6 @@ def choose(area,batch,reader,mode=MODE):
                 hit=cached(checkout,root,7,batch,mode)
                 if hit:
                     return "paired-cache",root,hit
-    if origins:
-        return "paired-run",origins[0],"-"
     for root in sorted(area.glob(f"fixed-q4-audit-{mode}.*"),key=lambda p:p.stat().st_mtime_ns,reverse=True):
         if not here(root) or field(root,"audit_reader") not in known_readers(reader,mode):
             continue
@@ -96,6 +96,8 @@ def choose(area,batch,reader,mode=MODE):
         if (arm/"local_placement_measured").is_file():
             valid_local(arm,batch,mode)
             return "local-cache","-",arm
+    if origins:
+        return "paired-run",origins[0],"-"
     return "local-run","-","-"
 
 def show_local(arm,batch,mode=MODE):
@@ -141,15 +143,18 @@ def compare_new(area,batch,reader):
 
 if __name__=="__main__":
     p=argparse.ArgumentParser()
-    p.add_argument("action",choices=("choose","show-local","compare"))
+    p.add_argument("action",choices=("choose","show-local","compare","compare-medium"))
     p.add_argument("path",type=Path)
     p.add_argument("batch",type=int,choices=(28,32))
     p.add_argument("reader",nargs="?")
-    p.add_argument("--mode",choices=(MODE,ADVANCE),default=MODE)
+    p.add_argument("--mode",choices=(MODE,ADVANCE,MEDIUM),default=MODE)
     a=p.parse_args()
     if a.action=="choose":
         print(*choose(a.path,a.batch,a.reader,a.mode),sep="\t")
     elif a.action=="show-local":
         show_local(a.path,a.batch,a.mode)
+    elif a.action=="compare-medium":
+        from medium_tail_report import compare
+        compare(a.path, a.batch, a.reader)
     else:
         compare_new(a.path,a.batch,a.reader)

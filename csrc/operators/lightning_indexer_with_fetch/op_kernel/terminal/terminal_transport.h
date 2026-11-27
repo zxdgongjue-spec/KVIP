@@ -26,6 +26,11 @@ __aicore__ inline TerminalBatches PlanTerminalBatches(uint32_t own, uint32_t slo
             }
         }
     }
+#if defined(KVIP_TEST_MEDIUM_TAIL_BATCHES)
+    if (own >= 64 && slots >= priorSlots && slots - priorSlots >= 192 && slots - priorSlots < kPacingThreshold) {
+        plan.ends[plan.count++] = (own + 1) / 2;
+    }
+#endif
     plan.ends[plan.count++] = own;
     return plan;
 }

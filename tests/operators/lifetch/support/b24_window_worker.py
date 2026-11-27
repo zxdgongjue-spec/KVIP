@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from b24_window_policy import ADVANCE, WINDOW_CEILINGS, install, policy, trace_lanes
+from b24_window_policy import ADVANCE, MEDIUM, WINDOW_CEILINGS, install, policy, trace_lanes
 
 
 def diagnostic(ex, torch, state, inputs, oracle, mode):
@@ -75,12 +75,16 @@ def run(a):
 
     import os
     local = os.environ.get("PEER_G7_X4_LOCAL") == "1"
-    if local and (a.mode not in ("window-x4-early",ADVANCE) or a.group != 7 or a.batch not in (28, 32)):
+    if local and (a.mode not in ("window-x4-early",ADVANCE,MEDIUM) or a.group != 7 or a.batch not in (28, 32)):
         raise ValueError("Unexpected local window shape")
     original = None if local else json.loads((a.ref / f"g{a.group}/bs{a.batch}/block1/fused/packed_result.json").read_bytes())
-    install(large_two_cold, a.mode)
+    is_medium = a.mode == MEDIUM
+    install(large_two_cold, ADVANCE if is_medium else a.mode)
+    if is_medium:
+        import medium_tail
+        medium_tail.install(large_two_cold, a.sdk / "build-npu")
     regular_traffic = large_batch_pair.window_traffic
-    if a.mode == ADVANCE:
+    if a.mode in (ADVANCE, MEDIUM):
         def earned_traffic(counters, counts, grants=(), *, carry_credit=False):
             traffic = regular_traffic(counters, counts, grants, carry_credit=True)
             if grants and np.any(counters[:,7:] > np.asarray(WINDOW_CEILINGS)):
@@ -92,15 +96,20 @@ def run(a):
     def measure(ex, proof, serial, torch, states, sequence, *rest, **kwargs):
         if kwargs.get("window_density") or not kwargs["fused"]:
             raise ValueError("Expected a natural timed ten-call graph")
-        image = terminal_image(states[0], a.sdk)
+        image = medium_tail.image(states[0]) if is_medium else terminal_image(states[0], a.sdk)
         if original and (image["cold_build"].split("/")[0] != original["cold_build_fingerprint"].split("/")[0]
                 or image["cold_build"] == original["cold_build_fingerprint"]):
             raise ValueError("Expected the archived regular library with a distinct isolated LI23 image")
         result = regular_measure(ex, proof, serial, torch, states, sequence, *rest, **kwargs)
         if result["correctness"] == "PASS":
+            if is_medium:
+                proof["measured_private_final_CQEs"] = medium_tail.receipts(states)
             proof.update(diagnostic(ex, torch, states[0], sequence.inputs, serial[0], a.mode))
             proof["original_library"] = image["cold_build"].split("/")[0]
             proof["tail_text"] = image["tail_text"]
+            if is_medium:
+                proof["original_tail_text"] = image["old_tail_text"]
+                proof["medium_tail"] = True
         return result
 
     packed.measure_packed = measure

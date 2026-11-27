@@ -123,7 +123,7 @@ if [[ -n $follow_ref ]]; then
 fi
 audit_mode=${PEER_FOUR_RANK_AUDIT:-}
 if [[ -n $audit_mode ]]; then
-    case $audit_mode in serial|journal|frozen|team-schedule|two-row-natural|two-row-frozen|window-x4-earned|window-x[2348]-linear|window-x[2348]-early) ;; *) echo "Unknown audit mode: $audit_mode" >&2; exit 2 ;; esac
+    case $audit_mode in serial|journal|frozen|team-schedule|two-row-natural|two-row-frozen|window-x4-earned|window-x4-earned-medium|window-x[2348]-linear|window-x[2348]-early) ;; *) echo "Unknown audit mode: $audit_mode" >&2; exit 2 ;; esac
     (( standalone )) &&
         [[ -n ${PEER_AUDIT_REFERENCE:-} && -z $follow_ref && -z ${PEER_PACKED_RESUME:-} && $peer_physical_npu == 4 ]] ||
         { echo "Invalid four-rank audit configuration" >&2; exit 2; }
@@ -323,7 +323,7 @@ fi
 # Use the same registered CPU memory placement for the serial and fused arms.
 placement="auto auto"
 if [[ ${PEER_G7_X4_LOCAL:-0} == 1 ]]; then
-    [[ ( $audit_mode == window-x4-early || $audit_mode == window-x4-earned ) && ${groups[*]} == 7 && ${#batches[@]} == 1 ]] || exit 2
+    [[ ( $audit_mode == window-x4-early || $audit_mode == window-x4-earned || $audit_mode == window-x4-earned-medium ) && ${groups[*]} == 7 && ${#batches[@]} == 1 ]] || exit 2
     placement=$("$PYTHON" -B "$workers/large_batch_placement.py" find "$out")
 elif [[ -n $audit_mode ]]; then
     placement=$("$PYTHON" -B "$controller_root/tests/operators/lifetch/support/large_batch_placement.py" get "$PEER_AUDIT_REFERENCE/g7/bs${PEER_G7_X4_ARCHIVE_BATCH:-32}/block1/fused/thp.json")

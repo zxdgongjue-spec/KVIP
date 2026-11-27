@@ -39,9 +39,10 @@ class WindowStudy(unittest.TestCase):
         self.assertTrue((words[:, :, :9] == ranks).all())
 
     def test_image_key_changes_for_every_policy(self):
-        digests = set()
+        digests = {}
         for mode in MODES:
             with TemporaryDirectory() as td:
                 experiment = stage(SUPPORT/"large_two_cold_native", Path(td), mode)
-                digests.add((experiment/"policy.sha256").read_text().splitlines()[1])
-        self.assertEqual(len(digests), len(MODES))
+                digests[mode] = (experiment/"policy.sha256").read_text()
+        self.assertEqual(digests["window-x4-earned-medium"], digests["window-x4-earned"])
+        self.assertEqual(len(set(digests.values())), len(MODES)-1)

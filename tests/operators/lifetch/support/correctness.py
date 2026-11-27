@@ -21,11 +21,14 @@ TOPK, BLOCK_TOKENS, TOKEN_BYTES = 2048, 128, 656
 FETCH_AB_MAGIC = 0x4B5641464247444F
 
 
-def validate_terminal_receipts(counts, statuses, queue_views):
+def validate_terminal_receipts(counts, statuses, queue_views, *, medium_rows=False):
     """Check each Q's own KVAF acknowledgments after the graph has finished."""
     queues = statuses[np.asarray(queue_views)].reshape(*counts.shape, -1)
     long_rows = counts.sum(axis=1, keepdims=True) >= 256
     expected = np.where(long_rows, np.minimum(counts, 4), counts != 0)
+    if medium_rows:
+        totals = counts.sum(axis=1, keepdims=True)
+        expected = np.where((totals >= 192) & (totals < 256) & (counts >= 64), 2, expected)
     valid = (
         (queues[:, :, 0] == FETCH_AB_MAGIC)
         & (queues[:, :, 1] == counts)

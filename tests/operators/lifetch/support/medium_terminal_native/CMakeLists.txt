@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.16)
+project(lifetch_medium_tail LANGUAGES C CXX)
+option(KVIP_TEST_MEDIUM_TAIL_BATCHES "Split medium tail lists in the isolated terminal" ON)
+add_subdirectory("${OP}" production EXCLUDE_FROM_ALL)
+add_library(medium_tail_bridge SHARED bridge.cpp)
+target_link_libraries(medium_tail_bridge PRIVATE parallel_terminal_kernel)
+target_link_options(medium_tail_bridge PRIVATE -Wl,-Bsymbolic)
