@@ -115,6 +115,66 @@ def evaluate(record, control):
                 control_tail_text=image["original_tail_text"], candidate_tail_text=image["tail_text"])
 
 
+def serial_tail(reference, group, record, control):
+    from export_large_rank_evidence import observation
+    from four_rank_followup import serial_reference
+    _, physical = observation(reference, reference / f"g{group}/bs32/block1", group, 32, "fused")
+    baseline = serial_reference(reference, physical, group, 32)
+    if baseline is None:
+        return None
+    t = baseline["tail"]
+    require(isfinite(t) and t > 0,"Invalid archived serial LIDU preparation + fetch")
+    return dict(strong_serial_LIDU_prepare_plus_fetch=t,
+                four_window_final_TopK_through_tail=control["mean_us"]["tail"],
+                two_row_final_TopK_through_tail=record["mean_us"]["tail"],
+                four_window_minus_serial_tail=control["mean_us"]["tail"]-t,
+                two_row_minus_serial_tail=record["mean_us"]["tail"]-t,
+                source=baseline["source"],blocks=baseline["blocks"])
+
+
+def frozen_evidence(area, group, host, natural_ref=None):
+    from b24_two_row_results import show
+    roots=sorted(area.glob("fixed-q4-audit-two-row-frozen.*"),key=lambda r:r.stat().st_mtime_ns,reverse=True)
+    for root in roots:
+        reference=Path(field(root,"audit_reference"))
+        folder=root / f"g{group}/bs32/block1/two-row-frozen"
+        path=folder/"two-row-frozen.json"
+        if not local(root,host) or not path.is_file() or not (folder/"placement_verified").is_file():
+            continue
+        if natural_ref is not None and reference != natural_ref:
+            continue
+        require(reference.resolve().parent==area.resolve() and local(reference,host),
+                f"Frozen source outside this local NPU4 archive: {reference}")
+        record=read(path)
+        original=Path(record["original_control"])
+        require(original.parents[3].parent.resolve()==area.resolve() and local(original.parents[3],host),
+                "Frozen control differs from local NPU4")
+        paired=read(original/"frozen.json")
+        require(record["original_tail_text"]==paired["tail_text"] and
+                record["tail_text"]!=record["original_tail_text"] and
+                all(arm["correctness"]=="PASS" and arm["calls"]==10 and arm["checked_rows"]==320
+                    and arm["full_KV_Index_checked_calls"]==10 and arm["checked_queries"]==1280
+                    for arm in (record,paired)), "Frozen graph/ordinary tail/checks differ")
+        # show() validates same-card runtime and actual NUMA/UB, hashes the pinned control file,
+        # and checks both ten-call ordered window/final address digests before reporting differences.
+        show(folder,reference,group,32,"two-row-frozen")
+        if record.get("guarded_pass") and paired.get("guarded_pass"):
+            require(record["paired_ordered_calls"]==10 and record["same_counts_calls"]==10
+                    and record["checked_map_rows"]==320 and
+                    record["map_mismatch_rows"]==record["map_unknown_rows"]==0,
+                    "Frozen ten-call Index maps or GET order differ")
+            print(f"G{group} BS32 FIXED_LIST_TAIL original/two_row/delta_us="
+                  f"{paired['mean_us']['tail']:.2f}/{record['mean_us']['tail']:.2f}/"
+                  f"{record['mean_us']['tail']-paired['mean_us']['tail']:+.2f} "
+                  "matching_ordered_lists=10/10 matching_Index_rows=320/320")
+        else:
+            print(f"G{group} BS32 FIXED_LIST_TAIL=UNAVAILABLE matching_ordered_lists="
+                  f"{record.get('paired_ordered_calls')}/10 matching_Index_rows="
+                  f"{record.get('checked_map_rows',0)-record.get('map_mismatch_rows',0)}/320")
+        return
+    print(f"G{group} BS32 FIXED_LIST_TAIL=UNAVAILABLE missing_completed_same_card_archive")
+
+
 def audit(work, identity):
     area = work / "peer-baseline"
     if not area.is_dir():
@@ -122,6 +182,7 @@ def audit(work, identity):
         return
     roots = sorted(area.glob("fixed-q4-audit-two-row-natural.*"), key=lambda r:r.stat().st_mtime_ns, reverse=True)
     for group in GROUPS:
+        natural_ref=None
         for root in roots:
             if not local(root, identity):
                 continue
@@ -137,13 +198,21 @@ def audit(work, identity):
                     and field(root,"audit_reader") and (control/"placement_verified").is_file()
                     and placement(candidate/"thp.json")==placement(control/"thp.json"),
                     f"Local reference or placement is unverifiable for {result_file}")
-            result = evaluate(read(result_file),read(control/"packed_result.json"))
+            candidate_record, control_record = read(result_file), read(control/"packed_result.json")
+            result = evaluate(candidate_record,control_record)
+            natural_ref=reference
+            serial=serial_tail(reference,group,candidate_record,control_record)
+            if serial is None:
+                print(f"G{group} BS32 SERIAL_TAIL=UNAVAILABLE no_matching_two_GET_worker_ten_call_graph")
+            else:
+                print(f"G{group} BS32 SERIAL_TAIL_MEAN_us "+json.dumps(serial,separators=(",",":")))
             print(f"G{group} BS32 graph/LI/tail_candidate_minus_control_us={result['graph_delta']:+.2f}/"
                   f"{result['li_delta']:+.2f}/{result['tail_delta']:+.2f} result={result_file}")
             print(f"G{group} AUDIT "+json.dumps(result,separators=(",",":")))
             break
         else:
             print(f"G{group} BS32 NO_LOCAL_COMPLETED_TWO_ROW_RESULT physical_NPU=4")
+        frozen_evidence(area,group,identity,natural_ref)
     print("CQ_CLOCK_SOURCE=unavailable_in_natural_receipts traffic_matching=counts_only")
 
 
