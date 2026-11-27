@@ -3,21 +3,36 @@
 # Collect only missing stand-alone diagnostic calls on the same card and original timing tree.
 set -euo pipefail
 repo=${1:?expected KVIP Git checkout}
-baseline=$(cd "${2:?expected four-rank result root}" && pwd -P)
-mode=${3:-all}
-case $mode in tail|li|all|prefetch-ready) ;; *) echo 'Expected tail, li, prefetch-ready or all' >&2; exit 2 ;; esac
 here=$(cd "$(dirname "$0")" && pwd -P)
-work=$(cd "$baseline/../.." && pwd -P)
-[[ ${baseline%/*} == "$work/peer-baseline" && -s $baseline/packed_summary.json &&
-   $(<"$baseline/physical_npu.txt") == 4 && $(<"$baseline/selection_oracle.txt") == captured_logical_scores &&
-   $(<"$baseline/host.txt") == "$(uname -n)" ]] || { echo "Wrong candidate archive $baseline" >&2; exit 2; }
-if [[ -s /etc/machine-id && -s $baseline/machine_id.txt ]]; then
-    cmp -s /etc/machine-id "$baseline/machine_id.txt" || { echo 'Machine ID differs'; exit 2; }
-else
-    cmp -s /proc/sys/kernel/random/boot_id "$baseline/boot_id.txt" || { echo 'Cannot verify archive host'; exit 2; }
+mode=${3:-all}
+arg=${2:?local reference directory or AUTO required}
+work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold}
+py="$work/peer-baseline/python-da318bdb/bin/python"
+if ! "$py" -B -c 'import numpy, hashlib; assert hasattr(hashlib,"file_digest")' 2>/dev/null; then py=/usr/local/python3.12.13/bin/python3; fi
+if [[ $mode == window-tails ]]; then
+    for task in window-tail-x2 window-tail-x4 window-tail-x3; do bash "$0" "$repo" "$arg" "$task"; done
+    exit 0
 fi
-native=$(<"$baseline/native.txt")
+case $mode in tail|li|all|prefetch-ready|window-tail-x2|window-tail-x3|window-tail-x4) ;; *) echo "Unknown diagnostic $mode" >&2; exit 2 ;; esac
+if [[ $arg == AUTO ]]; then
+    [[ $mode == window-tail-x* ]] || { echo 'AUTO requires a window-tail diagnostic' >&2; exit 2; }
+    baseline=$("$py" -B "$here/support/b24_window_tail_diagnostic.py" --origin "$work/peer-baseline")
+else
+    baseline=$(cd "$arg" && pwd -P)
+fi
+if [[ $baseline == LOCAL ]]; then
+    native=d0fc5963881bd38fa97eff0f6ef40c757a6e8713
+    echo "LOCAL_UNPAIRED measured_calls=0 serial_runs=0 physical_NPU=4"
+else
+    work=$(cd "$baseline/../.." && pwd -P)
+    [[ ${baseline%/*} == "$work/peer-baseline" && -s $baseline/packed_summary.json &&
+       $(<"$baseline/physical_npu.txt") == 4 && $(<"$baseline/selection_oracle.txt") == captured_logical_scores &&
+       $(<"$baseline/host.txt") == "$(uname -n)" ]] || { echo "Wrong candidate archive $baseline" >&2; exit 2; }
+    if [[ -s /etc/machine-id && -s $baseline/machine_id.txt ]]; then cmp -s /etc/machine-id "$baseline/machine_id.txt"; else cmp -s /proc/sys/kernel/random/boot_id "$baseline/boot_id.txt"; fi
+    native=$(<"$baseline/native.txt")
+fi
 sources="$work/fused-scan-sources"
+mkdir -p "$sources"
 picked=
 for candidate in "$sources"/four-ranks-npu4.*; do
     if [[ -f $candidate/.git ]] && [[ $(git -C "$candidate" rev-parse HEAD) == "$native" ]] &&

@@ -16,7 +16,7 @@
 + }
 --- a/terminal_transport.h
 +++ b/terminal_transport.h
-@@ -69,0 +70,33 @@
+@@ -69,0 +70,38 @@
 +// Diagnostic samples use only Q2's window-prefetch CQ. The final-GET CQ is
 +// supplied separately so an accidental alias is visible to the reader.
 +struct ReadOnlyPrefetchCq {
@@ -42,22 +42,27 @@
 +    dest[2]=cursor;dest[3]=pending;
 +    uint32_t status=4; // invalid lease, range or visible error
 +    if(e->cq_va!=f->cq_va && a->queue_state!=finalArgs->queue_state &&
-+       e->cq_depth>1 && pending<e->cq_depth && pending<=4 && cursor<=UINT64_MAX-pending) {
++       e->cq_depth>1 && pending<e->cq_depth && pending<=5 && cursor<=UINT64_MAX-pending) {
 +        ReadOnlyPrefetchCq p{{reinterpret_cast<__gm__ uint8_t*>(e->cq_va),e->cqe_size,
 +            reinterpret_cast<__gm__ uint32_t*>(e->cq_db_va),queue}};
-+        const bool done=::joint_tail::PrefetchVisible(p,cursor,e->cq_depth,pending);
++        // The verified observer handles up to four positions. A five-window
++        // policy can leave a fifth CQE. Inspect it only after a successful prefix.
++        const uint32_t prefix=pending>4?4:pending;
++        bool done=::joint_tail::PrefetchVisible(p,cursor,e->cq_depth,prefix);
++        if(done && !(p.lastWord>>16) && pending>prefix)
++            done=::joint_tail::PrefetchVisible(p,cursor+prefix,e->cq_depth,pending-prefix);
 +        status=!pending?3:(done?(p.lastWord>>16?4:2):1);
 +    }
 +    dest[4]=status;dest[1]=GetSystemCycle();
 +}
-@@ -72 +105 @@
+@@ -72 +110 @@
 -    const TerminalBatches& batches, uint64_t head, __gm__ uint64_t* clocks) {
 +    const TerminalBatches& batches, uint64_t head, __gm__ uint64_t* clocks, __gm__ Context* ctx, uint32_t row, __gm__ uint64_t* probes) {
-@@ -82 +115,4 @@
+@@ -82 +120,4 @@
 -    if (nonempty) clocks[8+3] = GetSystemCycle();
 +    if (nonempty) {
 +        clocks[8+3] = GetSystemCycle();
 +        if(probes)ObservePrefetch(ctx,row,args,probes+5);
 +    }
-@@ -93,0 +130 @@
+@@ -93,0 +135 @@
 +        if(probes)ObservePrefetch(ctx,row,args,probes+(batch+1)*5);

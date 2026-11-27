@@ -466,24 +466,25 @@ fi
 if [[ -n $diag_source ]]; then
     count=0
     for group in 7 2 10; do
-        case $group:${PEER_RANK_DIAG_MODE:?} in 7:li|2:tail|10:tail|2:prefetch-ready|10:prefetch-ready) continue ;; esac
+        case $group:${PEER_RANK_DIAG_MODE:?} in 7:li|2:tail|10:tail|2:prefetch-ready|10:prefetch-ready|2:window-tail-*|7:window-tail-x3|10:window-tail-x4) continue ;; esac
         trace=
         mkdir -p "$out/g$group"
         prepared_bank="$out/g$group/donors"
         shapes=(32)
         if [[ $group == 7 ]]; then shapes+=(28); fi
         if [[ $PEER_RANK_DIAG_MODE == prefetch-ready ]]; then shapes=(28); fi
+        if [[ $PEER_RANK_DIAG_MODE == window-tail-x* ]]; then shapes=(32); fi
         for batch in "${shapes[@]}"; do
             pair="$out/g$group/bs$batch"
             mkdir -p "$pair"
             ref="$diag_source/g$group/bs$batch/block1/fused"
-            [[ -f $ref/placement_verified && -s $ref/packed_result.json ]]
+            [[ $diag_source == LOCAL || ( -f $ref/placement_verified && -s $ref/packed_result.json ) ]]
             cached=$("$PYTHON" -B "$controller_root/tests/operators/lifetch/support/four_rank_diagnostic.py" \
                 --cached "$diag_source" "$group" "$batch" "$controller_root")
             if [[ -n $cached ]]; then
                 printf '%s\n' "$cached" > "$pair/diagnostic_source.txt"
                 echo "DIAGNOSTIC_REUSED G$group BS$batch source=$cached" >&3
-                grep -E "^(SINGLE_DIAGNOSTIC |BATCH_CLOCK |LAST_TEAM |LI_COUNTER|PREFETCH_CQ )" "$cached/worker.log" | tee -a "$out/summary.txt" >&3
+                grep -E "^(SINGLE_DIAGNOSTIC |BATCH_CLOCK |LAST_TEAM |LI_COUNTER|PREFETCH_CQ |WINDOW_TAIL |CRITICAL_TAIL )" "$cached/worker.log" | tee -a "$out/summary.txt" >&3
                 count=$((count+1))
                 continue
             fi
@@ -491,15 +492,21 @@ if [[ -n $diag_source ]]; then
                 trace=$(bash "$helpers/peer_g2_input.sh" "$work" "$group")
                 "$PYTHON" -B "$controller_root/tests/operators/lifetch/support/large_batch_input.py" "$trace" "$group" "$prepared_bank"
             fi
-            placement=$("$PYTHON" -B "$workers/large_batch_placement.py" get "$ref/thp.json")
-            read -r planned_node planned_adapter <<<"$placement"
-            set_cpu_placement "$planned_node" "$planned_adapter" archived
+            if [[ $diag_source != LOCAL ]]; then
+                placement=$("$PYTHON" -B "$workers/large_batch_placement.py" get "$ref/thp.json")
+                read -r planned_node planned_adapter <<<"$placement"
+                set_cpu_placement "$planned_node" "$planned_adapter" archived
+            fi
             printf 'DIAGNOSTIC_BEGIN G%s BS%s mode=%s\n' "$group" "$batch" "$PEER_RANK_DIAG_MODE" >&3
             run_arm "$group" "$batch" "$trace" fused "$pair"
-            "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref/thp.json" "$pair/fused/thp.json"
+            if [[ $diag_source == LOCAL ]]; then
+                "$PYTHON" -B "$workers/large_batch_placement.py" get "$pair/fused/thp.json" >/dev/null
+            else
+                "$PYTHON" -B "$workers/large_batch_placement.py" compare "$ref/thp.json" "$pair/fused/thp.json"
+            fi
             touch "$pair/fused/placement_verified"
             printf '%s\n' "$pair/fused" > "$pair/diagnostic_source.txt"
-            grep -E "^(SINGLE_DIAGNOSTIC |BATCH_CLOCK |LAST_TEAM |LI_COUNTER|PREFETCH_CQ )" "$pair/fused/worker.log" | tee -a "$out/summary.txt" >&3
+            grep -E "^(SINGLE_DIAGNOSTIC |BATCH_CLOCK |LAST_TEAM |LI_COUNTER|PREFETCH_CQ |WINDOW_TAIL |CRITICAL_TAIL )" "$pair/fused/worker.log" | tee -a "$out/summary.txt" >&3
             count=$((count+1))
         done
         rm -rf -- "$out/g$group/donors"

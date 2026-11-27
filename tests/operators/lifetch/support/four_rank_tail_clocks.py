@@ -99,7 +99,7 @@ def decode(stamps, detail, mhz):
                 terminal_span_us=(stamps[last_row][last_q][10]-origin)/mhz)
 
 
-def collect(state, directory, repo, prefetch_ready=False):
+def collect(state, directory, repo, prefetch_ready=False, profile_only_terminal=False):
     import torch
     from large_batch_pair import check_ordered_index
     launch = state.large_window_launch
@@ -123,7 +123,13 @@ def collect(state, directory, repo, prefetch_ready=False):
     fwd.events_dst.fill_(-1)
     terminal.workspace[32:40].copy_(pointer)
     fwd.terminal_function = lambda a,b,s,shape: launch(a,b,s,shape,hot,tail)
-    fwd.set_diagnostics(True)
+    if profile_only_terminal:
+        # The timed window policy must retain all ordinary LI options.
+        if fwd.diagnostics_enabled or bytes(terminal.workspace[52:56].cpu().tolist()) != bytes(4):
+            raise ValueError("Expected original LI and terminal options before attaching the observer")
+        terminal.workspace[52:56].copy_(torch.tensor([1,0,0,0], dtype=torch.uint8, device=state.device))
+    else:
+        fwd.set_diagnostics(True)
     stream.synchronize()
     fwd()
     stream.synchronize()
@@ -145,7 +151,7 @@ def collect(state, directory, repo, prefetch_ready=False):
         for i, (first, end) in enumerate(zip(window_ends, journal_ends))
     ]
     r, q = report["last_row"], report["last_q"]
-    print(f"LAST_TEAM G7 BS{state.batch} row={r} Q={q} diagnostic_span_us={report['terminal_span_us']:.2f}")
+    print(f"LAST_TEAM BS{state.batch} row={r} Q={q} diagnostic_span_us={report['terminal_span_us']:.2f}")
     useful = [x for x in report["qs"] if x["batches"]]
     latest = max(useful, key=lambda x:x["batches"][-1]["drain_end"]) if useful else None
     for entry in report["qs"]:
@@ -155,10 +161,16 @@ def collect(state, directory, repo, prefetch_ready=False):
         drains = "/".join(f"{(c['drain_end']-c['drain_begin'])/mhz:.2f}" for c in spans) or "-"
         posts = "/".join(f"{(c['post_end']-report['origin'])/mhz:.2f}" for c in spans) or "-"
         after = entry["last_final_cq_to_exit_us"]
-        print(f"BATCH_CLOCK G7 BS{state.batch} row={entry['row']} Q={entry['query']} final={entry['own']} "
+        print(f"BATCH_CLOCK BS{state.batch} row={entry['row']} Q={entry['query']} final={entry['own']} "
               f"post_end_from_first_entry_us={posts} Index_join_us={entry['phases_us']['Index_join']:.2f} "
               f"drain_duration_us={drains} last_final_CQ_to_exit_us={after if after is None else round(after,2)}")
     extra = {}
+    if profile_only_terminal:
+        from b24_team_schedule import SCHEMA, decode as decode_teams
+        raw = dict(schema=SCHEMA,schedule_words=terminal.row_schedule.cpu().tolist(),
+                   q_entry_ticks=[[q[0] for q in row] for row in stamps],
+                   q_exit_ticks=[[q[10] for q in row] for row in stamps],counter_mhz=mhz)
+        extra["original_team_schedule"] = decode_teams(raw,state.batch)
     if prefetch_ready:
         from four_rank_prefetch_ready import decode_visibility
         checked = decode_visibility(stamps, detail, visibility[0])
@@ -168,7 +180,7 @@ def collect(state, directory, repo, prefetch_ready=False):
             pending = [v for v in snapshot if v["pending"]]
             if snapshot:
                 name = f"after_final_CQ_{step}" if step else "after_Index"
-                print(f"PREFETCH_CQ G7 BS{state.batch} Q2 {name} "
+                print(f"PREFETCH_CQ BS{state.batch} Q2 {name} "
                       f"all_window_CQEs_visible={sum(v['all_visible'] for v in pending)}/{len(pending)} "
                       f"no_window_CQE_due={len(snapshot)-len(pending)}")
     return dict(**extra, clock_mhz=mhz, separate_terminal_query_stamps=stamps, prefix_clock_words=detail,

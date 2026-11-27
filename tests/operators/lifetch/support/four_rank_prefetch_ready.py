@@ -16,7 +16,7 @@ def decode_visibility(stamps, detail, visibility):
         observations = []
         for step, anchor in enumerate(anchors):
             lo, hi, cursor, pending, status = raw[5*step:5*step+5]
-            require(anchor <= lo <= hi and lo > 0 and 0 <= pending <= 4, "Broken final/Index time bound")
+            require(anchor <= lo <= hi and lo > 0 and 0 <= pending <= 5, "Broken final/Index time bound")
             require((pending == 0 and status == 3) or (pending > 0 and status in (1, 2)),
                     "Invalid lease, invisible owner, or failed CQE")
             require(not observations or observations[-1]["end_tick"] <= anchor, "Overlapping checkpoints")
