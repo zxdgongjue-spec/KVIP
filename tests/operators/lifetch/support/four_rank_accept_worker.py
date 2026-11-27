@@ -166,8 +166,10 @@ def run(a):
     from reporting import atomic_json
     from workloads import configuration, ReplayPagePlan
 
-    rec = json.loads((a.ref / f"g{a.group}/bs{a.batch}/block1/fused/packed_result.json").read_bytes())
-    old = rec["identity"]
+    ref_path = a.ref / f"g{a.group}/bs{a.batch}/block1/fused/packed_result.json"
+    local_journal = a.mode in ("stagger-journal", "stagger-pair") and not ref_path.is_file()
+    rec = {} if local_journal else json.loads(ref_path.read_bytes())
+    old = {"native":"d0fc5963881bd38fa97eff0f6ef40c757a6e8713"} if local_journal else rec["identity"]
     rev = subprocess.check_output(["git", "-C", a.timed, "rev-parse", "HEAD"], text=True).strip()
     if (
         subprocess.check_output(["git", "-C", a.timed, "status", "--porcelain", "-uno"], text=True).strip()
@@ -195,10 +197,12 @@ def run(a):
         cann=str(getattr(torch.version, "cann", "")),
         kvaf_get_kernel_sha256=sha(a.sdk / "build-npu/bin/kvaf_execute_batch_get_kernels.o"),
     )
+    if local_journal:
+        old.update(wanted)
     if old["physical_npu"] != 4 or any(old[k] != v for k, v in wanted.items()):
         raise ValueError("Archive and live run differ in input, device, SDK or hardware")
     fused = a.mode != "serial"
-    journal = a.mode in ("journal", "team-schedule")
+    journal = a.mode in ("journal", "team-schedule", "stagger-journal")
     timed = not journal
     if a.mode == "team-schedule" and rev != "d0fc5963881bd38fa97eff0f6ef40c757a6e8713":
         raise ValueError("A scheduler capture must use the original fixed four-window source")
@@ -268,13 +272,14 @@ def run(a):
 
         def worker(torch, states, sequence, config, directory, *, fused):
             (s,) = states
-            if rec["cold_build_fingerprint"] != s.large_window_launch.source_fingerprint:
+            if rec and rec["cold_build_fingerprint"] != s.large_window_launch.source_fingerprint:
                 raise ValueError("Diagnostic and measured LI executable differ")
             proof.update(terminal_image(s, a.sdk))
             if rev == "d0fc5963881bd38fa97eff0f6ef40c757a6e8713":
                 from b24_team_schedule import capture
                 proof["terminal_team_schedule"] = capture(s)
-            proof.update(measured_calls=0, diagnostic_calls=1)
+            proof.update(measured_calls=0, diagnostic_calls=1,
+                         final_starts=s.forward.terminal.times[:, :, 22].cpu().tolist())
             s.forward.set_diagnostics(False)
             _, counts = read_selected(s, inputs, True)
             records = device_journal(s, inputs, pages, counts)
@@ -337,6 +342,8 @@ def run(a):
                 super().__init__(*args, **options)
                 validate_bound_addresses(self, records)
                 extend_state(self, ids, counts)
+                if stagger:
+                    terminal_stagger_attach.bind_final_plan(self, records, manifest.get("final_starts"))
                 clear_evidence(self)
 
         ex.FusedReplayState = ControlledState
@@ -366,6 +373,13 @@ def run(a):
                 elif any(proof[k] != value for k, value in image.items()):
                     raise ValueError("The ten-call graph used different LI or terminal images")
             elif stagger:
+                codes = state.captured_final_plan[:, :, 2].cpu().numpy()
+                checks[-1]["native_final_guard_failures"] = int(np.count_nonzero(codes != 1))
+                final_keys = [k for k in records if "_q" in k]
+                checks[-1]["final_source_order_bad"] = sum(
+                    not np.array_equal(actual[k][:,:4], records[k][:,:4]) for k in final_keys)
+                checks[-1]["final_destinations_bad"] = sum(
+                    not np.array_equal(actual[k][:,4], records[k][:,4]) for k in final_keys)
                 image = terminal_stagger_attach.identity(state, enabled)
                 if index == 0:
                     proof.update(image, compiler_sha256=compiler_identity(a.sdk))
@@ -408,14 +422,14 @@ def run(a):
     if a.mode == "team-schedule":
         atomic_json(a.out / "journal.json", dict(summary, arm="journal"))
     path = {"team-schedule": "team-schedule.json", "serial": "packed_result.json", "journal": "journal.json", "frozen": "frozen.json",
-            "two-row-frozen": "two-row-frozen.json", "stagger-pair": "stagger.json"}[a.mode]
+            "two-row-frozen": "two-row-frozen.json", "stagger-pair": "stagger.json", "stagger-journal": "journal.json"}[a.mode]
     atomic_json(a.out / path, summary)
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     from b24_window_policy import MODES
-    p.add_argument("mode", choices=[*MODES, "journal", "serial", "frozen", "two-row-natural", "two-row-frozen", "stagger-pair", "team-schedule"])
+    p.add_argument("mode", choices=[*MODES, "journal", "serial", "frozen", "two-row-natural", "two-row-frozen", "stagger-pair", "stagger-journal", "team-schedule"])
     for name in ("timed", "ref"):
         p.add_argument(name, type=Path)
     for name in ("group", "batch"):

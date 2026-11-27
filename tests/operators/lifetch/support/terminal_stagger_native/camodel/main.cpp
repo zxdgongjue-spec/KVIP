@@ -41,13 +41,34 @@ static void run(aclrtStream stream,uint32_t enabled,bool fault) {
         args[i].channel_entity=m.copy(ent);args[i].indices=m.alloc(128);
     }
     auto argbuf=m.copy(args);
+    constexpr unsigned width=32+4096;
+    std::vector<uint32_t> plans(n*width);
+    const uint32_t count[4]={4,0,6,3},pred[4]={3,4,0,4};
+    for(unsigned i=0;i<n;++i){
+        auto p=plans.data()+i*width;
+        unsigned q=i%4; p[0]=count[q];p[1]=i==9?1:pred[q];
+        for(unsigned j=0;j<count[q];++j){p[32+j]=500+10*q+count[q]-1-j;p[32+2048+j]=500+10*q+j;}
+    }
+    auto table=m.alloc(plans.size()*4,plans.data());
+    std::array<uint32_t,32+1024> shared{};shared[0]=127;
+    auto scratch=m.copy(shared);
     for (unsigned offset: {0U, 4U, 8U}) {
         std::printf("START enabled=%u fault=%u offset=%u\n",enabled,unsigned(fault),offset);
-        ck(ACLRT_LAUNCH_KERNEL(gate_camodel)(4,stream,(void*)argbuf,(void*)data,enabled,offset));
+        ck(ACLRT_LAUNCH_KERNEL(gate_camodel)(4,stream,(void*)argbuf,(void*)data,enabled,offset,(void*)table,(void*)scratch));
         ck(aclrtSynchronizeStream(stream));
     }
     for(unsigned i=0;i<n;++i) {
         auto result=m.read<std::array<uint64_t,64>>(data+i*64*8);
+        const auto observed=reinterpret_cast<const uint32_t*>(result.data()+48);
+        const auto query=i%4;
+        const uint32_t prior=i/4*13+127, expected[4]={prior+3,0,prior+7,prior};
+        std::printf("Reservation queue=%u base=%u expected=%u source_guard=%u first=%u\n",i,observed[0],expected[query],observed[8],observed[1]);
+        require(observed[0]==expected[query],"wrong archived Q reservation predecessor");
+        for(unsigned j=0;j<count[query];++j){
+            unsigned want=i==8?(j==0?777:500+j):i==6?(j==1?520:520+j):500+query*10+count[query]-1-j;
+            require(observed[j+1]==want,"ordered final list or bad-member fallback");
+        }
+        require(observed[8]==(i==9?5U:(i==8||i==6)?2U:1U),"guard or bounded fallback");
         auto bells=m.read<std::array<uint64_t,16>>(args[i].indices);
         auto state=m.read<KvafBatchGetQueueState>(args[i].queue_state);
         auto status=m.read<KvafBatchGetCoreStatus>(args[i].core_status);

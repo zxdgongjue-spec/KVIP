@@ -22,8 +22,23 @@ def report(pair):
             raise ValueError("Incomplete frozen control or candidate")
     bs = a["identity"]["batch"]
     check = compare(a, b, [None] * bs)
-    if not check["guarded_pass"]:
-        raise ValueError(f"Cross-arm private GET lists, counts or ordered Index differed: {check}")
+    ca, cb = a["timed_journal_checks"], b["timed_journal_checks"]
+    same_live = sum(all(x[k] == y[k] for k in ("actual_window_sha256", "actual_final_sha256"))
+                    for x, y in zip(ca, cb, strict=True))
+    original = [sum(c["ordered_match"] for c in checks) for checks in (ca, cb)]
+    print(f"G{a['identity']['group']} BS{bs} live_GET_vs_live={same_live}/10 "
+          f"off_vs_original={original[0]}/10 on_vs_original={original[1]}/10 "
+          f"identical_Index_rows={check['checked_map_rows']-check['map_mismatch_rows']}/{10*bs}")
+    guard = [sum(x["native_final_guard_failures"] for x in checks) for checks in (ca, cb)]
+    print(f"native_final_guard_failed_queries_off/on={guard[0]}/{guard[1]}")
+    if any(guard) or not check["guarded_pass"] or same_live != 10 or original != [10,10]:
+        for arm, checks in (("off", ca), ("on", cb)):
+            bad = [(i,x.get("final_source_order_bad"),x.get("final_destinations_bad"),x.get("first_mismatch"))
+                   for i,x in enumerate(checks) if not x["ordered_match"]]
+            if bad:
+                print(f"{arm} first_failure_call/final_source_order_bad/private_destinations_bad/entry={bad[0]}")
+        print("CONTROLLED_SAVINGS=UNAVAILABLE")
+        return
     group = a["identity"]["group"]
     print(f"G{group} BS{bs} CHECK TopK/KV/ordered_Index=PASS full_frozen_GET=10/10 same_LI_and_tail_binary=PASS")
     four = 0

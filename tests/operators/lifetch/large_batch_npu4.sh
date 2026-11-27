@@ -322,7 +322,9 @@ elif (( fixed )); then
 fi
 # Use the same registered CPU memory placement for the serial and fused arms.
 placement="auto auto"
-if [[ -n $audit_mode ]]; then
+if [[ $audit_mode == stagger-pair && ${PEER_STAGGER_LOCAL:-0} == 1 ]]; then
+    placement=$("$PYTHON" -B "$workers/large_batch_placement.py" find "$out")
+elif [[ -n $audit_mode ]]; then
     placement=$("$PYTHON" -B "$controller_root/tests/operators/lifetch/support/large_batch_placement.py" get "$PEER_AUDIT_REFERENCE/g7/bs32/block1/fused/thp.json")
 elif [[ -n $follow_ref ]]; then
     placement=$("$PYTHON" -B "$workers/large_batch_placement.py" get "$follow_ref/g7/bs32/block1/fused/thp.json")
@@ -405,7 +407,9 @@ run_arm() (
     monitor=$!
     if [[ -n $audit_mode ]]; then
         local tool="$controller_root/tests/operators/lifetch/support/four_rank_accept_worker.py"
-        (cd "$dir" && timeout --kill-after=30s 7200s "$PYTHON" -B "$tool" "$audit_mode" "$root"             "$PEER_AUDIT_REFERENCE" "$group" "$batch" "$trace" "$sdk" "127.0.0.1:$port" "$prepared_bank" "$dir") >"$dir/worker.log" 2>&1 || {
+        local worker_mode=$audit_mode
+        if [[ $audit_mode == stagger-pair && $arm == stagger-journal ]]; then worker_mode=stagger-journal; fi
+        (cd "$dir" && timeout --kill-after=30s 7200s "$PYTHON" -B "$tool" "$worker_mode" "$root"             "$PEER_AUDIT_REFERENCE" "$group" "$batch" "$trace" "$sdk" "127.0.0.1:$port" "$prepared_bank" "$dir") >"$dir/worker.log" 2>&1 || {
             rc=$?; tail -25 "$dir/worker.log"; exit "$rc"
         }
         wait "$monitor"; monitor=

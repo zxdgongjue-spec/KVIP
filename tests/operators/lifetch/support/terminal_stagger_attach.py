@@ -76,3 +76,52 @@ def identity(state, enabled):
         raise ValueError("Measured state lost its terminal gate setting")
     return dict(tail_text=images(state.terminal_gate_build), gate_word=word,
                 cold_build=state.large_window_launch.source_fingerprint)
+
+
+def final_plan(records, slots, archived_starts=None):
+    import numpy as np
+    batch, depth = slots.shape
+    data = np.zeros((batch, 4, 32 + 4096), dtype="<i4")
+    for row in range(batch):
+        by_q = [records[f"r{row}_q{q}"] for q in range(4)]
+        before = sum(len(records[f"r{row}_w{w}"]) for w in range(4))
+        spans = []
+        for q, entries in enumerate(by_q):
+            n = len(entries)
+            data[row,q,:2] = (n,4)
+            if n == 0:
+                continue
+            ids = entries[:,0]
+            if n > 2048 or len(np.unique(ids)) != n:
+                raise ValueError("Duplicate or oversize private final GET list")
+            data[row,q,32:32+n] = ids
+            data[row,q,32+2048:32+2048+n] = np.sort(ids)
+            if archived_starts is None:
+                starts = np.flatnonzero(slots[row] == entries[0,4])
+                if (len(starts) != 1 or starts[0]+n > depth or
+                        not np.array_equal(slots[row,starts[0]:starts[0]+n],entries[:,4])):
+                    raise ValueError("Cannot recover reservation order from this archived LRU")
+                begin = int(starts[0])
+            else:
+                begin = archived_starts[row][q]
+            spans.append((begin,n,q))
+        pred = 4
+        for begin,n,q in sorted(spans):
+            if begin != before:
+                raise ValueError("Archived final reservation spans have gaps or overlap")
+            data[row,q,1] = pred
+            pred = q
+            before += n
+    return data
+
+
+def bind_final_plan(state, records, archived_starts):
+    import struct
+    import torch
+    plan = final_plan(records, state.rotating.lru_slots.cpu().numpy(), archived_starts)
+    device = torch.from_numpy(plan).to(state.device)
+    slot = state.forward.terminal.workspace[112:120]
+    if slot.count_nonzero().item():
+        raise ValueError("Private final plan pointer conflicts with an active workspace")
+    slot.copy_(torch.tensor(list(struct.pack("<Q", device.data_ptr())), dtype=torch.uint8, device=state.device))
+    state.captured_final_plan = device

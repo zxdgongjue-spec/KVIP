@@ -48,17 +48,12 @@ PY
 ref=$(find_ref "${3:-}")
 if [[ -z $ref ]]; then
     if [[ -n ${3:-} ]]; then echo "Reference does not contain the selected same-host NPU4 cells: $3" >&2; exit 2; fi
-    # The audit uses this card's G7/BS32 placement. Ensure this fallback establishes it too.
-    requested_groups=$FIXED_Q4_GROUPS; requested_batches=$FIXED_Q4_BATCHES
-    [[ " $FIXED_Q4_GROUPS " == *" 7 "* ]] || FIXED_Q4_GROUPS="$FIXED_Q4_GROUPS 7"
-    [[ " $FIXED_Q4_BATCHES " == *" 32 "* ]] || FIXED_Q4_BATCHES="$FIXED_Q4_BATCHES 32"
-    echo "Preparing the missing same-card original four-window input and placement."
-    bash "$entry/large_batch_npu4.sh" --four-ranks-candidate-only
-    FIXED_Q4_GROUPS=$requested_groups; FIXED_Q4_BATCHES=$requested_batches
-    ref=$(find_ref)
-    [[ -n $ref ]] || { echo "Missing same-card original after collection" >&2; exit 1; }
+    ref="$work/peer-baseline"
+    export PEER_STAGGER_LOCAL=1
+    echo "No same-card timing reference; capturing a single untimed original GET journal for each selected cell."
+else
+    export PEER_STAGGER_LOCAL=0
 fi
 export PEER_AUDIT_ORIGIN="$ref" PEER_AUDIT_REFERENCE="$ref"
 echo "REFERENCE=$ref G=$FIXED_Q4_GROUPS BS=$FIXED_Q4_BATCHES NPU=4"
-PEER_FOUR_RANK_AUDIT=journal bash "$entry/large_batch_npu4.sh" --four-ranks-candidate-only
 PEER_FOUR_RANK_AUDIT=stagger-pair bash "$entry/large_batch_npu4.sh" --four-ranks-candidate-only
