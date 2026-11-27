@@ -9,7 +9,7 @@ import numpy as np
 from b24_window_policy import install, policy, trace_lanes
 
 
-def diagnostic(ex, torch, state, inputs, oracle, mode):
+def diagnostic(ex, torch, state, inputs, oracle, mode, *, save_clocks=False):
     from large_batch_pair import check_ordered_index, check_scores, li_intervals, read_selected
     from large_two_cold import attach, build
     from window_density import summarize
@@ -55,13 +55,17 @@ def diagnostic(ex, torch, state, inputs, oracle, mode):
         raise ValueError("Ranks actually consumed or covered positions disagree with the window policy")
     spans = trace_lanes(raw, len(grants)-1)
     li = li_intervals(forward.times.cpu().numpy(), state.batch, mhz)
-    density = summarize(state.rotating.events.cpu().numpy().view(np.uint64).tolist(), li, state.token_bytes,
+    events = state.rotating.events.cpu().numpy().view(np.uint64).tolist()
+    scores = {k: spans[:, lane, :, :2].tolist() for lane, k in enumerate(("post_owner", "sibling"))}
+    predecessor = spans[:, 1, :, 2:].tolist()
+    density = summarize(events, li, state.token_bytes,
                         winners=state.workspace.topk.cpu().numpy().reshape(state.batch, -1),
-                        sources=forward.events_src.cpu().numpy(), sibling_checks=spans[:, 1, :, 2:].tolist(),
-                        score_spans={k: spans[:, lane, :, :2].tolist() for lane, k in enumerate(("post_owner", "sibling"))})
+                        sources=forward.events_src.cpu().numpy(), sibling_checks=predecessor, score_spans=scores)
     if counts["posted_per_window"] != [e["posted_tokens"] for e in density["epochs"]]:
         raise ValueError("Window doorbells disagree with the row counters")
-    return dict(actual_ranks=list(ranks), checked_rank_queries=state.batch*4, window_density=density,
+    clocks = dict(separate_LI_diagnostic=li, separate_score_span_cycles=scores,
+                  separate_sibling_predecessor_cycles=predecessor, separate_window_event_u64=events, checked_traffic=counts) if save_clocks else {}
+    return dict(**clocks, actual_ranks=list(ranks), checked_rank_queries=state.batch*4, window_density=density,
                 diagnostic_cold_build_fingerprint=trace.source_fingerprint)
 
 

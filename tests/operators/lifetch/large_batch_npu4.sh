@@ -123,7 +123,7 @@ if [[ -n $follow_ref ]]; then
 fi
 audit_mode=${PEER_FOUR_RANK_AUDIT:-}
 if [[ -n $audit_mode ]]; then
-    case $audit_mode in serial|journal|frozen|team-schedule|two-row-natural|two-row-frozen|window-x[2348]-linear|window-x[2348]-early) ;; *) echo "Unknown audit mode: $audit_mode" >&2; exit 2 ;; esac
+    case $audit_mode in g2-window-clocks|serial|journal|frozen|team-schedule|two-row-natural|two-row-frozen|window-x[2348]-linear|window-x[2348]-early) ;; *) echo "Unknown audit mode: $audit_mode" >&2; exit 2 ;; esac
     (( standalone )) &&
         [[ -n ${PEER_AUDIT_REFERENCE:-} && -z $follow_ref && -z ${PEER_PACKED_RESUME:-} && $peer_physical_npu == 4 ]] ||
         { echo "Invalid four-rank audit configuration" >&2; exit 2; }

@@ -132,6 +132,15 @@ def device_journal(s, inputs, pages, counts, map_digests=None):
 
 def run(a):
     sys.path.insert(0, str(a.timed / "tests/operators/lifetch/support"))
+    if a.mode == "g2-window-clocks":
+        if a.group != 2 or a.batch not in (28, 32):
+            raise ValueError("Expected the completed G2 two-cold-window study at BS28 or BS32")
+        from b24_window_evidence import recorded
+        from four_rank_diagnostic import run as run_diagnostic
+        folder, _, _ = recorded(a.ref, a.group, a.batch, 2)
+        return run_diagnostic(argparse.Namespace(timed=a.timed, archive=a.ref, window_source=folder,
+            group=a.group, batch=a.batch, trace=a.trace, kvaf_root=a.sdk, kvaf_server=a.server,
+            prepared=a.bank, output=a.out))
     if a.mode.startswith("window-x"):
         from b24_window_worker import run as run_windows
         return run_windows(a)
@@ -397,7 +406,7 @@ def run(a):
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     from b24_window_policy import MODES
-    p.add_argument("mode", choices=[*MODES, "journal", "serial", "frozen", "two-row-natural", "two-row-frozen", "team-schedule"])
+    p.add_argument("mode", choices=[*MODES, "g2-window-clocks", "journal", "serial", "frozen", "two-row-natural", "two-row-frozen", "team-schedule"])
     for name in ("timed", "ref"):
         p.add_argument(name, type=Path)
     for name in ("group", "batch"):

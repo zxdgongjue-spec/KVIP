@@ -11,7 +11,7 @@ case $extra in
     tail) extra=isolated-scheduling ;;
     bs20) extra=isolated-schedule-focus ;;
 esac
-case $extra in windows-focus|windows-all) [[ $mode == window-study ]] || exit 2 ;; natural) ;; paired-frozen|isolated-li|isolated-tail|isolated-all|isolated-scheduling|isolated-schedule-only|isolated-schedule-focus) [[ $mode != serial-only ]] || exit 2 ;; *) exit 2 ;; esac
+case $extra in windows-focus|windows-all|windows-evidence|windows-archive) [[ $mode == window-study ]] || exit 2 ;; natural) ;; paired-frozen|isolated-li|isolated-tail|isolated-all|isolated-scheduling|isolated-schedule-only|isolated-schedule-focus) [[ $mode != serial-only ]] || exit 2 ;; *) exit 2 ;; esac
 native=
 if [[ $mode != serial-only && $mode != window-study ]]; then native=$(git -C "$repo" rev-parse --verify "$mode^{commit}"); fi
 base=d0fc5963881bd38fa97eff0f6ef40c757a6e8713
@@ -61,7 +61,7 @@ audit() {
             done
         done
         if (( complete )); then return 0; fi
-    elif [[ $1 != two-row-* ]]; then
+    elif [[ $1 != two-row-* && $1 != g2-window-clocks ]]; then
         local -a batches
         read -ra batches <<< "$FIXED_Q4_BATCHES"
         if "$py" -B "$entry/support/four_rank_accept.py" coverage "$3" "$1" --batches "${batches[@]}"; then return 0; else rc=$?; fi
@@ -72,7 +72,7 @@ audit() {
         bash "$entry/large_batch_npu4.sh" --four-ranks-candidate-only
 }
 if [[ $mode == window-study ]]; then
-    [[ $extra == windows-focus || $extra == windows-all ]]
+    [[ $extra == windows-* ]]
     if [[ -s /etc/machine-id && -s $ref/machine_id.txt ]]; then
         cmp -s /etc/machine-id "$ref/machine_id.txt"
     else
@@ -80,6 +80,15 @@ if [[ $mode == window-study ]]; then
     fi
     exec > >(tee "$stamp/windows.log") 2>&1
     echo "WINDOW_LOG=$stamp/windows.log"
+    if [[ $extra == windows-archive || $extra == windows-evidence ]]; then
+        action=archive
+        if [[ $extra == windows-evidence ]]; then
+            FIXED_Q4_GROUPS=2 FIXED_Q4_BATCHES="28 32" audit g2-window-clocks "$base" "$ref"
+            action=package
+        fi
+        "$py" -B "$entry/support/b24_window_evidence.py" "$action" "$stamp" "$ref" "$reader"
+        exit 0
+    fi
     if [[ $extra == windows-focus ]]; then
         # The low-miss shortfall and the busy link give opposite predictions.
         FIXED_Q4_GROUPS=2 FIXED_Q4_BATCHES="28 32" audit window-x2-early "$base" "$ref"

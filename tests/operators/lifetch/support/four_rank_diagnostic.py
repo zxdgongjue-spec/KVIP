@@ -23,8 +23,17 @@ def run(args):
     from reporting import atomic_json
     from workloads import ReplayPagePlan
 
-    row = cell(args.archive, args.group, args.batch)
-    path = args.archive / f"g{args.group}/bs{args.batch}/block1/fused/packed_result.json"
+    windows = getattr(args, "window_source", None)
+    if windows is None:
+        row = cell(args.archive, args.group, args.batch)
+        oracle_name = row["oracle"]
+        path = args.archive / f"g{args.group}/bs{args.batch}/block1/fused/packed_result.json"
+    else:
+        import large_two_cold
+        from b24_window_policy import install
+        install(large_two_cold, "window-x2-early")
+        oracle_name = "captured_logical_scores"
+        path = windows / "packed_result.json"
     previous = json.loads(path.read_text())
     identity = previous["identity"]
     if not (Path(kvaf.__file__).resolve().is_relative_to(args.kvaf_root / "build-npu/python")
@@ -53,11 +62,18 @@ def run(args):
         if not fused or len(states) != 1 or states[0].large_window_launch.source_fingerprint != previous["cold_build_fingerprint"]:
             raise ValueError("Expected one state using the same measured cold executable")
         state = states[0]
-        state.reset()
-        state.forward.set_diagnostics(False)
-        torch_mod.npu.current_stream(state.device).synchronize()
+        if windows is None:
+            state.reset()
+            state.forward.set_diagnostics(False)
+            torch_mod.npu.current_stream(state.device).synchronize()
         try:
-            if args.group == 7:
+            if windows is not None:
+                from b24_window_worker import diagnostic
+                clocks = diagnostic(execution, torch_mod, state, inputs, reference, "window-x2-early", save_clocks=True)
+                if clocks["diagnostic_cold_build_fingerprint"] != previous["diagnostic_cold_build_fingerprint"]:
+                    raise ValueError("Readback used a different diagnostic LI image")
+                proof["li_windows"] = clocks
+            elif args.group == 7:
                 from four_rank_tail_clocks import collect
                 proof["tail"] = collect(state, args.output, args.timed)
             else:
@@ -69,9 +85,12 @@ def run(args):
         except BaseException as error:
             execution.NativeFetchSession.quarantine("single_diagnostic_completion_uncertain", error)
             raise
-        selected, traffic = read_selected(state, inputs, True)
-        check_scores(inputs, selected, reference)
-        state.validate(inputs)
+        if windows is None:
+            selected, traffic = read_selected(state, inputs, True)
+            check_scores(inputs, selected, reference)
+            state.validate(inputs)
+        else:
+            traffic = proof["li_windows"].pop("checked_traffic")
         proof["traffic"] = traffic
         compare_keys = ("posted_per_window", "row_window_prefetch", "row_query_final")
         same = sum(all(sample[k] == traffic[k] for k in compare_keys) for sample in previous["traffic"])
@@ -97,7 +116,7 @@ def run(args):
     atomic_json(args.output/"single_diagnostic.json", dict(input_archive=str(path), identity=identity,
                 controller_commit=subprocess.check_output(["git", "-C", str(Path(__file__).resolve().parents[4]),
                 "rev-parse", "HEAD"], text=True).strip(), correctness="PASS", measured_calls=0,
-                diagnostic_calls=1, reference_oracle=row["oracle"], **proof))
+                diagnostic_calls=1, reference_oracle=oracle_name, **proof))
 
 
 def cached(source, group, batch, controller):
