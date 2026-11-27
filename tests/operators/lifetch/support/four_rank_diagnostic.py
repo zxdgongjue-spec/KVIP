@@ -135,7 +135,13 @@ def package(root):
             if source.parents[3] != root.parent or not (source/"placement_verified").is_file():
                 raise ValueError(f"Invalid diagnostic source {source}")
             names = [source/"single_diagnostic.json", source/"thp.json", source/"msprof-export.log"]
-            names.extend(sorted((source/"li-pmu").rglob("op_summary*.csv")))
+            counters = json.loads((source/"single_diagnostic.json").read_text()).get("li_counters", {})
+            profiler = source/"li-pmu"
+            if counters.get("status") == "PARTIAL":
+                # Preserve the one native capture for offline re-export on a different CANN installation.
+                names.extend(sorted(p for p in profiler.rglob("*") if p.is_file() and not p.is_symlink()))
+            else:
+                names.extend(sorted(profiler.rglob("op_summary*.csv")))
             for file in names:
                 if file.is_file():
                     out.add(file, arcname=f"{group}/{batch}/{file.relative_to(source)}")
