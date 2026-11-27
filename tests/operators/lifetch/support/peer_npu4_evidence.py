@@ -13,6 +13,23 @@ SDK = "813f1750a50b7e6c92d5f5397f2fbc05befef6da"
 TREE = "1de18e8315137d7a0227c3ae4c82afd45b5fe743"
 
 
+# These readers ran the same window clocks. Their differences are outside the
+# device path (host selection, summaries, or the offline CQ report).
+PORTABLE_READERS = ("128295e8533270b537b7c64128087f3505800209",
+                    "b70ad72e642a0d93e09f6937702525d2b9e3d753",
+                    "69f6805757fb03c44bb9f793aa88e25e19098806")
+EARLIER_PAIRED = "fc67beee1c357c2d0140dd8b1dfd2601d5ec445a"
+
+
+def paired_clock(ref, reader, b):
+    from b24_window_evidence import clock_hit
+    for version in (reader, *PORTABLE_READERS, EARLIER_PAIRED):
+        arm = clock_hit(ref, version, b)
+        if arm:
+            return arm
+    return None
+
+
 def machine():
     def read(path):
         p = Path(path)
@@ -59,7 +76,7 @@ def portable_clock(area, reader, b, current):
             d = json.loads((arm/"single_diagnostic.json").read_bytes())
             ident = d["identity"]
             placement(arm/"thp.json")
-            if (d["controller_commit"] == reader and d["correctness"] == "PASS" and d["reference_oracle"] == "captured_logical_scores"
+            if (d["controller_commit"] in (reader, *PORTABLE_READERS) and d["correctness"] == "PASS" and d["reference_oracle"] == "captured_logical_scores"
                     and d["diagnostic_calls"] == 1 and d["measured_calls"] == 0 and ident["native"] == BASE
                     and ident["physical_npu"] == 4 and ident["host"] == current[0] and ident["group"] == 2
                     and ident["batch"] == b and len(ident["sequence_sha256"]) == 64
@@ -71,7 +88,7 @@ def portable_clock(area, reader, b, current):
 
 
 def write_package(directory, ref, reader):
-    from b24_window_evidence import CELLS, READER, clock_hit, lines, recorded, show_clocks, saved_frequency_fields
+    from b24_window_evidence import CELLS, READER, lines, recorded, show_clocks, saved_frequency_fields
     from b24_window_report import cached
     from export_large_rank_evidence import observation
     data = dict(host=os.uname().nodename, physical_npu=4, reference=str(ref) if ref else None,
@@ -94,7 +111,7 @@ def write_package(directory, ref, reader):
             root = arm.parents[3]
             if (not local(root, machine()) or field(root, "native") != BASE
                     or field(root, "kvaf") != SDK or field(root, "kvaf_tree") != TREE
-                    or result["controller_commit"] != reader or result["correctness"] != "PASS"
+                    or result["controller_commit"] not in (reader, *PORTABLE_READERS) or result["correctness"] != "PASS"
                     or result["identity"]["physical_npu"] != 4 or result["identity"]["native"] != BASE
                     or result["identity"]["batch"] != b or result["identity"]["group"] != 2
                     or not (arm/"local_placement_measured").is_file()
@@ -112,7 +129,7 @@ def write_package(directory, ref, reader):
                         "separate_sibling_predecessor_cycles", "separate_window_event_u64")}
             data["local_diagnostics"][str(b)] = item
         else:
-            arm = clock_hit(ref, reader, b) if ref else None
+            arm = paired_clock(ref, reader, b) if ref else None
             if not arm:
                 raise ValueError(f"Missing expected G2 BS{b} diagnostic")
             data["local_diagnostics"][str(b)] = show_clocks(arm, ref, b)
@@ -125,12 +142,14 @@ def write_package(directory, ref, reader):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("command", choices=["origin","paired","clock","package"])
+    p.add_argument("command", choices=["origin","paired","paired-clock","clock","package"])
     p.add_argument("path", type=Path)
     p.add_argument("extra", nargs="*")
     a = p.parse_args()
     if a.command == "origin":
         print(origin(a.path.resolve(), machine()) or "")
+    elif a.command == "paired-clock":
+        print(paired_clock(a.path, a.extra[0], int(a.extra[1])) or "")
     elif a.command == "clock":
         print(portable_clock(a.path, a.extra[0], int(a.extra[1]), machine()) or "")
     elif a.command == "paired":

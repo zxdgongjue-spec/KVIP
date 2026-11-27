@@ -45,7 +45,15 @@ paired_shapes=()
 for b in 28 32; do
     if [[ -n $ref ]]; then
         paired=$("$py" -B "$helper" paired "$ref" "$b")
-        if [[ -n $paired ]]; then paired_shapes+=("$b"); continue; fi
+        if [[ -n $paired ]]; then
+            old=$("$py" -B "$helper" paired-clock "$ref" "$reader" "$b")
+            if [[ -n $old ]]; then
+                echo "REUSED G2 BS$b paired-window-clocks source=$old"
+            else
+                paired_shapes+=("$b")
+            fi
+            continue
+        fi
     fi
     old=$("$py" -B "$helper" clock "$work/peer-baseline" "$reader" "$b")
     if [[ -n $old ]]; then
