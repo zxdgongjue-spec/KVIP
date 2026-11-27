@@ -635,6 +635,48 @@ def measured_replays(ex, proofs, serial, torch, states, sequence, config, direct
     return dict(correctness="PASS", failures=[], rounds={inputs.source_round: timing}, all_rounds=timing)
 
 
+def replay_configuration(args, policy):
+    grants = None
+    if policy:
+        from large_two_cold import WINDOW_GRANTS
+        grants = WINDOW_GRANTS[policy]
+    return configuration(
+        [
+            "bench" if args.packed_ten else "diagnose",
+            "--transport",
+            "urma",
+            "--input",
+            "real",
+            "--trace-root",
+            str(args.trace),
+            "--group",
+            str(args.group),
+            "--round-range",
+            "1:1",
+            "--device",
+            "0",
+            "--kvaf-root",
+            str(args.kvaf_root),
+            "--kvaf-server",
+            args.kvaf_server,
+            "--prefetch-rank-start",
+            "1024",
+            "--prefetch-tokens",
+            str(sum(grants)) if grants is not None else "1024",
+            "--intermediate-fetches",
+            str(len(grants)) if grants is not None else "4",
+            "--warmup",
+            str(WARMUP),
+            "--iterations",
+            str(CALLS) if args.packed_ten else "1",
+            *([] if args.packed_ten else ["--level", "1"]),
+            "--output",
+            str(args.output),
+        ],
+        window_grants=grants,
+    )
+
+
 def run(args):
     import execution as ex
     from functools import partial
@@ -737,40 +779,7 @@ def run(args):
         if (args.batch != 32 or inputs.geometry["history"] != 131328
                 or np.unique((inputs.query_ends[:, -1] + 127) // 128).size != 1):
             raise ValueError("Split-role requires a fixed-length BS32 Q4 128K capture")
-    cfg = configuration(
-        [
-            "bench" if args.packed_ten else "diagnose",
-            "--transport",
-            "urma",
-            "--input",
-            "real",
-            "--trace-root",
-            str(args.trace),
-            "--group",
-            str(args.group),
-            "--round-range",
-            "1:1",
-            "--device",
-            "0",
-            "--kvaf-root",
-            str(args.kvaf_root),
-            "--kvaf-server",
-            args.kvaf_server,
-            "--prefetch-rank-start",
-            "1024",
-            "--prefetch-tokens",
-            "1024",
-            "--intermediate-fetches",
-            "3" if policy == "two-cold" else "4",
-            "--warmup",
-            str(WARMUP),
-            "--iterations",
-            str(CALLS) if args.packed_ten else "1",
-            *([] if args.packed_ten else ["--level", "1"]),
-            "--output",
-            str(args.output),
-        ]
-    )
+    cfg = replay_configuration(args, policy)
     proofs = {}
     scratch_existed = (args.output / "export_only_prof_dir").exists()
     if args.packed_ten:

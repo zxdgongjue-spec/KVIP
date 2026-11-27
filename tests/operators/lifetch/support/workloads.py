@@ -103,7 +103,7 @@ def round_range(value):
     return start, end
 
 
-def configuration(argv=None):
+def configuration(argv=None, *, window_grants=None):
     parser = argparse.ArgumentParser(description='Unified LIFetch tests')
     commands = parser.add_subparsers(dest='mode', required=True)
     for mode in ('all', 'check', 'bench', 'diagnose'):
@@ -186,9 +186,16 @@ def configuration(argv=None):
         if args.transport != 'urma' and args.prefetch_rank_start != 1024:
             parser.error('prefetch-rank-start requires the URMA ranked prefetch path')
         if (args.warmup < 0 or args.iterations <= 0 or not 1 <= args.intermediate_fetches <= 32
-                or not 0 <= args.prefetch_tokens <= 2048
-                or args.prefetch_tokens % args.intermediate_fetches):
+                or not 0 <= args.prefetch_tokens <= 2048):
             parser.error('invalid timing or prefetch configuration')
+        if window_grants is None:
+            if args.prefetch_tokens % args.intermediate_fetches:
+                parser.error('uniform windows require a divisible prefetch budget')
+        elif (args.input != 'real' or args.transport != 'urma'
+              or len(window_grants) != args.intermediate_fetches
+              or any(type(n) is not int or not 1 <= n <= 480 for n in window_grants)
+              or sum(window_grants) != args.prefetch_tokens):
+            parser.error('invalid per-window grants for this URMA replay')
     if args.mode == 'diagnose':
         if 'all' in args.stages and len(args.stages) != 1:
             parser.error('stages all cannot be combined with individual stages')

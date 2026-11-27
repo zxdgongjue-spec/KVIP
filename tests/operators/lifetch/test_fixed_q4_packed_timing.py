@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Ten-call device attribution without per-invocation event estimates."""
 
+from contextlib import redirect_stderr
+from io import StringIO
 import sys
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "python"))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "support"))
 from fixed_q4_packed_timing import packed_account
-from large_batch_pair import window_traffic
+from large_batch_pair import replay_configuration, window_traffic
+from workloads import configuration
 
 
 def fixture(names):
@@ -57,6 +62,25 @@ class PackedAttribution(unittest.TestCase):
                 self.assertAlmostEqual(sum(means[k] for k in ("LI", "tail", "inter_kernel_gap",
                                                               "between_calls", "event_edges")), means["graph"])
                 self.assertAlmostEqual(means["between_calls"] + means["event_edges"], means["event_minus_span"])
+
+    def test_packed_runner_accepts_the_native_window_schedule(self):
+        for batch, policy, rounds in [(b, "two-cold", 3) for b in (20, 24, 28, 32)] + [
+                (32, "shared-final", 4), (32, "split-role", 4), (20, None, 4), (16, None, 4)]:
+            with self.subTest(batch=batch, policy=policy):
+                args = SimpleNamespace(batch=batch, trace="trace", group=2, packed_ten=True,
+                                       kvaf_root="sdk", kvaf_server="localhost", output="result")
+                cfg = replay_configuration(args, policy)
+                self.assertEqual((cfg.intermediate_fetches, cfg.prefetch_tokens), (rounds, 1024))
+                self.assertEqual((cfg.mode, cfg.warmup, cfg.iterations), ("bench", 4, 10))
+
+    def test_invalid_replay_window_grants(self):
+        argv = ["bench", "--transport", "urma", "--input", "real", "--trace-root", "trace",
+                "--group", "2", "--round-range", "1:1", "--intermediate-fetches", "3",
+                "--prefetch-tokens", "1024"]
+        for grants in (None, (), (256, 384), (256, 384, 385), (256, 256, 512),
+                       (0, 512, 512), (256, 384, 384.0)):
+            with self.subTest(grants=grants), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                configuration(argv, window_grants=grants)
 
     def test_each_request_obeys_the_selected_window_grants(self):
         for grants in ((256, 384, 384), (256, 256, 256, 256)):
