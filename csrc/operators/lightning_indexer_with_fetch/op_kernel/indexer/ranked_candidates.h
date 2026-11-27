@@ -11,6 +11,11 @@ __aicore__ inline uint64_t CoveredAddress(uint64_t incremental,uint32_t batch,ui
 __simt_callee__ inline uint64_t CoveredAddressSimt(uint64_t incremental,uint32_t batch,uint32_t history,uint32_t b) {
     return incremental+uint64_t(batch)*(512+4*2048*6+1024)+uint64_t(b)*((history+255)/256*32);
 }
+#if defined(KVIP_TEST_WINDOW_RANK1)
+constexpr bool kCompactWindowIds = true;
+#else
+constexpr bool kCompactWindowIds = false;
+#endif
 // One bit per physical Index position: valid local or already admitted.
 // Packed scores and eligibility use disjoint banks; the full TopK stays intact.
 template<bool Gathered=false, bool Empty=false, bool PositiveFinal=false>
@@ -20,6 +25,7 @@ __simd_vf__ inline void PackUncovered(__ubuf__ uint32_t* ids,__ubuf__ uint16_t* 
     using namespace MicroAPI;auto all=CreateMask<uint32_t,MaskPattern::ALL>();
     RegTensor<uint32_t> id,safe,index,shift,bits,zero,one,mask31,invalid,kept,out,sum,ones,total;
     RegTensor<uint16_t> score;MaskReg bounded,miss,take;UnalignRegForStore store;
+    RegTensor<int32_t> slot;RegTensor<uint32_t> indexScore;
     Duplicate(zero,uint32_t(0));Duplicate(one,uint32_t(1));Duplicate(mask31,uint32_t(31));
     Duplicate(invalid,UINT32_MAX);Duplicate(sum,uint32_t(0));ClearSpr<SpecialPurposeReg::AR>();
     for(uint16_t i=0;i<2048;i+=64){
@@ -34,11 +40,19 @@ __simd_vf__ inline void PackUncovered(__ubuf__ uint32_t* ids,__ubuf__ uint16_t* 
         }
         CompareScalar<uint32_t,CMPMODE::EQ>(miss,bits,uint32_t(0),all);MaskAnd(take,bounded,miss,all);
         if constexpr (!PositiveFinal) {
-            Select(kept,id,invalid,take);StoreAlign(eligible+i,kept,all);
+            if constexpr (kCompactWindowIds) {
+                Arange(slot,int32_t(i));
+                ShiftLefts(indexScore,reinterpret_cast<RegTensor<uint32_t>&>(slot),int16_t(16),all);
+                Or(indexScore,indexScore,reinterpret_cast<RegTensor<uint32_t>&>(score),all);
+            } else {
+                Select(kept,id,invalid,take);StoreAlign(eligible+i,kept,all);
+            }
         }
         Duplicate<uint32_t,MaskMergeMode::ZEROING>(ones,uint32_t(1),take);Add(sum,sum,ones,all);
         if constexpr (PositiveFinal)
             Squeeze<uint32_t,MicroAPI::GatherMaskMode::STORE_REG>(out,id,take);
+        else if constexpr (kCompactWindowIds)
+            Squeeze<uint32_t,MicroAPI::GatherMaskMode::STORE_REG>(out,indexScore,take);
         else
             Squeeze<uint32_t,MicroAPI::GatherMaskMode::STORE_REG>(out,reinterpret_cast<RegTensor<uint32_t>&>(score),take);
         StoreUnAlign<uint32_t,PostLiteral::POST_MODE_UPDATE>(packed,out,store);
@@ -92,6 +106,51 @@ __simd_vf__ inline void Emit(__ubuf__ uint32_t* ids,__ubuf__ uint16_t* scores,
     }
     StoreUnAlignPost(output,store);ReduceSum(total,sum,all);auto one=CreateMask<uint32_t,MaskPattern::VL1>();StoreAlign(count,total,one);
 }
+// Walk the uncovered part of the window in its original slot order.
+__simd_vf__ inline void EmitUncovered(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* packed,
+    __ubuf__ uint32_t* output,__ubuf__ uint32_t* count,uint32_t n,uint32_t threshold) {
+    using namespace MicroAPI;
+    auto all=CreateMask<uint32_t,MaskPattern::ALL>();
+    RegTensor<uint32_t> id,entry,score,index,scoreMask,out,sum,ones,total;
+    MaskReg take; UnalignRegForStore store;
+    Duplicate(sum,uint32_t(0)); Duplicate(scoreMask,uint32_t(65535)); ClearSpr<SpecialPurposeReg::AR>();
+    for(uint16_t pass=0;pass<2;pass++) for(uint16_t i=0;i<n;i+=64) {
+        uint32_t left=n-i;auto live=UpdateMask<uint32_t>(left);
+        LoadAlign(entry,packed+i);
+        And(score,entry,scoreMask,all);ShiftRights(index,entry,int16_t(16),all);
+        // Only live lanes address a real slot; map trailing lanes back to slot zero.
+        RegTensor<uint32_t> zero;Duplicate(zero,uint32_t(0));Select(index,index,zero,live);
+        Gather(id,ids,index,all);
+        if(pass==0)CompareScalar<uint32_t,CMPMODE::GT>(take,score,threshold,live);
+        else CompareScalar<uint32_t,CMPMODE::EQ>(take,score,threshold,live);
+        Duplicate<uint32_t,MaskMergeMode::ZEROING>(ones,uint32_t(1),take);Add(sum,sum,ones,all);
+        Squeeze<uint32_t,MicroAPI::GatherMaskMode::STORE_REG>(out,id,take);
+        StoreUnAlign<uint32_t,PostLiteral::POST_MODE_UPDATE>(output,out,store);
+    }
+    StoreUnAlignPost(output,store);ReduceSum(total,sum,all);
+    auto first=CreateMask<uint32_t,MaskPattern::VL1>();StoreAlign(count,total,first);
+}
+// A list that fits in the per-Q minimum admits all its IDs. Even when
+// its scores include zero we must emit positive scores before the zero ties.
+__simd_vf__ inline void EmitSmallUncovered(__ubuf__ uint32_t* ids,
+    __ubuf__ uint32_t* packed,__ubuf__ uint32_t* output,uint32_t n) {
+    using namespace MicroAPI;
+    auto all=CreateMask<uint32_t,MaskPattern::ALL>();
+    uint32_t left=n;auto live=UpdateMask<uint32_t>(left);
+    RegTensor<uint32_t> value,slot,score,scoreMask,zero,id,out;
+    MaskReg take;UnalignRegForStore store;
+    Duplicate(zero,uint32_t(0));Duplicate(scoreMask,uint32_t(65535));
+    LoadAlign(value,packed);And(score,value,scoreMask,all);ShiftRights(slot,value,int16_t(16),all);
+    Select(slot,slot,zero,live);Gather(id,ids,slot,all);
+    ClearSpr<SpecialPurposeReg::AR>();
+    CompareScalar<uint32_t,CMPMODE::GT>(take,score,uint32_t(0),live);
+    Squeeze<uint32_t,MicroAPI::GatherMaskMode::STORE_REG>(out,id,take);
+    StoreUnAlign<uint32_t,PostLiteral::POST_MODE_UPDATE>(output,out,store);
+    CompareScalar<uint32_t,CMPMODE::EQ>(take,score,uint32_t(0),live);
+    Squeeze<uint32_t,MicroAPI::GatherMaskMode::STORE_REG>(out,id,take);
+    StoreUnAlign<uint32_t,PostLiteral::POST_MODE_UPDATE>(output,out,store);
+    StoreUnAlignPost(output,store);
+}
 // scratch >= 14 KiB, output >= 8 KiB (ties are truncated after compaction).
 // Scratch holds cold count and threshold banks. Optional clocks
 // isolate pack, window rank, quota rank and emit without changing the helper.
@@ -99,7 +158,7 @@ __aicore__ inline uint32_t Select(LocalTensor<uint32_t> ids,LocalTensor<uint16_t
     LocalTensor<uint32_t> output,LocalTensor<uint32_t> scratch,
     uint32_t resident,uint32_t valid,uint32_t rank,uint32_t quota,bool compact=true,
     uint64_t* clocks=nullptr,uint32_t minimum=0,uint32_t packedOffset=0,
-    uint32_t knownRankCut=UINT32_MAX) {
+    uint32_t knownRankCut=UINT32_MAX,uint32_t n=0) {
     auto p=reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr());
     auto full=reinterpret_cast<__ubuf__ uint16_t*>(p+3072);
     auto cold=reinterpret_cast<__ubuf__ uint16_t*>(p+2048);
@@ -108,11 +167,19 @@ __aicore__ inline uint32_t Select(LocalTensor<uint32_t> ids,LocalTensor<uint16_t
     auto score=reinterpret_cast<__ubuf__ uint16_t*>(scores.GetPhyAddr());
     auto out=reinterpret_cast<__ubuf__ uint32_t*>(output.GetPhyAddr());
     if(clocks)clocks[0]=GetSystemCycle();
-    SetFlag<HardEvent::V_S>(EVENT_ID4);WaitFlag<HardEvent::V_S>(EVENT_ID4);
-    uint32_t n=scratch.GetValue(3200);
+    if constexpr (!kCompactWindowIds) {
+        SetFlag<HardEvent::V_S>(EVENT_ID4);WaitFlag<HardEvent::V_S>(EVENT_ID4);
+        n=scratch.GetValue(3200);
+    }
     if(clocks)clocks[1]=GetSystemCycle();
     if(!quota||!n){if(clocks)clocks[2]=clocks[3]=clocks[4]=clocks[1];return 0;}
     minimum=minimum<quota?minimum:quota;
+    if(kCompactWindowIds && n<=minimum && n<=64) {
+        EmitSmallUncovered(id,p+packedOffset,out,n);
+        if(clocks){SetFlag<HardEvent::V_S>(EVENT_ID4);WaitFlag<HardEvent::V_S>(EVENT_ID4);
+                   clocks[2]=clocks[3]=clocks[4]=GetSystemCycle();}
+        return n;
+    }
     uint32_t threshold=0;
     // Last window accepts the full Top2048; its minimum cannot reject any input.
     if(rank<2048 && !(minimum && n<=minimum)) {
@@ -147,7 +214,8 @@ __aicore__ inline uint32_t Select(LocalTensor<uint32_t> ids,LocalTensor<uint16_t
     }
     if(capThreshold>threshold)threshold=capThreshold;
     if(clocks)clocks[3]=GetSystemCycle();
-    Emit(id,score,out,stats+8,resident,valid,threshold);
+    if constexpr (kCompactWindowIds) EmitUncovered(id,p+packedOffset,out,stats+8,n,threshold);
+    else Emit(id,score,out,stats+8,resident,valid,threshold);
     SetFlag<HardEvent::V_S>(EVENT_ID4);WaitFlag<HardEvent::V_S>(EVENT_ID4);
     uint32_t count=scratch.GetValue(3208);
     if(clocks)clocks[4]=GetSystemCycle();
@@ -218,9 +286,15 @@ __aicore__ inline uint32_t SelectBitmap(LocalTensor<uint32_t> ids,LocalTensor<ui
         PackUncovered<true>(id,score,p,out,p+4096,p+6144,valid);
     }
     SetFlag<HardEvent::V_S>(EVENT_ID4);WaitFlag<HardEvent::V_S>(EVENT_ID4);
-    uint32_t n=scratch.GetValue(6144);scratch.SetValue(3200,n);
-    SetFlag<HardEvent::S_V>(EVENT_ID4);WaitFlag<HardEvent::S_V>(EVENT_ID4);
-    uint32_t count=Select(eligible,scores,output,scratch,0,valid,rank,quota,true,clocks,minimum,4096,knownRankCut);
+    uint32_t n=scratch.GetValue(6144);
+    uint32_t count;
+    if constexpr (kCompactWindowIds) {
+        count=Select(ids,scores,output,scratch,0,valid,rank,quota,true,clocks,minimum,4096,knownRankCut,n);
+    } else {
+        scratch.SetValue(3200,n);
+        SetFlag<HardEvent::S_V>(EVENT_ID4);WaitFlag<HardEvent::S_V>(EVENT_ID4);
+        count=Select(eligible,scores,output,scratch,0,valid,rank,quota,true,clocks,minimum,4096,knownRankCut);
+    }
     if(clocks)clocks[0]=begin;
     return count;
 }
