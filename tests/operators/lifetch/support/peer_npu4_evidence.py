@@ -48,6 +48,28 @@ def origin(area, current):
     return max(options)[-1] if options else None
 
 
+def portable_clock(area, reader, b, current):
+    # The capture manifests and row selectors for these two shapes are pinned by the reader.
+    for root in sorted(area.glob("local-q4-window-clocks.*"), key=lambda p:p.stat().st_mtime_ns, reverse=True):
+        arm = root / f"g2/bs{b}/block1/clocks"
+        if not (local(root,current) and field(root,"native") == BASE and field(root,"kvaf") == SDK
+                and field(root,"kvaf_tree") == TREE and (arm/"local_placement_measured").is_file()):
+            continue
+        try:
+            d = json.loads((arm/"single_diagnostic.json").read_bytes())
+            ident = d["identity"]
+            placement(arm/"thp.json")
+            if (d["controller_commit"] == reader and d["correctness"] == "PASS" and d["reference_oracle"] == "captured_logical_scores"
+                    and d["diagnostic_calls"] == 1 and d["measured_calls"] == 0 and ident["native"] == BASE
+                    and ident["physical_npu"] == 4 and ident["host"] == current[0] and ident["group"] == 2
+                    and ident["batch"] == b and len(ident["sequence_sha256"]) == 64
+                    and d["li_windows"]["checked_rank_queries"] == 4*b):
+                return arm
+        except (OSError, TypeError, ValueError, KeyError):
+            continue
+    return None
+
+
 def write_package(directory, ref, reader):
     from b24_window_evidence import CELLS, READER, clock_hit, lines, recorded, show_clocks, saved_frequency_fields
     from b24_window_report import cached
@@ -103,12 +125,14 @@ def write_package(directory, ref, reader):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("command", choices=["origin","paired","package"])
+    p.add_argument("command", choices=["origin","paired","clock","package"])
     p.add_argument("path", type=Path)
     p.add_argument("extra", nargs="*")
     a = p.parse_args()
     if a.command == "origin":
         print(origin(a.path.resolve(), machine()) or "")
+    elif a.command == "clock":
+        print(portable_clock(a.path, a.extra[0], int(a.extra[1]), machine()) or "")
     elif a.command == "paired":
         from b24_window_evidence import READER
         from b24_window_report import cached

@@ -213,7 +213,9 @@ def audit(work, identity):
         else:
             print(f"G{group} BS32 NO_LOCAL_COMPLETED_TWO_ROW_RESULT physical_NPU=4")
         frozen_evidence(area,group,identity,natural_ref)
-    print("CQ_CLOCK_SOURCE=unavailable_in_natural_receipts traffic_matching=counts_only")
+    print("TWO_ROW_CQ_CLOCKS=UNAVAILABLE natural_receipts_contain_counts_only")
+    from peer_tail_clocks import report
+    report(area, identity)
 
 
 if __name__ == "__main__":

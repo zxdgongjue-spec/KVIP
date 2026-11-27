@@ -47,7 +47,13 @@ for b in 28 32; do
         paired=$("$py" -B "$helper" paired "$ref" "$b")
         if [[ -n $paired ]]; then paired_shapes+=("$b"); continue; fi
     fi
-    local_shapes+=("$b")
+    old=$("$py" -B "$helper" clock "$work/peer-baseline" "$reader" "$b")
+    if [[ -n $old ]]; then
+        printf '%s\n' "$old" > "$stamp/g2-bs$b.txt"
+        echo "REUSED G2 BS$b local-window-clocks source=$old"
+    else
+        local_shapes+=("$b")
+    fi
 done
 if (( ${#paired_shapes[@]} )); then
     PEER_AUDIT_ORIGIN=$ref PEER_AUDIT_REFERENCE=$ref PEER_FOUR_RANK_AUDIT=g2-window-clocks FIXED_Q4_BATCHES="${paired_shapes[*]}" \

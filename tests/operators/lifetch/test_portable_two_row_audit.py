@@ -66,3 +66,17 @@ class PortableAudit(TestCase):
                 (root/(key+".txt")).write_text(v)
             self.assertTrue(local(root,("l","abc","newboot")))
             self.assertFalse(local(root,("l","other","boot")))
+
+    def test_first_and_following_batches_are_counted_once(self):
+        from peer_tail_clocks import pressure
+        def batch(end, start):
+            return dict(prefix_end=end,post_begin=start,post_end=start+1,
+                        drain_begin=start+2,drain_end=start+5)
+        qs = [dict(row=0,query=q,own=0,batches=[]) for q in range(4)]
+        qs[0].update(own=7, batches=[batch(2,10),batch(7,20)])
+        qs[1].update(own=1, batches=[batch(1,10)])
+        r=dict(tail=dict(clock_mhz=2,decoded=dict(qs=qs)),identity=dict(batch=1),traffic=dict(final=8))
+        self.assertEqual(pressure(r),dict(peak_unretired=2,batches=[2,1],tokens=[3,5],drain_p50_us=[1.5,1.5]))
+        qs[0]["batches"][1]["drain_begin"]=5
+        with self.assertRaisesRegex(ValueError,"clock order"):
+            pressure(r)
