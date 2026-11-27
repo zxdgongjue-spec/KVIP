@@ -13,14 +13,18 @@ import tempfile
 from b24_tail_archive import query_spans, require
 
 
-def build_probe(repo, normal_library, sdk_build, soc):
+def build_probe(repo, normal_library, sdk_build, soc, prefetch_ready=False):
     from kvip.runtime.build import build_failure, kvaf_build_paths
     cann, headers = kvaf_build_paths(sdk_build)
     op = repo / "csrc/operators/lightning_indexer_with_fetch"
     src = Path(__file__).with_name("terminal_batch_clock_native")
     digest = hashlib.sha256(normal_library.parent.name.encode())
+    resume = src.parent / "terminal_two_row_native/resume.h"
+    if prefetch_ready:
+        digest.update(b"window CQ visibility v1")
+        digest.update(resume.read_bytes())
     for file in sorted(src.iterdir()):
-        if file.is_file():
+        if file.is_file() and (file.name != "prefetch-ready.patch" or prefetch_ready):
             digest.update(file.read_bytes())
     folder = normal_library.parent / ("terminal-private-clock-" + digest.hexdigest()[:16])
     folder.mkdir(exist_ok=True)
@@ -35,8 +39,12 @@ def build_probe(repo, normal_library, sdk_build, soc):
                     shutil.copyfile(src / name, stage / name)
                 for name in ("row_kernel.h", "terminal_transport.h"):
                     shutil.copyfile(op / "op_kernel/terminal" / name, stage / name)
+                patches = [src / "device-clock.patch"]
+                if prefetch_ready:
+                    shutil.copyfile(resume, stage / "resume.h")
+                    patches.append(src / "prefetch-ready.patch")
                 for command in (
-                    ["patch", "--batch", "--fuzz=0", "-p1", "-i", str(src / "device-clock.patch")],
+                    *(["patch", "--batch", "--fuzz=0", "-p1", "-i", str(p)] for p in patches),
                     ["cmake", "-S", ".", "-B", "build", f"-DOP={op}", f"-DSOC_VERSION={soc}",
                      f"-DASCEND_CANN_PACKAGE_PATH={cann}", f"-DKVAF_INCLUDE={headers}"],
                     ["cmake", "--build", "build", "--target", "terminal_clock_bridge", "--parallel", "2"]
@@ -91,17 +99,17 @@ def decode(stamps, detail, mhz):
                 terminal_span_us=(stamps[last_row][last_q][10]-origin)/mhz)
 
 
-def collect(state, directory, repo):
+def collect(state, directory, repo, prefetch_ready=False):
     import torch
     from large_batch_pair import check_ordered_index
     launch = state.large_window_launch
     _, normal, sdk_build, soc, policy = state.large_window_build_args
     require(policy == "four-ranks" and not launch.trace_only, "Expected original timed LI")
-    lib = build_probe(repo, normal, sdk_build, soc)
+    lib = build_probe(repo, normal, sdk_build, soc, prefetch_ready)
     tail = ctypes.cast(lib.kvip_test_terminal_clocks, ctypes.c_void_p)
     hot = ctypes.cast(state.rotating.library.aclrtlaunch_v9_li_large_hot, ctypes.c_void_p)
     fwd, terminal = state.forward, state.forward.terminal
-    words = torch.zeros((2, state.batch, 4, 32), dtype=torch.int64, device=state.device)
+    words = torch.zeros((3 if prefetch_ready else 2, state.batch, 4, 32), dtype=torch.int64, device=state.device)
     pointer = torch.tensor(list(struct.pack("<Q", words.data_ptr())), dtype=torch.uint8, device=state.device)
     mhz = fwd.calibrate_counter_mhz()
     stream = torch.npu.current_stream(state.device)
@@ -123,7 +131,7 @@ def collect(state, directory, repo):
     terminal.workspace[32:40].copy_(old_pointer)
     fwd.set_diagnostics(False)
     stream.synchronize()
-    stamps, detail = words.cpu().tolist()
+    stamps, detail, *visibility = words.cpu().tolist()
     report = decode(stamps, detail, mhz)
     check_ordered_index(state, state.initial.captured_layout, state.initial.captured_hot_valid)
     # The original Index journal separates initial window admissions from the final assignments.
@@ -150,5 +158,18 @@ def collect(state, directory, repo):
         print(f"BATCH_CLOCK G7 BS{state.batch} row={entry['row']} Q={entry['query']} final={entry['own']} "
               f"post_end_from_first_entry_us={posts} Index_join_us={entry['phases_us']['Index_join']:.2f} "
               f"drain_duration_us={drains} last_final_CQ_to_exit_us={after if after is None else round(after,2)}")
-    return dict(clock_mhz=mhz, separate_terminal_query_stamps=stamps, prefix_clock_words=detail,
+    extra = {}
+    if prefetch_ready:
+        from four_rank_prefetch_ready import decode_visibility
+        checked = decode_visibility(stamps, detail, visibility[0])
+        extra["prefetch_cq_checkpoints"] = checked
+        for step in range(5):
+            snapshot = [r["observations"][step] for r in checked if len(r["observations"]) > step]
+            pending = [v for v in snapshot if v["pending"]]
+            if snapshot:
+                name = f"after_final_CQ_{step}" if step else "after_Index"
+                print(f"PREFETCH_CQ G7 BS{state.batch} Q2 {name} "
+                      f"all_window_CQEs_visible={sum(v['all_visible'] for v in pending)}/{len(pending)} "
+                      f"no_window_CQE_due={len(snapshot)-len(pending)}")
+    return dict(**extra, clock_mhz=mhz, separate_terminal_query_stamps=stamps, prefix_clock_words=detail,
                 decoded=report, final_index_assignments_by_row=final_assignments, ordered_Index_rows=state.batch)

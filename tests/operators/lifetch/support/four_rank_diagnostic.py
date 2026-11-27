@@ -23,6 +23,8 @@ def run(args):
     from reporting import atomic_json
     from workloads import ReplayPagePlan
 
+    if os.getenv("PEER_RANK_DIAG_MODE") == "prefetch-ready" and (args.group,args.batch) != (7,28):
+        raise ValueError("Window-prefetch CQ diagnosis requires G7 BS28")
     row = cell(args.archive, args.group, args.batch)
     path = args.archive / f"g{args.group}/bs{args.batch}/block1/fused/packed_result.json"
     previous = json.loads(path.read_text())
@@ -59,7 +61,7 @@ def run(args):
         try:
             if args.group == 7:
                 from four_rank_tail_clocks import collect
-                proof["tail"] = collect(state, args.output, args.timed)
+                proof["tail"] = collect(state, args.output, args.timed, os.getenv("PEER_RANK_DIAG_MODE") == "prefetch-ready")
             else:
                 from four_rank_li_counters import collect
                 proof["li_counters"] = collect(state, args.output)
@@ -112,6 +114,8 @@ def cached(source, group, batch, controller):
         try:
             observed = json.loads(path.read_text())
             if ((path.parent/"placement_verified").is_file() and (path.parent/"worker.log").is_file()
+                    and ((os.getenv("PEER_RANK_DIAG_MODE") == "prefetch-ready") ==
+                         ("prefetch_cq_checkpoints" in observed.get("tail", {})))
                     and observed.get("input_archive") == str(ref/"packed_result.json")
                     and observed["identity"] == expected["identity"] and observed["correctness"] == "PASS"
                     and observed["controller_commit"] == revision and observed["measured_calls"] == 0
