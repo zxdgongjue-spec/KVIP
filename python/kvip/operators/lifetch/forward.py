@@ -27,10 +27,14 @@ class LIFetchForward(StreamingLIFetchForward):
             self.terminal = TerminalLeaseBinding(rotating)
             self.terminal.attach_workspace(self)
             rotating.parallel_terminal = self.terminal
-            self.terminal_function = (
-                rotating.library.kvip_fixed_q4_small_forward if self.terminal.fixed_score_ready is not None
-                else rotating.library.kvip_parallel_tail_forward
-            )
+            if self.terminal.fixed_score_ready is not None:
+                self.terminal_function = rotating.library.kvip_fixed_q4_small_forward
+            elif getattr(rotating, "large_four_window_credit", False):
+                self.terminal_function = getattr(
+                    rotating.library, "kvip_large_four_window_credit_forward", rotating.library.kvip_parallel_tail_forward
+                )
+            else:
+                self.terminal_function = rotating.library.kvip_parallel_tail_forward
             self.terminal_function.argtypes = [ctypes.c_void_p] * 4
             self.terminal_function.restype = ctypes.c_uint32
 

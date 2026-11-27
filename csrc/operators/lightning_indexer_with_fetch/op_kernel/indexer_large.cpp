@@ -2,9 +2,6 @@
 // translation unit. Each block is a resident group of one cube and two vectors.
 #define KVIP_URMA_WINDOW_LI 1
 #define KVIP_LARGE_BATCH_LI 1
-#if !KVIP_BS32_SCORE_WINDOW_ROLES
-#define KVIP_LARGE_FOUR_WINDOW_CREDIT 1
-#endif
 #include "large_batch_li.h"
 #include "terminal/window_types.h"
 #include "terminal/terminal_runtime_abi.h"
@@ -491,6 +488,7 @@ __aicore__ inline void ColdOwner(const Inputs& input, const RowPlan& plan, uint3
 #endif
 
 #if !KVIP_BS32_SCORE_WINDOW_ROLES
+#if !KVIP_LARGE_FOUR_WINDOW_CREDIT
 extern "C" __global__ __aicore__ void v9_li_large_hot(GM_ADDR bindings, GM_ADDR terminal) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
@@ -509,6 +507,7 @@ extern "C" __global__ __aicore__ void v9_li_large_hot(GM_ADDR bindings, GM_ADDR 
 #endif
 }
 
+#endif
 extern "C" __global__ __aicore__ void v9_li_large_threshold_cold(GM_ADDR bindings, GM_ADDR terminal) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);

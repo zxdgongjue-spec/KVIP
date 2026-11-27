@@ -58,11 +58,13 @@ __aicore__ inline void AdvanceLargeWindowPair(uint32_t row, uint32_t epoch, uint
     DataCopy(incrementalMetadata_, header, 32);
     SetFlag<HardEvent::MTE2_S>(EVENT_ID5);
     WaitFlag<HardEvent::MTE2_S>(EVENT_ID5);
+#if KVIP_LARGE_FOUR_WINDOW_CREDIT
     const uint32_t used = incrementalOld_.GetValue(offsetof(rotating::Row, requests) / sizeof(uint32_t));
     windowCoveredEmpty_ = used == 0;
-#if KVIP_LARGE_FOUR_WINDOW_CREDIT
     windowQueryGrant_ = large_li::WindowGrant(runtimeShape_.rounds, epoch, ctx->windowLimit,
                                                ctx->prefetchLimit, used) / 4;
+#else
+    windowCoveredEmpty_ = incrementalOld_.GetValue(offsetof(rotating::Row, requests) / sizeof(uint32_t)) == 0;
 #endif
     incrementalMetadataActive_ = true;
     exportWindowCold_ = true;

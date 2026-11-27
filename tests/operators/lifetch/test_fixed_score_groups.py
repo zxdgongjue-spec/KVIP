@@ -106,13 +106,22 @@ def test_public_forward_uses_extended_entry_only_with_ready_state(monkeypatch):
     monkeypatch.setattr(forward, "TerminalLeaseBinding", Lease)
     monkeypatch.setattr(forward.StreamingLIFetchForward, "__init__", lambda *args, **kwargs: None)
     monkeypatch.setattr(forward.LIFetchForward, "set_options", lambda self: None)
-    for ready in (None, object()):
+    def four_window(*args):
+        pass
+
+    for ready, use_credit, has_credit, expected in (
+        (None, False, False, legacy), (None, True, True, four_window),
+        (None, True, False, legacy), (object(), False, True, sharded),
+    ):
         library = SimpleNamespace(kvip_parallel_tail_supported=lambda shape: 1, kvip_parallel_tail_forward=legacy)
         if ready is not None:
             library.kvip_fixed_q4_small_forward = sharded
-        rotating = SimpleNamespace(library=library, shape_pointer=None, torch=None, prefetch_limit=256, ready=ready)
+        if has_credit:
+            library.kvip_large_four_window_credit_forward = four_window
+        rotating = SimpleNamespace(library=library, shape_pointer=None, torch=None, prefetch_limit=1024,
+                                   ready=ready, large_four_window_credit=use_credit)
         op = forward.LIFetchForward(rotating, None)
-        assert op.terminal_function is (sharded if ready is not None else legacy)
+        assert op.terminal_function is expected
 
 
 def test_disjoint_windows_return_key_bank_and_keep_query(tmp_path):

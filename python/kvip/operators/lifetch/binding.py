@@ -107,6 +107,9 @@ class LIFetchBinding:
                 raise ValueError(f"V9 binary contract mismatch: {name}")
         prefetch_limit, window_limit = prefetch_budget(prefetch_limit, window_limit, intermediate_fetches)
         self.prefetch_limit = prefetch_limit
+        self.large_four_window_credit = (
+            batch > 16 and self.runtime_shape.rounds == 4 and window_limit == 256 and prefetch_limit == 1024
+        )
         geometry = li_geometry(batch, li_tiling, intermediate_fetches, aic_count, service_aics)
         if geometry["logical_aic_tasks"] > aic_count or not geometry["intermediate_fetches"]:
             raise ValueError("Direct hot-first mode requires a window and concurrently resident LI tasks")
