@@ -9,7 +9,7 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'support'))
-from fixed_q4_pressure_msprof import _label_capture, _source_comparison
+from fixed_q4_pressure_msprof import PHASES, _label_capture, _source_comparison
 from fixed_q4_staged_trace import CAPACITY, EVENT, HEADER_BYTES, LANE_BYTES, LANES, MAGIC, VERSION, decode, render, verify
 
 
@@ -30,12 +30,21 @@ def test_staged_ring_preserves_core_roles_and_detects_overflow():
         decode(data)
 
 
-def test_pair_preserves_vendor_payload_and_all_source_lane_events(tmp_path):
+@pytest.mark.parametrize('marked', (False, True))
+def test_pair_preserves_vendor_payload_and_all_source_lane_events(tmp_path, marked):
     kernels = ('v9_li_fixed_hot', 'v9_li_kernel_1', 'v9_li_fixed_cold', 'v9_parallel_terminal')
     timeline = tmp_path / 'msprof_1.json'
     sentinel = dict(ph='X', ts=1001, dur=0.1, pid=9, tid=2, name='ACL wait', cat='ACL', args={})
     vendor = [sentinel, *(dict(name=kernel, ph='X', cat='Kernel', pid=10, tid=2,
                               ts=1000 + n * 20, dur=8, args={}) for n, kernel in enumerate(kernels))]
+    if marked:
+        for index, (stage, _, _) in enumerate(PHASES):
+            for side, delta in (('BEGIN', -1), ('END', 9)):
+                vendor.append(dict(ph='i', s='t', ts=1000 + index * 20 + delta, pid=10, tid=2,
+                                   name=f'KVIP_LIFETCH_{stage}_{side}',
+                                   args={'Physic Stream Id': 2, 'Task Id': index * 2 + (side == 'END')}))
+        for task in vendor[1:5]:
+            task['args']['Physic Stream Id'] = 2
     timeline.write_text(json.dumps(dict(traceEvents=vendor)))
     source = [dict(lane=0, block=0, subblock=0, core=78, phase=1,
                    kernel=k, begin=100 + 50 * k, end=120 + 50 * k, detail=0,
@@ -50,6 +59,11 @@ def test_pair_preserves_vendor_payload_and_all_source_lane_events(tmp_path):
         rendered = json.loads(Path(capture['trace']).read_text())
         assert rendered['traceEvents'][:len(vendor)] == vendor
         assert len(capture['device_handoffs']) == 3
+        assert capture['attribution_source'] == ('device_marks' if marked else 'kernel_names')
+        if marked:
+            handoff = capture['device_handoffs'][0]
+            assert (handoff['kernel_to_end_mark_us'], handoff['between_marks_us'],
+                    handoff['begin_mark_to_kernel_us'], handoff['stream_id']) == (1, 10, 1, '2')
         document, _ = render(source, 50)
         assert any(event.get('args', {}).get('phase_id') == 192 for event in document['traceEvents'])
         business = path / 'lifetch_business_trace.json'

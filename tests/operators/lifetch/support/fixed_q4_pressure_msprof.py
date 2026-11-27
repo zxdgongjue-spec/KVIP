@@ -138,8 +138,11 @@ def _stage_intervals(document, cold_kernel='v9_li_fixed_cold'):
             if begin < last_end - TOLERANCE:
                 raise ValueError(f'{label} precedes the previous fusion stage')
             last_end = end
-        intervals.append(dict(stage=stage, kernel=kernel, name=label, begin_us=float(begin),
-                              end_us=float(end), duration_us=float(end - begin)))
+        row = dict(stage=stage, kernel=kernel, name=label, begin_us=float(begin),
+                   end_us=float(end), duration_us=float(end - begin))
+        if marked:
+            row.update(stream_id=stream, begin_mark_us=float(opening), end_mark_us=float(closing))
+        intervals.append(row)
     return intervals
 
 
@@ -164,10 +167,18 @@ def _overlay(events, intervals, caption, pid, offset):
 
 
 def _device_handoffs(intervals):
-    transitions = zip(intervals, intervals[1:])
-    return [dict(name=f"{left['name']} to {right['name']}", begin_us=left['end_us'], end_us=right['begin_us'],
-                 duration_us=right['begin_us'] - left['end_us'])
-            for left, right in transitions]
+    handoffs = []
+    for left, right in zip(intervals, intervals[1:]):
+        begin, end = left['end_us'], right['begin_us']
+        row = dict(name=f"{left['name']} to {right['name']}", begin_us=begin, end_us=end,
+                   duration_us=end - begin)
+        if 'end_mark_us' in left:
+            end_mark, begin_mark = left['end_mark_us'], right['begin_mark_us']
+            row.update(stream_id=left['stream_id'], prior_end_mark_us=end_mark, next_begin_mark_us=begin_mark,
+                       kernel_to_end_mark_us=end_mark - begin, between_marks_us=begin_mark - end_mark,
+                       begin_mark_to_kernel_us=end - begin_mark)
+        handoffs.append(row)
+    return handoffs
 
 
 def _label_capture(paths, route, caption, case, save):
@@ -197,10 +208,11 @@ def _label_capture(paths, route, caption, case, save):
         trace = route / 'lifetch_msprof_trace.json'
         save(trace, view)
         (route / 'msprof_trace.json').symlink_to(trace.name)
-        return dict(attribution='VERIFIED', trace=str(trace), intervals=intervals, device_handoffs=handoffs)
+        attribution_source = 'device_marks' if 'begin_mark_us' in intervals[0] else 'kernel_names'
+        return dict(attribution='VERIFIED', attribution_source=attribution_source, trace=str(trace),
+                    intervals=intervals, device_handoffs=handoffs)
     # Preserve the vendor trace even if CANN did not expose attributable names.
     return dict(attribution='UNATTRIBUTED', errors=failures)
-
 
 
 def _source_comparison(captures):
@@ -217,6 +229,7 @@ def _source_comparison(captures):
                 metadata=dict(alignment='Independent staged replay clocks aligned at their first recorded scope',
                               baseline=captures['baseline']['business_trace'],
                               optimized=captures['optimized']['business_trace']))
+
 
 def collect_pair(output, baseline_case, optimized_case, *, launch_case, profiler=None):
     """Run one selected case per route, then publish raw and compared traces."""
@@ -268,6 +281,7 @@ def collect_pair(output, baseline_case, optimized_case, *, launch_case, profiler
         handoff_report = route / 'lifetch_handoff_report.json'
         atomic_json(handoff_report, dict(source_clock=report['clock'], source_handoffs=report['source_handoffs'],
                                          device_clock='CANN msprof device task timestamps',
+                                         device_attribution=capture.get('attribution_source'),
                                          device_handoffs=capture.get('device_handoffs', [])))
         capture['handoff_report'] = str(handoff_report)
         captures[label] = capture

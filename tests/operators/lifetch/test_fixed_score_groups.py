@@ -132,6 +132,7 @@ def test_disjoint_windows_return_key_bank_and_keep_query(tmp_path):
 #include <cassert>
 #include <initializer_list>
 #include "fixed_score_groups.h"
+#include "stage_trace.h"
 namespace rotating {
 #include "sequence_schedule.h"
 }
@@ -172,7 +173,7 @@ template<class T> struct QuantLightningIndexerKernel {
     struct { unsigned s2Start; } splitCoreInfo;
     struct { unsigned s2LoopEnd, validS2Len; } tempLoopInfo;
     Cube matmulService{};
-    struct { void ProcessVec1(QLICommon::RunInfo, unsigned, bool) {} } vectorService;
+    struct { void ProcessVec1(QLICommon::RunInfo, unsigned, bool, bool = false) {} } vectorService;
     static constexpr unsigned S2_BASE_SIZE=128;
     void CalcRunInfo(unsigned, unsigned tile, QLICommon::RunInfo& out, unsigned, unsigned) { out.tile=tile; }
     bool fixedDeferCredit_ = false;
@@ -224,7 +225,8 @@ int main() {
     )
     exe = tmp_path / "bank"
     subprocess.run([compiler, "-std=c++17", "-O2", "-I", str(operators / "lightning_indexer_with_fetch/include"),
-                    "-I", str(operators / "common/lifetch"), str(source), "-o", str(exe)], check=True)
+                    "-I", str(indexer.parent.parent), "-I", str(operators / "common/lifetch"),
+                    str(source), "-o", str(exe)], check=True)
     subprocess.run([str(exe)], check=True, timeout=5)
 
 

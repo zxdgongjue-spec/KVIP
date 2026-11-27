@@ -47,7 +47,7 @@ PHASES = {1: 'Kernel body',
  226: 'Initialize pipeline events and credits',
  227: 'Drain pipeline events and output banks',
  228: 'Destroy LI pipeline',
- 229: 'Clear Cold progress before Resident Top2048',
+ 229: 'Clear Cold progress for the upcoming replay',
  230: 'Read resident thresholds into Cold UB',
  231: 'Drain and rebind Dedicated Cold query',
  232: 'Prepare Cold progress staging in UB',
@@ -65,9 +65,10 @@ PHASES = {1: 'Kernel body',
  248: 'Dynamically assigned Score fragment',
  249: 'Dynamically assigned Service window',
  250: 'P8 bulk cursor GM to UB',
- 251: 'Snapshot W1 TopK ready bounds',
- 252: 'Join W1 TopK workers',
- 253: 'W1 TopK worker query slice'}
+ 251: 'Last-window TopK snapshot',
+ 252: 'Join last-window TopK workers',
+ 253: 'Last-window TopK worker',
+ 254: 'Wait for last-window TopK snapshot'}
 PIPE_SCOPES = {180: ('AIC', 'WAIT', 'Wait for AIV credit'),
  181: ('AIC', 'MTE2', 'K GM to L1 with ready wait'),
  182: ('AIC', 'MTE2', 'Q GM to L1 with ready wait'),
@@ -110,8 +111,6 @@ PIPE_SCOPES = {180: ('AIC', 'WAIT', 'Wait for AIV credit'),
  240: ('AIV', 'VF', 'Gather and classify Resident victims'),
  241: ('AIV', 'MTE3', 'Publish Resident hit bitmap')}
 PHASES.update({phase: name for phase, (_, _, name) in PIPE_SCOPES.items()})
-PHASES.update({251: 'Last-window TopK snapshot', 252: 'Join last-window TopK workers',
-               253: 'Last-window TopK worker'})
 CLOCK = 'Device GetSystemCycle scaled by NPU Event calibration'
 SCOPE_SEMANTICS = ('Sampled source issue and synchronization scopes. Actual durations may overlap. '
                    'CANN device task timestamps use a separate clock domain.')
@@ -180,8 +179,8 @@ def verify(events, *, batch, windows, service_lanes, hot_groups, cold_groups, pr
     required = {
         20: {1, 2, 21, 22, 183, 184, 185, 191, 192},
         21: {1, 2, 23, 196, 197, 198},
-        22: {1, 2, 21, 22, 25, 150, 151, 152, 155, 180, 183, 184, 185, 191, 192, 218, 251, 252, 253},
-        23: {1, 2, 160, 161, 163, 166, 169, 211, 213, 214, 216},
+        22: {1, 2, 21, 22, 25, 150, 151, 152, 155, 180, 183, 184, 185, 191, 192, 218, 251, 252, 253, 254},
+        23: {1, 2, 160, 161, 163, 166, 169, 210, 213, 214, 216},
     }
     if prefetch:
         required[22].update({153, 154, 204, 205, 223})
@@ -215,9 +214,11 @@ def verify(events, *, batch, windows, service_lanes, hot_groups, cold_groups, pr
         epochs = {event['iteration'] for event in cold if event['phase'] == phase}
         if epochs != set(range(1, windows)):
             raise ValueError(f'{PHASES[phase]} must cover every Cold window')
-    for phase, size in ((251, batch), (252, batch), (253, batch * 4)):
+    query_ids = range(batch * 4)
+    for phase, units in ((251, range(batch)), (252, range(batch)), (253, query_ids),
+                         (254, (task for task in query_ids if task % 4))):
         observed = Counter((event['iteration'], event['detail']) for event in cold if event['phase'] == phase)
-        if observed != Counter((windows - 1, unit) for unit in range(size)):
+        if observed != Counter((windows - 1, unit) for unit in units):
             raise ValueError(f'{PHASES[phase]} has missing or duplicate last-window work')
 
 
@@ -259,7 +260,7 @@ def render(events, counter_mhz):
             details['pipe'] = pipe
         if phase in (25, 150, 151, 243, 244):
             details['service_lane'] = event['detail']
-        if phase in (23, 155, 253):
+        if phase in (23, 155, 253, 254):
             details.update(request_row=event['detail'] // 4, query=event['detail'] % 4)
         if phase in (251, 252):
             details['request_row'] = event['detail']
