@@ -701,7 +701,10 @@ __aicore__ inline void HelpFixedWindowQ() {
     const auto task = fixed_window_q::Helper(runtimeShape_, blockId_);
     if (!task.query) return;
     SetFlag<HardEvent::MTE3_S>(EVENT_ID5); WaitFlag<HardEvent::MTE3_S>(EVENT_ID5);
+    KVIP_TRACE_BEGIN(snapshotWait, KVIP_TRACE_WORKSPACE(streamingWorkspace_), Cold, WindowQSnapshotWait,
+        runtimeShape_.rounds - 1, task.row * 4 + task.query);
     fixed_window_q::Wait(fixedWindowScratch_, task.row, 0);
+    KVIP_TRACE_END(snapshotWait);
     auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     auto ends = reinterpret_cast<__gm__ const uint32_t*>(ctx->queryEnds);
     const uint32_t scan = rotating::ActiveScanHistory(runtimeShape_, ends, task.row);

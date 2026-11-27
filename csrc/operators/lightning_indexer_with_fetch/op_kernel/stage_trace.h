@@ -59,7 +59,8 @@ enum Phase : uint32_t {
     ResidentVictimClassifyVf = 240, ResidentHitBitmapMte3 = 241,
     ResidentWindowSeed = 242, WindowReadyLoad = 243, WindowStateFlush = 244,
     ResidentQuerySetup = 245, WindowCursorLoad = 246, EarlyTopKHeaderEnqueue = 247,
-    BulkCursorMte2 = 250, WindowQSnapshot = 251, WindowQJoin = 252, WindowQWorker = 253
+    BulkCursorMte2 = 250, WindowQSnapshot = 251, WindowQJoin = 252, WindowQWorker = 253,
+    WindowQSnapshotWait = 254
 };
 
 // Separate IDs for opt-in scheduling; leave the LI handoff range distinct.
