@@ -137,6 +137,19 @@ bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed "$G2_TRACE"
 
 `packed-synthetic --dry-run` 和 `--dry-run` 分别枚举合成及 G2 的九个 oracle 和 36 个计时图。
 
+## 12 号机 Fixed Q4 加末窗 Q1
+
+固定分核沿 K 页并行算分。末窗 Q1 在原 Service owner 取到 Score 就绪快照后，用 owner 和三个已完成打分的 AIV 各算一个 Q 的 Top2048。原 owner 汇合后跨 Q 去重，提交预取。BS1 保留 P8/W2，BS2、4、8、16 分别保留 P8、P8、P4、P2 及 W4。预取预算和 rank 起点沿用 MR38。
+
+在 24 号机 MR35 的同 W2 对照中，Q4→4×Q1 在 BS1、2、4、8 上的 KV ready 降幅分别为 17.2%、21.3%、23.5%、23.3%。BS16 的 W4 末窗对照在 miss 5%、10%、15% 分别为慢 3.38%、慢 5.08%、快 0.53%。原宽 batch 数据用分组调用。此处的 BS20、24、28、32 测原生整批，输出串行和融合基线，Q1 标为不支持。
+
+```bash
+bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed-q1-pair --dry-run
+bash tests/operators/lifetch/run_fixed_q4_a5_12.sh packed-q1-pair
+```
+
+沿用九档合成 Q4、H131072/R16384、目标 miss 10%、seed 43，先跑九个同卡串行 oracle 和原串行／融合 AB/BA 的 36 个图，再用同一二进制为支持 Q1 的五档各跑四个 Q1 开关图。每图十调用、预热四次。KV、Index、Top2048 及候选逐 Q 完成标记均在计时范围外核验。`RESULT_ROOT` 下的 `summary.csv` 和 `packed_summary.json` 给出整图与阶段耗时、预取、最终 Get 和工作量一致性。
+
 ## 12 号机 Q1/W2 加倍复测
 
 用两个独立的干净检出目录。MR35 W2 实测版本为 `a9f4fe3b`，主仓基线为 `df8ad259`。

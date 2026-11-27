@@ -922,6 +922,11 @@ __aicore__ inline void QuantLightningIndexerKernel<QLIT>::ProcessSequenceSplit()
                     if (serviceEpoch == epoch) vectorService.RotateFetch(epoch, serviceHalf);
                 }
             }
+#if KVIP_WINDOW_Q1
+            if ASCEND_IS_AIV {
+                vectorService.HelpLastWindowQ1(halfTokens);
+            }
+#endif
         }
 
         if ASCEND_IS_AIV {

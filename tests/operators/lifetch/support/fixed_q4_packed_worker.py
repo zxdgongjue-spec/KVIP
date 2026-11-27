@@ -43,6 +43,9 @@ class FrozenPackedRound:
                 if state.lease is not first.lease:
                     raise ValueError("Expected one shared stream-ordered KVAF lease")
                 persistent += [state.workspace.topk, state.update.logical_output, terminal.owner.core_status]
+                window_q1_scratch = getattr(terminal, "window_q1_scratch", None)
+                if window_q1_scratch is not None:
+                    persistent.append(window_q1_scratch)
             else:
                 if state.native.owner.session.runtime is not first.native.owner.session.runtime:
                     raise ValueError("Expected one shared strong-serial GET runtime")
@@ -66,6 +69,14 @@ class FrozenPackedRound:
         selected, counts = read_selected(state, inputs, self.fused)
         self.exact += check_scores(inputs, selected, self.serial[index])
         state.validate(inputs)
+        if self.fused:
+            scratch = getattr(state.forward.terminal, "window_q1_scratch", None)
+            if scratch is not None:
+                # This runs after graph synchronization, outside the device event.
+                ready = scratch[:, 1:, 0].cpu().numpy()
+                if ready.shape != (state.batch, 4) or not np.all(ready == 1):
+                    raise ValueError(f"Call {index}: missing last-window Q1 device completion receipts")
+                counts["window_q1_ready_flags"] = int(ready.size)
         self.traffic.append(counts)
 
 

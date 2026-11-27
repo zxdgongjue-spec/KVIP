@@ -20,10 +20,19 @@ case "$mode" in
     packed_input=(--synthetic)
     packed_name=synthetic
     ;;
+  packed-q1-pair)
+    if [[ "${1:-}" == --dry-run ]]; then
+      shift
+      exec "${KVIP_PYTHON:-python3}" -B "$runner" --dry-run --synthetic --window-q1-pair "$@"
+    fi
+    packed_input=(--synthetic --window-q1-pair)
+    packed_name=window-q1
+    ;;
   packed|q1-w2) ;;
   *)
     printf '%s\n' 'Usage:' '  run_fixed_q4_a5_12.sh packed G2_PREPARED_TRACE [runner options]' \
       '  run_fixed_q4_a5_12.sh packed-synthetic [runner options]' \
+      '  run_fixed_q4_a5_12.sh packed-q1-pair [runner options]' \
       '  run_fixed_q4_a5_12.sh q1-w2 MR35_CHECKOUT MAIN_CHECKOUT' \
       '  run_fixed_q4_a5_12.sh --dry-run'
     if [[ "$mode" == --help || "$mode" == -h ]]; then exit 0; fi
@@ -61,8 +70,12 @@ elif [[ "$mode" == q1-w2 ]]; then
 fi
 
 git -C "$repo" diff --quiet HEAD --
-git -C "$repo" diff --quiet af52a02b97daddadd5d93b9d100f2ff1b03b499d HEAD -- \
-  csrc python patches scripts pyproject.toml
+if [[ "$mode" == packed-q1-pair ]]; then
+  git -C "$repo" merge-base --is-ancestor 555e1e51c3639fad47e0132eaab426582cddc543 HEAD
+else
+  git -C "$repo" diff --quiet af52a02b97daddadd5d93b9d100f2ff1b03b499d HEAD -- \
+    csrc python patches scripts pyproject.toml
+fi
 test "$(git -C "$kvaf" rev-parse HEAD)" = 813f1750a50b7e6c92d5f5397f2fbc05befef6da
 for kind in get put; do
   test -s "$build/bin/kvaf_execute_batch_${kind}_kernels.o"

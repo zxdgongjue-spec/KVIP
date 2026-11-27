@@ -22,33 +22,67 @@ def verify_source(out, archive, repo):
     same_production(repo, NATIVE, 'HEAD')
 
 
+def packed_arm(directory, arm, group, batch, cohort, root):
+    row = json.loads((directory / "packed_result.json").read_text())
+    identity = row["identity"]
+    if (not (directory / "placement_verified").is_file()
+            or row["arm"] != arm or row["calls"] != 10 or row["correctness"] != "PASS"
+            or identity["group"] != group or identity["batch"] != batch
+            or identity["physical_npu"] != int(field(root, "physical_npu"))
+            or identity["host"] != field(root, "host") or identity["native"] != field(root, "native")
+            or row["checked_queries"] != 40 * batch or row["checked_rows"] != 10 * batch
+            or (arm == "serial" and row["get_workers"] != 2)):
+        raise ValueError(f"Incomplete or mismatched packed result: {directory}")
+    if batch <= 16 and identity["donor_rows"] != list(range(cohort, 16, 16 // batch)):
+        raise ValueError(f"Wrong source requests for {directory}")
+    times = {s: row["mean_us"][s] for s in ("LI", "tail")}
+    times["graph"] = row["graph_mean_us"]
+    if (not all(isfinite(v) and v > 0 for v in times.values()) or
+            not isclose(times["graph"] * 10, row["graph_event_us"], rel_tol=1e-8)):
+        raise ValueError(f"Invalid ten-call device event or stage measurements: {directory}")
+    return row, times, (identity, placement(directory / "thp.json"))
+
+
 def read_pair(pair, group, batch, cohort, root):
-    rows = {}
-    identities = []
-    for arm in ('serial', 'fused'):
+    _, serial_times, serial_context = packed_arm(pair / "serial", "serial", group, batch, cohort, root)
+    _, fused_times, fused_context = packed_arm(pair / "fused", "fused", group, batch, cohort, root)
+    if serial_context != fused_context:
+        raise ValueError(f"Serial and fused inputs, runtime or memory placement differ: {pair}")
+    return dict(serial=serial_times, fused=fused_times)
+
+
+Q1_STAGES = (*STAGES, "LI1", "LI2", "LI3")
+
+
+def read_q1_pair(pair, group, batch, cohort, root):
+    rows, contexts, bridges = {}, [], []
+    for arm, enabled in (("off", False), ("on", True)):
         directory = pair / arm
-        row = json.loads((directory / 'packed_result.json').read_text())
-        identity = row['identity']
-        if (not (directory / 'placement_verified').is_file()
-                or row['arm'] != arm or row['calls'] != 10 or row['correctness'] != 'PASS'
-                or identity['group'] != group or identity['batch'] != batch
-                or identity['physical_npu'] != int(field(root, 'physical_npu'))
-                or identity['host'] != field(root, 'host') or identity['native'] != field(root, 'native')
-                or row['checked_queries'] != 40 * batch or row['checked_rows'] != 10 * batch
-                or (arm == 'serial' and row['get_workers'] != 2)):
-            raise ValueError(f'Incomplete or mismatched packed result: {directory}')
-        if batch <= 16 and identity['donor_rows'] != list(range(cohort, 16, 16 // batch)):
-            raise ValueError(f'Wrong source requests for {directory}')
-        times = {s: row['mean_us'][s] for s in ('LI', 'tail')}
-        times['graph'] = row['graph_mean_us']
-        if (not all(isfinite(v) and v > 0 for v in times.values()) or
-                not isclose(times['graph'] * 10, row['graph_event_us'], rel_tol=1e-8)):
-            raise ValueError(f'Invalid ten-call device event or stage measurements: {directory}')
-        identities.append((identity, placement(directory / 'thp.json')))
-        rows[arm] = times
-    if identities[0] != identities[1]:
-        raise ValueError(f'Serial and fused inputs, runtime or memory placement differ: {pair}')
-    return rows
+        row, times, context = packed_arm(directory, "fused", group, batch, cohort, root)
+        if (row.get("window_q1_enabled") is not enabled or row["get_workers"] != 40
+                or row["full_KV_Index_checked_calls"] != 10):
+            raise ValueError(f"Packed fused result did not complete in its requested Q1 mode: {directory}")
+        bridge = row.get("fused_bridge_sha256")
+        if not isinstance(bridge, str) or len(bridge) != 64:
+            raise ValueError(f"Missing loaded LIFetch bridge hash: {directory}")
+        stages = {s: row["mean_us"][s] for s in ("LI1", "LI2", "LI3")}
+        if not all(isfinite(v) and v > 0 for v in stages.values()):
+            raise ValueError(f"Invalid LI kernel durations: {directory}")
+        traffic = row["traffic"]
+        if len(traffic) != 10 or any(call.get("window_q1_ready_flags", 0) != 4 * batch * enabled for call in traffic):
+            raise ValueError(f"Missing or unexpected Q1 completion receipts: {directory}")
+        if any(
+            len(call[key + "_by_request"]) != batch or sum(call[key + "_by_request"]) != call[key]
+            or any(count < 0 for count in call[key + "_by_request"])
+            for call in traffic for key in ("prefetch", "final")
+        ):
+            raise ValueError(f"Missing packed per-request GET counts: {directory}")
+        rows[arm] = dict(mean_us={**times, **stages}, traffic=traffic)
+        contexts.append(context)
+        bridges.append(bridge)
+    if contexts[0] != contexts[1] or bridges[0] != bridges[1]:
+        raise ValueError(f"Q1 and baseline used different inputs, runtime, bridge, or memory placement: {pair}")
+    return dict(arms=rows, context=contexts[0], fused_bridge_sha256=bridges[0])
 
 
 def cell_summary(root, group, batch):

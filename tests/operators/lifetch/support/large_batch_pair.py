@@ -66,7 +66,8 @@ def fixed_stage_records(events, scope, *, fused, batch, strict_bounds=False):
         }
     )
     if batch == 16 and fused:
-        names = {"pr30_li": ("v9_li_kernel",), "tail": ("v9_parallel_terminal",)}
+        names = {"pr30_li": ("v9_li_kernel", "v9_li_window_q1_threshold", "v9_li_window_q1_cold"),
+                 "tail": ("v9_parallel_terminal",)}
     elif fused and batch < 16:
         names = {"LI1": ("v9_li_fixed_hot",), "LI2": ("v9_li_kernel_1",),
                  "LI3": ("v9_li_fixed_cold",), "tail": ("v9_parallel_terminal",)}
@@ -136,9 +137,13 @@ def fixed_invocation_intervals(stages, scope):
             launches[-1].append(record)
         if len(launches) != 3:
             raise ValueError(f"{scope}: expected three separate PR30 LI launches, got {len(launches)}")
-        for i, (name, launch) in enumerate(zip(("v9_li_kernel", "v9_li_kernel_1", "v9_li_kernel_2"), launches), 1):
-            if any(not re.fullmatch(name + KERNEL_SUFFIX, r[4], re.I) for r in launch):
-                raise ValueError(f"{scope}: wrong PR30 LI{i} kernel, expected {name}, got {launch}")
+        li_symbols = (
+            ("v9_li_kernel",), ("v9_li_kernel_1", "v9_li_window_q1_threshold"),
+            ("v9_li_kernel_2", "v9_li_window_q1_cold"),
+        )
+        for i, (names, launch) in enumerate(zip(li_symbols, launches, strict=True), 1):
+            if not any(all(re.fullmatch(name + KERNEL_SUFFIX, r[4], re.I) for r in launch) for name in names):
+                raise ValueError(f"{scope}: wrong PR30 LI{i} kernel, expected {names}, got {launch}")
             stages[f"LI{i}"] = launch
     intervals = {}
     for key, records in stages.items():
@@ -291,7 +296,8 @@ def read_selected(state, inputs, fused):
         prefetch = state.rotating.rows[:, 9].cpu().numpy()
         if np.any(prefetch < 0) or np.any(prefetch > 2048):
             raise ValueError("Prefetch exceeded the per-request reservation")
-        traffic = dict(prefetch=int(prefetch.sum()), final=int(counts.sum()))
+        traffic = dict(prefetch=int(prefetch.sum()), final=int(counts.sum()),
+                       prefetch_by_request=prefetch.tolist(), final_by_request=counts.sum(axis=1).tolist())
         raw = state.workspace.topk.cpu().numpy().reshape(shape)
         unpack = state.workspace.inputs.unpack_indices.cpu().numpy().reshape(-1)
         if np.any(raw < 0) or np.any(raw >= state.history) or not np.array_equal(np.sort(unpack), np.arange(batch * 4)):
@@ -658,6 +664,10 @@ def selected_device(device, physical_npu):
 
 
 def run(args):
+    # Never inherit a candidate switch into the baseline or native oracle.
+    os.environ.pop("KVIP_FIXED_Q4_WINDOW_Q1", None)
+    if args.window_q1:
+        os.environ["KVIP_FIXED_Q4_WINDOW_Q1"] = "1"
     device, physical_npu = selected_device(args.device, args.physical_npu)
     import execution as ex
     from functools import partial
@@ -670,6 +680,9 @@ def run(args):
     revision = subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip()
     if subprocess.check_output(["git", "-C", repo, "status", "--porcelain", "-uno"], text=True).strip():
         raise ValueError("The checked-out measurement revision has tracked modifications")
+    if args.q1_study:
+        from fixed_q4_packed_archive import verify_q1_production
+        verify_q1_production(repo, revision)
     sdk_python = args.kvaf_root.resolve() / "build-npu/python"
     if not Path(kvaf.__file__).resolve().is_relative_to(sdk_python) or not Path(kvip.__file__).resolve().is_relative_to(
         repo / "python"
@@ -736,7 +749,7 @@ def run(args):
     previous = None
     if args.packed_ten:
         from fixed_q4_packed_archive import load_archived_oracle
-        serial = load_archived_oracle(args.serial_result, identity, repo)
+        serial = load_archived_oracle(args.serial_result, identity, repo, q1_study=args.q1_study)
     elif fused:
         base = identity
         if args.compare_archived_pair:
@@ -791,7 +804,15 @@ def run(args):
     scratch_existed = (args.output / "export_only_prof_dir").exists()
     if args.packed_ten:
         from fixed_q4_packed_worker import measure_packed, save_packed
-        benchmark = partial(measure_packed, ex, proofs, serial)
+        def benchmark(torch, states, sequence, config, directory, *, fused):
+            if fused and args.q1_study:
+                enabled = [getattr(state.forward.terminal, "window_q1_scratch", None) is not None for state in states]
+                if enabled != [args.window_q1] * len(states):
+                    raise ValueError("The packed fused graph did not bind the requested Q1 mode")
+                with Path(states[0].rotating.library._name).open("rb") as stream:
+                    proofs["fused_bridge_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+                proofs["window_q1_enabled"] = args.window_q1
+            return measure_packed(ex, proofs, serial, torch, states, sequence, config, directory, fused=fused)
     else:
         benchmark = partial(measured_replays, ex, proofs, serial)
     result = ex.run_path(
@@ -948,6 +969,8 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arm", choices=("serial", "fused"), required=True)
     parser.add_argument("--packed-ten", action="store_true", help="Capture and time ten independent states in one graph")
+    parser.add_argument("--q1-study", action="store_true", help="Use a fresh oracle from the fixed-Q4 Q1 revision")
+    parser.add_argument("--window-q1", action="store_true", help="Bind the window Q1 candidate")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--trace", type=Path)
     source.add_argument("--synthetic-fixture", type=Path, help="Prepared compact synthetic Q4 fixture directory")
@@ -968,6 +991,12 @@ def parse_args(argv=None):
         "--keep-trace", action="store_true", help="Keep the raw profiler timeline after successful attribution"
     )
     args = parser.parse_args(argv)
+    if args.q1_study and args.synthetic_fixture is None:
+        parser.error("The Q1 study requires synthetic input")
+    if args.window_q1:
+        from fixed_q4_packed_archive import Q1_BATCHES
+        if not args.q1_study or not args.packed_ten or args.arm != "fused" or args.batch not in Q1_BATCHES:
+            parser.error("Window Q1 requires a supported fused packed arm in the Q1 study")
     if args.synthetic_fixture is not None:
         if args.group != SYNTHETIC_GROUP or args.round != 1 or args.cohort != 0:
             parser.error("Synthetic input requires group 0, round 1 and cohort 0")

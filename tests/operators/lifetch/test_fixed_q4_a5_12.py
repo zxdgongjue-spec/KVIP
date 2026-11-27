@@ -51,7 +51,7 @@ def test_synthetic_prepares_once_and_uses_fresh_oracles(tmp_path, monkeypatch):
     cpu.chmod(0o700)
     out = tmp_path / "out"
     args = SimpleNamespace(kvaf_root=kvaf, cpu_numa=None, cpu_ub_device=None, device=2, physical_npu=2,
-                           synthetic=True, trace=None, output=out)
+                           synthetic=True, trace=None, output=out, window_q1_pair=False)
 
     def git_output(command, **_kwargs):
         if command[3] == "status":
@@ -153,3 +153,87 @@ def test_one_cohort_summary_reuses_pair_evidence(tmp_path):
     with (tmp_path / "summary.csv").open(newline="") as handle:
         data = list(csv.DictReader(handle))[0]
     assert data["fused_graph_us"] == "85" and data["input_kind"] == "real"
+
+
+def test_q1_dry_run_preserves_nine_baseline_cells():
+    script = Path(__file__).resolve().parent / "support/fixed_q4_a5_12.py"
+    command = [sys.executable, "-B", script, "--window-q1-pair", "--dry-run"]
+    rejected = subprocess.run(command, text=True, capture_output=True)
+    assert rejected.returncode == 2 and "requires --synthetic" in rejected.stderr
+    data = json.loads(subprocess.check_output([*command, "--synthetic"], text=True))
+    assert data["batch_sizes"] == list(runner.FIXED_BATCHES)
+    assert data["oracles"] == 9 and data["measured_graphs"] == 56
+    assert data["window_q1_pair"]["enabled_batches"] == list(runner.Q1_BATCHES)
+    assert data["window_q1_pair"]["unsupported_batches"] == [20, 24, 28, 32]
+    assert data["window_q1_pair"]["blocks"] == [["off", "on"], ["on", "off"]]
+
+
+def test_q1_uses_paired_bridge_and_compares_request_counts(tmp_path, monkeypatch):
+    batch = 16
+    cell = tmp_path / "synthetic/bs16/cohort0"
+    oracle = cell / "oracle/serial"
+    for key, value in (("native", "q1-revision"), ("host", "a5-12"), ("physical_npu", "2")):
+        (tmp_path / f"{key}.txt").write_text(value)
+    enabled_order = []
+
+    def fake_arm(_args, output, actual_batch, arm, _src, group, _node, _cpus,
+                 *, oracle=None, adapter=None, window_q1=False):
+        assert arm == "fused" and actual_batch == batch and group == 0
+        assert oracle == cell / "oracle/serial" and adapter == "adapter"
+        enabled_order.append(window_q1)
+        output.mkdir(parents=True)
+        (output / "placement_verified").touch()
+        (output / "thp.json").write_text(json.dumps(dict(
+            status="measured", page_mode="thp", coverage_min_pct=100, ub_device="adapter",
+            numa_pages_overlapping_vmas={"0": 100},
+        )))
+        graph = 90 if window_q1 else 100
+        prefetch = [2] * batch
+        final = [4] * batch
+        if window_q1:
+            # First request shifts work to Terminal, second increases total GET.
+            prefetch[0], final[0], final[1] = 1, 5, 5
+        call = dict(prefetch=sum(prefetch), final=sum(final),
+                    prefetch_by_request=prefetch, final_by_request=final)
+        if window_q1:
+            call["window_q1_ready_flags"] = 4 * batch
+        (output / "packed_result.json").write_text(json.dumps(dict(
+            identity=dict(group=0, batch=batch, host="a5-12", native="q1-revision", physical_npu=2,
+                          donor_rows=list(range(batch)), sequence_sha256="same"),
+            arm=arm, calls=10, checked_queries=640, checked_rows=160, correctness="PASS", get_workers=40,
+            full_KV_Index_checked_calls=10, window_q1_enabled=window_q1, fused_bridge_sha256="a" * 64,
+            graph_event_us=10 * graph, graph_mean_us=graph,
+            mean_us=dict(LI=60, tail=30, LI1=20, LI2=20, LI3=20), traffic=[call] * 10,
+        )))
+
+    monkeypatch.setattr(runner, "run_arm", fake_arm)
+    result = runner.q1_cell(None, tmp_path, cell, batch, oracle, [], 0, "0", "0", "adapter")
+    assert enabled_order == [False, True, True, False]
+    assert result["mean_us"]["on"]["graph"] == 90 and result["graph_gain_pct"] == 10
+    assert result["changed_request_records"] == 40 and result["changed_total_records"] == 20
+    assert result["traffic_mean"]["off"] == {"prefetch": 32, "final": 64, "total": 96}
+    assert result["traffic_mean"]["on"] == {"prefetch": 31, "final": 66, "total": 97}
+    assert runner.q1_cell(None, tmp_path, cell, 32, oracle, [], 0, "0", "0", "adapter") == {
+        "status": "unsupported",
+    }
+    path = cell / "q1/block1/on/packed_result.json"
+    data = json.loads(path.read_text())
+    data["window_q1_enabled"] = False
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="requested Q1 mode"):
+        runner.read_q1_pair(cell / "q1/block1", 0, batch, 0, tmp_path)
+
+
+def test_bs16_q1_profiler_aliases():
+    from large_batch_pair import fixed_invocation_intervals, fixed_stage_records
+
+    names = (
+        "v9_li_kernel", "v9_li_window_q1_threshold", "v9_li_window_q1_cold", "v9_parallel_terminal",
+    )
+    events = [dict(name="scope", ph="X", ts=0, dur=20)]
+    for index, name in enumerate(names, 1):
+        events.append(dict(name=f"{name}_1", ph="X", cat="kernel", ts=4 * index, dur=1))
+    recorded = fixed_stage_records(events, "scope", fused=True, batch=16, strict_bounds=True)
+    assert fixed_invocation_intervals(recorded, "scope") == {
+        "LI1": [(4, 5)], "LI2": [(8, 9)], "LI3": [(12, 13)], "tail": [(16, 17)],
+    }

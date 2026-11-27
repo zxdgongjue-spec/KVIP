@@ -3338,11 +3338,41 @@ class FusedReplayState:
                 status=torch.zeros(self.batch, dtype=torch.int32, device=device),
                 outputs=torch.zeros((2, self.batch * 4, 1, 2048), dtype=torch.int32, device=device))
             self.forward = StreamingForward(self.rotating, self.update, torch, prefetch_tokens)
+            if os.environ.get("KVIP_FIXED_Q4_WINDOW_Q1") == "1":
+                self._bind_fixed_window_q1()
             self.reset()
         except BaseException:
             if self.owns_lease:
                 self.lease.close()
             raise
+
+    def _bind_fixed_window_q1(self):
+        import ctypes
+        import struct
+
+        terminal = self.forward.terminal
+        shape = self.rotating.runtime_shape
+        library = self.rotating.library
+        supported = getattr(library, "kvip_fixed_q4_window_q1_supported", None)
+        if terminal is None or supported is None:
+            raise ValueError("Packed window Q1 requires the experimental URMA bridge")
+        supported.argtypes = [ctypes.POINTER(type(shape))]
+        supported.restype = ctypes.c_uint32
+        if not supported(ctypes.byref(shape)):
+            raise ValueError(f"Packed window Q1 is unavailable for BS{shape.batch}/W{shape.rounds}")
+
+        scratch = self.torch.empty((shape.batch, 5, 32), dtype=self.torch.int32, device=self.device)
+        if scratch.data_ptr() % 128 or terminal.workspace.numel() != 128:
+            raise ValueError("Unexpected packed window Q1 binding layout")
+        offset = struct.calcsize("<6Q2I5Q")  # terminal_runtime::Binding::reserved[5]
+        address = self.torch.tensor(list(struct.pack("<Q", scratch.data_ptr())),
+                                    dtype=self.torch.uint8, device=self.device)
+        terminal.workspace[offset:offset + address.numel()].copy_(address)
+        terminal.window_q1_scratch = scratch
+        launch = library.kvip_fixed_q4_window_q1_forward
+        launch.argtypes = [ctypes.c_void_p] * 4
+        launch.restype = ctypes.c_uint32
+        self.forward.terminal_function = launch
 
     def upload(self, target, array):
         self_value = self.torch.from_numpy(np.ascontiguousarray(array)).to(self.device)
