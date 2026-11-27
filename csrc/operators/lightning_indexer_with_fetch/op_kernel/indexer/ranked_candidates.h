@@ -221,6 +221,58 @@ __aicore__ inline uint32_t Select(LocalTensor<uint32_t> ids,LocalTensor<uint16_t
     if(clocks)clocks[4]=GetSystemCycle();
     return count<quota?count:quota;
 }
+// Only slots with untagged token IDs can miss. Compact their positions
+// before loading scores or probing the row bitmap.
+__simd_vf__ inline void CollectUntaggedSlots(__ubuf__ uint32_t* ids,
+    __ubuf__ uint32_t* slots,__ubuf__ uint32_t* count,uint32_t valid) {
+    using namespace MicroAPI;
+    auto all=CreateMask<uint32_t,MaskPattern::ALL>();
+    RegTensor<uint32_t> id,compact,ones,sum,total;
+    RegTensor<int32_t> pos;
+    MaskReg live;UnalignRegForStore store;
+    Duplicate(sum,uint32_t(0));ClearSpr<SpecialPurposeReg::AR>();
+    for(uint16_t i=0;i<2048;i+=64) {
+        LoadAlign(id,ids+i);CompareScalar<uint32_t,CMPMODE::LT>(live,id,valid,all);
+        Arange(pos,int32_t(i));
+        Duplicate<uint32_t,MaskMergeMode::ZEROING>(ones,uint32_t(1),live);Add(sum,sum,ones,all);
+        Squeeze<uint32_t,MicroAPI::GatherMaskMode::STORE_REG>(compact,reinterpret_cast<RegTensor<uint32_t>&>(pos),live);
+        StoreUnAlign<uint32_t,PostLiteral::POST_MODE_UPDATE>(slots,compact,store);
+    }
+    StoreUnAlignPost(slots,store);ReduceSum(total,sum,all);
+    auto first=CreateMask<uint32_t,MaskPattern::VL1>();StoreAlign(count,total,first);
+}
+template<bool Empty>
+__simd_vf__ inline void PackUntaggedSlots(__ubuf__ uint32_t* ids,__ubuf__ uint32_t* scoreWords,
+    __ubuf__ uint32_t* slots,__ubuf__ uint32_t* covered,__ubuf__ uint32_t* packed,
+    __ubuf__ uint32_t* count,uint32_t n) {
+    using namespace MicroAPI;
+    auto all=CreateMask<uint32_t,MaskPattern::ALL>();
+    RegTensor<uint32_t> pos,safe,id,word,shift,bits,skey,sindex,one,mask31,mask16,zero,entry,compact,ones,sum,total;
+    MaskReg live,miss,take;UnalignRegForStore store;
+    Duplicate(zero,uint32_t(0));Duplicate(one,uint32_t(1));Duplicate(mask31,uint32_t(31));
+    Duplicate(mask16,uint32_t(65535));Duplicate(sum,uint32_t(0));ClearSpr<SpecialPurposeReg::AR>();
+    for(uint16_t i=0;i<n;i+=64) {
+        uint32_t left=n-i;live=UpdateMask<uint32_t>(left);LoadAlign(pos,slots+i);
+        Select(safe,pos,zero,live);
+        if constexpr (!Empty) {
+            Gather(id,ids,safe,all);
+            Select(id,id,zero,live);ShiftRights(word,id,int16_t(5),all);
+            Gather(bits,covered,word,all);And(shift,id,mask31,all);
+            ShiftRight(bits,bits,reinterpret_cast<RegTensor<int32_t>&>(shift),all);
+            And(bits,bits,one,all);CompareScalar<uint32_t,CMPMODE::EQ>(miss,bits,uint32_t(0),live);
+            MaskAnd(take,live,miss,all);
+        } else {take=live;}
+        ShiftRights(sindex,safe,int16_t(1),all);Gather(skey,scoreWords,sindex,all);
+        And(shift,safe,one,all);ShiftLefts(shift,shift,int16_t(4),all);
+        ShiftRight(skey,skey,reinterpret_cast<RegTensor<int32_t>&>(shift),all);And(skey,skey,mask16,all);
+        ShiftLefts(entry,safe,int16_t(16),all);Or(entry,entry,skey,all);
+        Duplicate<uint32_t,MaskMergeMode::ZEROING>(ones,uint32_t(1),take);Add(sum,sum,ones,all);
+        Squeeze<uint32_t,MicroAPI::GatherMaskMode::STORE_REG>(compact,entry,take);
+        StoreUnAlign<uint32_t,PostLiteral::POST_MODE_UPDATE>(packed,compact,store);
+    }
+    StoreUnAlignPost(packed,store);ReduceSum(total,sum,all);
+    auto first=CreateMask<uint32_t,MaskPattern::VL1>();StoreAlign(count,total,first);
+}
 // Long histories keep the same UB budget: gather only the words addressed by
 // this Q's TopK, rather than loading a history-sized bitmap into a 16-KiB bank.
 __simt_vf__ __aicore__ LAUNCH_BOUND(256)
@@ -257,7 +309,21 @@ __aicore__ inline uint32_t SelectBitmap(LocalTensor<uint32_t> ids,LocalTensor<ui
     auto id=reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr());
     auto score=reinterpret_cast<__ubuf__ uint16_t*>(scores.GetPhyAddr());
     auto out=reinterpret_cast<__ubuf__ uint32_t*>(eligible.GetPhyAddr());
-    if(coveredEmpty){
+    if(kCompactWindowIds && history<=131072) {
+        if(!coveredEmpty) {
+            GlobalTensor<uint32_t> bits;bits.SetGlobalBuffer(covered);DataCopy(scratch,bits,(history+255)/256*8);
+        }
+        CollectUntaggedSlots(id,out,p+6144,valid);
+        SetFlag<HardEvent::V_S>(EVENT_ID4);WaitFlag<HardEvent::V_S>(EVENT_ID4);
+        const uint32_t untagged=scratch.GetValue(6144);
+        if(!coveredEmpty) {SetFlag<HardEvent::MTE2_V>(EVENT_ID4);WaitFlag<HardEvent::MTE2_V>(EVENT_ID4);}
+        if(!untagged) {
+            if(clocks){clocks[0]=begin;clocks[1]=clocks[2]=clocks[3]=clocks[4]=GetSystemCycle();}
+            return 0;
+        }
+        if(coveredEmpty) PackUntaggedSlots<true>(id,reinterpret_cast<__ubuf__ uint32_t*>(score),out,p,p+4096,p+6144,untagged);
+        else PackUntaggedSlots<false>(id,reinterpret_cast<__ubuf__ uint32_t*>(score),out,p,p+4096,p+6144,untagged);
+    }else if(coveredEmpty) {
         PackUncovered<false,true>(id,score,p,out,p+4096,p+6144,valid);
     }else if(history<=131072){
         GlobalTensor<uint32_t> bits;bits.SetGlobalBuffer(covered);
