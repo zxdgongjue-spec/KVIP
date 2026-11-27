@@ -1,3 +1,4 @@
+#include "../stage_trace.h"
 #include "terminal_runtime_abi.h"
 #include "large_batch_li.h"
 #include "window_types.h"
@@ -94,9 +95,15 @@ template<bool LargeBatch>
 __aicore__ inline void RunTerminalRow(GM_ADDR binding, uint32_t b, uint32_t q){
  auto runtime=reinterpret_cast<__gm__ terminal_runtime::Binding*>(binding);
  GM_ADDR arg=reinterpret_cast<GM_ADDR>(runtime->pipeline);
+ uint32_t query=b*4+q;
+#if KVIP_STAGE_TRACE
+ const uint64_t trace = KVIP_TRACE_WORKSPACE(arg);
+ const kvip_trace::ScanSample pipeSample{trace, kvip_trace::Terminal, 0, query};
+#endif
+ KVIP_TRACE_BEGIN(bodyScope, trace, Terminal, KernelBody, 0, query);
+ KVIP_TRACE_BEGIN(setupScope, trace, Terminal, Setup, 0, query);
  auto a=reinterpret_cast<__gm__ pipeline_ab::Args*>(arg);auto ctx=reinterpret_cast<__gm__ rotating::Context*>(a->context);auto s=rotating::LoadRuntimeShape(ctx);
  bool profile=(runtime->options&1U)!=0;
- uint32_t query=b*4+q;
  auto flags=reinterpret_cast<__gm__ uint32_t*>(runtime->flags)+terminal_runtime::RowFlagOffset(b);
  auto ts=reinterpret_cast<__gm__ uint64_t*>(runtime->times)+terminal_runtime::QueryTraceOffset(b,q);
  const uint32_t owner=ctx->rowOwners?reinterpret_cast<__gm__ uint32_t*>(ctx->rowOwners)[b]:b;
@@ -112,11 +119,15 @@ __aicore__ inline void RunTerminalRow(GM_ADDR binding, uint32_t b, uint32_t q){
  TPipe pipe;
  using Type=QLICommon::QLIType<fp8_e4m3fn_t,fp8_e4m3fn_t,int32_t,true,QLICommon::LI_LAYOUT::BSND,QLICommon::LI_LAYOUT::PA_BSND,bfloat16_t,float,float,uint16_t>;
  QLIKernel::QLIVector<Type> op;QLICommon::ConstInfo ci{};ci.gSize=32;ci.qHeadNum=32;ci.kHeadNum=1;ci.headDim=128;ci.mBaseSize=64;ci.s1BaseSize=2;ci.s2BaseSize=128;ci.sparseCount=2048;ci.kSeqSize=s.history;ci.kCacheBlockSize=128;ci.maxBlockNumPerBatch=s.history/128;
+ KVIP_TRACE_BEGIN(bufferScope, trace, Terminal, LiBufferSetup, 0, query);
  QLITilingData tiling{};op.SetStreamingWorkspace(arg);op.InitParams(ci,&tiling,false);op.InitBuffers(&pipe,false);op.SetRotationContext(reinterpret_cast<GM_ADDR>(ctx));
  GlobalTensor<uint16_t> scores;op.InitVecWorkspaceTensor(scores);GlobalTensor<bfloat16_t> weights;GlobalTensor<float> qs,ks;GlobalTensor<int32_t> out,blocks;out.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(ctx->selected));op.InitVecInputTensor(weights,qs,ks,out,blocks);
+ KVIP_TRACE_END(bufferScope);
  auto ends=reinterpret_cast<__gm__ const uint32_t*>(ctx->queryEnds);
  uint32_t scanHistory=LargeBatch ? large_li::ScanHistory(s,ends,b) : rotating::ActiveScanHistory(s,ends,b);
  op.AllocEventID();if(profile)ts[1]=GetSystemCycle();
+ KVIP_TRACE_END(setupScope);
+ KVIP_TRACE_BEGIN(topkScope, trace, Terminal, TerminalTopK, 0, query);
  uint32_t topkError=0;
  if constexpr (LargeBatch) {
   auto ready=reinterpret_cast<__gm__ uint32_t*>(runtime->reserved[2])+(b*8+q)*32;
@@ -141,6 +152,9 @@ __aicore__ inline void RunTerminalRow(GM_ADDR binding, uint32_t b, uint32_t q){
  }else{
   topkError=op.template TerminalQueryRuntime<false>(query,scanHistory);
  }
+ KVIP_TRACE_END(topkScope);
+ KVIP_TRACE_BEGIN(resolveScope, trace, Terminal, TerminalResolve, 0, query);
+ KVIP_TRACE_BEGIN(prepareScope, trace, Terminal, TerminalResolvePrepare, 0, query);
  uint32_t ownError=topkError;if(profile)ts[2]=GetSystemCycle();Signal(flags,q,generation);
  auto postWork=op.TerminalWork(),postIds=op.TerminalCompact(),postScratch=op.TerminalScratch();
  auto compact=reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048;
@@ -159,8 +173,10 @@ __aicore__ inline void RunTerminalRow(GM_ADDR binding, uint32_t b, uint32_t q){
  auto activeLru=reinterpret_cast<__gm__ uint32_t*>(ctx->lruSlots)+uint64_t(b)*rotating::kLruSlots;
  uint32_t slotCapacity=rotating::kLruSlots;bool capacityCounted=false;
  auto headers=reinterpret_cast<__gm__ uint32_t*>(rotating::TopKHeader(ctx))+b*128;
+ KVIP_TRACE_END(prepareScope);
  for(uint32_t capacityPass=0;capacityPass<2;++capacityPass){
  if(capacityPass){
+ KVIP_TRACE_BEGIN(capacityScope, trace, Terminal, TerminalCapacity, capacityPass, query);
  Simt::VF_CALL<PrepareTerminalCapacity>(Simt::Dim3{32,1,1},
   reinterpret_cast<__ubuf__ uint32_t*>(postIds.GetPhyAddr()),candidates,mapping,
   headers,flags,generation,q,priorSlots,
@@ -185,10 +201,13 @@ __aicore__ inline void RunTerminalRow(GM_ADDR binding, uint32_t b, uint32_t q){
  // Consume the original compact UB result directly; compact destinations use postWork.
  // MERGED_OUTPUT_BEFORE_WQE
  if(profile)ts[6]=GetSystemCycle();
+ KVIP_TRACE_BEGIN(packScope, trace, Terminal, TerminalResolveVf, capacityPass, query);
  Simt::VF_CALL<PackUniqueLocal<LargeBatch>>(Simt::Dim3{512,1,1},reinterpret_cast<__ubuf__ uint32_t*>(postIds.GetPhyAddr()),width,counts[0],counts[1],counts[2],counts[3],q,mapping,reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postControl.GetPhyAddr()),(reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+uint64_t(b)*1),reinterpret_cast<__gm__ uint64_t*>(rotating::RequestAddressTable(ctx,b,owner,s.history)),reinterpret_cast<__ubuf__ uint32_t*>(postWork.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postWork[2048].GetPhyAddr()),s.resident,reinterpret_cast<__ubuf__ uint32_t*>(postWork[4096].GetPhyAddr()),activeLru,slotCapacity,capacityCounted,capacityPass==0,headers,priorSlots,(reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity),(reinterpret_cast<__gm__ uint32_t*>(ctx->changeSlots)+uint64_t(b)*rotating::kChangeCapacity),(uint64_t(tailEnd)<<32)|tailBegin,tailCapacity,reinterpret_cast<__gm__ uint32_t*>(runtime->templates)+query*32,args,reinterpret_cast<__ubuf__ uint32_t*>(op.TerminalIds().GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postScratch.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(postControl[8].GetPhyAddr()),(reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history),flags,generation,s.history,reinterpret_cast<__gm__ uint32_t*>(ctx->selected)+query*2048,owner*uint32_t(ctx->outputStride),update,s.batch,query);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+ KVIP_TRACE_END(packScope);
  if(!postControl.GetValue(14))break;
  }
+ KVIP_TRACE_END(resolveScope);
  if(profile)ts[11]=GetSystemCycle();
  uint32_t own=postControl.GetValue(0);
  uint32_t total=postControl.GetValue(13);
@@ -196,6 +215,8 @@ __aicore__ inline void RunTerminalRow(GM_ADDR binding, uint32_t b, uint32_t q){
  uint32_t slotBase=postControl.GetValue(1);
  if(profile){ts[20]=own;ts[21]=own;ts[22]=slotBase;}
  if(profile)ts[12]=GetSystemCycle();
+ KVIP_TRACE_BEGIN(outputScope, trace, Terminal, TerminalOutput, 0, query);
+ KVIP_TRACE_BEGIN(outputMte3, trace, Terminal, TerminalOutputMte3, 0, query);
  auto ids=op.TerminalIds();
  GlobalTensor<uint32_t> output,slots;
  output.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(runtime->logical)+query*2048);slots.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+query*2048);
@@ -205,13 +226,16 @@ __aicore__ inline void RunTerminalRow(GM_ADDR binding, uint32_t b, uint32_t q){
  const bool sharedSlotOutput = LargeBatch && update[23] == ctx->locations;
  if (!sharedSlotOutput) DataCopy(slots,postScratch,2048);
  PublishTerminalOutputs<LargeBatch>(update,s.batch,query,ids,postScratch,postControl[terminal_runtime::Routes<LargeBatch>::base],sharedSlotOutput ? 0 : ctx->locations+uint64_t(query)*2048*4);
+ KVIP_TRACE_END(outputMte3);
+ KVIP_TRACE_END(outputScope);
  uint32_t packError=postControl.GetValue(8);ownError|=packError;
  if(profile)ts[7]=GetSystemCycle();
  auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(args->queue_state);
  uint64_t originalHead=uint64_t(postWork.GetValue(6144+18))|(uint64_t(postWork.GetValue(6144+19))<<32);
  if(own){
+  KVIP_TRACE_BEGIN(wqeScope, trace, Terminal, TerminalWqe, 0, query);
   if(profile)ts[13]=GetSystemCycle();
-  rotating::WriteReservedWqes(s.tokenBytes,args->channel_entity,args->queue_state,args->output,postWork[4096],postScratch,postWork,postWork[2048],postWork[6144],own,256,false,nullptr,0,own,reinterpret_cast<__gm__ uint32_t*>(runtime->templates)+query*32,originalHead);
+  rotating::WriteReservedWqes(s.tokenBytes,args->channel_entity,args->queue_state,args->output,postWork[4096],postScratch,postWork,postWork[2048],postWork[6144],own,256,false,nullptr,0,own,reinterpret_cast<__gm__ uint32_t*>(runtime->templates)+query*32,originalHead KVIP_PIPE_ARG);
   if (batches.count > 1) {
    auto cfg = postWork[6144];
    auto sq = reinterpret_cast<__gm__ uint32_t*>(cfg.ReinterpretCast<uint64_t>().GetValue(12));
@@ -223,7 +247,9 @@ __aicore__ inline void RunTerminalRow(GM_ADDR binding, uint32_t b, uint32_t q){
  if(profile)ts[14]=GetSystemCycle();
  // Logical IDs are emitted with slots after all admissions are visible.
  if(profile)ts[15]=GetSystemCycle();
+ KVIP_TRACE_BEGIN(commitScope, trace, Terminal, TerminalDoorbell, 0, query);
  rotating::CommitTerminalPost(args,originalHead,batches.ends[0],post);
+ KVIP_TRACE_END(commitScope);
  if(profile)ts[4]=GetSystemCycle();
 
  op.FreeEventID();
@@ -231,6 +257,7 @@ __aicore__ inline void RunTerminalRow(GM_ADDR binding, uint32_t b, uint32_t q){
  auto local=op.TerminalScratch();auto work=reinterpret_cast<__ubuf__ uint32_t*>(local.GetPhyAddr());
  // Publish output readiness and join in the same full-warp task.
  auto allSources=reinterpret_cast<__gm__ uint32_t*>(ctx->changes)+uint64_t(b)*rotating::kChangeCapacity;
+ KVIP_TRACE_BEGIN(indexScope, trace, Terminal, TerminalIndex, 0, query);
  if(profile)ts[8]=GetSystemCycle();
  kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(queue),64);
  if(profile && !q)ts[30]=(reinterpret_cast<__gm__ volatile rotating::MappingJournal*>(ctx->mappingJournal)+uint64_t(b)*1)->count;
@@ -245,6 +272,7 @@ __aicore__ inline void RunTerminalRow(GM_ADDR binding, uint32_t b, uint32_t q){
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  }
  if(profile)ts[26]=GetSystemCycle();
+ KVIP_TRACE_BEGIN(indexVf, trace, Terminal, TerminalIndexVf, 0, query);
  uint32_t indexError=0;
  Simt::VF_CALL<UpdateIndex>(Simt::Dim3{512,1,1},src,dst,n,s.resident,s.history,(reinterpret_cast<__gm__ uint64_t*>(a->keys)+uint64_t(owner)*s.history*16),(reinterpret_cast<__gm__ uint32_t*>(a->scales)+uint64_t(owner)*s.history),(reinterpret_cast<__gm__ uint64_t*>(a->addresses)+uint64_t(owner)*addressStride),(reinterpret_cast<__gm__ uint64_t*>(a->logical)+uint64_t(owner)*s.history),work,ctx,total,q,first,reinterpret_cast<__gm__ uint32_t*>(rotating::TopKHeader(ctx))+query*32,reinterpret_cast<__gm__ uint32_t*>(ctx->progress)+query*32,priorJournalCount,b,flags+(12+q)*32,false);
  SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
@@ -291,14 +319,22 @@ __aicore__ inline void RunTerminalRow(GM_ADDR binding, uint32_t b, uint32_t q){
    reinterpret_cast<__gm__ uint32_t*>(ctx->progress)+query*32,priorJournalCount,b,flags+(12+q)*32,true);
   SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
  }
+ KVIP_TRACE_END(indexVf);
+ KVIP_TRACE_END(indexScope);
  ownError|=(indexError<<4);
  if(profile)ts[16]=GetSystemCycle();
+ KVIP_TRACE_BEGIN(finalCqScope, trace, Terminal, TerminalGetCq, 0, query);
  uint64_t cqError=rotating::CompleteTerminalPost(args,post,batches,originalHead);
+ KVIP_TRACE_END(finalCqScope);
  if(profile)ts[24]=GetSystemCycle();
- if(q==1)rotating::CompleteTerminalPrefetch(ctx,b);
+ if(q==1) {
+  KVIP_TRACE_BEGIN(earlyCqScope, trace, Terminal, TerminalPrefetchCq, 0, query);
+  rotating::CompleteTerminalPrefetch(ctx,b);
+ }
  ownError|=uint32_t(cqError);
  if(profile)ts[17]=GetSystemCycle();
  if(profile)ts[9]=GetSystemCycle();
+ KVIP_TRACE_BEGIN(finishScope, trace, Terminal, TerminalFinish, 0, query);
  uint32_t prefetchError=q==1?(reinterpret_cast<__gm__ rotating::Row*>(ctx->rows)+b)->error:0;
  cqError|=prefetchError;
  if(ownError || cqError){

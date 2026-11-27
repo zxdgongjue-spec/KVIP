@@ -1,3 +1,4 @@
+#include "stage_trace.h"
 /**
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
@@ -39,7 +40,7 @@ public:
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
     template <bool DeferResultCredit = false>
-    __aicore__ inline void ComputeMm1(const QLICommon::RunInfo &runInfo);
+    __aicore__ inline void ComputeMm1(const QLICommon::RunInfo &runInfo KVIP_PIPE_PARAM_DEFAULT);
 
     static constexpr uint64_t KEY_BUF_NUM = 3;
     static constexpr uint64_t QUERY_BUF_NUM = 2;
@@ -69,7 +70,8 @@ public:
     static constexpr uint64_t L0C_BUFFER_OFFSET = M_BASIC_BLOCK_L0 * S2_BASIC_BLOCK_L0;
 
 protected:
-    __aicore__ inline void WaitResultCredit(uint32_t loop) {
+    __aicore__ inline void WaitResultCredit(uint32_t loop KVIP_PIPE_PARAM) {
+        KVIP_PIPE_SAMPLE(credit, pipeSample, AicCreditWait);
         const uint32_t bank = QLICommon::ConstInfo::CROSS_VC_EVENT + loop % 2;
         CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(bank);
         CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
@@ -163,15 +165,16 @@ QLIMatmul<QLIT>::InitMm1GlobalTensor(const GlobalTensor<int32_t> &blkTableGm, co
 
 template <typename QLIT>
 template <bool DeferResultCredit>
-__aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &runInfo)
+__aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &runInfo KVIP_PIPE_PARAM)
 {
     bool pendingCredit = DeferResultCredit;
-    if constexpr (!DeferResultCredit) WaitResultCredit(runInfo.loop);
+    if constexpr (!DeferResultCredit) WaitResultCredit(runInfo.loop KVIP_PIPE_ARG);
     uint64_t s2GmBaseOffset = runInfo.s2Idx * constInfo_.s2BaseSize;
     uint64_t s1gProcessSize = runInfo.actMBaseSize;
     uint64_t s2ProcessSize = runInfo.actualSingleProcessSInnerSize;
     if (s2BasicBlock_ == 128) {
         for (uint64_t s2GmOffset = 0; s2GmOffset < s2ProcessSize; s2GmOffset += s2BasicBlock_) {
+            KVIP_PIPE_SAMPLE(keyScope, pipeSample, AicKeyMte2);
             WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + keyL1BufIdx_ % KEY_BUF_NUM);
             uint64_t s2L1RealSize =
                 s2GmOffset + s2BasicBlock_ > s2ProcessSize ? s2ProcessSize - s2GmOffset : s2BasicBlock_;
@@ -183,6 +186,7 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
 
             SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
             WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
+            KVIP_TRACE_END(keyScope);
             // s1gProcessSize当前必定不会超过2倍的s1g basic block
             for (uint64_t s1gGmOffset = 0; s1gGmOffset < s1gProcessSize; s1gGmOffset += constInfo_.mBaseSize) {
                 uint64_t s1gL1RealSize =
@@ -195,12 +199,14 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
 #else
                 if (runInfo.isFirstS2InnerLoop && s2GmOffset == 0) {
 #endif
+                    KVIP_PIPE_SAMPLE(queryScope, pipeSample, AicQueryMte2);
                     queryL1Mte2BufIdx_++;
                     queryL1Mte1BufIdx_ = queryL1Mte2BufIdx_;
                     WaitFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + queryL1Mte2BufIdx_ % QUERY_BUF_NUM);
                     QueryNd2Nz(s1gL1RealSize, s1gGmOffset, runInfo);
                     SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
                     WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
+                    KVIP_TRACE_END(queryScope);
                 } else {
                     queryL1Mte1BufIdx_ =
                         queryL1Mte2BufIdx_ - (CeilDiv(s1gProcessSize, constInfo_.mBaseSize) - 1 - (s1gGmOffset > 0));
@@ -209,6 +215,7 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
                     uint64_t s2L0RealSize =
                         s2L1Offset + S2_BASIC_BLOCK_L0 > s2L1RealSize ? s2L1RealSize - s2L1Offset : S2_BASIC_BLOCK_L0;
                     for (uint64_t s1gOffset = 0; s1gOffset < s1gL1SizeAlign2G; s1gOffset += constInfo_.mBaseSize) {
+                        KVIP_PIPE_SAMPLE(l0Scope, pipeSample, AicL0Mte1);
                         WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
                         uint64_t s1gL0RealSize =
                             s1gOffset + constInfo_.mBaseSize > s1gL1SizeAlign2G ?
@@ -219,9 +226,14 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
 
                         SetFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
                         WaitFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
+                        KVIP_TRACE_END(l0Scope);
 
+                        KVIP_PIPE_SAMPLE(fixWait, pipeSample, AicFixpWait);
                         WaitFlag<HardEvent::FIX_M>(FIX_M_EVENT + l0BufIdx_ % L0_BUF_NUM);
+                        KVIP_TRACE_END(fixWait);
+                        KVIP_PIPE_SAMPLE(cubeScope, pipeSample, AicCubeIssue);
                         ComputeL0c(s1gL0RealSize, s2L0RealSize, runInfo);
+                        KVIP_TRACE_END(cubeScope);
 
                         SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
 
@@ -229,11 +241,13 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
                             // AIC-private MTE and MMAD may issue before the
                             // matching result bank is released by BOTH AIVs.
                             if (pendingCredit) {
-                                WaitResultCredit(runInfo.loop);
+                                WaitResultCredit(runInfo.loop KVIP_PIPE_ARG);
                                 pendingCredit = false;
                             }
                         }
+                        KVIP_PIPE_SAMPLE(fixScope, pipeSample, AicFixpIssue);
                         Fixp(s1gGmOffset + s1gOffset, s2GmOffset + s2L1Offset, s1gL0RealSize, s2L0RealSize, runInfo);
+                        KVIP_TRACE_END(fixScope);
                         SetFlag<HardEvent::FIX_M>(FIX_M_EVENT + l0BufIdx_ % L0_BUF_NUM);
                         l0BufIdx_++;
                     }
@@ -259,6 +273,7 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
             bool keyCacheHit = isKeyCacheValid_ && (s2GmBaseOffset >= keyGmStart_) &&
                                  (s2GmBaseOffset + s2ProcessSize <= keyGmStart_ + keyLoadedSize_);
             if (!keyCacheHit) {
+                KVIP_PIPE_SAMPLE(keyScope, pipeSample, AicKeyMte2);
                 WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + keyL1BufIdx_ % KEY_BUF_NUM);
                 // 缓存未命中，需要从GM搬到L1 min（256, 剩余s2）
                 uint64_t s2TotalRemainNum = runInfo.actS2Size - s2GmBaseOffset;
@@ -271,6 +286,7 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
 
                 SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
                 WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
+                KVIP_TRACE_END(keyScope);
 
                 isKeyCacheValid_ = true;
                 keyGmStart_ = s2GmBaseOffset;
@@ -290,12 +306,14 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
 #else
                 if (runInfo.isFirstS2InnerLoop && s2GmOffset == 0) {
 #endif
+                    KVIP_PIPE_SAMPLE(queryScope, pipeSample, AicQueryMte2);
                     queryL1Mte2BufIdx_++;
                     queryL1Mte1BufIdx_ = queryL1Mte2BufIdx_;
                     WaitFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + queryL1Mte2BufIdx_ % QUERY_BUF_NUM);
                     QueryNd2Nz(s1gL1RealSize, s1gGmOffset, runInfo);
                     SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
                     WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
+                    KVIP_TRACE_END(queryScope);
                 } else {
                     queryL1Mte1BufIdx_ =
                         queryL1Mte2BufIdx_ - (CeilDiv(s1gProcessSize, constInfo_.mBaseSize) - 1 - (s1gGmOffset > 0));
@@ -307,6 +325,7 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
                                             l1S2Offset + s2ProcessSize - s2L1Offset :
                                             S2_BASIC_BLOCK_L0;
                     for (uint64_t s1gOffset = 0; s1gOffset < s1gL1SizeAlign2G; s1gOffset += constInfo_.mBaseSize) {
+                        KVIP_PIPE_SAMPLE(l0Scope, pipeSample, AicL0Mte1);
                         WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
                         uint64_t s1gL0RealSize =
                             s1gOffset + constInfo_.mBaseSize > s1gL1SizeAlign2G ?
@@ -317,9 +336,14 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
 
                         SetFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
                         WaitFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
+                        KVIP_TRACE_END(l0Scope);
 
+                        KVIP_PIPE_SAMPLE(fixWait, pipeSample, AicFixpWait);
                         WaitFlag<HardEvent::FIX_M>(FIX_M_EVENT + l0BufIdx_ % L0_BUF_NUM);
+                        KVIP_TRACE_END(fixWait);
+                        KVIP_PIPE_SAMPLE(cubeScope, pipeSample, AicCubeIssue);
                         ComputeL0c(s1gL0RealSize, s2L0RealSize, runInfo);
+                        KVIP_TRACE_END(cubeScope);
 
                         SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
 
@@ -327,12 +351,14 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
                             // AIC-private MTE and MMAD may issue before the
                             // matching result bank is released by BOTH AIVs.
                             if (pendingCredit) {
-                                WaitResultCredit(runInfo.loop);
+                                WaitResultCredit(runInfo.loop KVIP_PIPE_ARG);
                                 pendingCredit = false;
                             }
                         }
+                        KVIP_PIPE_SAMPLE(fixScope, pipeSample, AicFixpIssue);
                         Fixp(s1gGmOffset + s1gOffset, (s2L1Offset - l1S2Offset),
                                                 s1gL0RealSize, s2L0RealSize, runInfo);
+                        KVIP_TRACE_END(fixScope);
                         SetFlag<HardEvent::FIX_M>(FIX_M_EVENT + l0BufIdx_ % L0_BUF_NUM);
                         l0BufIdx_++;
                     }
@@ -356,7 +382,7 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
 
     if constexpr (DeferResultCredit) {
         // Keep the credit ledger balanced for an empty issue as well.
-        if (pendingCredit) WaitResultCredit(runInfo.loop);
+        if (pendingCredit) WaitResultCredit(runInfo.loop KVIP_PIPE_ARG);
     }
     CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_CV_EVENT + runInfo.loop % 2);
     CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_CV_EVENT + runInfo.loop % 2 + QLICommon::ConstInfo::AIV0_AIV1_OFFSET);

@@ -1,4 +1,5 @@
 #pragma once
+#include "stage_trace.h"
 #if V9_UBMEM
 #include "../../lightning_indexer_with_fetch_ubmem/op_kernel/controller/prefetch.h"
 namespace kvaf_device { using ubmem_device::CleanCacheLines; constexpr uint32_t kInvalidArgs=0x20000, kCqTimeout=0x40000; }
@@ -264,7 +265,7 @@ __simd_vf__ inline void FinalBuild(uint32_t rt_tokenBytes,__ubuf__ uint32_t* rem
 }
 
 __aicore__ inline bool SubmitWqesAt(uint32_t rt_tokenBytes,uint64_t entityAddress,uint64_t queueAddress,uint64_t output,LocalTensor<uint32_t> slots,LocalTensor<uint32_t> words,
-    LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize,bool final,__gm__ Row* row) {
+    LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize,bool final,__gm__ Row* row KVIP_PIPE_PARAM_DEFAULT) {
     auto queue=reinterpret_cast<__gm__ KvafBatchGetQueueState*>(queueAddress);
     // Intermediate service exclusively owns this queue; CQ draining starts
     // after LI completes. Keep its state on the DMA path, like the batch row.
@@ -307,12 +308,15 @@ __aicore__ inline bool SubmitWqesAt(uint32_t rt_tokenBytes,uint64_t entityAddres
     // 1024 WQEs, halving the dispatch/DMA fences for the usual final batch.
     for(uint32_t begin=0;begin<count;begin+=bankSize) {
         uint32_t n=count-begin<bankSize?count-begin:bankSize;
+        KVIP_PIPE_SAMPLE(buildScope, pipeSample, PrefetchBuildVf);
         FinalBuild(rt_tokenBytes,reinterpret_cast<__ubuf__ uint32_t*>(remoteLow.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(remoteHigh.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(slots.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(words.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),begin,n,count);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        KVIP_TRACE_END(buildScope);
+        KVIP_PIPE_SAMPLE(sqScope, pipeSample, PrefetchSqMte3);
         uint32_t start=uint32_t(head+begin)&(sqDepth-1),first=n<sqDepth-start?n:sqDepth-start;
         DataCopy(sq[start*16],words,first*16);
         if(first!=n)DataCopy(sq,words[first*16],(n-first)*16);
@@ -327,6 +331,7 @@ __aicore__ inline bool SubmitWqesAt(uint32_t rt_tokenBytes,uint64_t entityAddres
         SetFlag<HardEvent::S_MTE3>(EVENT_ID0);WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
         DataCopy(queueGm,queueLocal,16);
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        KVIP_PIPE_SAMPLE(doorbellScope, pipeSample, PrefetchDoorbell);
 #if V9_SIMULATION
         *reinterpret_cast<__gm__ uint64_t*>(doorbell)=head+count;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(doorbell),64);
@@ -349,7 +354,7 @@ __aicore__ inline bool SubmitWqesAt(uint32_t rt_tokenBytes,uint64_t entityAddres
 }
 #if KVIP_PARALLEL_TERMINAL
 __aicore__ inline bool WriteReservedWqes(uint32_t rt_tokenBytes,uint64_t entityAddress,uint64_t queueAddress,uint64_t output,LocalTensor<uint32_t> slots,LocalTensor<uint32_t> words,
-    LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize,bool final,__gm__ Row* row,uint32_t offset,uint32_t total,__gm__ uint32_t* boundTemplate,uint64_t originalHead) {
+    LocalTensor<uint32_t> remoteLow,LocalTensor<uint32_t> remoteHigh,LocalTensor<uint32_t> cfg,uint32_t count,uint32_t bankSize,bool final,__gm__ Row* row,uint32_t offset,uint32_t total,__gm__ uint32_t* boundTemplate,uint64_t originalHead KVIP_PIPE_PARAM_DEFAULT) {
     if(!count)return false;
     auto cfg64=cfg.ReinterpretCast<uint64_t>();uint64_t head=originalHead+offset;
 #ifdef KVIP_KVAF_URMA_REGISTERED_BASE
@@ -363,12 +368,15 @@ __aicore__ inline bool WriteReservedWqes(uint32_t rt_tokenBytes,uint64_t entityA
     // selected and locations are both dead: their contiguous 64KiB holds
     // 1024 WQEs, halving the dispatch/DMA fences for the usual final batch.
     if(count<=bankSize){
+        KVIP_PIPE_SAMPLE(buildScope, pipeSample, TerminalWqeVf);
         FinalBuild(rt_tokenBytes,reinterpret_cast<__ubuf__ uint32_t*>(remoteLow.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(remoteHigh.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(slots.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(words.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),0,count,total-offset);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        KVIP_TRACE_END(buildScope);
+        KVIP_PIPE_SAMPLE(sqScope, pipeSample, TerminalSqMte3);
         uint32_t start=uint32_t(head)&(sqDepth-1),first=count<sqDepth-start?count:sqDepth-start;
         DataCopy(sq[start*16],words,first*16);
         if(first!=count)DataCopy(sq,words[first*16],(count-first)*16);
@@ -376,12 +384,15 @@ __aicore__ inline bool WriteReservedWqes(uint32_t rt_tokenBytes,uint64_t entityA
     }else{
     for(uint32_t begin=0;begin<count;begin+=bankSize) {
         uint32_t n=count-begin<bankSize?count-begin:bankSize;
+        KVIP_PIPE_SAMPLE(buildScope, pipeSample, TerminalWqeVf);
         FinalBuild(rt_tokenBytes,reinterpret_cast<__ubuf__ uint32_t*>(remoteLow.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(remoteHigh.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(slots.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(words.GetPhyAddr()),
             reinterpret_cast<__ubuf__ uint32_t*>(cfg.GetPhyAddr()),begin,n,total-offset);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        KVIP_TRACE_END(buildScope);
+        KVIP_PIPE_SAMPLE(sqScope, pipeSample, TerminalSqMte3);
         uint32_t start=uint32_t(head+begin)&(sqDepth-1),first=n<sqDepth-start?n:sqDepth-start;
         DataCopy(sq[start*16],words,first*16);
         if(first!=n)DataCopy(sq,words[first*16],(n-first)*16);
@@ -590,7 +601,7 @@ inline void UnionColdTopk(__ubuf__ uint32_t* input,__ubuf__ uint32_t* bits,
 template<bool captureIo, bool predecessorChecked=false>
 __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_rounds,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer,uint32_t epoch,uint32_t core,uint32_t lane,
     LocalTensor<uint32_t> scratch,LocalTensor<uint16_t> flags,LocalTensor<uint32_t> ids,
-    uint32_t sequenceHalfWindow) {
+    uint32_t sequenceHalfWindow KVIP_PIPE_PARAM_DEFAULT) {
     // Only IDs in the service lane's scoring range can be nominated. Size the
     // local set by that range; mappings and global covered rows use the full stride.
     const uint32_t tokenLimit = sequenceHalfWindow
@@ -604,6 +615,7 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     auto ctx=reinterpret_cast<__gm__ Context*>(pointer);auto events=reinterpret_cast<__gm__ Event*>(ctx->events);
     auto event=events+epoch*rt_serviceLanes+lane;event->core=core;event->epoch=epoch;V9_FETCH_PROFILE(if constexpr (!predecessorChecked) event->waitBegin=GetSystemCycle();)
     if constexpr (!predecessorChecked) if(epoch) {
+        KVIP_TRACE_BEGIN(waitScope, pipeSample.base, Cold, ServicePredecessor, epoch, lane);
         auto previous=reinterpret_cast<__gm__ volatile Event*>(events)+(epoch-1)*rt_serviceLanes+lane;
         do { kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(events+(epoch-1)*rt_serviceLanes+lane),64); }
         while(!previous->complete);
@@ -618,6 +630,7 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
     GlobalTensor<uint32_t> allRows;allRows.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rows));
     if(rt_batchedRows) {
         if(lane<rt_batch) {
+            KVIP_TRACE_BEGIN(rowRead, pipeSample.base, Cold, ServiceInputMte2, epoch, lane);
             DataCopyExtParams copy;copy.blockCount=(rt_batch-lane+rt_serviceLanes-1)/rt_serviceLanes;
             copy.blockLen=sizeof(Row);copy.srcStride=(rt_serviceLanes-1)*sizeof(Row);copy.dstStride=0;
             DataCopyPadExtParams<uint32_t> pad{false,0,0,0};
@@ -632,6 +645,7 @@ __aicore__ inline void FastService(uint32_t rt_batch,uint32_t rt_history,uint32_
         GlobalTensor<uint32_t> rowGm;
         rowGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->rows)+b*256);
         if(!rt_batchedRows) {
+            KVIP_TRACE_BEGIN(rowRead, pipeSample.base, Cold, ServiceInputMte2, epoch, b);
             DataCopy(state,rowGm,256);
             SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
         }
@@ -646,12 +660,15 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         uint32_t available=requests<ctx->prefetchLimit?ctx->prefetchLimit-requests:0;
         if(available>ctx->windowLimit)available=ctx->windowLimit;
         V9_FETCH_PROFILE(scanBegin=GetSystemCycle();)
+        KVIP_TRACE_BEGIN(selectScope, pipeSample.base, Cold, ServiceSelect, epoch, b);
         // Counts occupy spare incremental metadata, exported alongside TopK.
         GlobalTensor<uint32_t> metadata,compact;
         metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(rotating::TopKHeader(ctx))+b*128);
         compact.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ctx->locations)+b*8192);
+        KVIP_TRACE_BEGIN(headerRead, pipeSample.base, Cold, ServiceInputMte2, epoch, b);
         DataCopy(cfg[128],metadata,128);
         SetFlag<HardEvent::MTE2_S>(EVENT_ID0);WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        KVIP_TRACE_END(headerRead);
         uint32_t counts[4],maxCount=0;
         for(uint32_t q=0;q<4;++q){counts[q]=cfg.GetValue(128+q*32+6);if(counts[q]>maxCount)maxCount=counts[q];}
         cfg.SetValue(40,0);
@@ -663,11 +680,14 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
         // overwrite ctx->locations in the original downstream submission path.
         for(uint32_t start=0;start<maxCount;start+=256) {
             uint32_t width=maxCount-start;if(width>256)width=256;width=(width+7)/8*8;
+            KVIP_TRACE_BEGIN(idsRead, pipeSample.base, Cold, ServiceInputMte2, epoch, b);
             SetFlag<HardEvent::V_MTE2>(EVENT_ID5);WaitFlag<HardEvent::V_MTE2>(EVENT_ID5);
             DataCopyExtParams copy;copy.blockCount=4;copy.blockLen=width*4;copy.srcStride=(2048-width)*4;copy.dstStride=0;
             DataCopyPadExtParams<uint32_t> pad{false,0,0,0};
             DataCopyPad(input,compact[start],copy,pad);
             SetFlag<HardEvent::MTE2_V>(EVENT_ID5);WaitFlag<HardEvent::MTE2_V>(EVENT_ID5);
+            KVIP_TRACE_END(idsRead);
+            KVIP_TRACE_BEGIN(unionScope, pipeSample.base, Cold, ServiceUnionVf, epoch, b);
             SetFlag<HardEvent::S_V>(EVENT_ID0);WaitFlag<HardEvent::S_V>(EVENT_ID0);
             uint32_t n[4];for(uint32_t q=0;q<4;++q)n[q]=counts[q]>start?((counts[q]-start)<width?counts[q]-start:width):0;
             Simt::VF_CALL<UnionColdTopk>(Simt::Dim3{256,1,1},
@@ -678,6 +698,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
                 reinterpret_cast<__gm__ uint32_t*>(ctx->mapping)+uint64_t(b)*rt_history,ctx,b,rt_resident);
         }
         SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        KVIP_TRACE_END(selectScope);
         candidateCount=cfg.GetValue(40);if(candidateCount>kCandidateCapacity)candidateCount=kCandidateCapacity;
 
 
@@ -699,6 +720,7 @@ auto postInput=cfg[256+(b/rt_serviceLanes)*80];
                 uint64_t output=args.output+uint64_t(owner)*stride*rt_tokenBytes;
                 V9_FETCH_PROFILE(postBegin=GetSystemCycle();)
 if (rt_batchedRows) {
+                KVIP_TRACE_BEGIN(prepareScope, pipeSample.base, Cold, PrefetchPrepare, epoch, b);
                 auto post64=postInput.ReinterpretCast<uint64_t>();
                 postInput.SetValue(64,count);postInput.SetValue(65,rt_resident+slots);
                 postInput.SetValue(66,pending);post64.SetValue(34,addresses);
@@ -726,13 +748,16 @@ if (rt_batchedRows) {
                 slots+=count;requests+=count;
 } else {
                 {
+                    KVIP_TRACE_BEGIN(prepareScope, pipeSample.base, Cold, PrefetchPrepare, epoch, b);
                     Simt::VF_CALL<PrepareCandidateWqes>(Simt::Dim3{256,1,1},rt_resident,
                         reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
                         reinterpret_cast<__ubuf__ uint32_t*>(work[512].GetPhyAddr()),reinterpret_cast<__ubuf__ uint32_t*>(work[1024].GetPhyAddr()),
                         map,reinterpret_cast<__gm__ uint64_t*>(addresses),count,rt_resident+slots,ctx,b,reinterpret_cast<__gm__ uint32_t*>(kvip_prefetch_rank::CoveredAddress(ctx->incremental,rt_batch,rt_history,b)));
                     SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+                    KVIP_TRACE_END(prepareScope);
+                    KVIP_TRACE_BEGIN(postScope, pipeSample.base, Cold, PrefetchSubmit, epoch, b);
                     if(captureIo && !firstDoorbell)firstDoorbell=GetSystemCycle();
-                    SubmitWqesAt(rt_tokenBytes,entityAddress,queueAddress,output,work[1024],scratch,work,work[512],cfg,count,256,false,nullptr);
+                    SubmitWqesAt(rt_tokenBytes,entityAddress,queueAddress,output,work[1024],scratch,work,work[512],cfg,count,256,false,nullptr KVIP_PIPE_ARG);
                     ++pending;
                     if(captureIo)lastDoorbell=GetSystemCycle();
                     slots+=count;requests+=count;
@@ -762,12 +787,14 @@ if (rt_batchedRows) {
     }
 if (rt_batchedRows) {
     if(postedCount) {
+        KVIP_TRACE_BEGIN(postScope, pipeSample.base, Cold, PrefetchSubmit, epoch, lane);
         V9_FETCH_PROFILE(begin=GetSystemCycle();)
         uint32_t maxCount=0;
         for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
             uint32_t n=cfg.GetValue(256+(b/rt_serviceLanes)*80+64);if(n>maxCount)maxCount=n;
         }
         for(uint32_t start=0;start<maxCount;start+=rt_postBank) {
+            KVIP_TRACE_BEGIN(batchBuildScope, pipeSample.base, Cold, PrefetchBuildVf, epoch, lane);
             Simt::VF_CALL<BatchBuild<V9_BATCH_POST==1>>(Simt::Dim3{512,1,1},rt_batch,rt_history,rt_resident,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,sparseWindow,ctx,epoch,lane,start,
                 reinterpret_cast<__ubuf__ uint64_t*>(work[512].GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(work.GetPhyAddr()),
@@ -775,6 +802,7 @@ if (rt_batchedRows) {
                 reinterpret_cast<__ubuf__ uint32_t*>(scratch.GetPhyAddr()));
             SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
             SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            KVIP_TRACE_END(batchBuildScope);
             for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
                 uint32_t g=b/rt_serviceLanes;auto input=cfg[256+g*80];auto in64=input.ReinterpretCast<uint64_t>();
                 uint32_t count=input.GetValue(64);if(count<=start)continue;
@@ -782,13 +810,16 @@ if (rt_batchedRows) {
                 uint32_t depth=input.GetValue(19),offset=uint32_t(in64.GetValue(25)+start)&(depth-1);
                 uint32_t first=n<depth-offset?n:depth-offset;
 #if V9_BATCH_POST == 2
+                KVIP_TRACE_BEGIN(wqeBuildScope, pipeSample.base, Cold, PrefetchBuildVf, epoch, b);
                 FinalBuild(rt_tokenBytes,reinterpret_cast<__ubuf__ uint32_t*>(work[512+g*rt_postBank].GetPhyAddr()),
                     reinterpret_cast<__ubuf__ uint32_t*>(work[1024+g*rt_postBank].GetPhyAddr()),
                     reinterpret_cast<__ubuf__ uint32_t*>(work[1536+g*rt_postBank].GetPhyAddr()),
                     reinterpret_cast<__ubuf__ uint32_t*>(scratch[g*rt_postBank*16].GetPhyAddr()),
                     reinterpret_cast<__ubuf__ uint32_t*>(work[g*32].GetPhyAddr()),0,n,count-start);
                 SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+                KVIP_TRACE_END(wqeBuildScope);
 #endif
+                KVIP_TRACE_BEGIN(sqScope, pipeSample.base, Cold, PrefetchSqMte3, epoch, b);
                 GlobalTensor<uint32_t> sq;sq.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(in64.GetValue(7)));
                 DataCopy(sq[offset*16],scratch[g*rt_postBank*16],first*16);
                 if(first<n)DataCopy(sq,scratch[(g*rt_postBank+first)*16],(n-first)*16);
@@ -810,6 +841,7 @@ if (rt_batchedRows) {
         for(uint32_t b=lane;b<rt_batch;b+=rt_serviceLanes) {
             auto input=cfg[256+(b/rt_serviceLanes)*80];if(!input.GetValue(64))continue;
             auto in64=input.ReinterpretCast<uint64_t>();uint64_t db=in64.GetValue(8),head=in64.GetValue(25);
+            KVIP_TRACE_BEGIN(doorbellScope, pipeSample.base, Cold, PrefetchDoorbell, epoch, b);
             if(captureIo && !firstDoorbell)firstDoorbell=GetSystemCycle();
 #if V9_SIMULATION
             *reinterpret_cast<__gm__ uint64_t*>(db)=head;
@@ -833,12 +865,20 @@ if (rt_batchedRows) {
 namespace rotating {
 __aicore__ inline void Service(uint32_t rt_batch,uint32_t rt_history,uint32_t rt_resident,uint32_t rt_splitQ,uint32_t rt_rounds,uint32_t rt_serviceAics,uint32_t rt_serviceLanes,uint32_t rt_tokenBytes,uint32_t rt_postThreads,uint32_t rt_postBank,uint32_t rt_batchedRows,uint32_t rt_scanTokens,GM_ADDR pointer, uint32_t epoch, uint32_t core,
     uint32_t lane, LocalTensor<uint32_t> scratch, LocalTensor<uint16_t> flags,
-    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false) {
+    LocalTensor<uint32_t> indices, uint32_t sequenceHalfWindow = 0,bool captureIo = false
+#if KVIP_STAGE_TRACE
+    , uint64_t traceBase = 0
+#endif
+    ) {
+#if KVIP_STAGE_TRACE
+    const kvip_trace::ScanSample pipeSample{traceBase, kvip_trace::Cold, epoch,
+        ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane)};
+#endif
     // RotateFetch calls AdvanceWindow first, which joins the same lane's
     // predecessor before touching incremental state. A second CQ-independent
     // poll here adds no ordering and delays the resumed score producer.
-    if(captureIo) FastService<true,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
-    else FastService<false,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow);
+    if(captureIo) FastService<true,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow KVIP_PIPE_ARG);
+    else FastService<false,true>(rt_batch,rt_history,rt_resident,rt_rounds,rt_serviceLanes,rt_tokenBytes,rt_postThreads,rt_postBank,rt_batchedRows,rt_scanTokens,pointer, epoch, core, ServiceLane(rt_batch,rt_splitQ,rt_serviceAics,core,lane), scratch, flags, indices, sequenceHalfWindow KVIP_PIPE_ARG);
 }
 }
 

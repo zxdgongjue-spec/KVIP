@@ -13,8 +13,15 @@ template <SequenceLiPhase Phase>
 __aicore__ inline void FixedLi(GM_ADDR bindings, GM_ADDR terminal) {
     auto args = reinterpret_cast<__gm__ terminal_runtime::Binding*>(terminal);
     auto ready = reinterpret_cast<__gm__ uint32_t*>(args->reserved[3]);
+#if KVIP_STAGE_TRACE
+    const uint32_t traceKernel = Phase == SequenceLiPhase::Hot ? kvip_trace::Hot : kvip_trace::Cold;
+    auto a = reinterpret_cast<__gm__ uint64_t*>(bindings);
+    const uint64_t trace = KVIP_TRACE_WORKSPACE(reinterpret_cast<GM_ADDR>(a[15]));
+#endif
+    KVIP_TRACE_RECORD(kernelScope, trace, traceKernel, kvip_trace::KernelBody, 0, AscendC::GetBlockIdx());
     if constexpr (Phase == SequenceLiPhase::Hot) {
         if ASCEND_IS_AIV {
+            KVIP_TRACE_BEGIN(resetScope, trace, Hot, ColdProgressReset, 0, AscendC::GetBlockIdx());
             auto line = ready + AscendC::GetBlockIdx() * 32;
             *line = 0;
             kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(line), 128);

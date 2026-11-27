@@ -4,6 +4,7 @@
 #define KVIP_URMA_WINDOW_LI 1
 #endif
 #include "kernel_operator.h"
+#include "stage_trace.h"
 #if defined(__CCE_AICORE__)
 #include "context.h"
 #if !V9_UBMEM
@@ -36,6 +37,17 @@ __aicore__ inline void RunLi(GM_ADDR bindings
     using namespace AscendC; using namespace QLICommon;
     auto a=reinterpret_cast<__gm__ uint64_t*>(bindings);
 #define P(i) reinterpret_cast<GM_ADDR>(a[i])
+#if KVIP_STAGE_TRACE
+    const uint32_t traceKernel = Phase == SequenceLiPhase::Hot ? kvip_trace::Hot :
+        Phase == SequenceLiPhase::Threshold ? kvip_trace::Threshold :
+        Phase == SequenceLiPhase::Cold ? kvip_trace::Cold : kvip_trace::Final;
+    const uint64_t trace = KVIP_TRACE_WORKSPACE(P(15));
+#endif
+#if !KVIP_FIXED_SCORE_SHARDS
+    KVIP_TRACE_RECORD(kernelScope, trace, traceKernel, kvip_trace::KernelBody, 0, GetBlockIdx());
+#endif
+    KVIP_TRACE_RECORD(setupScope, trace, traceKernel, kvip_trace::Setup, 0, GetBlockIdx());
+    KVIP_TRACE_RECORD(shapeScope, trace, traceKernel, kvip_trace::LiShapeSetup, 0, GetBlockIdx());
     auto shape = rotating::LoadRuntimeShape(reinterpret_cast<__gm__ rotating::Context*>(a[14]));
     bool splitSequence = rotating::UseSequenceSplit(shape) && HasUniformLengths(shape, P(5), P(6));
     if constexpr (Phase != SequenceLiPhase::Hot) {
@@ -51,11 +63,16 @@ __aicore__ inline void RunLi(GM_ADDR bindings
     if ASCEND_IS_AIV { physical /= 2; }
     if (!splitSequence && physical >= shape.liCores) return;
 #endif
+    KVIP_TRACE_END(shapeScope);
     TPipe pipe;
     using Type=QLIType<fp8_e4m3fn_t,fp8_e4m3fn_t,int32_t,true,LI_LAYOUT::BSND,LI_LAYOUT::PA_BSND,
         bfloat16_t,float,float,uint16_t>;
     QLIKernel::QuantLightningIndexerKernel<Type> op;
     op.runtimeShape_ = shape;
+#if KVIP_STAGE_TRACE
+    op.stageTrace_ = trace;
+    op.traceKernel_ = traceKernel;
+#endif
 #if KVIP_FIXED_SCORE_SHARDS
     op.fixedReady_ = reinterpret_cast<__gm__ uint32_t*>(ready);
     if constexpr (Phase == SequenceLiPhase::Cold) {
@@ -72,17 +89,22 @@ __aicore__ inline void RunLi(GM_ADDR bindings
         2048,shape.liCores,128,shape.history/128,0,16384,128,shape.resident,
         splitSequence ? 0U : shape.splitQ,shape.aicCount};
     if ASCEND_IS_AIV { op.vectorService.SetStreamingWorkspace(P(15)); }
+    KVIP_TRACE_RECORD(initScope, trace, traceKernel, kvip_trace::LiBufferSetup, 0, GetBlockIdx());
     op.Init(P(0),P(1),P(2),P(3),P(4),P(5),P(6),P(7),P(9),P(12),&tiling,&pipe);
+    KVIP_TRACE_END(initScope);
     if ASCEND_IS_AIV {
+        KVIP_TRACE_RECORD(bindScope, trace, traceKernel, kvip_trace::LiWorkspaceBind, 0, GetBlockIdx());
         op.vectorService.SetPrefixStorage(P(13));
         op.vectorService.SetRotationContext(P(14));
     }
+    KVIP_TRACE_END(setupScope);
     if constexpr (Phase == SequenceLiPhase::Hot) {
         if (splitSequence) op.template ProcessSequenceSplit<Phase>();
         else op.Process();
     } else {
         op.template ProcessSequenceSplit<Phase>();
     }
+    KVIP_TRACE_RECORD(destroyScope, trace, traceKernel, kvip_trace::LiPipeDestroy, 0, GetBlockIdx());
     pipe.Destroy();
 #undef P
 }

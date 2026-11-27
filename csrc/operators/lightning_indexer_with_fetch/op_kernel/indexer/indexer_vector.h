@@ -1,3 +1,4 @@
+#include "../stage_trace.h"
 #include "prefetch.h"
 #if KVIP_STREAMING_LI
 #include "pipeline_types.h"
@@ -131,6 +132,12 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query, uint32_t scanHis
 
 #endif
     __aicore__ inline void RotateFetch(uint32_t epoch, uint32_t sequenceHalfWindow = 0) {
+#if KVIP_STAGE_TRACE && KVIP_STREAMING_LI
+        const auto traceBase = KVIP_TRACE_WORKSPACE(streamingWorkspace_);
+        const uint32_t traceLane = rotating::ServiceLane(runtimeShape_.batch, runtimeShape_.splitQ,
+            runtimeShape_.serviceAics, blockId_ / 2, blockId_ % 2);
+#endif
+        KVIP_TRACE_BEGIN(serviceScope, traceBase, Cold, ServiceBody, epoch, traceLane);
 #if !V9_UBMEM
 #if KVIP_LARGE_BATCH_LI
         if (epoch == 0) {
@@ -152,6 +159,7 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query, uint32_t scanHis
         } else
 #endif
         {
+            KVIP_TRACE_BEGIN(windowScope, traceBase, Cold, LiWindow, epoch, traceLane);
             AdvanceWindow(epoch, sequenceHalfWindow);
         }
 #endif
@@ -169,7 +177,11 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query, uint32_t scanHis
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow);
 #else
             topkSharedTmpLocal_, mrgValueLocal_, indicesOutLocal_, sequenceHalfWindow,
-            streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U));
+            streamingWorkspace_ && (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U)
+#if KVIP_STAGE_TRACE
+            , KVIP_TRACE_WORKSPACE(streamingWorkspace_)
+#endif
+            );
 #endif
     }
     __aicore__ inline void LoadSequenceSplitThresholds(uint32_t batch) {
@@ -195,9 +207,9 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query, uint32_t scanHis
     __aicore__ inline QLIVector(){};
     __aicore__ inline void ProcessVec1(const QLICommon::RunInfo &info, uint32_t progressShard = 0,
 #if !V9_UBMEM
-                                     bool publishShardEnd = false, bool scoreOnly = false);
+                                     bool publishShardEnd = false, bool scoreOnly = false KVIP_PIPE_PARAM_DEFAULT);
 #else
-                                     bool publishShardEnd = false);
+                                     bool publishShardEnd = false KVIP_PIPE_PARAM_DEFAULT);
 #endif
     __aicore__ inline void ProcessTopK(const QLICommon::RunInfo &info, uint32_t queryRow = SIM_Q);
     __aicore__ inline void SetPrefixStorage(GM_ADDR output) { prefixOutput_ = output; }
@@ -312,6 +324,10 @@ private:
 #else
     __aicore__ inline void SaveResident(uint32_t query, uint32_t scoreRow, bool publishProgress) {
 #endif
+#if KVIP_STAGE_TRACE
+        const auto traceBase = KVIP_TRACE_WORKSPACE(streamingWorkspace_);
+#endif
+        KVIP_TRACE_BEGIN(minScope, traceBase, Threshold, ResidentMinVf, 0, query);
         auto src = (__local_mem__ uint16_t *)scoreOutLocal_.GetPhyAddr();
         auto dst = (__local_mem__ uint16_t *)prefixThreshold_.GetPhyAddr() + (query % 2) * 128;
         __VEC_SCOPE__ {
@@ -325,6 +341,8 @@ private:
             MicroAPI::ReduceMin(reduced, minimum, mask);
             MicroAPI::StoreAlign(dst, reduced, mask);
         }
+        KVIP_TRACE_END(minScope);
+        KVIP_TRACE_BEGIN(publishScope, traceBase, Threshold, ThresholdOutputMte3, 0, query);
         SetFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         WaitFlag<HardEvent::V_MTE3>(TOPK_V_MTE3_EVENT);
         constexpr uint32_t count = SIM_Q * 2048;
@@ -339,6 +357,7 @@ private:
         DataCopy(indices[q * 2048], indicesOutLocal_.template ReinterpretCast<int32_t>(), 2048);
         DataCopy(thresholds[q * 128], prefixThreshold_[(query % 2) * 128], 128);
         PipeBarrier<PIPE_ALL>();
+        KVIP_TRACE_END(publishScope);
         auto context = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
         if (context->lruSlots) {
             // TopK scratch is dead after the resident result is saved. Reuse
@@ -353,8 +372,11 @@ private:
             uint32_t validEnd = context->queryEnds ?
                 reinterpret_cast<__gm__ uint32_t*>(context->queryEnds)[query] : runtimeShape_.history;
             if (validEnd > runtimeShape_.resident) validEnd = runtimeShape_.resident;
+            KVIP_TRACE_BEGIN(victimsScope, traceBase, Threshold, ResidentVictimIdsMte2, 0, query);
             DataCopy(reservedChunk.template ReinterpretCast<uint32_t>(), victims, 2048);
             SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            KVIP_TRACE_END(victimsScope);
+            KVIP_TRACE_BEGIN(classifyScope, traceBase, Threshold, ResidentVictimClassifyVf, 0, query);
 #if !V9_UBMEM
             // One SIMT invocation covers both paths; zero selects GM only.
             Simt::VF_CALL<rotating::GatherVictimScoresUb>(Simt::Dim3{256,1,1},
@@ -378,6 +400,8 @@ private:
                 reinterpret_cast<__ubuf__ uint16_t*>(prefixThreshold_[(query % 2) * 128].GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint16_t*>(hitChunk.GetPhyAddr()), validEnd);
             SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            KVIP_TRACE_END(classifyScope);
+            KVIP_TRACE_BEGIN(bitmapScope, traceBase, Threshold, ResidentHitBitmapMte3, 0, query);
             DataCopyExtParams copy;
             copy.blockCount = 16; copy.blockLen = 32;
             copy.srcStride = 7; copy.dstStride = 0;
@@ -385,6 +409,7 @@ private:
             SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
         }
 #if !V9_UBMEM
+        KVIP_TRACE_BEGIN(seedScope, traceBase, Threshold, ResidentWindowSeed, 0, query);
         // Private incremental TopK state, shared by all prefetch windows.
         auto windowMeta=reinterpret_cast<__gm__ uint64_t*>(rotating::TopKHeader(context))+query*16;
         windowMeta[0]=reinterpret_cast<uint64_t>(scoreGm.GetPhyAddr())+uint64_t(scoreRow)*runtimeShape_.history*2;
@@ -717,9 +742,9 @@ __aicore__ inline void QLIVector<QLIT>::GetKeyScale(const QLICommon::RunInfo &ru
 template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &info, uint32_t progressShard,
 #if !V9_UBMEM
-                                                   bool publishShardEnd, bool scoreOnly)
+                                                   bool publishShardEnd, bool scoreOnly KVIP_PIPE_PARAM)
 #else
-                                                   bool publishShardEnd)
+                                                   bool publishShardEnd KVIP_PIPE_PARAM)
 #endif
 {
     auto pingpong = (info.loop % 2);
@@ -732,7 +757,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     int64_t curAivS1Idx = curS1Idx + (blockId_ % 2) * CeilDiv(curS1ProcNum, 2);
     int64_t curAivS1ProcNum = (blockId_ % 2 == 0) ? CeilDiv(curS1ProcNum, 2) : curS1ProcNum / 2;
     if (curAivS1ProcNum == 0) {
+        KVIP_PIPE_SAMPLE(cubeWait, pipeSample, AivCubeWait);
         CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_CV_EVENT + pingpong);  // V核等C核计算完mm1，mm1Res已搬运到UB
+        KVIP_TRACE_END(cubeWait);
         CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   // V核处理完，通知C核可以把mm1Res搬运到UB
         return;
     }
@@ -742,6 +769,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
 #else
     if (info.isFirstS2InnerLoop) {
 #endif
+        KVIP_PIPE_SAMPLE(queryMte2, pipeSample, AivQueryMte2);
         WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_QSCALE + qScalepingpong);
         //weightsGm --> weightUB_
         int64_t weightGmOffset = info.tensorWeightsOffset + curAivS1Idx * kHeadNum_ * gSize_;
@@ -765,9 +793,11 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                     qScaleGm[weightGmOffset], qDataCopyExtParams, padQScaleParams);
         SetFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_QSCALE + qScalepingpong);
         WaitFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_QSCALE + qScalepingpong);
+        KVIP_TRACE_END(queryMte2);
     }
 
     if ((info.s2Idx - info.s2Start) % QLICommon::KScaleTiles == 0) {
+        KVIP_PIPE_SAMPLE(keyMte2, pipeSample, AivKeyScaleMte2);
         WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + kScalepingpong);
         uint32_t getLen = QLICommon::KScaleTiles * s2BaseSize_ > (info.validS2Len - info.s2Idx * s2BaseSize_)
                                            ? info.validS2Len - info.s2Idx * s2BaseSize_
@@ -776,11 +806,16 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         GetKeyScale(info, kScaleUB_, info.bIdx, curS2Idx, getLen);
         SetFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_KSCALE + kScalepingpong);
         WaitFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_KSCALE + kScalepingpong);
+        KVIP_TRACE_END(keyMte2);
     }
+    KVIP_PIPE_SAMPLE(bankWait, pipeSample, AivBankWait);
     WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+    KVIP_TRACE_END(bankWait);
 
+    KVIP_PIPE_SAMPLE(cubeWait, pipeSample, AivCubeWait);
     //CV同步
     CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_CV_EVENT + info.loop % 2);   //V核等C核计算完mm1，mm1Res已搬运到UB
+    KVIP_TRACE_END(cubeWait);
     LocalTensor<SCORE_T> outBase;
     if (std::is_same_v<SCORE_T, uint16_t>) {
         outBase = vec1OutUB_[pingpong * (UB_BANK_STRIDE / sizeof(uint16_t))];
@@ -794,6 +829,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     auto qkBase = resMm1UB_[pingpong * (UB_BANK_STRIDE / sizeof(float))];
     auto qkVLstride = (UB_BANK_DEPTH_STRIDE / sizeof(float)) / 2 * constInfo_.mBaseSize;
 
+    KVIP_PIPE_SAMPLE(scoreVf, pipeSample, AivScoreVf);
 #if !V9_UBMEM
     if (!scoreOnly && curS2Idx >= runtimeShape_.resident) {
 #else
@@ -815,6 +851,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                                         qScaleBase, UB_BANK_DEPTH_STRIDE / sizeof(SCALE_T),
                                         gSize_, curAivS1ProcNum);
     }
+    KVIP_TRACE_END(scoreVf);
 #if !V9_UBMEM
     if (info.LoadQuery()) {
 #else
@@ -830,6 +867,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         (info.s2Idx + 1) * s2BaseSize_ >= info.validS2Len || info.isLastS2InnerLoop) {
         SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + kScalepingpong);
     }
+    KVIP_PIPE_SAMPLE(scoreMte3, pipeSample, AivScoreMte3);
     SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
     WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
     //outUB_ --->  scoreGm
@@ -889,6 +927,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     }
 #endif
     SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+    KVIP_TRACE_END(scoreMte3);
     CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB
 }
 
@@ -1115,6 +1154,9 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
 #if KVIP_STREAMING_LI
         uint32_t streamingQuery = info.indiceOutOffset / topkCount_ + curS1Idx + rowIdx;
         streamingPrefetched_ = false;
+#if KVIP_STAGE_TRACE
+        const auto thresholdTrace = prefixActive_ ? KVIP_TRACE_WORKSPACE(streamingWorkspace_) : 0;
+#endif
 #endif
 
         SCORE_T zero = 0;
@@ -1179,6 +1221,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
                 Duplicate(mrgValueLocal_[validS2Len / 256 * 256], zero, validS2LenAlign - validS2Len / 256 * 256);
                 SetFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
                 WaitFlag<HardEvent::V_MTE2>(V_MTE2_EVENT3);
+                KVIP_TRACE_BEGIN(inputScope, thresholdTrace, Threshold, ThresholdInputMte2, 0, streamingQuery);
                 copyInParams.blockLen = validS2Len * sizeof(SCORE_T); // byte
                 AscendC::DataCopyPadExtParams<SCORE_T> padParams{true, 0, 0, 0};
                 AscendC::DataCopyPad(mrgValueLocal_, scoreGm[vecOffset * QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_)], copyInParams, padParams);
@@ -1220,6 +1263,8 @@ __aicore__ inline void QLIVector<QLIT>::ProcessTopK(const QLICommon::RunInfo &in
 #if KVIP_STREAMING_LI
                 BeginFinalMetadata(streamingQuery);
 #endif
+                KVIP_TRACE_END(inputScope);
+                KVIP_TRACE_BEGIN(topkScope, thresholdTrace, Threshold, ThresholdTopKVf, 0, streamingQuery);
                 topkOp_(mrgValueLocal_, indicesOutLocal_, scoreOutLocal_, validS2LenAlign, 0, 1, prefixActive_);
 #if !V9_UBMEM && KVIP_STREAMING_LI
                 if (recentMerged) {
