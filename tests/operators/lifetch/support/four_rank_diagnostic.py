@@ -24,7 +24,9 @@ def run(args):
     from workloads import ReplayPagePlan
 
     windows = getattr(args, "window_source", None)
-    if windows is None:
+    local_windows = getattr(args, "local_windows", False)
+    use_windows = windows is not None or local_windows
+    if not use_windows:
         row = cell(args.archive, args.group, args.batch)
         oracle_name = row["oracle"]
         path = args.archive / f"g{args.group}/bs{args.batch}/block1/fused/packed_result.json"
@@ -33,9 +35,8 @@ def run(args):
         from b24_window_policy import install
         install(large_two_cold, "window-x2-early")
         oracle_name = "captured_logical_scores"
-        path = windows / "packed_result.json"
-    previous = json.loads(path.read_text())
-    identity = previous["identity"]
+        path = None if local_windows else windows / "packed_result.json"
+    previous = json.loads(path.read_text()) if path else None
     if not (Path(kvaf.__file__).resolve().is_relative_to(args.kvaf_root / "build-npu/python")
             and Path(kvip.__file__).resolve().is_relative_to(args.timed / "python")):
         raise ValueError("KVIP/KVAF must be loaded from the archived timing checkout and SDK")
@@ -50,6 +51,11 @@ def run(args):
                   physical_npu=4, host=os.uname().nodename, hardware=torch.npu.get_device_name(torch.device("npu:0")),
                   torch=str(torch.__version__), torch_npu=str(torch_npu.__version__),
                   cann=str(getattr(torch.version, "cann", "")), kvaf_get_kernel_sha256=sdk_digest)
+    identity = previous["identity"] if previous is not None else dict(wanted, group=args.group, batch=args.batch)
+    if local_windows:
+        from peer_npu4_evidence import BASE
+        if revision != BASE or args.group != 2 or args.batch not in (28, 32):
+            raise ValueError("Unexpected local window diagnostic input")
     if any(identity[k] != v for k,v in wanted.items()) or os.environ["ASCEND_RT_VISIBLE_DEVICES"] != "4":
         raise ValueError("Diagnostic differs from the archived input, binary, host, software or physical card")
     reference = captured_score_oracle(inputs)[0]
@@ -59,18 +65,18 @@ def run(args):
     proof = {}
 
     def benchmark(torch_mod, states, seq, config, directory, *, fused):
-        if not fused or len(states) != 1 or states[0].large_window_launch.source_fingerprint != previous["cold_build_fingerprint"]:
+        if not fused or len(states) != 1 or (previous and states[0].large_window_launch.source_fingerprint != previous["cold_build_fingerprint"]):
             raise ValueError("Expected one state using the same measured cold executable")
         state = states[0]
-        if windows is None:
+        if not use_windows:
             state.reset()
             state.forward.set_diagnostics(False)
             torch_mod.npu.current_stream(state.device).synchronize()
         try:
-            if windows is not None:
+            if use_windows:
                 from b24_window_worker import diagnostic
                 clocks = diagnostic(execution, torch_mod, state, inputs, reference, "window-x2-early", save_clocks=True)
-                if clocks["diagnostic_cold_build_fingerprint"] != previous["diagnostic_cold_build_fingerprint"]:
+                if previous and clocks["diagnostic_cold_build_fingerprint"] != previous["diagnostic_cold_build_fingerprint"]:
                     raise ValueError("Readback used a different diagnostic LI image")
                 proof["li_windows"] = clocks
             elif args.group == 7:
@@ -85,13 +91,19 @@ def run(args):
         except BaseException as error:
             execution.NativeFetchSession.quarantine("single_diagnostic_completion_uncertain", error)
             raise
-        if windows is None:
+        if not use_windows:
             selected, traffic = read_selected(state, inputs, True)
             check_scores(inputs, selected, reference)
             state.validate(inputs)
         else:
             traffic = proof["li_windows"].pop("checked_traffic")
         proof["traffic"] = traffic
+        if local_windows:
+            proof["cold_build_fingerprint"] = state.large_window_launch.source_fingerprint
+            print(f"G{args.group} BS{args.batch} LOCAL_WINDOW_CLOCKS TopK_score/KV/ordered_Index/private_CQ=PASS "
+                  f"queries={4*args.batch} measured_calls=0 diagnostic_calls=1 "
+                  f"prefetch/final={traffic['prefetch']}/{traffic['final']}")
+            return dict(correctness="PASS", failures=[])
         compare_keys = ("posted_per_window", "row_window_prefetch", "row_query_final")
         same = sum(all(sample[k] == traffic[k] for k in compare_keys) for sample in previous["traffic"])
         proof["archive_matches_window_and_final_counts"] = same
@@ -113,7 +125,7 @@ def run(args):
                                 large_window_policy="four-ranks")
     if result["correctness"] != "PASS" or result["failures"] or result["runtime_workers"] != 32:
         raise ValueError("Original eager certification or diagnostic failed")
-    atomic_json(args.output/"single_diagnostic.json", dict(input_archive=str(path), identity=identity,
+    atomic_json(args.output/"single_diagnostic.json", dict(input_archive=str(path) if path else None, identity=identity,
                 controller_commit=subprocess.check_output(["git", "-C", str(Path(__file__).resolve().parents[4]),
                 "rev-parse", "HEAD"], text=True).strip(), correctness="PASS", measured_calls=0,
                 diagnostic_calls=1, reference_oracle=oracle_name, **proof))
@@ -187,4 +199,5 @@ if __name__ == "__main__":
     p.add_argument("kvaf_server")
     p.add_argument("prepared", type=Path)
     p.add_argument("output", type=Path)
+    p.add_argument("--local-windows", action="store_true")
     run(p.parse_args())

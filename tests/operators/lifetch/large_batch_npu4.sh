@@ -129,6 +129,13 @@ if [[ -n $audit_mode ]]; then
         { echo "Invalid four-rank audit configuration" >&2; exit 2; }
     prefix="fixed-q4-audit-$audit_mode"
 fi
+local_windows=${PEER_LOCAL_WINDOW_CLOCKS:-0}
+if [[ $local_windows == 1 ]]; then
+    (( standalone )) && [[ $peer_physical_npu == 4 && -z $audit_mode && -z $follow_ref && -z ${PEER_RANK_DIAG_SOURCE:-} &&
+        -z ${PEER_PACKED_RESUME:-} && ${groups[*]} == 2 ]] || exit 2
+    for b in "${batches[@]}"; do [[ $b == 28 || $b == 32 ]] || exit 2; done
+    prefix=local-q4-window-clocks
+fi
 diag_source=${PEER_RANK_DIAG_SOURCE:-}
 if [[ -n $diag_source ]]; then
     (( standalone )) && [[ $peer_physical_npu == 4 && -z ${PEER_PACKED_RESUME:-} ]] ||
@@ -269,7 +276,9 @@ if (( !resuming )); then
     printf '%s\n' "$actual" > "$out/kvaf_tree.txt"
     printf '%s\n' "$sdk_rev" > "$out/kvaf.txt"
 fi
-if [[ -n $audit_mode ]]; then
+if [[ $local_windows == 1 ]]; then
+    echo "LOCAL_WINDOW_CLOCKS physical_NPU=4 measured_calls=0 diagnostic_calls=1 per_shape=1 baseline_runs=0" >&3
+elif [[ -n $audit_mode ]]; then
     git -C "$controller_root" rev-parse HEAD > "$out/audit_reader.txt"
     printf '%s\n' "$PEER_AUDIT_REFERENCE" > "$out/audit_reference.txt"
     echo "AUDIT physical_NPU=4 mode=$audit_mode source=$PEER_AUDIT_REFERENCE" >&3
@@ -323,7 +332,7 @@ fi
 # Use the same registered CPU memory placement for the serial and fused arms.
 placement="auto auto"
 if [[ -n $audit_mode ]]; then
-    placement=$("$PYTHON" -B "$controller_root/tests/operators/lifetch/support/large_batch_placement.py" get "$PEER_AUDIT_REFERENCE/g7/bs32/block1/fused/thp.json")
+    placement=$("$PYTHON" -B "$controller_root/tests/operators/lifetch/support/large_batch_placement.py" get "$PEER_AUDIT_REFERENCE/g${groups[0]}/bs${batches[0]}/block1/fused/thp.json")
 elif [[ -n $follow_ref ]]; then
     placement=$("$PYTHON" -B "$workers/large_batch_placement.py" get "$follow_ref/g7/bs32/block1/fused/thp.json")
 elif [[ -z $archive && -z $fixed_archive && -z $packed_archive ]]; then
@@ -403,6 +412,16 @@ run_arm() (
     grep -Fq "LISTEN address=127.0.0.1 port=$port" "$dir/cpu.log" || { tail -20 "$dir/cpu.log"; exit 1; }
     "$PYTHON" -B "$helpers/support/peer_thp.py" --unified-sdk --pid "$server" --log "$dir/cpu.log" --output "$dir/thp.json" --timeout 7200 9>&- &
     monitor=$!
+    if [[ $local_windows == 1 ]]; then
+        local tool="$controller_root/tests/operators/lifetch/support/four_rank_diagnostic.py"
+        (cd "$dir" && timeout --kill-after=30s 7200s "$PYTHON" -B "$tool" "$root" . "$group" "$batch" "$trace" \
+            "$sdk" "127.0.0.1:$port" "$prepared_bank" "$dir" --local-windows) >"$dir/worker.log" 2>&1 || {
+            rc=$?; tail -25 "$dir/worker.log"; exit "$rc"
+        }
+        wait "$monitor"
+        monitor=
+        return
+    fi
     if [[ -n $audit_mode ]]; then
         local tool="$controller_root/tests/operators/lifetch/support/four_rank_accept_worker.py"
         (cd "$dir" && timeout --kill-after=30s 7200s "$PYTHON" -B "$tool" "$audit_mode" "$root"             "$PEER_AUDIT_REFERENCE" "$group" "$batch" "$trace" "$sdk" "127.0.0.1:$port" "$prepared_bank" "$dir") >"$dir/worker.log" 2>&1 || {
@@ -459,6 +478,31 @@ run_arm() (
     wait "$monitor"
     monitor=
 )
+if [[ $local_windows == 1 ]]; then
+    trace=$(bash "$helpers/peer_g2_input.sh" "$work" 2)
+    mkdir -p "$out/g2"
+    prepared_bank="$out/g2/donors"
+    "$PYTHON" -B "$controller_root/tests/operators/lifetch/support/large_batch_input.py" "$trace" 2 "$prepared_bank"
+    for batch in "${batches[@]}"; do
+        pair="$out/g2/bs$batch/block1"
+        mkdir -p "$pair"
+        echo "COLLECT G2 BS$batch local-window-clocks" >&3
+        run_arm 2 "$batch" "$trace" clocks "$pair"
+        arm="$pair/clocks"
+        placement=$("$PYTHON" -B "$workers/large_batch_placement.py" get "$arm/thp.json")
+        read -r node adapter <<< "$placement"
+        [[ $planned_node == auto || $planned_node == "$node" ]] && [[ $planned_adapter == auto || $planned_adapter == "$adapter" ]] || exit 1
+        planned_node=$node
+        planned_adapter=$adapter
+        set_cpu_placement "$node" "$adapter" archived
+        touch "$arm/local_placement_measured"
+        grep ' LOCAL_WINDOW_CLOCKS ' "$arm/worker.log" >&3
+        echo "LOCAL_CLOCK_FILE=$arm/single_diagnostic.json" >&3
+    done
+    rm -rf -- "$prepared_bank" "$host_tools"
+    echo "REPLAY_COMPLETE RESULT_ROOT=$out" >&3
+    exit 0
+fi
 if [[ -n $audit_mode ]]; then
     source "$controller_root/tests/operators/lifetch/support/four_rank_accept_loop.sh"
     exit 0
