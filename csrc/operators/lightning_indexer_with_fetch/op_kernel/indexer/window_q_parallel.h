@@ -29,10 +29,9 @@ struct Trial {
 __aicore__ inline Trial LoadTrial(GM_ADDR workspace, const rotating::RuntimeShape& shape, uint32_t parts)
 {
     const uint32_t batch = shape.batch;
-    const bool p4 = parts == 4 && (batch == 1 || batch == 2 || batch == 4 || batch == 8);
-    const bool p2 = parts == 2 && batch == 16;
+    const bool p4 = parts == 4 && shape.rounds == 2 && (batch == 1 || batch == 2 || batch == 4 || batch == 8);
+    const bool p2 = parts == 2 && batch == 16 && (shape.rounds == 2 || shape.rounds == 4);
     if (!workspace || (!p4 && !p2) ||
-        shape.rounds != 2 ||
         shape.history != 131072 || shape.resident != 16384 || shape.indexHeads != 32 ||
         shape.aicCount != 32 || shape.splitQ != 1 || shape.liCores != 2 * batch ||
         shape.serviceAics != (batch + 1) / 2 || shape.serviceLanes != 2 * shape.serviceAics) {
@@ -41,7 +40,7 @@ __aicore__ inline Trial LoadTrial(GM_ADDR workspace, const rotating::RuntimeShap
     const uint64_t option = *reinterpret_cast<__gm__ const uint64_t*>(workspace + kOptionOffset);
     const uint32_t workers = option % kLineBytes;
     const uint64_t address = option - workers;
-    if (!address || (workers != 2 && workers != 4)) return {};
+    if (!address || (workers != 4 && (shape.rounds != 2 || workers != 2))) return {};
     return {reinterpret_cast<GM_ADDR>(address), workers};
 }
 
@@ -50,14 +49,22 @@ struct Helper {
     uint32_t worker;
 };
 
-__aicore__ inline Helper ScoreHelper(uint32_t batch, uint32_t aiv)
+__aicore__ inline Helper ScoreHelper(const rotating::RuntimeShape& shape, uint32_t aiv)
 {
+    const uint32_t batch = shape.batch;
     if (batch == 1) {
         // G0 serves W0 and G2 serves W1. Reuse both peers of G1 and one of G3.
         return {0, aiv == 2 ? 1U : aiv == 3 ? 2U : aiv == 6 ? 3U : 0U};
     }
     const uint32_t group = aiv / 2;
     if (batch == 16) {
+        if (shape.rounds == 4) {
+            const uint32_t epoch = rotating::ServiceRank(batch, shape.splitQ, group) / shape.serviceAics;
+            const uint32_t row = rotating::ServiceLane(batch, shape.splitQ, shape.serviceAics, group, aiv % 2);
+            // W3 retains its original owner. Former W0, W1 and W2 owners
+            // help only after the score loop and their earlier Service.
+            return {row, epoch == 3 ? 0 : epoch + 1};
+        }
         // Even groups in the two halves own W0 and W1, respectively.
         // Reuse the two odd groups first. The W0 owner can help only at the
         // post-Score hook, after completing its original W0 Service.

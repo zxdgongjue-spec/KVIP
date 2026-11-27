@@ -1010,3 +1010,63 @@ The `--iterations` value applies to native batch sizes. For grouped
 rows, the documented number of forwards fills each measured device
 graph. All arms write to the run's `summary.csv`. Use
 `--window-q-matrix --trace` for the existing native per-call traces.
+
+### BS16 P2/W4 last-window Q1
+
+`--bs16-w4-q1` fixes BS16, Q4, 128K history, 16K resident and 32 MIX
+groups. The default miss rates are 5%, 10% and 15%. Each performance
+set compares the pinned main P2/W4, the P2/W4 experiment with four
+Top2048 workers in W3, and the existing P2/W2 four-way Q1 experiment.
+All three use the original resident threshold and prefetch policy with
+rank start 1024, 512 tokens per request and 128 tokens per window.
+
+For the W4 experiment, W0 through W2 retain the original rotating
+Service. The W3 owner waits for W2 to publish completion and takes the
+same Score frontier snapshot used by the serial path. The former W0,
+W1 and W2 owners help only after their previous Service and their own
+last Cold Score finish. Each worker publishes its own Q state. The
+W3 owner joins the four results, deduplicates the candidates and posts
+the request's WQE. Terminal runs the original path.
+
+On the A5-24 host, update the existing checkout and prepare the pinned
+main worktree if it is absent.
+
+```bash
+base=/home/w00568585/vLLM-DSA
+repo="$base/third_party/KVIP-mr32"
+main="$base/third_party/KVIP-main-df8ad259"
+git -C "$repo" fetch origin refs/heads/codex/lifetch-bs2-window-q-a5
+git -C "$repo" switch --detach FETCH_HEAD
+git -C "$repo" fetch origin main
+if [[ ! -e "$main" ]]; then
+    git -C "$repo" worktree add --detach "$main" df8ad2598e70e4b5e266b15028ab26c601a2bdf2
+fi
+```
+
+In the A5 container, use the existing KVAF and LIDU builds.
+
+```bash
+base=/home/w00568585/vLLM-DSA
+export KVIP_A5_DEVICE=0
+export KVIP_KVAF_ROOT="$base/third_party/KVAF-unified-813f1750"
+export KVIP_AB_OUTPUT="$base/results/lifetch-bs16-w4-q1"
+runner="$base/third_party/KVIP-mr32/experiments/lifetch_mr23_service/run_full32_a5.sh"
+bash "$runner" --bs16-w4-q1 --main-root "$base/third_party/KVIP-main-df8ad259" \
+  --warmup 2 --iterations 5
+bash "$runner" --bs16-w4-q1 --trace
+```
+
+The performance run records graph Event KV ready, actual prefetch and
+final Get counts, and Hot, Threshold, Cold + Service and Terminal
+kernel means. The trace run builds all three arms with the same
+instrumented bridge. The trace reference is the serial P2/W4 route on
+that bridge. It records window-level prefetch, predecessor wait, AIC
+credit wait samples and the last window's Top2048, join and WQE
+scopes. Use `summary.csv` for the route metrics and
+`window_q_report.json` for the source scopes. Pass `--miss-percent 10`
+to select one miss rate.
+
+The W3 experiment targets the last Service tail. Earlier windows
+retain their original handoff and credit dependencies. Independent
+Service and dynamic Score scheduling are separate comparisons in
+[MR 36](https://gitcode.com/CacheOS/KVIP/merge_requests/36).

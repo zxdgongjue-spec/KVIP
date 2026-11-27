@@ -642,12 +642,12 @@ __aicore__ inline void RecordWindowAdvance(uint32_t epoch, uint32_t lane, uint64
 }
 
 #if KVIP_HOT_SCORE_PARTITION && !V9_UBMEM
-__aicore__ inline void RunParallelWindowQueries(uint32_t row, uint32_t worker, uint32_t half) {
+__aicore__ inline void RunParallelWindowQueries(uint32_t row, uint32_t worker, uint32_t half, uint32_t epoch) {
     const uint32_t width = kvip_window_q::kQueries / windowQTrial_.workers;
     const uint32_t from = worker * width;
     const uint32_t to = from + width;
     KVIP_TRACE_BEGIN(workerScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
-        Cold, WindowQWorker, 1, row * 4 + from);
+        Cold, WindowQWorker, epoch, row * 4 + from);
     auto ctx = reinterpret_cast<__gm__ rotating::Context*>(rotationContext_);
     GlobalTensor<uint64_t> metadata;
     metadata.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(rotating::TopKHeader(ctx)));
@@ -663,11 +663,11 @@ __aicore__ inline void RunParallelWindowQueries(uint32_t row, uint32_t worker, u
         }
         windowCoveredEmpty_ = snapshot->coveredEmpty != 0;
     }
-    const uint32_t cap = rotating::SequenceWindowEnd(runtimeShape_.history, runtimeShape_.resident, half, 1);
+    const uint32_t cap = rotating::SequenceWindowEnd(runtimeShape_.history, runtimeShape_.resident, half, epoch);
     exportWindowCold_ = true;
     rankTrace_ = streamingWorkspace_ &&
         (reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_)->prefetchCount & 0x80000000U);
-    rankedEpoch_ = 1;
+    rankedEpoch_ = epoch;
     incrementalCalls_ = 0;
     incrementalScanned_ = 0;
     incrementalCandidates_ = 0;
@@ -693,7 +693,7 @@ __aicore__ inline void RunParallelWindowQueries(uint32_t row, uint32_t worker, u
             incrementalNextEnd1_ = Min(uint32_t(next >> 32), cap);
         }
         KVIP_TRACE_BEGIN(queryScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_),
-            Cold, WindowQueryTopK, 1, row * 4 + q);
+            Cold, WindowQueryTopK, epoch, row * 4 + q);
         AdvanceIncremental(row * 4 + q, end0, end1, half);
     }
     JoinColdOutput();
@@ -729,7 +729,7 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half,uint32_t lane)
     const auto option = p8Row || earlyShape ? kvip_window_probe::Option(streamingWorkspace_) : 0;
     auto topkReady = earlyShape ? kvip_window_probe::Ready(option) : nullptr;
     bool headerIssued = false;
-    const bool parallelQ = epoch == 1 && lane < runtimeShape_.batch && windowQTrial_.scratch;
+    const bool parallelQ = epoch + 1 == runtimeShape_.rounds && lane < runtimeShape_.batch && windowQTrial_.scratch;
 #endif
     // The predecessor wait is part of the optional window service and can
     // delay the producer. Capture it separately from incremental computation.
@@ -902,7 +902,7 @@ __aicore__ inline bool AdvanceWindow(uint32_t epoch,uint32_t half,uint32_t lane)
         KVIP_TRACE_END(snapshotScope);
 #endif
         kvip_window_q::Publish(windowQTrial_.scratch, lane, 0, 1);
-        RunParallelWindowQueries(lane, 0, half);
+        RunParallelWindowQueries(lane, 0, half, epoch);
         KVIP_TRACE_BEGIN(joinScope, KVIP_TRACE_WORKSPACE(streamingWorkspace_), Cold, WindowQJoin, epoch, lane);
         for (uint32_t worker = 1; worker < windowQTrial_.workers; ++worker) {
             kvip_window_q::Wait(windowQTrial_.scratch, lane, worker);

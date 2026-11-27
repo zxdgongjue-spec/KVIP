@@ -93,11 +93,11 @@ public:
 
     __aicore__ inline void RunWindowQHelper(uint32_t half) {
         if (!windowQTrial_.scratch) return;
-        const auto [row, worker] = kvip_window_q::ScoreHelper(runtimeShape_.batch, blockId_);
+        const auto [row, worker] = kvip_window_q::ScoreHelper(runtimeShape_, blockId_);
         if (worker == 0 || worker >= windowQTrial_.workers) return;
         DrainColdPublication();
         kvip_window_q::Wait(windowQTrial_.scratch, row, 0);
-        RunParallelWindowQueries(row, worker, half);
+        RunParallelWindowQueries(row, worker, half, runtimeShape_.rounds - 1);
         auto completion = kvip_window_q::Signal(windowQTrial_.scratch, row, worker);
         completion->calls = incrementalCalls_;
         completion->scanned = incrementalScanned_;

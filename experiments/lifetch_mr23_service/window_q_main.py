@@ -8,6 +8,7 @@ import sys
 from run_mr25_handoff import apply_group_timing, read
 from diagnostics import account
 from terminal_handoff import COUNT_COLUMNS, STAGES, fixture_hash, terminal_stages
+from window_q_trace import window_prefetch_get_counts
 
 
 NATIVE_BENCH = """
@@ -76,6 +77,7 @@ def measure_main(root, output, case, commit):
                     or min(final_by_query) < 0):
                 raise ValueError(f'Main BS{batch}: invalid completed Get counters')
             counts.append(dict(source_round=1, invocation=invocation, request=request['request'],
+                               prefetch_by_window=windows, final_get_by_query=final_by_query,
                                **dict(zip(COUNT_COLUMNS, (early, final, early + final)))))
 
     row = dict(variant='p2', source_commit=commit, batch=logical_batch, accepted=True, score_parts=2,
@@ -86,6 +88,8 @@ def measure_main(root, output, case, commit):
                per_call_requests=counts, report=str(folder / 'report.json'),
                **{key: statistics.mean(sample[key] for sample in stages) for key in STAGES},
                **{key + '_per_call': sum(record[key] for record in counts) / calls for key in COUNT_COLUMNS})
+    if case.get('window_q'):
+        row.update(window_prefetch_get_counts(counts, case['effective_windows'], calls=calls))
     if waves > 1:
         apply_group_timing(row, profile['timing'], waves)
         timing_label, get_unit = f'{waves}xBS{batch} graph KV ready', 'group'
