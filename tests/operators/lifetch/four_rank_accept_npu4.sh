@@ -4,7 +4,9 @@
 set -euo pipefail
 repo=$(cd "${1:?expected KVIP checkout}" && pwd -P)
 reader=$(git -C "$repo" rev-parse --verify "${2:?expected reader commit}^{commit}")
-native=$(git -C "$repo" rev-parse --verify "${3:?expected candidate commit}^{commit}")
+mode=${3:?expected candidate commit or serial-only}
+native=
+if [[ $mode != serial-only ]]; then native=$(git -C "$repo" rev-parse --verify "$mode^{commit}"); fi
 base=d0fc5963881bd38fa97eff0f6ef40c757a6e8713
 serial=10442f1ffa314606c23f54b73e49ecfc372f1f9a
 work=/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold
@@ -40,6 +42,13 @@ audit() {
     PEER_FOUR_RANK_AUDIT=$1 PEER_TIMED_SOURCE=$timed PEER_AUDIT_REFERENCE=$3 \
         bash "$entry/large_batch_npu4.sh" --four-ranks-candidate-only
 }
+if [[ $mode == serial-only ]]; then
+    if "$py" -B "$entry/support/four_rank_accept.py" serial-summary "$ref"; then exit 0; else rc=$?; fi
+    (( rc == 3 )) || exit "$rc"
+    audit serial "$serial" "$ref"
+    "$py" -B "$entry/support/four_rank_accept.py" serial-summary "$ref"
+    exit 0
+fi
 audit serial "$serial" "$ref"
 audit journal "$base" "$ref"
 cached=$("$py" -B "$entry/support/four_rank_accept.py" timed "$ref" "$native")

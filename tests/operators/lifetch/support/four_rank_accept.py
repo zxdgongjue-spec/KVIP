@@ -194,10 +194,30 @@ def timed(ref, native):
     return None
 
 
+
+def serial_summary(ref):
+    matches = []
+    missing = []
+    for g, b in CELLS:
+        _, identity = observation(ref, ref / f"g{g}/bs{b}/block1", g, b, "fused")
+        src = serial_reference(ref, identity, g, b)
+        if src is None:
+            missing.append(f"G{g}/BS{b}")
+            continue
+        print(f"G{g} BS{b} strong_serial graph/LI/tail_mean_us={src['graph']:.2f}/{src['LI']:.2f}/{src['tail']:.2f} "
+              f"blocks={src['blocks']} source={src['source']}")
+        matches.append(dict(group=g, batch=b, **src))
+    print(f"SERIAL_COVERAGE={len(matches)}/{len(CELLS)} missing={','.join(missing) or 'none'}")
+    if missing:
+        return False
+    return True
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="action", required=True)
     sub.add_parser("placement").add_argument("path", type=Path)
+    sub.add_parser("serial-summary").add_argument("ref", type=Path)
     t = sub.add_parser("timed")
     t.add_argument("ref", type=Path)
     t.add_argument("native")
@@ -210,6 +230,8 @@ if __name__ == "__main__":
             q.add_argument("batch", type=int)
             q.add_argument("mode", choices=["serial", "journal"])
     a = p.parse_args()
+    if a.action == "serial-summary":
+        raise SystemExit(0 if serial_summary(a.ref) else 3)
     if a.action == "timed":
         hit = timed(a.ref, a.native)
         if hit:
