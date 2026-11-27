@@ -650,9 +650,13 @@ def measured_replays(ex, proofs, serial, torch, states, sequence, config, direct
 
 def replay_configuration(args, policy):
     grants = None
+    start_rank = 1024
     if policy:
         from large_two_cold import WINDOW_GRANTS
         grants = WINDOW_GRANTS[policy]
+        if policy == "four-ranks":
+            from large_two_cold import FOUR_WINDOW_RANKS
+            start_rank = FOUR_WINDOW_RANKS[0]
     return configuration(
         [
             "bench" if args.packed_ten else "diagnose",
@@ -673,7 +677,7 @@ def replay_configuration(args, policy):
             "--kvaf-server",
             args.kvaf_server,
             "--prefetch-rank-start",
-            "1024",
+            str(start_rank),
             "--prefetch-tokens",
             str(sum(grants)) if grants is not None else "1024",
             "--intermediate-fetches",
@@ -969,7 +973,7 @@ if __name__ == "__main__":
     windows = parser.add_mutually_exclusive_group()
     windows.add_argument("--large-two-cold", dest="large_window_policy", action="store_const", const="two-cold",
                          help="Measure the isolated three-window large-batch cold kernel")
-    windows.add_argument("--large-window-policy", choices=("two-cold", "split-role", "shared-final"),
+    windows.add_argument("--large-window-policy", choices=("two-cold", "split-role", "shared-final", "four-ranks"),
                          help="Measure the selected large-batch cold kernel in the packed candidate")
     parser.add_argument("--carry-credit", action="store_true", help="Audit the four-window earned budget and private CQ receipts")
     parser.add_argument("--window-density", action="store_true", help="Collect post timestamps in one separate large-BS call")

@@ -12,12 +12,24 @@ case $mode in
               batches='28 24 32 20'; groups='2 10 7 4 17' ;;
     carry)    export PEER_LARGE_COLD_WINDOWS=3 PEER_FOUR_WINDOW_CARRY=1
               batches='32 28 24 20'; groups='7 2 10 4 17' ;;
-    *) echo "Expected two-cold or carry" >&2; exit 2 ;;
+    four-ranks) export PEER_LARGE_COLD_WINDOWS=3 PEER_FOUR_WINDOW_CARRY=0
+                batches='32 28 24 20'; groups='7 2 10 4 17' ;;
+    *) echo "Expected two-cold, carry or four-ranks" >&2; exit 2 ;;
 esac
+export PEER_FOUR_WINDOW_RANKS=0
+if [[ $mode == four-ranks ]]; then
+    export PEER_FOUR_WINDOW_RANKS=1
+    batches=${FIXED_Q4_BATCHES:-$batches}
+    groups=${FIXED_Q4_GROUPS:-$groups}
+fi
 case $PEER_PACKED_BLOCKS in 1|2) ;; *) echo "Expected one or two candidate blocks" >&2; exit 2 ;; esac
 work=${PEER_G2_WORK:-/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold}
 archive="$work/peer-baseline/fixed-q4.ygIfRl"
 control="$work/peer-baseline/fixed-q4-packed.IWXS7N"
+if [[ $mode == four-ranks ]]; then
+    prior="$work/peer-baseline/fixed-q4-aiv-2cold.b4YDiH"
+    [[ -s "$prior/packed_summary.json" ]] || { echo "Missing two-cold reference at $prior" >&2; exit 1; }
+fi
 if [[ ! -s "$control/packed_summary.json" || ! -s "$archive/native.txt" ||
       $(<"$control/native.txt") != 10442f1ffa314606c23f54b73e49ecfc372f1f9a ||
       $(<"$control/physical_npu.txt") != 3 ]]; then

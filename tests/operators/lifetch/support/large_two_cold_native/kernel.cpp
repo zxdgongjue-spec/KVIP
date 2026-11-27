@@ -4,6 +4,17 @@
 #if defined(__CCE_AICORE__) && KVIP_BS32_SCORE_WINDOW_ROLES != 1
 #error "Split-role device implementation is required"
 #endif
+#elif defined(KVIP_TEST_WINDOW_RANK1)
+#if KVIP_TEST_SIBLING_TRACE
+#define QLIKernel FixedRankTraceQLIKernel
+#define v9_li_large_hot v9_li_four_ranks_trace_unused_hot
+#define v9_li_large_threshold_cold v9_li_large_four_ranks_trace
+#else
+#define QLIKernel FixedRankQLIKernel
+#define v9_li_large_hot v9_li_four_ranks_unused_hot
+#define v9_li_large_threshold_cold v9_li_large_four_ranks
+#endif
+#include "indexer_large.cpp"
 #else
 #define KVIP_EXPERIMENT_TWO_COLD 1
 #if KVIP_TEST_SIBLING_TRACE

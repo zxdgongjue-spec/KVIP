@@ -12,9 +12,11 @@ from kvip.runtime.build import kvaf_build_paths
 
 
 SPLIT_ROLE_POLICIES = ("split-role", "shared-final")
-WINDOW_GRANTS = {"two-cold": (256, 384, 384), **{p: (256, 256, 256, 256) for p in SPLIT_ROLE_POLICIES}}
+FOUR_WINDOW_RANKS = (1024, 1568, 1792, 2048)
+WINDOW_GRANTS = {"two-cold": (256, 384, 384),
+                 **{p: (256,) * 4 for p in (*SPLIT_ROLE_POLICIES, "four-ranks")}}
 COLD_SYMBOL = {"two-cold": "v9_li_large_two_cold", "split-role": "v9_li_large_bs32_split_role",
-               "shared-final": "v9_li_large_bs32_shared_final"}
+               "shared-final": "v9_li_large_bs32_shared_final", "four-ranks": "v9_li_large_four_ranks"}
 
 
 def build(experiment_source, normal_library, sdk_build, soc, policy="two-cold", *, trace_sibling=False):
@@ -24,6 +26,8 @@ def build(experiment_source, normal_library, sdk_build, soc, policy="two-cold", 
     # The normal build ID covers CANN, compiler, KVAF and all included operator sources.
     digest = hashlib.sha256()
     digest.update(f"{policy}:{soc}:trace_sibling={int(trace_sibling)}".encode())
+    if policy == "four-ranks":
+        digest.update(repr(FOUR_WINDOW_RANKS).encode())
     if policy in SPLIT_ROLE_POLICIES:
         source = (experiment_source.resolve().parents[4] / "csrc/operators/lightning_indexer_with_fetch"
                   / "op_kernel/indexer_large_dualrole.cpp")
@@ -55,6 +59,9 @@ def build(experiment_source, normal_library, sdk_build, soc, policy="two-cold", 
                              f"-DKVIP_BS32_SHARE_FINAL={'ON' if policy == 'shared-final' else 'OFF'}",
                              f"-DTRACE_SIBLING={'ON' if trace_sibling else 'OFF'}",
                              f"-DKVAF_INCLUDE={headers}"]
+                if policy == "four-ranks":
+                    configure.extend([f"-DKVIP_TEST_WINDOW_RANK1={FOUR_WINDOW_RANKS[1]}",
+                                      f"-DKVIP_TEST_WINDOW_RANK2={FOUR_WINDOW_RANKS[2]}"])
                 compile_kernel = ["cmake", "--build", tmp, "--target", "two_cold_bridge", "--parallel", "2"]
                 for command in (configure, compile_kernel):
                     result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT)
@@ -63,7 +70,8 @@ def build(experiment_source, normal_library, sdk_build, soc, policy="two-cold", 
                         raise build_failure(log, f"large-batch {policy} kernel", result.returncode)
                 (Path(tmp) / library.name).replace(library)
     experimental = ctypes.CDLL(str(library))
-    launch = (experimental.kvip_test_bs32_split_role_forward if policy in SPLIT_ROLE_POLICIES
+    launch = (experimental.kvip_test_four_ranks_forward if policy == "four-ranks"
+              else experimental.kvip_test_bs32_split_role_forward if policy in SPLIT_ROLE_POLICIES
               else experimental.kvip_test_two_cold_forward)
     launch.argtypes = [ctypes.c_void_p] * 6
     launch.restype = ctypes.c_uint32

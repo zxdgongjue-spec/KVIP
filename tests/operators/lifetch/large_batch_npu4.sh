@@ -14,6 +14,7 @@ large_cold_windows=${PEER_LARGE_COLD_WINDOWS:-2}
 if [[ $large_cold_windows != 2 && $large_cold_windows != 3 ]]; then
     echo "PEER_LARGE_COLD_WINDOWS must be 2 or 3" >&2; exit 2
 fi
+four_ranks=${PEER_FOUR_WINDOW_RANKS:-0}
 bs32_li=${PEER_BS32_LI:-}
 if [[ -n $bs32_li && $bs32_li != split-role && $bs32_li != shared-final ]]; then
     echo "Unknown PEER_BS32_LI=$bs32_li" >&2; exit 2
@@ -91,6 +92,12 @@ if [[ $carry_credit != 0 ]]; then
         { echo "Four-window carry requires the packed regular four-window candidate" >&2; exit 2; }
     for batch in "${batches[@]}"; do (( batch > 16 )) || { echo "Four-window carry requires BS>16" >&2; exit 2; }; done
     prefix=fixed-q4-four-window-carry
+fi
+if [[ $four_ranks != 0 ]]; then
+    [[ $four_ranks == 1 && $packed_candidate == 1 && $large_cold_windows == 3 && $carry_credit == 0 && -z $bs32_li ]] ||
+        { echo "Four ranks requires the fixed, non-carry four-window candidate" >&2; exit 2; }
+    for batch in "${batches[@]}"; do (( batch > 16 )) || { echo "Four ranks requires BS>16" >&2; exit 2; }; done
+    prefix=fixed-q4-four-ranks
 fi
 if [[ -n $bs32_li ]]; then prefix="$prefix-bs32-$bs32_li"; fi
 if (( packed_blocks == 1 )); then prefix="$prefix-one-block"; fi
@@ -308,8 +315,10 @@ run_arm() (
         args+=(--packed-ten --serial-result "$packed_oracle")
         if (( packed_candidate )); then args+=(--compare-packed-candidate); fi
         if (( carry_credit )); then args+=(--carry-credit); fi
-        if (( packed_candidate && batch == 32 )) && [[ ${pair##*/} == block1 ]]; then args+=(--window-density); fi
-        if (( packed_candidate && batch == 32 )) && [[ -n $bs32_li ]]; then
+        if (( packed_candidate && (batch == 32 || four_ranks) )) && [[ ${pair##*/} == block1 ]]; then args+=(--window-density); fi
+        if (( four_ranks )); then
+            args+=(--large-window-policy four-ranks)
+        elif (( packed_candidate && batch == 32 )) && [[ -n $bs32_li ]]; then
             args+=(--large-window-policy "$bs32_li")
         elif (( packed_candidate && batch > 16 && large_cold_windows == 2 )); then
             args+=(--large-two-cold)
@@ -395,7 +404,7 @@ run_packed_cohort() {
             printf 'CASE_BEGIN G%s BS%s cohort=%s block=%s arm=%s\n' "$group" "$batch" "$cohort" "$block" "$arm" >&3
             run_arm "$group" "$batch" "$trace" "$arm" "$dir" "$cohort"
             [[ -s $result/packed_result.json ]]
-            if (( packed_candidate && batch == 32 && block == 1 )); then
+            if (( packed_candidate && (batch == 32 || four_ranks) && block == 1 )); then
                 grep ' WINDOW_DIAG ' "$result/worker.log" | tee -a "$out/summary.txt" >&3
                 if [[ -n $bs32_li ]]; then
                     grep ' SPLIT_ROLE_DIAG ' "$result/worker.log" | tee -a "$out/summary.txt" >&3
@@ -407,7 +416,7 @@ run_packed_cohort() {
             if (( carry_credit )); then
                 grep '^CREDIT ' "$result/worker.log" | tee -a "$out/summary.txt" >&3
             fi
-            if (( packed_candidate && batch > 16 && large_cold_windows == 2 )) ||
+            if (( four_ranks || (packed_candidate && batch > 16 && large_cold_windows == 2) )) ||
                 { (( packed_candidate && batch == 32 )) && [[ -n $bs32_li ]]; }; then
                 grep '^WINDOWS ' "$result/worker.log" | tee -a "$out/summary.txt" >&3
             fi
@@ -458,6 +467,9 @@ run_group_batches() {
         done
         if [[ -n $packed_archive ]]; then
             "$PYTHON" -B "$workers/fixed_q4_packed_report.py" cell "$out" "$group" "$batch" | tee -a "$out/summary.txt" >&3
+            if (( four_ranks )); then
+                "$PYTHON" -B "$workers/fixed_q4_window_ranks.py" "$out" "$group" "$batch" | tee -a "$out/summary.txt" >&3
+            fi
         elif (( fixed && batch == 16 )); then
             for block in 1 2; do
                 d="$out/pr30/block$block/g$group"

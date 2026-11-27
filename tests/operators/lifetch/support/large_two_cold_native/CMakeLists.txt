@@ -15,6 +15,16 @@ ascendc_compile_options(two_cold_kernel PRIVATE -DKVIP_STREAMING_LI=1 -DKVIP_OUT
   -DV9_BATCH_POST=2 -DSIM_Q=4 -DSIM_CAPTURE_HITS=1 -DV9_SIMULATION=0 -DROTATION_PUBLISH_TILES=1)
 add_library(two_cold_bridge SHARED bridge.cpp)
 option(KVIP_EXPERIMENT_SPLIT_ROLE "Use the single-vector Q4 scoring and dedicated window service implementation" OFF)
+if(DEFINED KVIP_TEST_WINDOW_RANK1 OR DEFINED KVIP_TEST_WINDOW_RANK2)
+  if(KVIP_EXPERIMENT_SPLIT_ROLE OR NOT KVIP_TEST_WINDOW_RANK1 MATCHES "^[0-9]+$" OR
+     NOT KVIP_TEST_WINDOW_RANK2 MATCHES "^[0-9]+$" OR KVIP_TEST_WINDOW_RANK1 LESS 1 OR
+     KVIP_TEST_WINDOW_RANK1 GREATER KVIP_TEST_WINDOW_RANK2 OR KVIP_TEST_WINDOW_RANK2 GREATER 2048)
+    message(FATAL_ERROR "Invalid isolated four-window rank curve")
+  endif()
+  ascendc_compile_options(two_cold_kernel PRIVATE -DKVIP_TEST_WINDOW_RANK1=${KVIP_TEST_WINDOW_RANK1}
+    -DKVIP_TEST_WINDOW_RANK2=${KVIP_TEST_WINDOW_RANK2})
+  target_compile_definitions(two_cold_bridge PRIVATE KVIP_TEST_WINDOW_RANK1=${KVIP_TEST_WINDOW_RANK1})
+endif()
 if(KVIP_EXPERIMENT_SPLIT_ROLE)
   if(NOT EXISTS "${OP}/op_kernel/indexer_large_dualrole.cpp")
     message(FATAL_ERROR "Missing split-role device implementation")

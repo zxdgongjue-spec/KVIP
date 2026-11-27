@@ -13,6 +13,14 @@ constexpr uint32_t kWindows = 4;
 #else
 #define launch_cold aclrtlaunch_v9_li_large_bs32_split_role
 #endif
+#elif defined(KVIP_TEST_WINDOW_RANK1)
+constexpr uint32_t kWindows = 4;
+#define test_forward kvip_test_four_ranks_forward
+#if KVIP_TEST_SIBLING_TRACE
+#define launch_cold aclrtlaunch_v9_li_large_four_ranks_trace
+#else
+#define launch_cold aclrtlaunch_v9_li_large_four_ranks
+#endif
 #else
 constexpr uint32_t kWindows = 3;
 #define test_forward kvip_test_two_cold_forward
@@ -39,6 +47,10 @@ extern "C" uint32_t test_forward(
         shape->resident != 16384 || shape->tokenBytes != 656 || shape->splitQ != 0) {
         return 100000;
     }
+#endif
+#if defined(KVIP_TEST_WINDOW_RANK1)
+    if (shape->history != 131328 || shape->resident != 16384 ||
+        shape->indexHeads != 32 || shape->tokenBytes != 656 || shape->splitQ != 0) return 100000;
 #endif
     uint32_t rc = hot(shape->liCores, stream, bindings, terminal);
     if (!rc) rc = launch_cold(shape->liCores, stream, bindings, terminal);

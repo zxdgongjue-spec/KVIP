@@ -109,6 +109,9 @@ def measure_packed(ex, proofs, serial, torch, states, sequence, config, director
         inputs = sequence.inputs
         state.reset()
         mhz = state.forward.calibrate_counter_mhz()
+        four_ranks = launch is not None and launch.window_policy == "four-ranks"
+        if four_ranks:
+            state.rotating.rank_progress.zero_()
         state.forward.times.zero_()
         state.forward.events_src.fill_(-1)
         state.forward.events_dst.fill_(-1)
@@ -151,12 +154,24 @@ def measure_packed(ex, proofs, serial, torch, states, sequence, config, director
         events = state.rotating.events.cpu().numpy().view("<u8").tolist()
         clocks = state.forward.times.cpu().numpy()
         li = li_intervals(clocks, state.batch, mhz)
+        if four_ranks:
+            proofs["separate_LI_diagnostic"] = li
+            proofs["separate_window_event_u64"] = events
+            from fixed_q4_window_ranks import decode_ranks
+            from large_two_cold import FOUR_WINDOW_RANKS
+            proofs["diagnostic_ranks"] = decode_ranks(state.rotating.rank_progress.cpu().numpy(),
+                                                       state.rotating.query_ends.cpu().numpy(), FOUR_WINDOW_RANKS)
         if trace_args and not split_trace:
             count = len(events) - 1
+            if not 1 <= count <= 3:
+                raise ValueError("16 timestamp words per query support at most three instrumented cold windows")
             words = clocks[state.batch * 64:state.batch * 128].reshape(state.batch, 4, 16)
             lane_times = words[:, :, 4:4 + 4 * count].reshape(state.batch, 4, count, 4)
             sibling_checks = lane_times[:, 3, :, 2:].tolist()
             score_spans = {name: lane_times[:, q, :, :2].tolist() for name, q in (("post_owner", 0), ("sibling", 3))}
+            if four_ranks:
+                proofs["separate_score_span_cycles"] = score_spans
+                proofs["separate_sibling_predecessor_cycles"] = sibling_checks
         winners = state.workspace.topk.cpu().numpy().reshape(state.batch, -1)
         sources = state.forward.events_src.cpu().numpy()
         density = summarize(events, li, state.token_bytes, winners=winners, sources=sources,
