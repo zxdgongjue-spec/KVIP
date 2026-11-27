@@ -28,6 +28,11 @@ for group in "${groups[@]}"; do
         placement=$("$PYTHON" -B "$report" placement "$thp")
         read -r node adapter <<<"$placement"
         set_cpu_placement "$node" "$adapter" archived
+        if [[ $audit_mode == frozen ]]; then
+            PEER_FROZEN_LIST=$("$PYTHON" -B "$report" cached "$out" "$PEER_AUDIT_ORIGIN" "$group" "$batch" journal)
+            [[ -n $PEER_FROZEN_LIST && -s $PEER_FROZEN_LIST/journal.npz ]]
+            export PEER_FROZEN_LIST
+        fi
         echo "COLLECT G$group BS$batch $audit_mode" >&3
         run_arm "$group" "$batch" "$trace" "$audit_mode" "$pair"
         "$PYTHON" -B "$controller_root/tests/operators/lifetch/support/large_batch_placement.py" compare "$thp" "$pair/$audit_mode/thp.json"

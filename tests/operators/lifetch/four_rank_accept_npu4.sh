@@ -5,12 +5,14 @@ set -euo pipefail
 repo=$(cd "${1:?expected KVIP checkout}" && pwd -P)
 reader=$(git -C "$repo" rev-parse --verify "${2:?expected reader commit}^{commit}")
 mode=${3:?expected candidate commit or serial-only}
+extra=${4:-natural}
+[[ $extra == natural || ( $extra == paired-frozen && $mode != serial-only ) ]] || exit 2
 native=
 if [[ $mode != serial-only ]]; then native=$(git -C "$repo" rev-parse --verify "$mode^{commit}"); fi
 base=d0fc5963881bd38fa97eff0f6ef40c757a6e8713
 serial=10442f1ffa314606c23f54b73e49ecfc372f1f9a
 work=/home/c00982601/CacheOS/ubmem-validation/recent-index-threshold
-ref="$work/peer-baseline/fixed-q4-four-ranks-one-block.MRDDaH"
+ref=$(cd "$work/peer-baseline/fixed-q4-four-ranks-one-block.MRDDaH" && pwd -P)
 [[ $(<"$ref/physical_npu.txt") == 4 && $(<"$ref/native.txt") == "$base" &&
    $(<"$ref/host.txt") == "$(uname -n)" && $native != "$base" && $native != "$reader" ]]
 sources="$work/fused-scan-sources"
@@ -37,7 +39,9 @@ if ! "$py" -B -c 'import numpy, hashlib; assert hasattr(hashlib, "file_digest")'
     py=/usr/local/python3.12.13/bin/python3
 fi
 audit() {
-    local timed
+    local timed rc
+    if "$py" -B "$entry/support/four_rank_accept.py" coverage "$3" "$1"; then return 0; else rc=$?; fi
+    (( rc == 3 )) || return "$rc"
     timed=$(staged_tree "$2")
     PEER_FOUR_RANK_AUDIT=$1 PEER_TIMED_SOURCE=$timed PEER_AUDIT_REFERENCE=$3 \
         bash "$entry/large_batch_npu4.sh" --four-ranks-candidate-only
@@ -56,9 +60,22 @@ if [[ -n $cached ]]; then
     candidate=$cached
     echo "REUSED_TIMED_CANDIDATE=$candidate"
 else
+    PEER_FOUR_RANK_VALIDATED_RESUME=$("$py" -B "$entry/support/four_rank_accept.py" partial "$ref" "$native")
+    export PEER_FOUR_RANK_VALIDATED_RESUME
     bash "$entry/four_rank_followup_npu4.sh" "$repo" "$reader" "$native" "$ref" all | tee "$stamp/candidate.log"
     candidate=$(sed -n 's/^RESULT_ROOT=//p' "$stamp/candidate.log")
 fi
 [[ -s $candidate/followup_summary.json && $(<"$candidate/native.txt") == "$native" ]]
 audit journal "$native" "$candidate"
-"$py" -B "$entry/support/four_rank_accept.py" report "$candidate" "$ref" | tee "$stamp/acceptance.log"
+if [[ $extra == natural ]]; then
+    "$py" -B "$entry/support/four_rank_accept.py" report "$candidate" "$ref" | tee "$stamp/acceptance.log"
+    exit 0
+fi
+# A natural ordering difference is visible evidence and does not prevent the controlled comparison.
+rc=0
+"$py" -B "$entry/support/four_rank_accept.py" report "$candidate" "$ref" > "$stamp/acceptance.log" || rc=$?
+cat "$stamp/acceptance.log"
+[[ $rc == 0 || $rc == 3 ]] || exit "$rc"
+audit frozen "$base" "$ref"
+audit frozen "$native" "$candidate"
+"$py" -B "$entry/support/four_rank_accept.py" frozen-report "$candidate" "$ref"

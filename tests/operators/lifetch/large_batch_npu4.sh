@@ -123,7 +123,7 @@ if [[ -n $follow_ref ]]; then
 fi
 audit_mode=${PEER_FOUR_RANK_AUDIT:-}
 if [[ -n $audit_mode ]]; then
-    [[ $audit_mode == serial || $audit_mode == journal ]] && (( standalone )) &&
+    [[ $audit_mode == serial || $audit_mode == journal || $audit_mode == frozen ]] && (( standalone )) &&
         [[ -n ${PEER_AUDIT_REFERENCE:-} && -z $follow_ref && -z ${PEER_PACKED_RESUME:-} && $peer_physical_npu == 4 ]] ||
         { echo "Invalid four-rank audit configuration" >&2; exit 2; }
     prefix="fixed-q4-audit-$audit_mode"
@@ -146,6 +146,10 @@ if [[ -n ${PEER_PACKED_RESUME:-} ]]; then
        $(<"$out/host.txt") == "$(uname -n)" &&
        $(<"$out/kvaf.txt") == "$sdk_rev" && $(<"$out/kvaf_tree.txt") == "$sdk_tree" ]] ||
         { echo "Resume source, host, card or SDK mismatch: $out" >&2; exit 2; }
+    if [[ -n $follow_ref && ( ! -s $out/followup_reference.txt || $(<"$out/followup_reference.txt") != "$follow_ref" ) ]]; then
+        echo "Interrupted candidate used another comparison archive: $out" >&2
+        exit 2
+    fi
     if [[ -s $out/machine_id.txt && -s /etc/machine-id ]]; then
         cmp -s "$out/machine_id.txt" /etc/machine-id || { echo "Resume machine ID mismatch: $out" >&2; exit 2; }
     elif [[ ! -s $out/boot_id.txt || $(<"$out/boot_id.txt") != "$(</proc/sys/kernel/random/boot_id)" ]]; then
@@ -323,7 +327,10 @@ elif [[ -z $archive && -z $fixed_archive && -z $packed_archive ]]; then
     placement=$("$PYTHON" -B "$workers/large_batch_placement.py" find "$out")
 fi
 trace_paths=()
-if (( standalone && resuming )); then
+if (( standalone && resuming )) && [[ -n $follow_ref ]]; then
+    "$PYTHON" -B "$controller_root/tests/operators/lifetch/support/four_rank_accept.py" validate-partial \
+        "$out" "$follow_ref" "$native" >&3
+elif (( standalone && resuming )); then
     verified=$("$PYTHON" -B "$controller_root/tests/operators/lifetch/support/fixed_q4_resume.py" \
         "$out" "$root" "$helpers" "$work" "$KVAF_BATCH_GET_KERNEL" 2>&3)
     while IFS=$'\t' read -r key value; do

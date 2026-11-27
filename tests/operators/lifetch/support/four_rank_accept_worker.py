@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""One strong-serial timing block or one untimed ordered GET journal diagnostic."""
+"""Strong-serial timing, a single natural GET journal, or an instrumented fixed-list timing block."""
 
 import argparse
 import ctypes
@@ -63,6 +63,62 @@ def canonical_journal(inputs, pages, addresses, sources, slots, epochs, final, s
     return result
 
 
+def terminal_image(s, sdk):
+    from kvip.runtime.build import kvaf_build_paths
+
+    fwd = s.forward
+    library = Path(s.rotating.library._name).resolve()
+    fun = fwd.terminal_function
+    bound = dict(zip(fun.__code__.co_freevars, (v.cell_contents for v in fun.__closure__)))
+    expected = ctypes.cast(s.rotating.library.aclrtlaunch_v9_parallel_terminal_large, ctypes.c_void_p)
+    if getattr(bound.get("tail"), "value", None) != expected.value:
+        raise ValueError("Cannot verify the bound four-Q terminal launch")
+    cann, _ = kvaf_build_paths(sdk / "build-npu")
+    compilers = [
+        cann / p
+        for p in (
+            "compiler/ccec_compiler/bin/bisheng",
+            "aarch64-linux/ccec_compiler/bin/bisheng",
+            "compiler/bin/bisheng",
+            "bin/bisheng",
+        )
+        if (cann / p).is_file()
+    ]
+    if not compilers:
+        raise ValueError(f"Cannot identify the installed device compiler in {cann}")
+    tools = {str(p.resolve()): sha(p) for p in dict.fromkeys(p.resolve() for p in compilers)}
+    rules = cann / "compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake"
+    tools[str(rules.resolve())] = sha(rules)
+    return dict(
+        tail_text=tail_text(library),
+        compiler_sha256=tools,
+        cold_build=s.large_window_launch.source_fingerprint,
+    )
+
+
+def device_journal(s, inputs, pages, counts):
+    from large_batch_pair import check_ordered_index
+
+    fwd = s.forward
+    check_ordered_index(s, inputs.captured_layout, inputs.captured_hot_valid)
+    stamp = fwd.terminal.times.cpu().numpy()
+    final = counts["row_query_final"]
+    if not np.array_equal(stamp[:, :, 20], final):
+        raise ValueError("Terminal count and per-Q completed GETs disagree")
+    return canonical_journal(
+        inputs,
+        pages,
+        s.logical_addresses,
+        fwd.events_src.cpu().numpy(),
+        fwd.events_dst.cpu().numpy(),
+        counts["row_window_prefetch"],
+        final,
+        stamp[:, :, 22],
+        s.history,
+        s.token_bytes,
+    )
+
+
 def run(a):
     sys.path.insert(0, str(a.timed / "tests/operators/lifetch/support"))
     import torch
@@ -84,7 +140,7 @@ def run(a):
         or not Path(kvip.__file__).resolve().is_relative_to(a.timed / "python")
         or not Path(kvaf.__file__).resolve().is_relative_to(a.sdk / "build-npu/python")
         or (a.mode == "serial" and rev != "10442f1ffa314606c23f54b73e49ecfc372f1f9a")
-        or (a.mode == "journal" and rev != old["native"])
+        or (a.mode != "serial" and rev != old["native"])
     ):
         raise ValueError("Wrong timed source, runtime or archive")
     seq, donors = load(a.trace, a.group, 1, a.batch, 0, a.bank)
@@ -107,7 +163,8 @@ def run(a):
     )
     if old["physical_npu"] != 4 or any(old[k] != v for k, v in wanted.items()):
         raise ValueError("Archive and live run differ in input, device, SDK or hardware")
-    fused = a.mode == "journal"
+    fused = a.mode != "serial"
+    timed = a.mode != "journal"
     cfg = configuration(
         [
             "bench",
@@ -128,9 +185,9 @@ def run(a):
             "--kvaf-server",
             a.server,
             "--warmup",
-            "0" if fused else "4",
+            "4" if timed else "0",
             "--iterations",
-            "1" if fused else "10",
+            "10" if timed else "1",
             "--prefetch-rank-start",
             "1024",
             "--prefetch-tokens",
@@ -143,7 +200,7 @@ def run(a):
     )
     kwargs = {}
     proof = {}
-    if not fused:
+    if timed:
         ref = np.empty((a.batch, 4, 2048), dtype=np.int32)
         for r in range(a.batch):
             for q in range(4):
@@ -155,9 +212,7 @@ def run(a):
                 ref[r, q] = np.sort(ids[top])
         inputs.validate_topk(ref)
         worker = partial(measure_packed, ex, proof, np.broadcast_to(ref, (10, *ref.shape)))
-    else:
-        from large_batch_pair import check_ordered_index
-        from kvip.runtime.build import kvaf_build_paths
+    if a.mode == "journal":
 
         kwargs = dict(large_window_policy="four-ranks")
 
@@ -177,53 +232,10 @@ def run(a):
             (s,) = states
             if rec["cold_build_fingerprint"] != s.large_window_launch.source_fingerprint:
                 raise ValueError("Diagnostic and measured LI executable differ")
-            fwd = s.forward
-            library = Path(s.rotating.library._name).resolve()
-            fun = fwd.terminal_function
-            bound = dict(zip(fun.__code__.co_freevars, (v.cell_contents for v in fun.__closure__)))
-            expected = ctypes.cast(s.rotating.library.aclrtlaunch_v9_parallel_terminal_large, ctypes.c_void_p)
-            if getattr(bound.get("tail"), "value", None) != expected.value:
-                raise ValueError("Cannot verify the bound four-Q terminal launch")
-            cann, _ = kvaf_build_paths(a.sdk / "build-npu")
-            compilers = [
-                cann / p
-                for p in (
-                    "compiler/ccec_compiler/bin/bisheng",
-                    "aarch64-linux/ccec_compiler/bin/bisheng",
-                    "compiler/bin/bisheng",
-                    "bin/bisheng",
-                )
-                if (cann / p).is_file()
-            ]
-            if not compilers:
-                raise ValueError(f"Cannot identify the installed device compiler in {cann}")
-            tools = {str(p.resolve()): sha(p) for p in dict.fromkeys(p.resolve() for p in compilers)}
-            rules = cann / "compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake"
-            tools[str(rules.resolve())] = sha(rules)
-            proof.update(
-                tail_text=tail_text(library),
-                compiler_sha256=tools,
-                cold_build=s.large_window_launch.source_fingerprint,
-            )
-            fwd.set_diagnostics(False)
+            proof.update(terminal_image(s, a.sdk))
+            s.forward.set_diagnostics(False)
             _, counts = read_selected(s, inputs, True)
-            check_ordered_index(s, inputs.captured_layout, inputs.captured_hot_valid)
-            stamp = fwd.terminal.times.cpu().numpy()
-            final = counts["row_query_final"]
-            if not np.array_equal(stamp[:, :, 20], final):
-                raise ValueError("Terminal count and per-Q completed GETs disagree")
-            records = canonical_journal(
-                inputs,
-                pages,
-                s.logical_addresses,
-                fwd.events_src.cpu().numpy(),
-                fwd.events_dst.cpu().numpy(),
-                counts["row_window_prefetch"],
-                final,
-                stamp[:, :, 22],
-                s.history,
-                s.token_bytes,
-            )
+            records = device_journal(s, inputs, pages, counts)
             path = a.out / "journal.npz"
             np.savez_compressed(path, **records)
             proof.update(
@@ -234,6 +246,55 @@ def run(a):
             )
             return dict(correctness="PASS", failures=[])
 
+    if a.mode == "frozen":
+        from four_rank_controlled import (GUARD, clear_evidence, controlled_build, evidence, extend_state,
+                                          list_digest, validate_bound_addresses, validate_physical_operands, window_inputs)
+        import large_two_cold
+        from fixed_q4_packed_worker import FrozenPackedRound
+
+        folder = Path(os.environ["PEER_FROZEN_LIST"])
+        manifest = json.loads((folder / "journal.json").read_bytes())
+        pinned = manifest["identity"]
+        if (manifest["correctness"] != "PASS" or pinned["native"] != "d0fc5963881bd38fa97eff0f6ef40c757a6e8713"
+                or not (folder / "placement_verified").is_file() or any(pinned[k] != v for k, v in wanted.items())
+                or sha(folder / "journal.npz") != manifest["journal_sha256"]):
+            raise ValueError("Incorrect, unmatched, or corrupted original ordered GET list")
+        with np.load(folder / "journal.npz", allow_pickle=False) as j:
+            records = {k: j[k] for k in j.files}
+        ids, counts = window_inputs(records, a.batch, inputs.geometry["history"])
+        validate_physical_operands(records, inputs, pages)
+        large_two_cold.build = controlled_build(large_two_cold.build)
+        kwargs = dict(large_window_policy="four-ranks")
+
+        class ControlledState(ex.FusedReplayState):
+            def __init__(self, *args, **options):
+                super().__init__(*args, **options)
+                validate_bound_addresses(self, records)
+                extend_state(self, ids, counts)
+                clear_evidence(self)
+
+        ex.FusedReplayState = ControlledState
+        base_reset, base_validate = FrozenPackedRound.reset, FrozenPackedRound.validate
+        checks = []
+
+        def reset(frozen, state):
+            base_reset(frozen, state)
+            clear_evidence(state)
+
+        def validate(frozen, state, inp, index):
+            base_validate(frozen, state, inp, index)
+            count = frozen.traffic[-1]
+            actual = device_journal(state, inp, pages, count)
+            seen, status = state.frozen_binding[2], state.frozen_binding[4]
+            checks.append(evidence(records, actual, np.asarray(count["row_window_prefetch"]),
+                                   seen.cpu().numpy(), status[:, :, 0].cpu().numpy()))
+            if index == 0:
+                proof.update(terminal_image(state, a.sdk))
+
+        FrozenPackedRound.reset, FrozenPackedRound.validate = reset, validate
+        proof.update(frozen_journal_sha256=manifest["journal_sha256"], guard_sha256=sha(GUARD),
+                     original_journal=str(folder), timed_journal_checks=checks,
+                     expected_window_sha256=list_digest(records, "w"), expected_final_sha256=list_digest(records, "q"))
     outcome = ex.run_path(cfg, a.out / "path", seq, pages, fused=fused, measure=worker, **kwargs)
     workers = 32 if fused else 2
     if outcome["correctness"] != "PASS" or outcome["failures"] or outcome["runtime_workers"] != workers:
@@ -241,19 +302,25 @@ def run(a):
     summary = dict(
         identity=dict(old, native=rev), arm=a.mode, correctness="PASS", get_workers=workers, **proof
     )
-    if not fused:
+    if timed:
         summary.update(
             checked_queries=40 * a.batch,
             checked_rows=10 * a.batch,
             full_KV_Index_checked_calls=10,
             selection_oracle="captured_logical_scores",
         )
-    atomic_json(a.out / ("journal.json" if fused else "packed_result.json"), summary)
+    if a.mode == "frozen":
+        if len(checks) != 10 or proof["tail_text"] != manifest["tail_text"] or proof["compiler_sha256"] != manifest["compiler_sha256"]:
+            raise ValueError("Expected ten measured journals and identical original tail image and compiler")
+        summary["guarded_pass"] = all(c["ordered_match"] for c in checks)
+        summary["scope"] = "controlled ten-call graph with guarded GET and tail diagnostics enabled"
+    path = dict(serial="packed_result.json", journal="journal.json", frozen="frozen.json")[a.mode]
+    atomic_json(a.out / path, summary)
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("mode", choices=["journal", "serial"])
+    p.add_argument("mode", choices=["journal", "serial", "frozen"])
     for name in ("timed", "ref"):
         p.add_argument(name, type=Path)
     for name in ("group", "batch"):

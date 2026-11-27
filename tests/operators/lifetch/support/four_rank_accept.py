@@ -4,11 +4,13 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import numpy as np
 
 from export_large_rank_evidence import observation
+from four_rank_controlled import GUARD
 from four_rank_followup import CELLS, serial_reference
 from large_batch_placement import field, placement, same_card
 from reporting import atomic_json
@@ -33,6 +35,32 @@ def cached(root, ref, group, batch, mode):
         serial = serial_reference(root, identity, group, batch)
         return Path(serial["source"]) if serial else None
     expected = read(base / "fused/packed_result.json")
+    if mode == "frozen":
+        origin = Path(os.environ["PEER_AUDIT_ORIGIN"])
+        pinned = cached(root, origin, group, batch, "journal")
+        if not pinned:
+            raise ValueError("The untimed original GET journal has not been collected")
+        reference = read(pinned / "journal.json")
+        for path in sorted(root.parent.glob(
+            f"fixed-q4-audit-frozen.*/g{group}/bs{batch}/block1/frozen/frozen.json"
+        )):
+            d, trial = path.parent, path.parents[4]
+            if (not (d / "placement_verified").is_file() or not matched(trial, ref)
+                    or field(trial, "native") != expected["identity"]["native"]):
+                continue
+            a = read(path)
+            if (a.get("identity") == expected["identity"] and a.get("correctness") == "PASS"
+                    and a.get("arm") == "frozen" and a.get("get_workers") == 32
+                    and a.get("guard_sha256") == hashlib.sha256(GUARD.read_bytes()).hexdigest()
+                    and a.get("frozen_journal_sha256") == reference["journal_sha256"]
+                    and a.get("tail_text") == reference["tail_text"]
+                    and a.get("compiler_sha256") == reference["compiler_sha256"]
+                    and a.get("calls") == len(a.get("timed_journal_checks", [])) == 10
+                    and a.get("full_KV_Index_checked_calls") == 10
+                    and a.get("expected_window_sha256") and a.get("expected_final_sha256")
+                    and placement(d / "thp.json") == identity[1]):
+                return d
+        return None
     for path in sorted(
         root.parent.glob(f"fixed-q4-audit-journal.*/g{group}/bs{batch}/block1/journal/journal.json")
     ):
@@ -143,9 +171,9 @@ def report(root, ref):
             f"serial_LI/tail_us={src['LI']:.2f}/{src['tail']:.2f} candidate_LI/tail_us={new['LI']:.2f}/{new['tail']:.2f} "
             f"saved_vs_previous_graph/LI/tail_us={old['graph'] - new['graph']:+.2f}/{old['LI'] - new['LI']:+.2f}/{old['tail'] - new['tail']:+.2f} "
             f"matched_counts={n}/10 "
-            f"ordered_GET_segments={journal['matched_segments']}/{journal['total_segments']} "
+            f"one_untimed_ordered_GET_segments={journal['matched_segments']}/{journal['total_segments']} "
             f"tail_text_compiler={'PASS' if journal['tail_text_and_compiler_match'] else 'FAIL'} "
-            f"strict={'PASS' if passed else 'FAIL'}"
+            f"natural_diagnostic={'PASS' if passed else 'FAIL'}"
         )
     path = root / "strict_acceptance.json"
     atomic_json(
@@ -164,9 +192,44 @@ def report(root, ref):
     )
     print(
         f"STRICT_REPORT={path} strict_pass_cells={sum(r['strict_equivalence_pass'] for r in result)}/{len(result)} "
-        f"graph20_cells={sum(r['target20_graph'] for r in result)}/{len(result)}"
+        f"natural_raw_speed_graph20_cells={sum(r['target20_graph'] for r in result)}/{len(result)}"
     )
     return all(r["strict_equivalence_pass"] for r in result)
+
+
+def frozen_report(root, ref):
+    result = []
+    for g, b in CELLS:
+        old = cached(root, ref, g, b, "frozen")
+        new = cached(root, root, g, b, "frozen")
+        if old is None or new is None:
+            raise ValueError(f"Missing a controlled arm for G{g} BS{b}")
+        left, right = (read(d / "frozen.json") for d in (old, new))
+        if left["frozen_journal_sha256"] != right["frozen_journal_sha256"]:
+            raise ValueError("Two arms used different original GET journals")
+        if any(left[k] != right[k] for k in ("expected_window_sha256", "expected_final_sha256",
+                                              "tail_text", "compiler_sha256", "guard_sha256")):
+            raise ValueError("Controlled arms used different list, guard, compiler or terminal")
+        def verified(a):
+            return sum(c["ordered_match"] and c["actual_window_sha256"] == a["expected_window_sha256"]
+                       and c["actual_final_sha256"] == a["expected_final_sha256"] for c in a["timed_journal_checks"])
+        checked = [verified(a) for a in (left, right)]
+        passed = checked == [10, 10]
+        delta = None
+        if passed:
+            delta = {s: left["mean_us"][s] - right["mean_us"][s] for s in ("LI", "tail")}
+            delta["graph"] = left["graph_mean_us"] - right["graph_mean_us"]
+        rec = dict(group=g, batch=b, original=str(old), candidate=str(new), verified_graph_calls=checked,
+                   guarded_pass=passed, controlled_savings_us=delta)
+        result.append(rec)
+        gains = "/".join(f"{delta[k]:+.2f}" for k in ("graph", "LI", "tail")) if passed else "UNAVAILABLE"
+        print(f"G{g} BS{b} CONTROLLED old/new_ordered_calls={checked[0]}/10,{checked[1]}/10 "
+              f"graph/LI/tail_saved_mean_us={gains}")
+    path = root / "controlled_acceptance.json"
+    atomic_json(path, dict(scope="controlled only; both arms include identical guard and terminal journaling",
+                           cells=result))
+    print(f"CONTROLLED_REPORT={path} controlled_pass_cells={sum(c['guarded_pass'] for c in result)}/{len(result)}")
+    return all(c["guarded_pass"] for c in result)
 
 
 def timed(ref, native):
@@ -195,6 +258,36 @@ def timed(ref, native):
 
 
 
+def completed_natural_cells(root, ref, native):
+    """Authenticate every completed cell of an interrupted natural candidate against the pinned archive."""
+    if field(root, "native") != native or field(root, "followup_reference") != str(ref) or not matched(root, ref):
+        raise ValueError(f"Wrong native, same-card comparison archive, or runtime at {root}")
+    allowed = {root / f"g{g}/bs{b}/block1/fused/placement_verified": (g,b) for g,b in CELLS}
+    markers = list(root.glob("g*/bs*/block*/fused/placement_verified"))
+    if any(m not in allowed or m.resolve() != root.resolve() / m.relative_to(root) for m in markers):
+        raise ValueError(f"Unexpected completed state or batch at {root}")
+    for m in markers:
+        g,b = allowed[m]
+        relative = m.parent.parent.relative_to(root)
+        _, old = observation(ref, ref / relative, g, b, "fused")
+        _, fresh = observation(root, root / relative, g, b, "fused")
+        from fixed_q4_candidate_only import cell
+        r = cell(root, g, b)
+        if fresh != old or r["ranks"]["ranks"] != [1024,1568,1792,2048]:
+            raise ValueError(f"Completed candidate cell differs in input, placement, or ranks at {m}")
+    return len(markers)
+
+
+def partial_natural(ref, native):
+    options = []
+    for root in ref.parent.glob("fixed-q4-rank-followup.*"):
+        if field(root, "native") == native and field(root, "followup_reference") == str(ref) and matched(root, ref):
+            n = completed_natural_cells(root, ref, native)
+            if n:
+                options.append((n, root.stat().st_mtime_ns, root))
+    return max(options)[2] if options else None
+
+
 def serial_summary(ref):
     matches = []
     missing = []
@@ -218,31 +311,55 @@ if __name__ == "__main__":
     sub = p.add_subparsers(dest="action", required=True)
     sub.add_parser("placement").add_argument("path", type=Path)
     sub.add_parser("serial-summary").add_argument("ref", type=Path)
-    t = sub.add_parser("timed")
-    t.add_argument("ref", type=Path)
-    t.add_argument("native")
-    for action in ("cached", "check", "report"):
+    q = sub.add_parser("coverage")
+    q.add_argument("ref", type=Path)
+    q.add_argument("mode", choices=["serial", "journal", "frozen"])
+    for action in ("timed", "partial"):
+        t = sub.add_parser(action)
+        t.add_argument("ref", type=Path)
+        t.add_argument("native")
+    validate = sub.add_parser("validate-partial")
+    validate.add_argument("path", type=Path)
+    validate.add_argument("ref", type=Path)
+    validate.add_argument("native")
+    for action in ("cached", "check", "report", "frozen-report"):
         q = sub.add_parser(action)
         q.add_argument("root", type=Path)
         q.add_argument("ref", type=Path)
-        if action != "report":
+        if action in ("cached", "check"):
             q.add_argument("group", type=int)
             q.add_argument("batch", type=int)
-            q.add_argument("mode", choices=["serial", "journal"])
+            q.add_argument("mode", choices=["serial", "journal", "frozen"])
     a = p.parse_args()
+    if a.action == "coverage":
+        missing = [(g,b) for g,b in CELLS if not cached(a.ref, a.ref, g, b, a.mode)]
+        print(f"ARCHIVE mode={a.mode} complete={len(CELLS)-len(missing)}/{len(CELLS)}")
+        raise SystemExit(3 if missing else 0)
     if a.action == "serial-summary":
         raise SystemExit(0 if serial_summary(a.ref) else 3)
-    if a.action == "timed":
-        hit = timed(a.ref, a.native)
+    if a.action == "validate-partial":
+        print(f"RESUME verified_cells={completed_natural_cells(a.path, a.ref, a.native)} root={a.path}")
+        raise SystemExit(0)
+    if a.action in ("timed", "partial"):
+        hit = (timed if a.action == "timed" else partial_natural)(a.ref, a.native)
         if hit:
             print(hit)
     elif a.action == "placement":
         print(*placement(a.path))
+    elif a.action == "frozen-report":
+        raise SystemExit(0 if frozen_report(a.root, a.ref) else 3)
     elif a.action == "report":
         raise SystemExit(0 if report(a.root, a.ref) else 3)
     else:
         hit = cached(a.root, a.ref, a.group, a.batch, a.mode)
         if a.action == "check" and not hit:
             raise ValueError(f"Unverified {a.mode} result at {a.root}")
-        if hit:
+        if hit and a.action == "check" and a.mode == "frozen":
+            data = read(hit / "frozen.json")
+            checks = data["timed_journal_checks"]
+            matched_calls = sum(item["ordered_match"] for item in checks)
+            print(f"G{a.group} BS{a.batch} CONTROLLED ordered_GET_calls={matched_calls}/10 "
+                  f"graph/LI/tail_mean_us={data['graph_mean_us']:.2f}/{data['mean_us']['LI']:.2f}/{data['mean_us']['tail']:.2f} "
+                  f"source={hit}")
+        elif hit:
             print(hit)
