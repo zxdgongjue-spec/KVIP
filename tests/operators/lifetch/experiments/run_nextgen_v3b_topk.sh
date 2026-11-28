@@ -34,6 +34,7 @@ git -C "$REPO" rev-parse HEAD | tee "$OUT/test_commit.txt"
 g++ -std=c++17 -O3 -shared -fPIC -ffp-contract=off "$DIR/b16_mtp_cpp_planner.cpp" -o "$OUT/libplanner.so"
 unset PYTHONOPTIMIZE
 "$VPY" -m py_compile "$DIR/nextgen_v3b_topk_test.py" "$DIR/b16_score_queue_test.py" "$DIR/nextgen_v3b_resource_gate.py"
+"$VPY" -u "$DIR/test_nextgen_v3b_resource_gate.py"
 "$VPY" -u "$DIR/nextgen_v3b_topk_test.py" --mode host --planner "$OUT/libplanner.so"
 if [[ "$MODE" == host ]]; then echo V3B_HOST_ONLY_PASS; exit 0; fi
 PHYSICAL="${NEXTGEN_PHYSICAL_DEVICE:-}"
