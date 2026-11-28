@@ -1,5 +1,5 @@
 #include "context.h"
-#include "pipeline_types.h"
+#include "../op_kernel/pipeline_types.h"
 #include <cstdint>
 
 extern "C" uint32_t aclrtlaunch_v9_nextgen_finalize_kernel(uint32_t,void*,void*);
