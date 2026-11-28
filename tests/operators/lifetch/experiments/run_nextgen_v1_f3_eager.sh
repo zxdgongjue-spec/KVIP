@@ -11,7 +11,7 @@ INIT_EVIDENCE=$(realpath "$4")
 V3B_EVIDENCE=$(realpath "$5")
 F2=$(realpath "$6")
 [[ "${CONFIRM_NEXTGEN_QUARANTINE_CLEARED:-0}" == 1 ]] || { echo "F3_BLOCKED: require administrator-confirmed transport quiescence and release of previous test service"; exit 2; }
-[[ ! -e /proc/123779 && ! -e /proc/123595 ]] || { echo "F3_BLOCKED: prior worker/service PID still visible"; exit 2; }
+[[ ! -e /proc/123779 && ! -e /proc/123595 && ! -e /proc/126581 && ! -e /proc/126398 ]] || { echo "F3_BLOCKED: prior worker/service PID still visible"; exit 2; }
 unset NEXTGEN_F3_LIBRARY
 PHYSICAL_DEVICE="${NEXTGEN_PHYSICAL_DEVICE:-}"
 [[ "$PHYSICAL_DEVICE" == 7 ]] || { echo "F3 incident replay requires physical NPU7"; exit 2; }
@@ -188,6 +188,7 @@ printf '%s\n' "$V3B_EVIDENCE" > "$OUT/v3b_evidence_path.txt"
 # INVALID rows. Between independent workers, poll for actual context release.
 GATE_DIR="$REPO/tests/operators/lifetch/experiments"
 "$VPY" -u "$GATE_DIR/test_nextgen_v3b_resource_gate.py"
+"$VPY" -u "$GATE_DIR/test_nextgen_v1_f3_recorder.py"
 exec 9>"$WORK/v3b-npu${PHYSICAL_DEVICE}.lock"
 flock -n 9 || { echo "NEXTGEN_VALIDATION_LOCK_BUSY"; exit 2; }
 idle_gate() {

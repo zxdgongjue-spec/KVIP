@@ -55,6 +55,15 @@ class CorrectnessRecorder:
         return 'FAIL' if self.failures else 'PASS' if self.checked else 'NOT_RUN'
 
 
+def require_eager_check(recorder, label, callback):
+    """Record a required eager check exactly once; never promote a failure."""
+    if not recorder.check(label, callback):
+        raise AssertionError(f"{label}: {recorder.failures[-1]['error']}")
+    if recorder.status != "PASS":
+        raise AssertionError(f"{label}: prior correctness failure {recorder.failures}")
+    return True
+
+
 def comparison_row(case_id, serial, fused, correctness, execution='COMPLETED'):
     """Keep measured deltas on incorrect results; expose acceptance separately."""
     row = dict(case=case_id, execution=execution, correctness=correctness,

@@ -38,7 +38,7 @@ from kvip.operators.lifetch_ubmem.build import UbmemGeometry, build_ubmem_librar
 from kvip.runtime.device import query_device_resources
 from kvip.runtime.loader import load_lifetch_library
 from performance import measure_sequence
-from reporting import CorrectnessRecorder, atomic_json, record_case_failure, timing_summary
+from reporting import CorrectnessRecorder, atomic_json, record_case_failure, timing_summary, require_eager_check
 from workloads import SOURCE, ReplayPagePlan, ReplaySequence
 
 # A validation worktree may exercise an immutable, separately built operator tree.
@@ -2007,12 +2007,13 @@ def run_urma_case(
     native.reset()
     native_call()
     stream.synchronize()
-    native_check()
     native_completion = check_native_completion if compact else None
     if not f3_eager:
+        native_check()
         measure(native_call, native.reset, native_check, timing_name="native_chain", completion_check=native_completion)
     else:
-        print("V1_F3_NATIVE_EAGER_PASS",flush=True)
+        require_eager_check(correctness, "F3 native eager", native_check)
+        print("V1_F3_NATIVE_EAGER_PASS", "status="+correctness.status, "checked="+str(correctness.checked), flush=True)
     reference = state["native_topk"].cpu().reshape(b, 4, 2048).numpy()
     if varlen_probe and correctness.status != 'PASS':
         raise AssertionError("V1 native first-round reference failed")
@@ -2288,7 +2289,11 @@ def run_urma_case(
             print("V1_F3_EAGER_SYNC_PASS",flush=True)
             # Check real completion before any diagnostic assertion can cause
             # lease teardown. Existing verify marks completed only after CQ checks.
-            probe_verify()
+            # Record the independent candidate check; assert fail-closed before
+            # emitting any success markers. Runtime/CQ exceptions propagate.
+            require_eager_check(correctness, "F3 candidate eager", probe_verify)
+            assert correctness.checked == 2
+            print("V1_F3_EAGER_RECORDER_PASS checked=2",flush=True)
             raw=rotating.events.cpu().numpy().copy().reshape(8,2,128)
             words=raw.view("<u4").reshape(8,2,32)
             rows=rotating.rows.cpu().numpy().view(np.uint32).reshape(4,256)
