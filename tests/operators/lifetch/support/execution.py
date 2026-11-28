@@ -1587,6 +1587,17 @@ def run_urma(args, run_dir):
         for b in map(int, args.batches.split(","))
     ]
     shared_build = run_dir / "universal-build"
+    f3_library = os.environ.get("NEXTGEN_F3_LIBRARY")
+    if f3_library:
+        assert getattr(args, "varlen_probe", False) and args.mode == "check"
+        assert cases == [(4,131072,16384,32,8)] and args.seed == 43
+        assert args.prefetch_tokens == 512 and args.miss_percent == 10.0
+        assert aics == 32
+        candidate = Path(f3_library).resolve(strict=True)
+        assert candidate.name == "libv9_bridge.so"
+        assert hashlib.sha256(candidate.read_bytes()).hexdigest() == "fc56dc00b505a552cf71356188fc93790e9082cbcf32f7d6e64fab5265c52261"
+        shared_build.symlink_to(candidate.parent, target_is_directory=True)
+        print("V1_F3_CANDIDATE_BOUND", candidate, flush=True)
     built_digest = None
     for case, (batch, history, resident, heads, windows) in enumerate(cases):
         args = SimpleNamespace(
@@ -1636,8 +1647,6 @@ def run_urma(args, run_dir):
                     cann=args.cann, headers=options["KVAF_INCLUDE"], soc=args.soc)
                 shared_build.symlink_to(library.parent.resolve(), target_is_directory=True)
             progress(run_dir, f"BS={batch}: REUSE LIFetch build={shared_build.resolve()}; logs={folder}")
-            import hashlib
-
             # Fail before allocating/populating DDR if shared dependencies cannot load.
             load_lifetch_library(build / "libv9_bridge.so")
 
@@ -1704,6 +1713,11 @@ def run_urma(args, run_dir):
                 raise
             finally:
                 owner.close()
+        if f3_library:
+            assert report["correctness"] == "PASS" and report["first_round_verified"] == 1
+            atomic_json(run_dir/"checks.json",[dict(case="f3_eager",correctness="PASS",
+                detail="candidate eager-only, full payload and index checks, 16 rotation events, lease closed")])
+            print("V1_F3_LEASE_CLOSED_PASS",flush=True)
         times = report["timing"]
         if getattr(args, 'varlen_probe', False):
             line = "V1_GENERIC_PROBE " + json.dumps(dict(batch=batch, actual_k=report['actual_k'],
@@ -1864,6 +1878,9 @@ def run_urma_case(
             raise AssertionError(f"native Get work differs from logical misses: {counts[:-1]} != {expected}")
         state["native_misses"] = counts[:-1]
 
+    f3_eager = bool(os.environ.get("NEXTGEN_F3_LIBRARY"))
+    if f3_eager:
+        assert varlen_probe and b == 4 and lengths.tolist() == [32768,65536,98304,131072]
     bench_only = getattr(args, "mode", None) == "bench"
     wall_costs = {}
     full_trace = {}
@@ -1880,6 +1897,9 @@ def run_urma_case(
         validation='full before sampling and final sample; completion every sample' if compact else 'full every sample',
         ordering='serial timing, fused timing, then diagnostic profiling',
     )
+    if f3_eager:
+        sampling_protocol.update(timed_region="NOT_REQUESTED",ordering="one native eager then one candidate eager",
+                                 warmup=0,iterations=0,validation="full eager")
     atomic_json(folder / 'sampling_protocol.json', sampling_protocol)
 
     def capture_graph(call, reset, *, native_get=False):
@@ -1989,7 +2009,10 @@ def run_urma_case(
     stream.synchronize()
     native_check()
     native_completion = check_native_completion if compact else None
-    measure(native_call, native.reset, native_check, timing_name="native_chain", completion_check=native_completion)
+    if not f3_eager:
+        measure(native_call, native.reset, native_check, timing_name="native_chain", completion_check=native_completion)
+    else:
+        print("V1_F3_NATIVE_EAGER_PASS",flush=True)
     reference = state["native_topk"].cpu().reshape(b, 4, 2048).numpy()
     if varlen_probe and correctness.status != 'PASS':
         raise AssertionError("V1 native first-round reference failed")
@@ -2255,8 +2278,43 @@ def run_urma_case(
                 for tensor, seed in zip(update.inputs[:3], seeds):
                     assert torch.equal(tensor[row].cpu(), seed[row,logical[row]]), "Index field ownership"
             verified.append(dict(reads=dict(state['fused_read_count']), completion=dict(state['completion'])))
-        measure(full, reset, probe_verify, timing_name="prototype_with_update")
-        assert correctness.status == "PASS" and len(verified) == args.iterations+args.warmup+2, correctness.failures
+        if f3_eager:
+            state["check_phase"]="F3 first candidate eager"
+            reset()
+            stream.synchronize()
+            print("V1_F3_EAGER_BEGIN",flush=True)
+            full()
+            stream.synchronize()
+            print("V1_F3_EAGER_SYNC_PASS",flush=True)
+            # Check real completion before any diagnostic assertion can cause
+            # lease teardown. Existing verify marks completed only after CQ checks.
+            probe_verify()
+            raw=rotating.events.cpu().numpy().copy().reshape(8,2,128)
+            words=raw.view("<u4").reshape(8,2,32)
+            rows=rotating.rows.cpu().numpy().view(np.uint32).reshape(4,256)
+            np.savez_compressed(folder/"f3_event_evidence.npz",events=raw,rows=rows)
+            records=[]
+            for epoch,core in enumerate((0,2,4,6,1,3,5,7)):
+                for lane in range(2):
+                    w=words[epoch,lane]
+                    record=dict(epoch=epoch,lane=lane,core=int(w[4]),event_epoch=int(w[5]),
+                                complete=int(w[6]),skipped=int(w[7]))
+                    records.append(record)
+            atomic_json(folder/"f3_event_evidence.json",records)
+            for rec in records:
+                epoch=rec["epoch"]
+                assert rec["core"]==(0,2,4,6,1,3,5,7)[epoch] and rec["event_epoch"]==epoch,rec
+                assert rec["complete"]==1 and rec["skipped"]==int(epoch in (4,5,6)),rec
+            for epoch in (4,5,6):
+                assert not rows[:,16+epoch].any(),("skipped epoch has row admissions",epoch)
+                assert not rows[:,214+epoch].any(),("skipped epoch has row service order",epoch)
+            assert not owner.graphs, "F3 must not capture any graph"
+            print("V1_F3_EVENT_CLOSURE_PASS records=16 skipped=6",flush=True)
+            print("V1_F3_PAYLOAD_INDEX_CQ_PASS",flush=True)
+        else:
+            measure(full, reset, probe_verify, timing_name="prototype_with_update")
+        expected_checks=1 if f3_eager else args.iterations+args.warmup+2
+        assert correctness.status == "PASS" and len(verified) == expected_checks, correctness.failures
         ids = state['ids']
         same_topk = bool(np.array_equal(np.sort(ids,axis=-1),np.sort(reference,axis=-1)))
         np.savez_compressed(folder/"v1_topk_evidence.npz", native=reference, fused=ids,
@@ -2268,7 +2326,7 @@ def run_urma_case(
                       timing=completed_timings, stateful_rounds=0, sfa=None,
                       first_round_verified=len(verified), checks=verified,
                       exact_same_topk=same_topk, native_misses_per_request=state["native_misses"],
-                      scope="native BSND sparse_mode=0 and generic fused route; no causal MTP, no stateful visibility or performance claim")
+                      scope=("F3 candidate first eager only; no graph or timing claim" if f3_eager else "native BSND sparse_mode=0 and generic fused route; no causal MTP, no stateful visibility or performance claim"))
         print("V1_FIRST_ROUND_VERIFIED", json.dumps({k:v for k,v in result.items() if k!="timing"}),flush=True)
         return result
 
