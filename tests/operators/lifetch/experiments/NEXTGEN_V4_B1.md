@@ -14,7 +14,7 @@ Before each replay, initialize the existing Context through the existing v9_init
 2. reuses QLIVector::BeginFinalMetadata and EmitFinalClassification to publish queryBitmaps, queryErrors and Context::locations;
 3. launches the existing v9_streaming_resolve_update for final Fetch and Index Update.
 
-The finalizer uses streamingTopkOnly_, so it does not wait on native Rotation event 8 and does not launch legacy LI. Intermediate Prefetch must be configured to zero for this bridge; final Fetch remains enabled.
+The finalizer uses streamingTopkOnly_, so it does not wait on native Rotation event 8 and does not launch legacy LI. Intermediate Prefetch must be configured to zero for this bridge; final Fetch remains enabled. Because the current Local/Global kernels do not publish device-side completion status, the caller must synchronize and validate Score, Local TopK and Global TopK outputs before passing upstream_validated=1. This is a correctness-only gate and must not be included in performance timing. V4-B2 must replace this host validation gate with device-visible status before graph/runtime use.
 
 ## Admission
 Initial gate is intentionally narrow: BS16, Q4, H=131072, R=16384, indexHeads=32, AIC=32, liCores=32, splitQ=1, finalWorkers=4, positive rounds/service lanes, Fetch workers 1/2/4, prefetch_limit=0. This does not relax main's history<=210944 admission and makes no 512K claim.

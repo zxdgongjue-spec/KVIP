@@ -11,8 +11,10 @@ extern "C" uint32_t aclrtlaunch_v9_streaming_resolve_update(uint32_t,void*,void*
 extern "C" uint32_t kvip_nextgen_finalize_and_resolve(
     void* bindings, void* update, void* workspace, void* stream,
     const rotating::RuntimeShape* shape, uint32_t workers,
-    uint32_t prefetch_limit) {
-    if (!bindings || !update || !workspace || !stream || !shape) return 100000;
+    uint32_t prefetch_limit, uint32_t upstream_validated) {
+    if (!bindings || !update || !workspace || !stream || !shape || upstream_validated != 1) return 100000;
+    // Local/Global TopK do not yet publish device-side completion status.
+    // Until V4-B2 adds that protocol, require a synchronized host validation.
     // Deliberately narrow V4-B1 admission; expand only after exact end-to-end
     // TopK, payload, CQ and ownership checks on the target device.
     if (shape->batch != 16 || shape->history != 131072 ||
