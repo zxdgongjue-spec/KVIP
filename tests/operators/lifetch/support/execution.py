@@ -1600,6 +1600,8 @@ def run_urma(args, run_dir):
     f6_graph = os.environ.get("NEXTGEN_F6_GRAPH", "0")
     assert f6_graph in ("0","1") and (f6_graph=="0" or (f3_library and f5_bs16 and f5_diag=="0" and f4_replays in (3,100) and f6_eager=="0"))
     assert f6_eager in ("0","1") and (f6_eager=="0" or (f3_library and f5_bs16 and f5_diag=="1" and f4_replays==0))
+    f6_r1 = os.environ.get("NEXTGEN_F6_R1", "0")
+    assert f6_r1 in ("0","1") and (f6_r1=="0" or (f3_library and not f5_bs16 and f5_diag=="0" and f6_eager=="0" and f6_graph=="0" and f4_replays==3))
     if f3_library:
         assert getattr(args, "varlen_probe", False) and args.mode == "check"
         assert cases == [(16 if f5_bs16 else 4,131072,16384,32,8)] and args.seed == 43
@@ -1607,9 +1609,9 @@ def run_urma(args, run_dir):
         assert aics == 32
         candidate = Path(f3_library).resolve(strict=True)
         assert candidate.name == "libv9_bridge.so"
-        expected_sha = "cea9c320043a074074808bcb7595edebd0fc1ebbaae1766955d858d8c38b13b4" if (f6_eager=="1" or f6_graph=="1") else "fc56dc00b505a552cf71356188fc93790e9082cbcf32f7d6e64fab5265c52261"
+        expected_sha = "cea9c320043a074074808bcb7595edebd0fc1ebbaae1766955d858d8c38b13b4" if (f6_eager=="1" or f6_graph=="1" or f6_r1=="1") else "fc56dc00b505a552cf71356188fc93790e9082cbcf32f7d6e64fab5265c52261"
         assert hashlib.sha256(candidate.read_bytes()).hexdigest() == expected_sha
-        if f6_eager=="1" or f6_graph=="1":
+        if f6_eager=="1" or f6_graph=="1" or f6_r1=="1":
             print("V1_F6_CANDIDATE_SHA_PASS", expected_sha, flush=True)
         shared_build.symlink_to(candidate.parent, target_is_directory=True)
         print("V1_F3_CANDIDATE_BOUND", candidate, flush=True)
@@ -1730,7 +1732,7 @@ def run_urma(args, run_dir):
                 owner.close()
         if f3_library:
             assert report["correctness"] == "PASS" and report["first_round_verified"] == 1+f4_replays
-            atomic_json(run_dir/"checks.json",[dict(case="f6_graph" if f6_graph=="1" else "f6_eager" if f6_eager=="1" else "f5_bs16" if f5_bs16 else "f4_graph" if f4_replays else "f3_eager",correctness="PASS",
+            atomic_json(run_dir/"checks.json",[dict(case="f6_r1" if f6_r1=="1" else "f6_graph" if f6_graph=="1" else "f6_eager" if f6_eager=="1" else "f5_bs16" if f5_bs16 else "f4_graph" if f4_replays else "f3_eager",correctness="PASS",
                 detail=("candidate eager plus 100 independent graph replays" if f4_replays == 100 else "candidate eager plus three independent graph replays" if f4_replays else "candidate eager-only")
                        + f", full payload and index checks, {64 if f5_bs16 else 16} rotation events per sample, lease closed")])
             print("V1_F4_LEASE_CLOSED_PASS" if f4_replays else "V1_F3_LEASE_CLOSED_PASS",flush=True)
@@ -2420,7 +2422,7 @@ def run_urma_case(
                       timing=completed_timings, stateful_rounds=0, sfa=None,
                       first_round_verified=len(verified), checks=verified,
                       exact_same_topk=same_topk, native_misses_per_request=state["native_misses"],
-                      scope=("F6 BS16 eager plus 100 independent graph replays; pre-oracle snapshots; no timing or stateful claim" if f6_graph and f4_replays == 100 else "F6 BS16 eager plus three independent graph replays; pre-oracle snapshots; no timing or stateful claim" if f6_graph else "F6 single BS16 eager with pre-oracle snapshot; no graph or timing claim" if os.environ.get("NEXTGEN_F6_EAGER")=="1" else "F5 diagnostic single eager; no graph or timing claim" if f5_diag else "F5 BS16 candidate eager plus three independent graph replays; no timing or stateful claim" if f5_bs16 else "F4 candidate eager plus three independent graph replays; no timing or stateful claim" if f4_replays else "F3 candidate first eager only; no graph or timing claim" if f3_eager else "native BSND sparse_mode=0 and generic fused route; no causal MTP, no stateful visibility or performance claim"))
+                      scope=("F6-R1 BS4 eager plus three independent graph replays; no timing or stateful claim" if os.environ.get("NEXTGEN_F6_R1")=="1" else "F6 BS16 eager plus 100 independent graph replays; pre-oracle snapshots; no timing or stateful claim" if f6_graph and f4_replays == 100 else "F6 BS16 eager plus three independent graph replays; pre-oracle snapshots; no timing or stateful claim" if f6_graph else "F6 single BS16 eager with pre-oracle snapshot; no graph or timing claim" if os.environ.get("NEXTGEN_F6_EAGER")=="1" else "F5 diagnostic single eager; no graph or timing claim" if f5_diag else "F5 BS16 candidate eager plus three independent graph replays; no timing or stateful claim" if f5_bs16 else "F4 candidate eager plus three independent graph replays; no timing or stateful claim" if f4_replays else "F3 candidate first eager only; no graph or timing claim" if f3_eager else "native BSND sparse_mode=0 and generic fused route; no causal MTP, no stateful visibility or performance claim"))
         print("V1_FIRST_ROUND_VERIFIED", json.dumps({k:v for k,v in result.items() if k!="timing"}),flush=True)
         return result
 
