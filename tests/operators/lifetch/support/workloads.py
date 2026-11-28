@@ -118,6 +118,7 @@ def configuration(argv=None):
             command.add_argument('--suite', type=csv_values, default=('all',))
             command.add_argument('--cases', type=csv_values)
             command.add_argument('--snapshot', type=Path)
+            command.add_argument('--check-varlen-probe', action='store_true', help='V1 first-round Q4 variable K; explicit generic URMA streaming route')
         if mode in ('bench', 'diagnose'):
             command.add_argument('--input', choices=('synthetic', 'real'), default='synthetic')
             # None distinguishes absent arguments from explicitly supplied defaults on real input.
@@ -149,6 +150,8 @@ def configuration(argv=None):
     if args.device < 0 or args.timeout_seconds <= 0:
         parser.error('device must be nonnegative and timeout positive')
     if args.mode == 'check':
+        if args.check_varlen_probe and (args.transport != 'urma' or args.suite != ('basic',) or not args.cases or set(args.cases)-{'basic_bs4', 'basic_bs16'}):
+            parser.error('varlen probe requires URMA basic and explicit basic_bs4/basic_bs16 cases')
         if 'all' in args.suite and len(args.suite) != 1:
             parser.error('suite all cannot be combined with individual suites')
         if set(args.suite) - {*CHECK_SUITES, 'all'}:

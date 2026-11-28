@@ -1705,6 +1705,14 @@ def run_urma(args, run_dir):
             finally:
                 owner.close()
         times = report["timing"]
+        if getattr(args, 'varlen_probe', False):
+            line = "V1_GENERIC_PROBE " + json.dumps(dict(batch=batch, actual_k=report['actual_k'],
+                correctness=report['correctness'], first_round_verified=report['first_round_verified'],
+                exact_same_topk=report['exact_same_topk'], scope=report['scope']))
+            summaries.append(line)
+            (run_dir / "cases.log").write_text("\n".join(summaries)+"\n")
+            print(line,flush=True)
+            continue
         line = (
             f"binary_sha256={built_digest} q_workers={args.q_workers}\nBS={batch} prototype {report.get('correctness', 'PASS')} index_heads={args.index_heads} windows={geometry['intermediate_fetches']} requested_windows={args.intermediate_fetches} history={args.history} hot={args.resident} topk=2048 Q=4 graph=True\n"
             + "graph_p50_us="
@@ -1777,6 +1785,19 @@ def run_urma_case(
         actual_key=torch.full((b,), h, device=device, dtype=torch.int32),
         block_table=arguments[7].view(torch.int32).reshape(b, -1),
     )
+    varlen_probe = getattr(args, 'varlen_probe', False)
+    lengths = None
+    if varlen_probe:
+        assert h == 131072 and r == 16384 and b in (4, 16)
+        lengths = np.asarray(([32768, 65536, 98304, 131072] if b == 4 else
+                              [131072]*8 + [32768]*8), dtype=np.int32)
+        assert arguments[5].view(torch.int32).numel() == b
+        assert arguments[6].view(torch.int32).numel() == b
+        assert (arguments[5].view(torch.int32).cpu().numpy() == 4).all()
+        assert (arguments[6].view(torch.int32).cpu().numpy() == h).all()
+        arguments[6].view(torch.int32).copy_(torch.from_numpy(lengths).to(device))
+        fixture["actual_key"].copy_(arguments[6].view(torch.int32))
+        print("V1_ACTUAL_LENGTHS", lengths.tolist(), "Q4 sparse_mode=0", flush=True)
     fixture["native_inputs"] = dict(
         weights=arguments[2].view(torch.bfloat16).reshape(b, 4, args.index_heads),
         query_scale=arguments[3].view(torch.float32).reshape(b, 4, args.index_heads),
@@ -1797,7 +1818,16 @@ def run_urma_case(
     compact = getattr(args, 'mode', None) in ('bench', 'diagnose')
     compact_scores = scores
     from correctness import validate_topk
-    if compact:
+    def check_visible_topk(ids):
+        # Fixture score oracle is stored as positive BF16 bit patterns.
+        # Use real per-request visible prefix and existing cutoff tolerance.
+        rows = np.asarray(ids).reshape(b, 4, 2048)
+        score_fp32 = (scores.astype(np.uint32) << 16).view(np.float32)
+        for req, length in enumerate(lengths):
+            validate_topk(rows[req], score_fp32[:, :int(length)])
+    if varlen_probe:
+        check_visible_topk(initial_selected)
+    elif compact:
         validate_topk(initial_selected, compact_scores)
     else:
         expected_ids = np.stack([np.flatnonzero(row >= np.partition(row, -2048)[-2048]) for row in scores])
@@ -1825,7 +1855,11 @@ def run_urma_case(
 
     def native_check():
         counts = native.verify(state["native_topk"])
-        expected = [len(set(int(t) for t in ids if t >= r)) for ids in initial_selected]
+        current = initial_selected
+        if varlen_probe:
+            current = state["native_topk"].cpu().reshape(b, -1).numpy()
+            check_visible_topk(current)
+        expected = [len(set(int(t) for t in ids if t >= r)) for ids in current]
         if counts[:-1] != expected:
             raise AssertionError(f"native Get work differs from logical misses: {counts[:-1]} != {expected}")
         state["native_misses"] = counts[:-1]
@@ -1924,6 +1958,11 @@ def run_urma_case(
                 # transport totals; diagnostic snapshots are collected separately.
                 if pipeline.terminal is not None:
                     reads = state["terminal_read_counts"]
+                elif varlen_probe:
+                    # Completion checks remain mandatory. The first-round probe
+                    # does not interpret retired/published mapping statistics.
+                    p = state['fused_read_count']
+                    reads = dict(prefetch=p['prefetch'], final=p['final'], total=p['prefetch']+p['final'])
                 else:
                     reads = actual_reads(rotating.mapping.cpu().numpy(), topk.cpu().numpy(),
                                          rotating.rows.cpu().numpy().view(np.uint32), r)
@@ -1952,6 +1991,8 @@ def run_urma_case(
     native_completion = check_native_completion if compact else None
     measure(native_call, native.reset, native_check, timing_name="native_chain", completion_check=native_completion)
     reference = state["native_topk"].cpu().reshape(b, 4, 2048).numpy()
+    if varlen_probe and correctness.status != 'PASS':
+        raise AssertionError("V1 native first-round reference failed")
     owner.acquire(build / "libv9_bridge.so")
     rotating = launch_module.LIFetchBinding(
         torch,
@@ -1967,6 +2008,8 @@ def run_urma_case(
         prefetch_limit=args.prefetch_tokens,
         prefetch_rank_start=getattr(args, "prefetch_rank_start", 1024),
         output_stride=owner.output.shape[1],
+        query_ends=(torch.from_numpy(np.repeat(lengths[:,None],4,axis=1)).to(device)
+                    if varlen_probe else None),
     )
     topk = arguments[9].view(torch.int32).reshape(b, 4, 2048)
     prefix = 4 * 2048 * 6 + 1024 + 4 * h * 2
@@ -1985,7 +2028,19 @@ def run_urma_case(
         locations=rotating.locations,
         rotating=rotating,
     )
-    pipeline = StreamingForward(rotating, update, torch, args.prefetch_tokens, fused_final=True, q_workers=args.q_workers)
+    if varlen_probe:
+        # Do NOT use q4 tiling: generic host launch requires finalWorkers=4.
+        # Explicitly instantiate generic streaming, bypassing shape-only
+        # selection of the uniform-length terminal. Production code unchanged.
+        from kvip.operators.lifetch.streaming import StreamingLIFetchForward
+        pipeline = StreamingLIFetchForward(rotating, update, torch, args.prefetch_tokens,
+                                           fused_final=True, q_workers=args.q_workers)
+        pipeline.terminal = None
+        assert rotating.runtime_shape.finalWorkers == 4
+        assert int(rotating.runtime_shape.liCores) == 2*b
+        print("V1_EXPLICIT_GENERIC_STREAMING", flush=True)
+    else:
+        pipeline = StreamingForward(rotating, update, torch, args.prefetch_tokens, fused_final=True, q_workers=args.q_workers)
     print("FUSED_TERMINAL_SELECTED", pipeline.terminal is not None, flush=True)
     pipeline.legacy_layout = False
     pipeline.parallel_finalize = True
@@ -2010,6 +2065,8 @@ def run_urma_case(
         else:
             update.set_order(initial_orders)
         owner.reset()
+        if varlen_probe:
+            topk.fill_(-1)
         owner.mark_launched()
 
     def full():
@@ -2087,7 +2144,9 @@ def run_urma_case(
         if (slots < 0).any() or (slots >= (r if persistent else owner.output.shape[1])).any():
             raise RuntimeError("Fetch slot outside cache")
         state["ids"], state["slots"] = (ids, slots.numpy())
-        if compact:
+        if varlen_probe:
+            check_visible_topk(ids)
+        elif compact:
             validate_topk(ids, compact_scores)
         elif not np.array_equal(np.sort(ids, axis=-1), np.sort(reference, axis=-1)):
             raise AssertionError("TopK changed")
@@ -2175,6 +2234,38 @@ def run_urma_case(
                 actual = hot_kv[row, mask]
             if not torch.equal(actual, expected):
                 raise AssertionError(f"valid hot slot has mismatched Index/KV owner: request={row}")
+
+    if varlen_probe:
+        # Eager and captured independent first-round replays only. In particular,
+        # do not assert physical-prefix visibility after persistent index swaps.
+        verified = []
+        def probe_verify():
+            verify(True)
+            verify_all_valid_hot()
+            logical = update.logical.cpu().long()
+            seeds = [saved[0].reshape(b,h,128).cpu(), saved[1].view(torch.float32).reshape(b,h).cpu(),
+                     saved[2][b*prefix:].view(torch.int64).reshape(b,tail//8)[:,:h].cpu()]
+            for row in range(b):
+                assert torch.equal(torch.sort(logical[row]).values, torch.arange(h)), "Index ownership permutation"
+                for tensor, seed in zip(update.inputs[:3], seeds):
+                    assert torch.equal(tensor[row].cpu(), seed[row,logical[row]]), "Index field ownership"
+            verified.append(dict(reads=dict(state['fused_read_count']), completion=dict(state['completion'])))
+        measure(full, reset, probe_verify, timing_name="prototype_with_update")
+        assert correctness.status == "PASS" and len(verified) == args.iterations+args.warmup+2, correctness.failures
+        ids = state['ids']
+        same_topk = bool(np.array_equal(np.sort(ids,axis=-1),np.sort(reference,axis=-1)))
+        np.savez_compressed(folder/"v1_topk_evidence.npz", native=reference, fused=ids,
+                            actual_k=lengths, actual_q=np.full(b,4,dtype=np.int32))
+        result = dict(status="pass", correctness="PASS", correctness_failures=[],
+                      probe="Q4_noncausal_variable_K_independent_first_round",
+                      actual_k=lengths.tolist(), actual_q=[4]*b, explicit_generic_streaming=True,
+                      parallel_terminal=False, production_lease_type=type(owner.lease).__name__,
+                      timing=completed_timings, stateful_rounds=0, sfa=None,
+                      first_round_verified=len(verified), checks=verified,
+                      exact_same_topk=same_topk, native_misses_per_request=state["native_misses"],
+                      scope="native BSND sparse_mode=0 and generic fused route; no causal MTP, no stateful visibility or performance claim")
+        print("V1_FIRST_ROUND_VERIFIED", json.dumps({k:v for k,v in result.items() if k!="timing"}),flush=True)
+        return result
 
     def check_pipeline(orders, cold_start=False, label="regular"):
         state["check_phase"] = label
