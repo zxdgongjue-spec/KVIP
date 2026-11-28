@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
 SRC="$ROOT/csrc/operators/lightning_indexer_with_fetch"
 : "${KVAF_INCLUDE:?Set KVAF_INCLUDE to the patched KVAF device include directory}"
 ASCEND_CANN_PACKAGE_PATH="${ASCEND_CANN_PACKAGE_PATH:-/usr/local/Ascend/cann-9.2.1}"

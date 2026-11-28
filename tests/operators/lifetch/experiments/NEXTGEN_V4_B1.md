@@ -9,7 +9,7 @@ The staged caller must already have completed:
 2. V3 Local TopK.
 3. V3 Global TopK into the existing LIFetch output buffer (bindings[9]).
 
-Then call kvip_nextgen_finalize_and_resolve on the same NPU stream. It:
+Before each replay, initialize the existing Context through the existing v9_init path, as the current LIFetch lifecycle requires. Then enqueue Score, Local TopK and Global TopK, and call kvip_nextgen_finalize_and_resolve on the same NPU stream. It:
 1. launches one AIV-only finalizer per logical Query;
 2. reuses QLIVector::BeginFinalMetadata and EmitFinalClassification to publish queryBitmaps, queryErrors and Context::locations;
 3. launches the existing v9_streaming_resolve_update for final Fetch and Index Update.

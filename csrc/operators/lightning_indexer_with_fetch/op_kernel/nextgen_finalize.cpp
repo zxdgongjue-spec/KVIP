@@ -31,6 +31,7 @@ __aicore__ inline void RunLiFinalize(GM_ADDR bindings) {
     TPipe pipe;
     QLIKernel::QuantLightningIndexerKernel<Type> op;
     op.runtimeShape_=shape;
+    op.rotationContext_=P(14);
     op.sequenceSplit_=false;
     op.sequenceTopKOnly_=true;
 
@@ -58,7 +59,7 @@ __aicore__ inline void RunLiFinalize(GM_ADDR bindings) {
 
 extern "C" __global__ __aicore__ void v9_nextgen_finalize_kernel(GM_ADDR bindings) {
 #if defined(__CCE_AICORE__)
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    RunLiFinalize(bindings);
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    if ASCEND_IS_AIV { RunLiFinalize(bindings); }
 #endif
 }

@@ -27,7 +27,7 @@ extern "C" uint32_t kvip_nextgen_finalize_and_resolve(
         return 100000;
     }
     uint32_t result=aclrtlaunch_v9_nextgen_finalize_kernel(
-        shape->batch*4,stream,bindings);
+        shape->liCores,stream,bindings);
     if (!result) {
         result=aclrtlaunch_v9_streaming_resolve_update(
             shape->batch*pipeline_ab::kResolveCores+4*workers,stream,workspace);
