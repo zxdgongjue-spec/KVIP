@@ -1590,9 +1590,12 @@ def run_urma(args, run_dir):
     f3_library = os.environ.get("NEXTGEN_F3_LIBRARY")
     f4_replays = int(os.environ.get("NEXTGEN_F4_REPLAYS", "0"))
     assert f4_replays in (0,3) and (not f4_replays or f3_library)
+    f5_bs16 = os.environ.get("NEXTGEN_F5_BS16", "0")
+    assert f5_bs16 in ("0","1") and (f5_bs16 == "0" or (f3_library and f4_replays == 3))
+    f5_bs16 = f5_bs16 == "1"
     if f3_library:
         assert getattr(args, "varlen_probe", False) and args.mode == "check"
-        assert cases == [(4,131072,16384,32,8)] and args.seed == 43
+        assert cases == [(16 if f5_bs16 else 4,131072,16384,32,8)] and args.seed == 43
         assert args.prefetch_tokens == 512 and args.miss_percent == 10.0
         assert aics == 32
         candidate = Path(f3_library).resolve(strict=True)
@@ -1717,9 +1720,9 @@ def run_urma(args, run_dir):
                 owner.close()
         if f3_library:
             assert report["correctness"] == "PASS" and report["first_round_verified"] == 1+f4_replays
-            atomic_json(run_dir/"checks.json",[dict(case="f4_graph" if f4_replays else "f3_eager",correctness="PASS",
+            atomic_json(run_dir/"checks.json",[dict(case="f5_bs16" if f5_bs16 else "f4_graph" if f4_replays else "f3_eager",correctness="PASS",
                 detail=("candidate eager plus three independent graph replays" if f4_replays else "candidate eager-only")
-                       + ", full payload and index checks, 16 rotation events per sample, lease closed")])
+                       + f", full payload and index checks, {64 if f5_bs16 else 16} rotation events per sample, lease closed")])
             print("V1_F4_LEASE_CLOSED_PASS" if f4_replays else "V1_F3_LEASE_CLOSED_PASS",flush=True)
         times = report["timing"]
         if getattr(args, 'varlen_probe', False):
@@ -1883,8 +1886,10 @@ def run_urma_case(
 
     f3_eager = bool(os.environ.get("NEXTGEN_F3_LIBRARY"))
     f4_replays = int(os.environ.get("NEXTGEN_F4_REPLAYS", "0"))
+    f5_bs16 = os.environ.get("NEXTGEN_F5_BS16", "0") == "1"
     if f3_eager:
-        assert varlen_probe and b == 4 and lengths.tolist() == [32768,65536,98304,131072]
+        assert varlen_probe and b == (16 if f5_bs16 else 4)
+        assert lengths.tolist() == ([131072]*8+[32768]*8 if f5_bs16 else [32768,65536,98304,131072])
     bench_only = getattr(args, "mode", None) == "bench"
     wall_costs = {}
     full_trace = {}
@@ -2286,25 +2291,38 @@ def run_urma_case(
                     assert torch.equal(tensor[row].cpu(), seed[row,logical[row]]), "Index field ownership"
             verified.append(dict(reads=dict(state['fused_read_count']), completion=dict(state['completion'])))
         def verify_events(stem):
-            raw=rotating.events.cpu().numpy().copy().reshape(8,2,128)
-            words=raw.view("<u4").reshape(8,2,32)
-            rows=rotating.rows.cpu().numpy().view(np.uint32).reshape(4,256)
+            from kvip.operators.lifetch.geometry import li_geometry, trigger_tokens
+            geom=li_geometry(b,"auto",args.intermediate_fetches,aics)
+            groups=geom["service_groups"]
+            lanes=geom["service_aivs_per_window"]
+            triggers=trigger_tokens(b,h,r,"auto",args.intermediate_fetches,aics)
+            assert len(groups)==len(triggers)==8
+            assert int(rotating.runtime_shape.serviceLanes)==lanes
+            expected=[dict(epoch=epoch,lane=2*j+sub,core=core,event_epoch=epoch,
+                           complete=1,skipped=int(triggers[epoch]>lengths[core//2]))
+                      for epoch,group in enumerate(groups)
+                      for j,core in enumerate(group) for sub in range(2)]
+            assert len(expected)==(64 if f5_bs16 else 16)
+            skipped=[x for x in expected if x["skipped"]]
+            assert len(skipped)==(32 if f5_bs16 else 6)
+            assert {x["epoch"] for x in skipped}==({2,3,6,7} if f5_bs16 else {4,5,6})
+            raw=rotating.events.cpu().numpy().copy().reshape(8,lanes,128)
+            words=raw.view("<u4").reshape(8,lanes,32)
+            rows=rotating.rows.cpu().numpy().view(np.uint32).reshape(b,256)
             np.savez_compressed(folder/(stem+"_event_evidence.npz"),events=raw,rows=rows)
             records=[]
-            for epoch,core in enumerate((0,2,4,6,1,3,5,7)):
-                for lane in range(2):
-                    w=words[epoch,lane]
-                    record=dict(epoch=epoch,lane=lane,core=int(w[4]),event_epoch=int(w[5]),
-                                complete=int(w[6]),skipped=int(w[7]))
-                    records.append(record)
+            for exp in expected:
+                epoch,lane=exp["epoch"],exp["lane"]
+                w=words[epoch,lane]
+                records.append(dict(epoch=epoch,lane=lane,core=int(w[4]),event_epoch=int(w[5]),
+                                    complete=int(w[6]),skipped=int(w[7])))
             atomic_json(folder/(stem+"_event_evidence.json"),records)
-            for rec in records:
-                epoch=rec["epoch"]
-                assert rec["core"]==(0,2,4,6,1,3,5,7)[epoch] and rec["event_epoch"]==epoch,rec
-                assert rec["complete"]==1 and rec["skipped"]==int(epoch in (4,5,6)),rec
-            for epoch in (4,5,6):
-                assert not rows[:,16+epoch].any(),("skipped epoch has row admissions",epoch)
-                assert not rows[:,214+epoch].any(),("skipped epoch has row service order",epoch)
+            assert records==expected,(records,expected)
+            for x in skipped:
+                epoch,lane=x["epoch"],x["lane"]
+                assert not rows[lane::lanes,16+epoch].any(),("skipped epoch has row admissions",epoch,lane)
+                assert not rows[lane::lanes,214+epoch].any(),("skipped epoch has row service order",epoch,lane)
+            print("V1_EVENT_SAMPLE_PASS",stem,"records="+str(len(records)),"skipped="+str(len(skipped)),flush=True)
         if f3_eager:
             graph = None
             for sample in range(1+f4_replays):
@@ -2335,7 +2353,7 @@ def run_urma_case(
                 if sample == 0:
                     assert not owner.graphs
                     print("V1_F3_EAGER_RECORDER_PASS checked=2",flush=True)
-                    print("V1_F3_EVENT_CLOSURE_PASS records=16 skipped=6",flush=True)
+                    print("V1_F5_EVENT_CLOSURE_PASS records=64 skipped=32" if f5_bs16 else "V1_F3_EVENT_CLOSURE_PASS records=16 skipped=6",flush=True)
                     print("V1_F3_PAYLOAD_INDEX_CQ_PASS",flush=True)
                 if f4_replays:
                     # F3 demonstrated exact membership for this fixed fixture.
@@ -2362,7 +2380,7 @@ def run_urma_case(
                       timing=completed_timings, stateful_rounds=0, sfa=None,
                       first_round_verified=len(verified), checks=verified,
                       exact_same_topk=same_topk, native_misses_per_request=state["native_misses"],
-                      scope=("F4 candidate eager plus three independent graph replays; no timing or stateful claim" if f4_replays else "F3 candidate first eager only; no graph or timing claim" if f3_eager else "native BSND sparse_mode=0 and generic fused route; no causal MTP, no stateful visibility or performance claim"))
+                      scope=("F5 BS16 candidate eager plus three independent graph replays; no timing or stateful claim" if f5_bs16 else "F4 candidate eager plus three independent graph replays; no timing or stateful claim" if f4_replays else "F3 candidate first eager only; no graph or timing claim" if f3_eager else "native BSND sparse_mode=0 and generic fused route; no causal MTP, no stateful visibility or performance claim"))
         print("V1_FIRST_ROUND_VERIFIED", json.dumps({k:v for k,v in result.items() if k!="timing"}),flush=True)
         return result
 
