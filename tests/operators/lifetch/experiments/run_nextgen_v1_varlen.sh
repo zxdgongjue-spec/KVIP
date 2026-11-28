@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # NextGen V1: Q4 variable K, independent first-round generic URMA streaming.
-# Usage: NEXTGEN_PHYSICAL_DEVICE=7 CONFIRM_NEXTGEN_NPU_IDLE=1 bash this-script URMA_MANIFEST PATCH_EVIDENCE_JSON ORIGINAL_FRAMEWORK_ROOT INIT_EVIDENCE_DIR
+# Usage: NEXTGEN_PHYSICAL_DEVICE=7 CONFIRM_NEXTGEN_NPU_IDLE=1 bash this-script URMA_MANIFEST PATCH_EVIDENCE_JSON ORIGINAL_FRAMEWORK_ROOT INIT_EVIDENCE_DIR V3B_EVIDENCE_DIR
 set -Eeuo pipefail
 umask 077
-[[ $# == 4 ]] || { echo "Usage: $0 URMA_MANIFEST PATCH_EVIDENCE_JSON ORIGINAL_FRAMEWORK_ROOT INIT_EVIDENCE_DIR" >&2; exit 2; }
+[[ $# == 5 ]] || { echo "Usage: $0 URMA_MANIFEST PATCH_EVIDENCE_JSON ORIGINAL_FRAMEWORK_ROOT INIT_EVIDENCE_DIR V3B_EVIDENCE_DIR" >&2; exit 2; }
 MANIFEST=$(realpath "$1")
 PATCH_EVIDENCE=$(realpath "$2")
 ORIGINAL_ROOT=$(realpath "$3")
 INIT_EVIDENCE=$(realpath "$4")
+V3B_EVIDENCE=$(realpath "$5")
 PHYSICAL_DEVICE="${NEXTGEN_PHYSICAL_DEVICE:-}"
 [[ "$PHYSICAL_DEVICE" == 6 || "$PHYSICAL_DEVICE" == 7 ]] || { echo 'Select NEXTGEN_PHYSICAL_DEVICE=6 or 7 explicitly.' >&2; exit 2; }
 [[ "${CONFIRM_NEXTGEN_NPU_IDLE:-0}" == 1 ]] || { echo 'Confirm selected physical NPU is healthy, idle and allocated to you first.' >&2; exit 2; }
@@ -40,8 +41,13 @@ echo '===== 1. FROZEN BUILD GATE ====='
 [[ $(git -C "$NEW_KVAF" rev-parse HEAD) == "$KVAF_SHA" ]]
 git -C "$NEW_KVIP" diff --quiet HEAD
 git -C "$REPO" diff --quiet HEAD
-# The independent V2a source does not participate in this frozen V1 build.
-git -C "$REPO" diff --quiet "$KVIP_SHA" "$COMMIT" -- csrc python ':(exclude)csrc/operators/lightning_indexer_with_fetch/experiments/nextgen_v2_score_queue/**'
+# Independent experimental sources do not participate in the frozen V1 build.
+git -C "$REPO" diff --quiet "$KVIP_SHA" "$COMMIT" -- csrc python \
+    ':(exclude)csrc/operators/lightning_indexer_with_fetch/experiments/nextgen_v2_score_queue/**' \
+    ':(exclude)csrc/operators/lightning_indexer_with_fetch/experiments/nextgen_v3_local_topk/**' \
+    ':(exclude)csrc/operators/lightning_indexer_with_fetch/experiments/nextgen_v3_global_topk/**'
+# No modifications to validated V3b device sources are admitted.
+git -C "$REPO" diff --quiet dd3f154b2d7d44d3f9a86f960452f7f17a61c00a "$COMMIT" -- csrc python
 [[ $(git -C "$NEW_KVAF" diff --binary HEAD | sha256sum | awk '{print $1}') == 8132c738cb7e7a79fe1dc14f173954cc0110be322e14b25274debed15a8a9052 ]]
 [[ "$SOC" == Ascend950DT_9582 && "$TRANSPORT" == urma ]]
 for item in \
@@ -155,35 +161,21 @@ V0="$WORK/v0-host.1gz9Nq"
 grep -Fxq NEXTGEN_V0_REPO_PASS "$V0/run.log"
 grep -Fxq 26a0e198ec501d21f4ae20f3328aab8027c2fa43 "$V0/test_commit.txt"
 echo 'PREVIOUS_V0_EVIDENCE_PASS'
+grep -Fxq V3B_TOPK_MATRIX_PASS "$V3B_EVIDENCE/run.log"
+grep -Fxq dd3f154b2d7d44d3f9a86f960452f7f17a61c00a "$V3B_EVIDENCE/test_commit.txt"
+"$VPY" -u "$REPO/tests/operators/lifetch/experiments/check_nextgen_v3b_evidence.py" "$V3B_EVIDENCE" "$OUT/v3b_evidence_sha256.json"
+printf '%s\n' "$V3B_EVIDENCE" > "$OUT/v3b_evidence_path.txt"
 
-# Require both absence of reported processes and near-idle HBM.
-# Conservative lab threshold, not a hardware limit. Do not reset a device.
+# Reuse V3b's exact, opt-in NPU7 incident exception. Default denies all
+# INVALID rows. Between independent workers, poll for actual context release.
+GATE_DIR="$REPO/tests/operators/lifetch/experiments"
+"$VPY" -u "$GATE_DIR/test_nextgen_v3b_resource_gate.py"
+exec 9>"$WORK/v3b-npu${PHYSICAL_DEVICE}.lock"
+flock -n 9 || { echo "NEXTGEN_VALIDATION_LOCK_BUSY"; exit 2; }
 idle_gate() {
     local label="$1"
-    npu-smi info | tee "$OUT/npu_$label.txt"
-    "$VPY" - "$OUT/npu_$label.txt" "$PHYSICAL_DEVICE" <<'PY'
-import re, sys
-from pathlib import Path
-data = Path(sys.argv[1]).read_text()
-physical = int(sys.argv[2])
-assert physical in (6, 7)
-rows = data.splitlines()
-matches = []
-for i, row in enumerate(rows[:-1]):
-    if re.match(rf'^\|\s*{physical}\s*\|\s*Ascend950DT\s*\|', row):
-        health = row.split('|')[3].strip()
-        hbm = re.search(r'(\d+)\s*/\s*(\d+)\s*\|\s*$', rows[i+1])
-        if hbm:
-            matches.append((health, int(hbm[1]), int(hbm[2])))
-if len(matches) != 1:
-    raise SystemExit(f"NPU{physical}_IDLE_GATE_BLOCKED: unrecognized or ambiguous HBM status")
-health, used, total = matches[0]
-no_process = bool(re.search(rf'^\|\s*No running processes found in NPU {physical}\s*\|', data, re.M))
-print(f'NPU{physical}_IDLE_GATE health={health} hbm_used_mb={used} hbm_total_mb={total} no_process={no_process}')
-if health != 'OK' or total != 98304 or used > 8192 or not no_process:
-    raise SystemExit(f'NPU{physical}_IDLE_GATE_BLOCKED: device must be healthy, process-free and HBM <= 8192 MB')
-print(f'NPU{physical}_IDLE_GATE_PASS')
-PY
+    "$VPY" -u "$GATE_DIR/nextgen_v3b_resource_gate.py" \
+      --physical "$PHYSICAL_DEVICE" --log "$OUT/npu_$label.txt"
 }
 echo '===== 3. PHYSICAL DEVICE GATE ====='
 idle_gate before
@@ -210,6 +202,8 @@ assert soc == 'Ascend950DT_9582' and cores['effective_aic'] == 32
 print(f'NPU{physical}_MAPPING_PASS')
 PY
 
+idle_gate after_mapping
+
 echo '===== 4. START ISOLATED CPU SERVICE ====='
 PORT=29009
 "$VPY" - "$PORT" <<'PY'
@@ -218,7 +212,7 @@ with socket.socket() as s:
     s.bind(('127.0.0.1', int(sys.argv[1])))
 print('PORT_FREE')
 PY
-"$CPU_SERVICE" --listen 127.0.0.1 --port "$PORT" --gather-threads 8 --gather-mode active > "$OUT/cpu_service.log" 2>&1 &
+"$CPU_SERVICE" --listen 127.0.0.1 --port "$PORT" --gather-threads 8 --gather-mode active > "$OUT/cpu_service.log" 2>&1 9>&- &
 SERVICE_PID=$!
 printf '%s\n' "$SERVICE_PID" > "$OUT/service.pid"
 "$VPY" - "$SERVICE_PID" "$PORT" <<'PY'
