@@ -78,7 +78,9 @@ def check_jobs(config):
                       ('transport', 'device', 'kvaf_root', 'kvaf_server', 'output', 'timeout_seconds')}
             values = {**defaults, **common, 'mode': 'check', 'operation': 'pipeline',
                       'check_suite': suite, 'check_case': name, 'batches': (batch,),
-                      'miss_percent': miss, 'prefetch_tokens': budget, 'warmup': 0, 'iterations': 1}
+                      'miss_percent': miss, 'prefetch_tokens': budget,
+                      'warmup': getattr(config, 'check_warmup', 0),
+                      'iterations': getattr(config, 'check_iterations', 1)}
             if suite == 'stateful':
                 values.update(history=12288, resident=4096)
             jobs.append((name, SimpleNamespace(**values)))
