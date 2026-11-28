@@ -237,6 +237,17 @@ assert report['history'] == 131072 and report['resident'] == 16384 and report['i
 assert report['stateful_rounds'] == 3, report['stateful_rounds']
 assert report['production_lease_type'] == 'KvafGetLease', report['production_lease_type']
 assert report['parallel_terminal'] is True, report['parallel_terminal']
+assert report['read_accounting'].startswith('completed_row_and_cq_totals')
+assert report['boundary_coverage']['hot-victim-collision_assignments']['former_selected_hot'] > 0
+for phase in ('regular', 'cold-start', 'hot-victim-collision'):
+    assignment = report['boundary_coverage'][phase + '_assignments']
+    assert assignment['assignment_source'] == 'untimed_terminal_diagnostic_before_retirement'
+    assert assignment['read_counts']['total'] == assignment['hot_changes'] + assignment['cold_changes']
+    assert (report_path.parent/(phase + '_terminal_assignments.npz')).is_file()
+    print('TERMINAL_ASSIGNMENT_EVIDENCE', phase, assignment)
+assert report['read_samples']['prototype_with_update']
+for sample in report['read_samples']['prototype_with_update']:
+    assert sample['total'] == sample['prefetch'] + sample['final']
 assert not report['correctness_failures'], report['correctness_failures']
 assert report['resources']['effective_aic'] == 32
 for name in ('native_chain', 'prototype_with_update'):

@@ -1458,6 +1458,70 @@ def actual_reads(mapping, selected, rows, resident):
     return result
 
 
+def terminal_read_counts(rows, posts, statuses, prefetch_cq, *, prefetch_limit):
+    """Parallel terminal retires mapping/changes; completed Row and CQ are authoritative.
+
+    Return only measured request counts. Per-token usefulness cannot be recovered
+    from the normal (non-diagnostic) replay after retirement.
+    """
+    rows, posts, statuses, prefetch_cq = map(np.asarray, (rows, posts, statuses, prefetch_cq))
+    b = len(rows)
+    if rows.shape != (b, 256) or posts.shape != (b, 4, 32) or statuses.shape != (b, 32):
+        raise ValueError("Unexpected terminal counter ABI")
+    if prefetch_cq.ndim != 2 or prefetch_cq.shape[0] != 2*b or prefetch_cq.shape[1] < 4:
+        raise ValueError("Unexpected prefetch CQ ABI")
+    pre = rows[:, 9].astype(np.uint64)
+    epochs = rows[:, 16:48].astype(np.uint64).sum(axis=1)
+    final = posts[:, :, 0].astype(np.uint64).sum(axis=1)
+    # Only even views belong to prefetch; odd views are terminal Q workers.
+    cq = prefetch_cq[::2]
+    good = ((pre == epochs) & (pre <= prefetch_limit) & (cq[:, 0] == 0x4B5641464247444F)
+            & (cq[:, 1] == pre) & (cq[:, 2] == 0)
+            & (final == rows[:, 247]) & (final == statuses[:, 1]))
+    if not good.all():
+        raise RuntimeError("Terminal read counter mismatch: " + str(dict(
+            row=pre.tolist(), epochs=epochs.tolist(), prefetch_cq=cq[:, :4].tolist(),
+            final_posts=final.tolist(), final_row=rows[:, 247].tolist(),
+            final_status=statuses[:, 1].tolist())))
+    p, f = int(pre.sum()), int(final.sum())
+    return dict(prefetch=p, final=f, total=p+f)
+
+
+def terminal_assignment_evidence(sources, destinations, counts, prefetch, journal_counts,
+                                 before_layout, selected, resident):
+    """Use diagnostic snapshots copied before RetireShared, not retired changes."""
+    sources, destinations, counts, prefetch, journal_counts, before_layout, selected = map(
+        np.asarray, (sources, destinations, counts, prefetch, journal_counts, before_layout, selected))
+    b, history = before_layout.shape
+    if (sources.shape != (b, 10240) or destinations.shape != sources.shape
+            or counts.shape != (b,) or prefetch.shape != (b,) or journal_counts.shape != (b,)
+            or selected.shape != (b, 4, 2048)):
+        raise ValueError("Unexpected terminal assignment snapshot ABI")
+    result = dict(hot_changes=0, cold_changes=0, prefetch_hot=0, prefetch_cold=0,
+                  unused_hot=0, unused_cold=0, former_selected_hot=0)
+    for row in range(b):
+        n, p = int(counts[row]), int(prefetch[row])
+        if not 0 <= p <= n <= 10240 or int(journal_counts[row]) != p:
+            raise RuntimeError(f"Assignment/journal counts differ: row={row} total={n} prefetch={p} journal={journal_counts[row]}")
+        src, dst = sources[row, :n], destinations[row, :n]
+        if (np.any(src < 0) or np.any(src >= history) or np.any(dst < 0)
+                or np.any(dst >= resident) or len(np.unique(dst)) != n
+                or len(np.unique(src[:p])) != p):
+            raise RuntimeError(f"Invalid terminal assignment snapshot: row={row}")
+        hot = src < resident
+        demand = np.unique(selected[row])
+        logical = before_layout[row, src]
+        used = np.isin(logical, demand)
+        result["hot_changes"] += int(hot.sum())
+        result["cold_changes"] += int((~hot).sum())
+        result["prefetch_hot"] += int(hot[:p].sum())
+        result["prefetch_cold"] += int((~hot[:p]).sum())
+        result["unused_hot"] += int((hot[:p] & ~used[:p]).sum())
+        result["unused_cold"] += int((~hot[:p] & ~used[:p]).sum())
+        result["former_selected_hot"] += int((hot & used).sum())
+    return result
+
+
 def completion_failures(rows, posts, statuses, prefetch, final):
     """Decode existing device status buffers; no device work or state changes."""
     failures = []

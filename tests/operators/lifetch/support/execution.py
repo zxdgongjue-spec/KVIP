@@ -26,7 +26,8 @@ from typing import Any
 import kvip
 import numpy as np
 from correctness import check_sfa, validate_terminal_receipts
-from diagnostics import actual_reads, collect_core, completion_failures, core_summary, score_rows, selected_bounds
+from diagnostics import (actual_reads, collect_core, completion_failures, core_summary, score_rows, selected_bounds,
+                         terminal_read_counts, terminal_assignment_evidence)
 from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
 from kvip.cache.index_storage import IndexCacheStorage
 from kvip.operators.lifetch.forward import LIFetchForward
@@ -1918,14 +1919,15 @@ def run_urma_case(
             if count_reads and step >= args.warmup and validate:
                 began = time.perf_counter()
                 split_samples.setdefault(timing_name, []).append(state["completion"])
-                read_samples.setdefault(timing_name, []).append(
-                    actual_reads(
-                        rotating.mapping.cpu().numpy(),
-                        topk.cpu().numpy(),
-                        rotating.rows.cpu().numpy().view(np.uint32),
-                        r,
-                    )
-                )
+                # Normal terminal replay deliberately retires mapping and change
+                # records. Its checked Row/CQ counters are the only normal-replay
+                # transport totals; diagnostic snapshots are collected separately.
+                if pipeline.terminal is not None:
+                    reads = state["terminal_read_counts"]
+                else:
+                    reads = actual_reads(rotating.mapping.cpu().numpy(), topk.cpu().numpy(),
+                                         rotating.rows.cpu().numpy().view(np.uint32), r)
+                read_samples.setdefault(timing_name, []).append(reads)
                 costs['reads_s'] += time.perf_counter() - began
         wall_costs[timing_name] = costs
         atomic_json(folder / 'bench_wall_costs.json', wall_costs)
@@ -2069,6 +2071,8 @@ def run_urma_case(
         if pipeline.terminal is not None:
             receipts = owner.core_status.cpu().numpy().view(np.uint64)
             validate_terminal_receipts(posts[:, :, 0], receipts, pipeline.terminal.queue_views)
+            state["terminal_read_counts"] = terminal_read_counts(
+                rows.view(np.uint32), posts, statuses, cq[0], prefetch_limit=args.prefetch_tokens)
         owner.mark_completed(completion_verified=True)
         if updated:
             update.check_capacity()
@@ -2179,9 +2183,23 @@ def run_urma_case(
         if cold_start:
             rotating.hot_valid.zero_()
         before_valid = rotating.hot_valid.cpu().numpy().copy()
-        before_layout = update.logical.cpu().numpy()[:, :r].copy()
-        full()
-        stream.synchronize()
+        before_full_layout = update.logical.cpu().numpy().copy()
+        before_layout = before_full_layout[:, :r]
+        # Existing terminal diagnostic ABI captures src/dst before retirement.
+        # This pass is untimed and does not change the ordinary graph protocol.
+        terminal_diagnostic = pipeline.terminal is not None
+        if terminal_diagnostic:
+            pipeline.events_src.fill_(-1)
+            pipeline.events_dst.fill_(-1)
+            pipeline.terminal.times.zero_()
+            pipeline.set_diagnostics(True)
+        try:
+            full()
+            stream.synchronize()
+        finally:
+            if terminal_diagnostic:
+                pipeline.set_diagnostics(False)
+                stream.synchronize()
         def validate_pipeline():
             verify(True)
             if getattr(args, "mode", None) == "check":
@@ -2218,11 +2236,32 @@ def run_urma_case(
                 allocated_slots=(rotating.change_slots.cpu().numpy() if getattr(pipeline, 'terminal', None) is not None else None),
                 prior_counts=rotating.rows[:, 9].cpu().numpy())
             atomic_json(folder / "boundary_coverage.json", boundary_phases)
-        changes = rotating.changes.cpu().numpy()
         result = dict(transport=state["completion"],
-            first_window_fetches=int(rotating.rows[:, 16].cpu().sum()),
-            hot_changes=int(np.count_nonzero((changes >= 0) & (changes < r))),
-            cold_changes=int(np.count_nonzero(changes >= r)))
+            first_window_fetches=int(rotating.rows[:, 16].cpu().sum()))
+        if terminal_diagnostic:
+            rows = rotating.rows.cpu().numpy().view(np.uint32)
+            posts = rotating.final_posts[:, :, 0].cpu().numpy()
+            counts = rotating.change_count.cpu().numpy().reshape(-1)
+            if not np.array_equal(counts, rows[:, 9].astype(np.uint64) + posts.astype(np.uint64).sum(axis=1)):
+                raise RuntimeError("Terminal change count differs from checked transport totals")
+            src = pipeline.events_src.cpu().numpy()
+            dst = pipeline.events_dst.cpu().numpy()
+            journal_counts = pipeline.terminal.times[:, 0, 30].cpu().numpy()
+            evidence = terminal_assignment_evidence(src, dst, counts, rows[:, 9], journal_counts,
+                                                    before_full_layout, state["ids"], r)
+            result.update(evidence)
+            result["read_counts"] = state["terminal_read_counts"]
+            result["assignment_source"] = "untimed_terminal_diagnostic_before_retirement"
+            boundary_phases[label + "_assignments"] = result
+            np.savez_compressed(folder / (label + "_terminal_assignments.npz"),
+                                sources=src, destinations=dst, counts=counts,
+                                prefetch=rows[:, 9], journal_counts=journal_counts,
+                                before_layout=before_full_layout, selected=state["ids"])
+            atomic_json(folder / "boundary_coverage.json", boundary_phases)
+        else:
+            changes = rotating.changes.cpu().numpy()
+            result.update(hot_changes=int(np.count_nonzero((changes >= 0) & (changes < r))),
+                          cold_changes=int(np.count_nonzero(changes >= r)))
         print(f"CHECK {'PASS' if passed else 'FAIL'} {label}: {json.dumps(result)}; full KV/Index/ownership verified", flush=True)
         return result
 
@@ -2240,8 +2279,10 @@ def run_urma_case(
     restored_hot = hot_case["hot_changes"]
     if not bench_only and not compact and args.prefetch_tokens and args.miss_percent < 100:
         def check_collision_coverage():
-            assert restored_hot, (
-                f"Selected former hot candidates were not repaired: {hot_case}")
+            # A genuine selected-hot repair must be in the pre-retirement
+            # assignment snapshot (not merely any hot source).
+            observed = hot_case["former_selected_hot"] if pipeline.terminal is not None else restored_hot
+            assert observed, f"Selected former hot candidates were not repaired: {hot_case}"
         correctness.check("hot-victim-collision coverage", check_collision_coverage)
 
     if getattr(args, "check_suite", None) == "boundary":
@@ -2435,6 +2476,8 @@ def run_urma_case(
         full_trace=full_trace,
         fetch_only=fetch_only,
         read_samples=read_samples,
+        read_accounting=("completed_row_and_cq_totals; per-token breakdown only in untimed assignment snapshots"
+                         if pipeline.terminal is not None else "legacy_mapping"),
         split_samples=split_samples,
         fused_read_counts=fused_read_counts,
         sampling_protocol=sampling_protocol,
