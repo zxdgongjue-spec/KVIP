@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # NextGen V1: Q4 variable K, independent first-round generic URMA streaming.
-# Usage: CONFIRM_NPU6_IDLE=1 bash this-script URMA_MANIFEST PATCH_EVIDENCE_JSON ORIGINAL_FRAMEWORK_ROOT INIT_EVIDENCE_DIR
+# Usage: NEXTGEN_PHYSICAL_DEVICE=7 CONFIRM_NEXTGEN_NPU_IDLE=1 bash this-script URMA_MANIFEST PATCH_EVIDENCE_JSON ORIGINAL_FRAMEWORK_ROOT INIT_EVIDENCE_DIR
 set -Eeuo pipefail
 umask 077
 [[ $# == 4 ]] || { echo "Usage: $0 URMA_MANIFEST PATCH_EVIDENCE_JSON ORIGINAL_FRAMEWORK_ROOT INIT_EVIDENCE_DIR" >&2; exit 2; }
@@ -8,7 +8,9 @@ MANIFEST=$(realpath "$1")
 PATCH_EVIDENCE=$(realpath "$2")
 ORIGINAL_ROOT=$(realpath "$3")
 INIT_EVIDENCE=$(realpath "$4")
-[[ "${CONFIRM_NPU6_IDLE:-0}" == 1 ]] || { echo 'Confirm physical NPU 6 is healthy, idle and allocated to you first.' >&2; exit 2; }
+PHYSICAL_DEVICE="${NEXTGEN_PHYSICAL_DEVICE:-}"
+[[ "$PHYSICAL_DEVICE" == 6 || "$PHYSICAL_DEVICE" == 7 ]] || { echo 'Select NEXTGEN_PHYSICAL_DEVICE=6 or 7 explicitly.' >&2; exit 2; }
+[[ "${CONFIRM_NEXTGEN_NPU_IDLE:-0}" == 1 ]] || { echo 'Confirm selected physical NPU is healthy, idle and allocated to you first.' >&2; exit 2; }
 source "$MANIFEST"
 WORK=$(dirname "$VENV")
 OUT=$(mktemp -d "$WORK/v1-varlen.XXXXXX")
@@ -28,6 +30,8 @@ cp "$PATCH_EVIDENCE" "$OUT/kvaf_new_files.json"
 printf '%s\n' "$COMMIT" > "$OUT/test_commit.txt"
 sha256sum "$OUT/executed.sh"
 echo "TEST_COMMIT=$COMMIT"
+printf '%s\n' "$PHYSICAL_DEVICE" > "$OUT/physical_device.txt"
+echo "SELECTED_PHYSICAL_DEVICE=$PHYSICAL_DEVICE"
 
 echo '===== 1. FROZEN BUILD GATE ====='
 [[ "$KVIP_SHA" == 79c6a22557ed63a53da687e58f1f5bc1401fd8ed ]]
@@ -36,7 +40,8 @@ echo '===== 1. FROZEN BUILD GATE ====='
 [[ $(git -C "$NEW_KVAF" rev-parse HEAD) == "$KVAF_SHA" ]]
 git -C "$NEW_KVIP" diff --quiet HEAD
 git -C "$REPO" diff --quiet HEAD
-git -C "$REPO" diff --quiet "$KVIP_SHA" "$COMMIT" -- csrc python
+# The independent V2a source does not participate in this frozen V1 build.
+git -C "$REPO" diff --quiet "$KVIP_SHA" "$COMMIT" -- csrc python ':(exclude)csrc/operators/lightning_indexer_with_fetch/experiments/nextgen_v2_score_queue/**'
 [[ $(git -C "$NEW_KVAF" diff --binary HEAD | sha256sum | awk '{print $1}') == 8132c738cb7e7a79fe1dc14f173954cc0110be322e14b25274debed15a8a9052 ]]
 [[ "$SOC" == Ascend950DT_9582 && "$TRANSPORT" == urma ]]
 for item in \
@@ -64,7 +69,7 @@ ps -eo pid,args | grep '[k]vaf_cpu_service.*--port 28999' > "$OUT/old_service_be
 set +u
 source "$CANN/set_env.sh"
 set -Eeuo pipefail
-export USER="${USER:-$(id -un)}" ASCEND_RT_VISIBLE_DEVICES=6 PYTHONNOUSERSITE=1
+export USER="${USER:-$(id -un)}" ASCEND_RT_VISIBLE_DEVICES="$PHYSICAL_DEVICE" PYTHONNOUSERSITE=1
 export PATH="$VENV/bin:$PATH" PYTHON="$VPY"
 export ASCEND_HOME_PATH="$CANN" ASCEND_CANN_PACKAGE_PATH="$CANN" SOC_VERSION="$SOC"
 LIDU_EXT="$NEW_KVIP/csrc/operators/lidu/torch_extension"
@@ -156,34 +161,38 @@ echo 'PREVIOUS_V0_EVIDENCE_PASS'
 idle_gate() {
     local label="$1"
     npu-smi info | tee "$OUT/npu_$label.txt"
-    "$VPY" - "$OUT/npu_$label.txt" <<'PY'
+    "$VPY" - "$OUT/npu_$label.txt" "$PHYSICAL_DEVICE" <<'PY'
 import re, sys
 from pathlib import Path
 data = Path(sys.argv[1]).read_text()
+physical = int(sys.argv[2])
+assert physical in (6, 7)
 rows = data.splitlines()
 matches = []
 for i, row in enumerate(rows[:-1]):
-    if re.match(r'^\|\s*6\s*\|\s*Ascend950DT\s*\|', row):
+    if re.match(rf'^\|\s*{physical}\s*\|\s*Ascend950DT\s*\|', row):
         health = row.split('|')[3].strip()
         hbm = re.search(r'(\d+)\s*/\s*(\d+)\s*\|\s*$', rows[i+1])
         if hbm:
             matches.append((health, int(hbm[1]), int(hbm[2])))
 if len(matches) != 1:
-    raise SystemExit("NPU6_IDLE_GATE_BLOCKED: unrecognized or ambiguous HBM status")
+    raise SystemExit(f"NPU{physical}_IDLE_GATE_BLOCKED: unrecognized or ambiguous HBM status")
 health, used, total = matches[0]
-no_process = bool(re.search(r'^\|\s*No running processes found in NPU 6\s*\|', data, re.M))
-print(f'NPU6_IDLE_GATE health={health} hbm_used_mb={used} hbm_total_mb={total} no_process={no_process}')
+no_process = bool(re.search(rf'^\|\s*No running processes found in NPU {physical}\s*\|', data, re.M))
+print(f'NPU{physical}_IDLE_GATE health={health} hbm_used_mb={used} hbm_total_mb={total} no_process={no_process}')
 if health != 'OK' or total != 98304 or used > 8192 or not no_process:
-    raise SystemExit('NPU6_IDLE_GATE_BLOCKED: device must be healthy, process-free and HBM <= 8192 MB')
-print('NPU6_IDLE_GATE_PASS')
+    raise SystemExit(f'NPU{physical}_IDLE_GATE_BLOCKED: device must be healthy, process-free and HBM <= 8192 MB')
+print(f'NPU{physical}_IDLE_GATE_PASS')
 PY
 }
 echo '===== 3. PHYSICAL DEVICE GATE ====='
 idle_gate before
-"$VPY" - "$CANN" <<'PY'
+"$VPY" - "$CANN" "$PHYSICAL_DEVICE" <<'PY'
 import ctypes, os, sys, torch, torch_npu, acl
 from kvip.runtime.device import query_device_resources
-assert os.environ['ASCEND_RT_VISIBLE_DEVICES'] == '6'
+physical = int(sys.argv[2])
+assert physical in (6, 7)
+assert os.environ['ASCEND_RT_VISIBLE_DEVICES'] == str(physical)
 assert torch.npu.device_count() == 1
 lib = ctypes.CDLL(sys.argv[1] + '/lib64/libascendcl.so')
 f = lib.aclrtGetPhyDevIdByLogicDevId
@@ -192,13 +201,13 @@ f.restype = ctypes.c_int
 p = ctypes.c_int32(-1)
 rc = f(0, ctypes.byref(p))
 print('LOGICAL=0 PHYSICAL=', p.value, 'RC=', rc)
-assert rc == 0 and p.value == 6
+assert rc == 0 and p.value == physical
 torch.npu.set_device(0)
 soc = acl.get_soc_name()
 cores = query_device_resources(sys.argv[1], 0)
 print('SOC=', soc, 'CORE_BUDGET=', cores)
 assert soc == 'Ascend950DT_9582' and cores['effective_aic'] == 32
-print('NPU6_MAPPING_PASS')
+print(f'NPU{physical}_MAPPING_PASS')
 PY
 
 echo '===== 4. START ISOLATED CPU SERVICE ====='
@@ -236,11 +245,21 @@ for _ in range(100):
 raise SystemExit('service listener not ready')
 PY
 
+# Earlier M0-C evidence was on card 6. Verify fresh real Put/Get and lease
+# lifecycle on the selected physical card before the larger worker.
+echo '===== 4B. SELECTED DEVICE REAL TRANSPORT INIT ====='
+idle_gate before_selected_init
+"$VPY" -u "$ENTRY" check --transport urma --device 0 --suite init \
+    --kvaf-root "$NEW_KVAF" --kvaf-server "127.0.0.1:$PORT" \
+    --output "$OUT/selected_init" --timeout-seconds 300 2>&1 | tee "$OUT/selected_init.log"
+check_summary "$OUT/selected_init" init
+echo "SELECTED_DEVICE_INIT_PASS physical=$PHYSICAL_DEVICE"
+
 echo '===== 5. VARIABLE K FIRST-ROUND PROBE (Q4) ====='
 for BS in 4 16; do
     CASE="basic_bs$BS"
     idle_gate "before_$CASE"
-    echo "V1_CASE_START $CASE"
+    echo "V1_CASE_START $CASE physical=$PHYSICAL_DEVICE"
     "$VPY" -u "$ENTRY" check --transport urma --device 0 --suite basic --cases "$CASE" \
         --check-varlen-probe --kvaf-root "$NEW_KVAF" --kvaf-server "127.0.0.1:$PORT" \
         --output "$OUT/$CASE" --timeout-seconds 900 2>&1 | tee "$OUT/$CASE.log"
