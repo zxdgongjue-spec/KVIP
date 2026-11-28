@@ -39,3 +39,26 @@ ascendc_compile_options(parallel_terminal_kernel PRIVATE -DKVIP_PARALLEL_TERMINA
   -DV9_USER_UB_BYTES=223232 -DV9_BATCH_POST=2 -DSIM_Q=4 -DSIM_CAPTURE_HITS=1
   -DV9_SIMULATION=0 -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WORKER=1 -DROTATION_PUBLISH_TILES=1)
 target_link_libraries(v9_bridge PRIVATE parallel_terminal_kernel)
+# NextGen V4-B1 is an opt-in final-publication bridge. The default production
+# build and both existing LI execution paths remain unchanged.
+option(KVIP_ENABLE_NEXTGEN_DYNAMIC "Build the NextGen external-TopK finalizer bridge" OFF)
+if(KVIP_ENABLE_NEXTGEN_DYNAMIC)
+  ascendc_library(nextgen_finalize_kernel STATIC op_kernel/nextgen_finalize.cpp)
+  ascendc_include_directories(nextgen_finalize_kernel PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel
+    ${CMAKE_CURRENT_SOURCE_DIR}/op_kernel/indexer
+    ${KVAF_INCLUDE}
+    ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include)
+  ascendc_compile_options(nextgen_finalize_kernel PRIVATE
+    -DKVIP_STREAMING_LI=1 -DKVIP_OUTPUT_WORKER=1 -DKVIP_FUSE_QUERY_WORK=1
+    -DKVIP_URMA_WINDOW_LI=1 -DV9_UBMEM=0 -DKVIP_ENABLE_NEXTGEN_DYNAMIC=1
+    -O2 -g --cce-auto-sync=off
+    -mllvm -user-reserved-ub-size=223232 -DV9_USER_UB_BYTES=223232
+    -DV9_PARTIAL_SCAN_SIMD=1 -DV9_PROBE_EPOCH=0 -DV9_INTERMEDIATE_PROFILING=0
+    -DV9_BATCH_POST=2 -DSIM_Q=4 -DSIM_CAPTURE_HITS=1 -DV9_SIMULATION=0
+    -DROTATION_PUBLISH_TILES=1)
+  target_sources(v9_bridge PRIVATE op_host/nextgen_launch.cpp)
+  target_compile_definitions(v9_bridge PRIVATE KVIP_ENABLE_NEXTGEN_DYNAMIC=1)
+  target_link_libraries(v9_bridge PRIVATE nextgen_finalize_kernel)
+endif()

@@ -155,6 +155,9 @@ __aicore__ inline uint32_t TerminalQueryRuntime(uint32_t query) {
     __aicore__ inline void SetStreamingWorkspace(GM_ADDR workspace) { streamingWorkspace_ = workspace; }
     __aicore__ inline void EmitFinalClassification(uint32_t query);
     __aicore__ inline void BeginFinalMetadata(uint32_t query);
+#if defined(KVIP_ENABLE_NEXTGEN_DYNAMIC) && KVIP_ENABLE_NEXTGEN_DYNAMIC
+    __aicore__ inline void FinalizeExternalTopK(uint32_t query);
+#endif
 #endif
     __aicore__ inline void ProcessResidentTopK(QLICommon::RunInfo info, uint32_t queryRow = SIM_Q) {
         info.actS2Size = runtimeShape_.resident;
@@ -1001,6 +1004,42 @@ __aicore__ inline void QLIVector<QLIT>::EmitFinalClassification(uint32_t query)
     if(profile){liTicks[7]=GetSystemCycle();liTicks[8]=overlapSecond?1:0;liTicks[9]=streamingTopkOnly_?1:0;
         kvaf_device::CleanCacheLines(reinterpret_cast<__gm__ uint8_t*>(liTicks),128);}
 }
+
+#if defined(KVIP_ENABLE_NEXTGEN_DYNAMIC) && KVIP_ENABLE_NEXTGEN_DYNAMIC
+template <typename QLIT>
+__aicore__ inline void QLIVector<QLIT>::FinalizeExternalTopK(uint32_t query)
+{
+    auto a = reinterpret_cast<__gm__ pipeline_ab::Args*>(streamingWorkspace_);
+    auto errors = a ? reinterpret_cast<__gm__ uint32_t*>(a->queryErrors) : nullptr;
+    if (!a || !errors || !a->queryBitmaps || !streamingTopkOnly_ ||
+        !rotationContext_ || query >= runtimeShape_.batch * SIM_Q ||
+        runtimeShape_.resident != 16384 || topkCount_ != 2048) {
+        if (errors && query < runtimeShape_.batch * SIM_Q) {
+            errors[query * 32] = 1;
+            kvaf_device::CleanCacheLines(
+                reinterpret_cast<__gm__ uint8_t*>(errors + query * 32), 128);
+        }
+        return;
+    }
+
+    // Consume the externally completed Global TopK row. This TopK-only
+    // phase does not wait for native Rotation event 8 or run legacy LI.
+    streamingPrefetched_ = false;
+    taggedLocations_ = false;
+    prefixActive_ = false;
+    BeginFinalMetadata(query);
+
+    // Join metadata and external-index DMA before reusing classification UB.
+    // AllocEventID/FreeEventID are owned by the caller.
+    WaitFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
+    DataCopy(indicesOutLocal_.template ReinterpretCast<int32_t>(),
+             indiceOutGm[uint64_t(query) * topkCount_], topkCount_);
+    SetFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+    WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
+
+    EmitFinalClassification(query);
+}
+#endif
 #endif
 
 template <typename QLIT>
