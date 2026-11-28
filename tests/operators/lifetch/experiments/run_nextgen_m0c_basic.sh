@@ -235,6 +235,8 @@ report = json.loads(report_path.read_text())
 assert report['correctness'] == 'PASS' and report['batch'] == bs
 assert report['history'] == 131072 and report['resident'] == 16384 and report['index_heads'] == 32
 assert report['stateful_rounds'] == 3, report['stateful_rounds']
+assert report['production_lease_type'] == 'KvafGetLease', report['production_lease_type']
+assert report['parallel_terminal'] is True, report['parallel_terminal']
 assert not report['correctness_failures'], report['correctness_failures']
 assert report['resources']['effective_aic'] == 32
 for name in ('native_chain', 'prototype_with_update'):
@@ -249,6 +251,7 @@ assert digest == frozen_digest, (library, digest, frozen_digest)
 record = dict(case=case, batch=bs, summary=str(summaries[0]), report=str(report_path),
               library=str(library), binary_sha256=digest, frozen_sha256=frozen_digest,
               same_binary_as_init=digest == frozen_digest, stateful_rounds=3,
+              production_lease_type=report['production_lease_type'], parallel_terminal=report['parallel_terminal'],
               resources=report['resources'], resource_geometry=report['resource_geometry'],
               final_workers=report['final_workers'], build_options=report['build_options'])
 for prev in out.glob('basic_bs*.evidence.json'):

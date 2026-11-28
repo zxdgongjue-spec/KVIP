@@ -27,7 +27,7 @@ import kvip
 import numpy as np
 from correctness import check_sfa, validate_terminal_receipts
 from diagnostics import actual_reads, collect_core, completion_failures, core_summary, score_rows, selected_bounds
-from kvip.adapters.kvaf import UbmemLease
+from kvip.adapters.kvaf import KvafGetLease, KvafQueueView, UbmemLease
 from kvip.cache.index_storage import IndexCacheStorage
 from kvip.operators.lifetch.forward import LIFetchForward
 from kvip.operators.lifetch.index_update import DirectIndexUpdate, UbmemIndexUpdate
@@ -1159,7 +1159,7 @@ class RealFetchSession:
         self.batch, self.history, self.resident_budget = batch, history, resident
         self.session = None
         self.lease = None
-        self.lease_stream = None
+        self.queue_view = None
         self.in_flight = False
         self.closed = False
         self.keepalive = []
@@ -1247,44 +1247,25 @@ class RealFetchSession:
         )
         torch.npu.synchronize()
 
-    def acquire(self):
+    def acquire(self, library):
+        """Use the production stream lease, not a second raw SDK lease."""
         if self.closed or self.lease is not None or self.in_flight:
             raise ValueError("invalid real-fetch lease transition")
         self.torch.npu.synchronize()
-        self.lease_stream = self.torch.npu.current_stream()
-        # KVAF validates bytes / shape[0] == token_bytes. Keep the convenient
-        # [B, row_slots, bytes] owner layout, but register a zero-copy slot view.
+        stream = self.torch.npu.current_stream(self.device)
         self.leased_output = self.output.reshape(self.geometry["output_tokens"], TOKEN_BYTES)
         if self.leased_output.data_ptr() != self.output.data_ptr():
             raise ValueError("real-fetch lease view must not copy output storage")
-        import kvaf
-
-        runtime = self.session.runtime
-        execution = kvaf.GetExecutionConfig("urma", "aiv", "direct")
-        lease_id = runtime.begin_get_graph(execution, self.leased_output, 1, self.lease_stream)
-        self.lease = {"lease_id": lease_id}
-        self.lease.update(runtime.get_graph_urma_resources(lease_id))
-        self.lease.update(output_address=self.output.data_ptr(), output_bytes=self.geometry["output_bytes"],
-                          token_bytes=runtime.batch_get_token_bytes, tokens_per_block=runtime.batch_get_tokens_per_block)
-        for name in (
-            "device_channel_entity",
-            "device_queue_state",
-            "device_core_status",
-            "output_address",
-            "output_bytes",
-            "worker_count",
-            "jettys_per_core",
-        ):
-            if type(self.lease.get(name)) is not int or self.lease[name] <= 0:
-                raise ValueError(f"invalid lease field: {name}")
-        if (
-            self.lease["output_address"] != self.output.data_ptr()
-            or self.lease["output_bytes"] != self.geometry["output_bytes"]
-            or self.lease.get("token_bytes") != TOKEN_BYTES
-            or self.lease.get("tokens_per_block") != BLOCK_TOKENS
-        ):
+        self.lease = KvafGetLease(self.torch, self.session.runtime, library, self.leased_output, stream)
+        context = self.lease.context
+        if (context["output_bytes"] != self.geometry["output_bytes"]
+                or context["token_bytes"] != TOKEN_BYTES
+                or context["tokens_per_block"] != BLOCK_TOKENS):
             raise ValueError("leased buffer geometry mismatch")
-        return dict(self.lease)
+        self.queue_view = KvafQueueView(self.lease, self.leased_output,
+                                        self.ddr_block_addresses, self.ddr_valid)
+        print("PRODUCTION_LEASE_READY", type(self.lease).__name__,
+              "workers=", context["worker_count"], "jettys=", context["jettys_per_core"], flush=True)
 
     def mark_launched(self, *tensors):
         if self.closed or self.lease is None:
@@ -1294,67 +1275,16 @@ class RealFetchSession:
 
 
     def build_device_args(self, abi_library: Path):
-        """Serialize real header ABI, one independent single-jetty view/AIV.
-
-        The lease has two jettys per AIC worker. Each physical AIV gets exactly
-        one of them and private core status; no locks or shared SQ producer.
-        AIV-to-view indexing must use physical AIV identity, not batch row.
-        """
-        if self.lease is None or self.in_flight:
+        """Delegate argument ABI and queue views to the production adapter."""
+        if self.lease is None or self.queue_view is None or self.in_flight:
             raise ValueError("build args requires an idle live lease")
-        lease = self.lease
-        if lease["jettys_per_core"] != 2:
-            raise ValueError("refactor requires two independent jettys per AIC worker")
-        lib = ctypes.CDLL(str(Path(abi_library).resolve()))
-        sizes = {}
-        for name in ("args", "status", "entity", "queue"):
-            fn = getattr(lib, f"refactor_fetch_{name}_bytes")
-            fn.argtypes, fn.restype = [], ctypes.c_uint32
-            sizes[name] = int(fn())
-            if sizes[name] <= 0:
-                raise ValueError(f"invalid native ABI size: {name}")
-        pack = lib.refactor_fetch_pack_args
-        pack.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint32]
-        pack.restype = ctypes.c_uint32
-        torch = self.torch
-        owners = lease["worker_count"] * 2
-        self.core_status = torch.zeros((owners, sizes["status"]), dtype=torch.uint8, device=self.device)
-        # Not consumed by prepared-WQE submission, but valid storage keeps the
-        # native args complete and available for final descriptor operations.
-        self.descriptor_scratch = torch.zeros((4, QUERIES * TOPK), dtype=torch.int32, device=self.device)
-        stride = QUERIES * TOPK * 4
-        blobs = []
-        for owner in range(owners):
-            values = [
-                self.ddr_block_addresses.data_ptr(),
-                self.ddr_valid.data_ptr(),
-                self.descriptor_scratch.data_ptr(),
-                self.descriptor_scratch.data_ptr() + stride,
-                self.descriptor_scratch.data_ptr() + 2 * stride,
-                self.descriptor_scratch.data_ptr() + 3 * stride,
-                self.output.data_ptr(),
-                self.core_status.data_ptr() + owner * sizes["status"],
-                lease["device_channel_entity"] + owner * sizes["entity"],
-                lease["device_queue_state"] + owner * sizes["queue"],
-                self.batch * self.geometry["blocks_per_row"],
-                QUERIES * TOPK,
-                self.geometry["output_tokens"],
-                TOKEN_BYTES,
-                BLOCK_TOKENS,
-                1,
-                1,
-            ]
-            fields = (ctypes.c_uint64 * len(values))(*values)
-            output = ctypes.create_string_buffer(sizes["args"])
-            result = pack(output, sizes["args"], fields, len(values))
-            if result:
-                raise ValueError(f"native ABI serialization failed: {result}")
-            blobs.extend(output.raw)
-        self.device_args = torch.tensor(blobs, dtype=torch.uint8, device=self.device).reshape(owners, sizes["args"])
-        self.abi_library = lib
-        self.abi_sizes = sizes
-        self.keepalive.extend([self.core_status, self.descriptor_scratch, self.device_args, lib])
-        self.torch.npu.synchronize()
+        # Keep the old fixture's owner interface for numerical checks/diagnostics.
+        self.device_args = self.queue_view.build_device_args(abi_library)
+        self.core_status = self.queue_view.core_status
+        self.abi_sizes = self.queue_view.abi_sizes
+        self.abi_library = self.lease.library
+        self.descriptor_scratch = self.queue_view.descriptors
+        self.keepalive.extend([self.queue_view, self.device_args, self.core_status])
         return self.device_args
 
     def mark_completed(self, *, completion_verified: bool):
@@ -1374,8 +1304,10 @@ class RealFetchSession:
             self.quarantine("real_fetch_release_inflight", "completion not verified")
         if self.lease is not None:
             try:
-                self.torch.npu.synchronize()
-                self.session.runtime.end_get_graph(self.lease["lease_id"], self.lease_stream, discard_result=True)
+                if self.graphs:
+                    raise RuntimeError("reset captured graphs before releasing fused lease")
+                self.lease.close()
+                self.queue_view = None
                 self.lease = None
             except BaseException as error:
                 self.quarantine("real_fetch_release_failed", error)
@@ -1389,14 +1321,14 @@ class RealFetchSession:
         if self.in_flight:
             self.quarantine("real_fetch_close_inflight", "pending communication")
         try:
+            for graph in self.graphs:
+                graph.reset()
+            self.graphs.clear()
+            for resources in self.native_graph_resources.values():
+                resources.close()
+            self.native_graph_resources.clear()
             self.release()
             if self.session is not None:
-                for graph in self.graphs:
-                    graph.reset()
-                self.graphs.clear()
-                for resources in self.native_graph_resources.values():
-                    resources.close()
-                self.native_graph_resources.clear()
                 self.session.close()
                 self.session = None
         except BaseException as error:
@@ -1920,9 +1852,12 @@ def run_urma_case(
         stream.synchronize()
         graph = torch.npu.NPUGraph()
         owner.graphs.append(graph)
-        scope = capture_native_get(owner.session.runtime, capture, call) if native_get else nullcontext()
-        with torch.npu.stream(capture), scope as resources:
-            if resources is not None:
+        with ExitStack() as scopes:
+            if not native_get:
+                scopes.enter_context(owner.lease.capture_scope())
+            scopes.enter_context(torch.npu.stream(capture))
+            if native_get:
+                resources = scopes.enter_context(capture_native_get(owner.session.runtime, capture, call))
                 owner.native_graph_resources[id(graph)] = resources
                 reset()
             with torch.npu.graph(graph, stream=capture):
@@ -2015,7 +1950,7 @@ def run_urma_case(
     native_completion = check_native_completion if compact else None
     measure(native_call, native.reset, native_check, timing_name="native_chain", completion_check=native_completion)
     reference = state["native_topk"].cpu().reshape(b, 4, 2048).numpy()
-    owner.acquire()
+    owner.acquire(build / "libv9_bridge.so")
     rotating = launch_module.LIFetchBinding(
         torch,
         build / "libv9_bridge.so",
@@ -2049,6 +1984,7 @@ def run_urma_case(
         rotating=rotating,
     )
     pipeline = StreamingForward(rotating, update, torch, args.prefetch_tokens, fused_final=True, q_workers=args.q_workers)
+    print("FUSED_TERMINAL_SELECTED", pipeline.terminal is not None, flush=True)
     pipeline.legacy_layout = False
     pipeline.parallel_finalize = True
     pipeline.prepare_metadata = True
@@ -2130,6 +2066,9 @@ def run_urma_case(
         )
         state['fused_read_count'] = dict(prefetch=int(rows[:, 9].astype(np.uint64).sum()),
                                          final=state['completion']['final_reads'])
+        if pipeline.terminal is not None:
+            receipts = owner.core_status.cpu().numpy().view(np.uint64)
+            validate_terminal_receipts(posts[:, :, 0], receipts, pipeline.terminal.queue_views)
         owner.mark_completed(completion_verified=True)
         if updated:
             update.check_capacity()
@@ -2404,8 +2343,9 @@ def run_urma_case(
         stream.synchronize()
         graph = torch.npu.NPUGraph()
         owner.graphs.append(graph)
-        with torch.npu.graph(graph, stream=capture):
-            full()
+        with owner.lease.capture_scope(), torch.npu.stream(capture):
+            with torch.npu.graph(graph, stream=capture):
+                full()
         capture.synchronize()
         for step in range(3):
             next_orders = []
@@ -2500,6 +2440,8 @@ def run_urma_case(
         sampling_protocol=sampling_protocol,
         sfa=sfa,
         stateful_rounds=0 if bench_only else 3,
+        production_lease_type=type(owner.lease).__name__ if owner.lease is not None else "released",
+        parallel_terminal=pipeline.terminal is not None,
         native_misses_per_request=state["native_misses"],
         cache_update=dict(
             swap_capacity_per_request=update.max_swaps,
