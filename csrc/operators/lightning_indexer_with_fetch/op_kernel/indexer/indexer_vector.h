@@ -1038,6 +1038,8 @@ __aicore__ inline void QLIVector<QLIT>::FinalizeExternalTopK(uint32_t query)
     WaitFlag<HardEvent::MTE2_V>(TOPK_MTE2_V_EVENT);
 
     EmitFinalClassification(query);
+    // Match ProcessTopK's event lifecycle: FreeEventID consumes this re-armed token.
+    SetFlag<HardEvent::V_MTE2>(TOPK_V_MTE2_EVENT);
 }
 #endif
 #endif
