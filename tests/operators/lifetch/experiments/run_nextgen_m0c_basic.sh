@@ -35,6 +35,8 @@ echo '===== 1. FROZEN BUILD GATE ====='
 [[ $(git -C "$NEW_KVIP" rev-parse HEAD) == "$KVIP_SHA" ]]
 [[ $(git -C "$NEW_KVAF" rev-parse HEAD) == "$KVAF_SHA" ]]
 git -C "$NEW_KVIP" diff --quiet HEAD
+git -C "$REPO" diff --quiet HEAD
+git -C "$REPO" diff --quiet "$KVIP_SHA" "$COMMIT" -- csrc python
 [[ $(git -C "$NEW_KVAF" diff --binary HEAD | sha256sum | awk '{print $1}') == 8132c738cb7e7a79fe1dc14f173954cc0110be322e14b25274debed15a8a9052 ]]
 [[ "$SOC" == Ascend950DT_9582 && "$TRANSPORT" == urma ]]
 for item in \
@@ -90,7 +92,28 @@ for r in records:
     assert hashlib.sha256((a/r['path']).read_bytes()).hexdigest() == r['sha256']
 print('FROZEN_MODULE_GATE_PASS')
 PY
-ENTRY="$NEW_KVIP/tests/operators/lifetch/test_lifetch.py"
+# Execute the committed validation code, while keeping the built operator tree frozen.
+export KVIP_TEST_OPERATOR_ROOT="$NEW_KVIP"
+ENTRY="$REPO/tests/operators/lifetch/test_lifetch.py"
+echo "TEST_ENTRY=$ENTRY"
+echo "OPERATOR_ROOT=$KVIP_TEST_OPERATOR_ROOT"
+"$VPY" - "$REPO" "$NEW_KVAF" "$CANN" "$NEW_KVIP" <<'PY'
+import sys
+from pathlib import Path
+repo, kvaf, cann, operator = map(lambda x: Path(x).resolve(), sys.argv[1:])
+sys.path.insert(0, str(repo/'tests/operators/lifetch/support'))
+import execution
+from kvip.runtime.build import kvaf_build_paths
+assert Path(execution.__file__).resolve().is_relative_to(repo)
+assert execution.ROOT == operator
+actual_cann, headers = kvaf_build_paths(kvaf/'build-npu')
+assert actual_cann.resolve() == cann
+assert execution.find_headers(kvaf) == headers
+assert headers.resolve() == kvaf/'access_operator/algorithms/get/direct/urma_aiv/include'
+print('TEST_SUPPORT_ORIGIN', execution.__file__)
+print('KVAF_CANN', actual_cann, 'KVAF_HEADERS', headers)
+print('TEST_HEADER_COMPATIBILITY_PASS')
+PY
 check_summary() {
     "$VPY" - "$1" "$2" <<'PY'
 import json, sys
@@ -183,9 +206,7 @@ raise SystemExit('service listener not ready')
 PY
 
 echo '===== 5. BASIC FULL-CHAIN CORRECTNESS ====='
-# The stock check runner uses /usr/local/Ascend/cann, not the canonical
-# CANN path in the init manifest. Confirm they resolve to the same toolkit.
-[[ $(realpath /usr/local/Ascend/cann) == $(realpath "$CANN") ]]
+# Runner options now use the actual CANN path from the KVAF build cache.
 for BS in 1 4 16; do
     CASE="basic_bs$BS"
     echo "CASE_START $CASE"
@@ -224,6 +245,7 @@ library = (worker/'universal-build'/'libv9_bridge.so').resolve()
 assert library.is_file(), library
 digest = hashlib.sha256(library.read_bytes()).hexdigest()
 frozen_digest = hashlib.sha256(frozen.read_bytes()).hexdigest()
+assert digest == frozen_digest, (library, digest, frozen_digest)
 record = dict(case=case, batch=bs, summary=str(summaries[0]), report=str(report_path),
               library=str(library), binary_sha256=digest, frozen_sha256=frozen_digest,
               same_binary_as_init=digest == frozen_digest, stateful_rounds=3,

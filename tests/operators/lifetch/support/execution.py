@@ -40,7 +40,10 @@ from performance import measure_sequence
 from reporting import CorrectnessRecorder, atomic_json, record_case_failure, timing_summary
 from workloads import SOURCE, ReplayPagePlan, ReplaySequence
 
-ROOT = Path(__file__).resolve().parents[4]
+# A validation worktree may exercise an immutable, separately built operator tree.
+ROOT = Path(os.environ.get("KVIP_TEST_OPERATOR_ROOT", Path(__file__).resolve().parents[4])).resolve()
+if not Path(kvip.__file__).resolve().is_relative_to(ROOT / "python"):
+    raise RuntimeError(f"Wrong KVIP operator package: {kvip.__file__}; expected {ROOT / 'python'}")
 
 
 TOKEN_BYTES = 656
@@ -149,11 +152,15 @@ def runner_options(config):
     """Prepare worker-only build and diagnostic settings from public configuration."""
     if config.input != 'synthetic':
         raise ValueError('real inputs require the continuous replay runner')
+    from kvip.runtime.build import kvaf_build_paths
+
+    kvaf_root = Path(config.kvaf_root).resolve()
+    cann, _ = kvaf_build_paths(kvaf_root / 'build-npu')
     values = dict(vars(config))
     values.update(
         batches=','.join(map(str, config.batches)),
-        kvaf_root=Path(config.kvaf_root).resolve(),
-        cann='/usr/local/Ascend/cann', soc=None,
+        kvaf_root=kvaf_root,
+        cann=str(cann), soc=None,
         q_workers=2,
         diagnostic_fetch_only=(config.mode == 'diagnose' and config.level == 3
                                and 'fetch' in config.stages),
@@ -671,10 +678,10 @@ def command(argv, log):
 def find_headers(root):
     if root is None:
         raise ValueError("--kvaf-root is required for the real KVAF backend")
-    path = Path(root) / "access_operator/demo/aiv_batch_get/include"
-    if not (path / "kvaf_batch_get_device.h").is_file():
-        raise ValueError(f"missing KVAF device headers: {path}")
-    return path
+    from kvip.runtime.build import kvaf_build_paths
+
+    _, headers = kvaf_build_paths(Path(root).resolve() / "build-npu")
+    return headers
 
 
 class Registration:
