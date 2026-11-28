@@ -33,7 +33,7 @@ echo "OUTPUT_DIR=$OUT"
 git -C "$REPO" rev-parse HEAD | tee "$OUT/test_commit.txt"
 g++ -std=c++17 -O3 -shared -fPIC -ffp-contract=off "$DIR/b16_mtp_cpp_planner.cpp" -o "$OUT/libplanner.so"
 unset PYTHONOPTIMIZE
-"$VPY" -m py_compile "$DIR/nextgen_v3b_topk_test.py" "$DIR/b16_score_queue_test.py"
+"$VPY" -m py_compile "$DIR/nextgen_v3b_topk_test.py" "$DIR/b16_score_queue_test.py" "$DIR/nextgen_v3b_resource_gate.py"
 "$VPY" -u "$DIR/nextgen_v3b_topk_test.py" --mode host --planner "$OUT/libplanner.so"
 if [[ "$MODE" == host ]]; then echo V3B_HOST_ONLY_PASS; exit 0; fi
 PHYSICAL="${NEXTGEN_PHYSICAL_DEVICE:-}"
@@ -46,27 +46,19 @@ export ASCEND_RT_VISIBLE_DEVICES="$PHYSICAL" DEVICE_ID=0 PYTHONNOUSERSITE=1
 export USER="${USER:-$(id -un)}"
 export PATH="$VENV/bin:$PATH" PYTHON="$VPY"
 echo "SELECTED_PHYSICAL_DEVICE=$PHYSICAL"
+# Local lock serializes this validation entry, not other teams. The
+# operator must still reserve the selected physical device exclusively.
+exec 9>"$(dirname "$VENV")/v3b-npu${PHYSICAL}.lock"
+flock -n 9 || { echo "V3B_VALIDATION_LOCK_BUSY"; exit 2; }
+"$VPY" -u "$DIR/nextgen_v3b_resource_gate.py" --physical "$PHYSICAL" --log "$OUT/initial-npu.log"
+# One process for the entire matrix. No fresh Context between cases.
+# A total timeout still bounds a stuck device launch.
+timeout --signal=TERM --kill-after=30s 6300s "$VPY" -u "$DIR/nextgen_v3b_topk_test.py" \
+    --mode device --planner "$OUT/libplanner.so" --library "$SO" --local "$LOCAL" --merge "$MERGE" --cann "$CANN" \
+    --matrix-out "$OUT" 2>&1 | tee "$OUT/matrix-device.log"
+grep -q '^V3B_SINGLE_WORKER_PASS ' "$OUT/matrix-device.log"
 for CASE in smoke smoke_q2 v05 v07 v08 v09 v10; do
-    npu-smi info | tee "$OUT/$CASE-npu-before.log"
-    "$VPY" - "$OUT/$CASE-npu-before.log" "$PHYSICAL" <<'PY'
-import re,sys
-from pathlib import Path
-t=Path(sys.argv[1]).read_text()
-n=int(sys.argv[2])
-rows=t.splitlines(); matches=[]
-for i,row in enumerate(rows[:-1]):
-    if re.match(rf'^\|\s*{n}\s*\|\s*Ascend950DT\s*\|',row):
-        m=re.search(r'(\d+)\s*/\s*(\d+)\s*\|\s*$',rows[i+1])
-        if m:matches.append((row.split('|')[3].strip(),int(m[1]),int(m[2])))
-idle=bool(re.search(rf'^\|\s*No running processes found in NPU {n}\s*\|',t,re.M))
-if len(matches)!=1 or matches[0][0]!='OK' or matches[0][2]!=98304 or matches[0][1]>8192 or not idle:
-    raise SystemExit(f'NPU{n}_IDLE_GATE_BLOCKED {matches} idle={idle}')
-print(f'NPU{n}_IDLE_GATE_PASS')
-PY
-    timeout --signal=TERM --kill-after=30s 900s "$VPY" -u "$DIR/nextgen_v3b_topk_test.py" \
-        --mode device --planner "$OUT/libplanner.so" --library "$SO" --local "$LOCAL" --merge "$MERGE" --cann "$CANN" \
-        --case "$CASE" --output "$OUT/$CASE.json" 2>&1 | tee "$OUT/$CASE.log"
-    grep -q "^V3B_CASE_PASS $CASE " "$OUT/$CASE.log"
+    grep -q "^V3B_CASE_PASS $CASE " "$OUT/matrix-device.log"
 done
 sha256sum --strict -c "$BUILD/binary-sha256.txt"
 sha256sum --strict -c "$TOPK/binary-sha256.txt"

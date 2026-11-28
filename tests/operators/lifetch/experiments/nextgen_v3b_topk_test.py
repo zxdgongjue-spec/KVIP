@@ -282,12 +282,35 @@ def main():
     p.add_argument("--merge",type=Path)
     p.add_argument("--case",choices=CASES)
     p.add_argument("--output",type=Path)
+    p.add_argument("--matrix-out",type=Path)
     a=p.parse_args();assert __debug__
     if a.mode=="host":
         for name in CASES:geometry(name,a.planner)
         host_oracle()
         print("V3B_HOST_PLAN_PASS",flush=True)
     else:
-        assert a.case and a.output and a.cann and all(x and x.is_file() for x in (a.library,a.local,a.merge))
-        device_run(a,*geometry(a.case,a.planner))
+        assert a.cann and all(x and x.is_file() for x in (a.library,a.local,a.merge))
+        if a.matrix_out is None:
+            assert a.case and a.output
+            device_run(a,*geometry(a.case,a.planner))
+            return
+        assert a.case is None and a.output is None and a.matrix_out.is_dir()
+        import gc
+        from nextgen_v3b_resource_gate import wait_gate
+        physical=int(os.environ["ASCEND_RT_VISIBLE_DEVICES"])
+        print("V3B_SINGLE_WORKER_BEGIN",os.getpid(),"physical",physical,flush=True)
+        for index,case in enumerate(CASES):
+            if index:
+                # Previous device_run returned after graph.reset(); release
+                # unreachable graph/tensor owners before the next fixture.
+                import torch
+                torch.npu.synchronize()
+                gc.collect()
+                torch.npu.empty_cache()
+                torch.npu.synchronize()
+                wait_gate(physical,a.matrix_out/(case+"-npu-before.log"),own_pid=os.getpid())
+            a.case=case;a.output=a.matrix_out/(case+".json")
+            print("V3B_WORKER_CASE_BEGIN",case,"pid",os.getpid(),flush=True)
+            device_run(a,*geometry(case,a.planner))
+        print("V3B_SINGLE_WORKER_PASS",os.getpid(),flush=True)
 if __name__=="__main__":main()
