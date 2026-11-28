@@ -1591,7 +1591,9 @@ def run_urma(args, run_dir):
     f4_replays = int(os.environ.get("NEXTGEN_F4_REPLAYS", "0"))
     assert f4_replays in (0,3) and (not f4_replays or f3_library)
     f5_bs16 = os.environ.get("NEXTGEN_F5_BS16", "0")
-    assert f5_bs16 in ("0","1") and (f5_bs16 == "0" or (f3_library and f4_replays == 3))
+    f5_diag = os.environ.get("NEXTGEN_F5_DIAGNOSTIC", "0")
+    assert f5_diag in ("0","1") and (f5_diag=="0" or (f5_bs16=="1" and f3_library and f4_replays==0))
+    assert f5_bs16 in ("0","1") and (f5_bs16 == "0" or (f3_library and (f4_replays == 3 or f5_diag=="1")))
     f5_bs16 = f5_bs16 == "1"
     if f3_library:
         assert getattr(args, "varlen_probe", False) and args.mode == "check"
@@ -1887,6 +1889,7 @@ def run_urma_case(
     f3_eager = bool(os.environ.get("NEXTGEN_F3_LIBRARY"))
     f4_replays = int(os.environ.get("NEXTGEN_F4_REPLAYS", "0"))
     f5_bs16 = os.environ.get("NEXTGEN_F5_BS16", "0") == "1"
+    f5_diag = os.environ.get("NEXTGEN_F5_DIAGNOSTIC", "0") == "1"
     if f3_eager:
         assert varlen_probe and b == (16 if f5_bs16 else 4)
         assert lengths.tolist() == ([131072]*8+[32768]*8 if f5_bs16 else [32768,65536,98304,131072])
@@ -2184,6 +2187,25 @@ def run_urma_case(
         if (slots < 0).any() or (slots >= (r if persistent else owner.output.shape[1])).any():
             raise RuntimeError("Fetch slot outside cache")
         state["ids"], state["slots"] = (ids, slots.numpy())
+        if f5_diag:
+            from f5_topk_diagnostic import save_snapshot
+            # CQ is checked and owner.mark_completed called above. Preserve evidence
+            # before the original oracle assertion; never bypass that assertion.
+            assert not owner.in_flight and updated and b==16 and not owner.graphs
+            score_raw = arguments[12].cpu().numpy().copy().view("<u2").reshape(-1)
+            events = rotating.events.cpu().numpy().copy()
+            rows_words = rotating.rows.cpu().numpy().copy().view("<u4").reshape(b,256)
+            meta = rotating.incremental.cpu().numpy().copy().view("<u8").reshape(b,4,16)
+            live_meta = None
+            if hasattr(pipeline,"_live_rows"):
+                raw_live = pipeline._live_rows.cpu().numpy().copy().view("u1").reshape(-1)
+                live_meta = raw_live[b*1024:b*1024+b*512].view("<u8").reshape(b,4,16).copy()
+            save_snapshot(folder, lengths, logical_scores[:,physical_order], reference, ids,
+                          selected, update.logical_output.cpu().numpy().reshape(b,4,2048),
+                          score_raw, int(arguments[12].data_ptr()), meta, live_meta,
+                          events, rows_words[:,8:], rotating.progress.cpu().numpy().copy(),
+                          state["completion"],state["fused_read_count"])
+            print("V1_F5_DIAGNOSTIC_SNAPSHOT_SAVED",flush=True)
         if varlen_probe:
             check_visible_topk(ids)
         elif compact:
@@ -2380,7 +2402,7 @@ def run_urma_case(
                       timing=completed_timings, stateful_rounds=0, sfa=None,
                       first_round_verified=len(verified), checks=verified,
                       exact_same_topk=same_topk, native_misses_per_request=state["native_misses"],
-                      scope=("F5 BS16 candidate eager plus three independent graph replays; no timing or stateful claim" if f5_bs16 else "F4 candidate eager plus three independent graph replays; no timing or stateful claim" if f4_replays else "F3 candidate first eager only; no graph or timing claim" if f3_eager else "native BSND sparse_mode=0 and generic fused route; no causal MTP, no stateful visibility or performance claim"))
+                      scope=("F5 diagnostic single eager; no graph or timing claim" if f5_diag else "F5 BS16 candidate eager plus three independent graph replays; no timing or stateful claim" if f5_bs16 else "F4 candidate eager plus three independent graph replays; no timing or stateful claim" if f4_replays else "F3 candidate first eager only; no graph or timing claim" if f3_eager else "native BSND sparse_mode=0 and generic fused route; no causal MTP, no stateful visibility or performance claim"))
         print("V1_FIRST_ROUND_VERIFIED", json.dumps({k:v for k,v in result.items() if k!="timing"}),flush=True)
         return result
 
