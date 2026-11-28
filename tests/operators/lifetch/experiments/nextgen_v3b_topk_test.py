@@ -115,7 +115,7 @@ def host_oracle():
 def device_run(a,h,ks,aq,vis,plans):
     import torch, torch_npu, acl
     physical=int(os.environ["ASCEND_RT_VISIBLE_DEVICES"])
-    assert physical in (6,7) and torch.npu.device_count()==1
+    assert physical in (0,6,7) and torch.npu.device_count()==1
     libacl=ct.CDLL(str(a.cann/"lib64/libascendcl.so"))
     mapping=libacl.aclrtGetPhyDevIdByLogicDevId
     mapping.argtypes=[ct.c_int32,ct.POINTER(ct.c_int32)]

@@ -37,7 +37,7 @@ unset PYTHONOPTIMIZE
 "$VPY" -u "$DIR/nextgen_v3b_topk_test.py" --mode host --planner "$OUT/libplanner.so"
 if [[ "$MODE" == host ]]; then echo V3B_HOST_ONLY_PASS; exit 0; fi
 PHYSICAL="${NEXTGEN_PHYSICAL_DEVICE:-}"
-[[ "$PHYSICAL" == 6 || "$PHYSICAL" == 7 ]]
+[[ "$PHYSICAL" == 0 || "$PHYSICAL" == 6 || "$PHYSICAL" == 7 ]]
 [[ "${CONFIRM_NEXTGEN_NPU_IDLE:-0}" == 1 ]]
 set +u
 source "$CANN/set_env.sh"
