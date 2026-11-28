@@ -1596,6 +1596,8 @@ def run_urma(args, run_dir):
     assert f5_bs16 in ("0","1") and (f5_bs16 == "0" or (f3_library and (f4_replays == 3 or f5_diag=="1")))
     f5_bs16 = f5_bs16 == "1"
     f6_eager = os.environ.get("NEXTGEN_F6_EAGER", "0")
+    f6_graph = os.environ.get("NEXTGEN_F6_GRAPH", "0")
+    assert f6_graph in ("0","1") and (f6_graph=="0" or (f3_library and f5_bs16 and f5_diag=="0" and f4_replays==3 and f6_eager=="0"))
     assert f6_eager in ("0","1") and (f6_eager=="0" or (f3_library and f5_bs16 and f5_diag=="1" and f4_replays==0))
     if f3_library:
         assert getattr(args, "varlen_probe", False) and args.mode == "check"
@@ -1604,9 +1606,9 @@ def run_urma(args, run_dir):
         assert aics == 32
         candidate = Path(f3_library).resolve(strict=True)
         assert candidate.name == "libv9_bridge.so"
-        expected_sha = "cea9c320043a074074808bcb7595edebd0fc1ebbaae1766955d858d8c38b13b4" if f6_eager=="1" else "fc56dc00b505a552cf71356188fc93790e9082cbcf32f7d6e64fab5265c52261"
+        expected_sha = "cea9c320043a074074808bcb7595edebd0fc1ebbaae1766955d858d8c38b13b4" if (f6_eager=="1" or f6_graph=="1") else "fc56dc00b505a552cf71356188fc93790e9082cbcf32f7d6e64fab5265c52261"
         assert hashlib.sha256(candidate.read_bytes()).hexdigest() == expected_sha
-        if f6_eager=="1":
+        if f6_eager=="1" or f6_graph=="1":
             print("V1_F6_CANDIDATE_SHA_PASS", expected_sha, flush=True)
         shared_build.symlink_to(candidate.parent, target_is_directory=True)
         print("V1_F3_CANDIDATE_BOUND", candidate, flush=True)
@@ -1727,7 +1729,7 @@ def run_urma(args, run_dir):
                 owner.close()
         if f3_library:
             assert report["correctness"] == "PASS" and report["first_round_verified"] == 1+f4_replays
-            atomic_json(run_dir/"checks.json",[dict(case="f6_eager" if f6_eager=="1" else "f5_bs16" if f5_bs16 else "f4_graph" if f4_replays else "f3_eager",correctness="PASS",
+            atomic_json(run_dir/"checks.json",[dict(case="f6_graph" if f6_graph=="1" else "f6_eager" if f6_eager=="1" else "f5_bs16" if f5_bs16 else "f4_graph" if f4_replays else "f3_eager",correctness="PASS",
                 detail=("candidate eager plus three independent graph replays" if f4_replays else "candidate eager-only")
                        + f", full payload and index checks, {64 if f5_bs16 else 16} rotation events per sample, lease closed")])
             print("V1_F4_LEASE_CLOSED_PASS" if f4_replays else "V1_F3_LEASE_CLOSED_PASS",flush=True)
@@ -1895,6 +1897,7 @@ def run_urma_case(
     f4_replays = int(os.environ.get("NEXTGEN_F4_REPLAYS", "0"))
     f5_bs16 = os.environ.get("NEXTGEN_F5_BS16", "0") == "1"
     f5_diag = os.environ.get("NEXTGEN_F5_DIAGNOSTIC", "0") == "1"
+    f6_graph = os.environ.get("NEXTGEN_F6_GRAPH", "0") == "1"
     if f3_eager:
         assert varlen_probe and b == (16 if f5_bs16 else 4)
         assert lengths.tolist() == ([131072]*8+[32768]*8 if f5_bs16 else [32768,65536,98304,131072])
@@ -2192,11 +2195,20 @@ def run_urma_case(
         if (slots < 0).any() or (slots >= (r if persistent else owner.output.shape[1])).any():
             raise RuntimeError("Fetch slot outside cache")
         state["ids"], state["slots"] = (ids, slots.numpy())
-        if f5_diag:
+        if f5_diag or f6_graph:
             from f5_topk_diagnostic import save_snapshot
             # CQ is checked and owner.mark_completed called above. Preserve evidence
             # before the original oracle assertion; never bypass that assertion.
-            assert not owner.in_flight and updated and b==16 and not owner.graphs
+            assert not owner.in_flight and updated and b==16
+            snapshot_folder = folder
+            if f6_graph:
+                stem = state["check_phase"]
+                assert stem in ("f3","f4_replay_01","f4_replay_02","f4_replay_03")
+                assert len(owner.graphs)==int(stem!="f3")
+                snapshot_folder=folder/stem
+                snapshot_folder.mkdir(exist_ok=False)
+            else:
+                assert not owner.graphs
             score_raw = arguments[12].cpu().numpy().copy().view("<u2").reshape(-1)
             events = rotating.events.cpu().numpy().copy()
             rows_words = rotating.rows.cpu().numpy().copy().view("<u4").reshape(b,256)
@@ -2205,7 +2217,7 @@ def run_urma_case(
             if hasattr(pipeline,"_live_rows"):
                 raw_live = pipeline._live_rows.cpu().numpy().copy().view("u1").reshape(-1)
                 live_meta = raw_live[b*1024:b*1024+b*512].view("<u8").reshape(b,4,16).copy()
-            save_snapshot(folder, lengths, logical_scores[:,physical_order], reference, ids,
+            save_snapshot(snapshot_folder, lengths, logical_scores[:,physical_order], reference, ids,
                           selected, update.logical_output.cpu().numpy().reshape(b,4,2048),
                           score_raw, int(arguments[12].data_ptr()), meta, live_meta,
                           events, rows_words[:,8:], rotating.progress.cpu().numpy().copy(),
@@ -2407,7 +2419,7 @@ def run_urma_case(
                       timing=completed_timings, stateful_rounds=0, sfa=None,
                       first_round_verified=len(verified), checks=verified,
                       exact_same_topk=same_topk, native_misses_per_request=state["native_misses"],
-                      scope=("F6 single BS16 eager with pre-oracle snapshot; no graph or timing claim" if os.environ.get("NEXTGEN_F6_EAGER")=="1" else "F5 diagnostic single eager; no graph or timing claim" if f5_diag else "F5 BS16 candidate eager plus three independent graph replays; no timing or stateful claim" if f5_bs16 else "F4 candidate eager plus three independent graph replays; no timing or stateful claim" if f4_replays else "F3 candidate first eager only; no graph or timing claim" if f3_eager else "native BSND sparse_mode=0 and generic fused route; no causal MTP, no stateful visibility or performance claim"))
+                      scope=("F6 BS16 eager plus three independent graph replays; pre-oracle snapshots; no timing or stateful claim" if f6_graph else "F6 single BS16 eager with pre-oracle snapshot; no graph or timing claim" if os.environ.get("NEXTGEN_F6_EAGER")=="1" else "F5 diagnostic single eager; no graph or timing claim" if f5_diag else "F5 BS16 candidate eager plus three independent graph replays; no timing or stateful claim" if f5_bs16 else "F4 candidate eager plus three independent graph replays; no timing or stateful claim" if f4_replays else "F3 candidate first eager only; no graph or timing claim" if f3_eager else "native BSND sparse_mode=0 and generic fused route; no causal MTP, no stateful visibility or performance claim"))
         print("V1_FIRST_ROUND_VERIFIED", json.dumps({k:v for k,v in result.items() if k!="timing"}),flush=True)
         return result
 
