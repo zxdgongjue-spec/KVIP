@@ -2045,7 +2045,12 @@ def run_urma_case(
     pipeline.legacy_layout = False
     pipeline.parallel_finalize = True
     pipeline.prepare_metadata = True
-    pipeline.set_diagnostics(False)
+    # Generic StreamingLIFetchForward exposes set_options, while the
+    # test-only StreamingForward subclass also exposes set_diagnostics.
+    # Use the shared API in both paths, after setting the launch options.
+    pipeline.set_options(diagnostics=False)
+    if varlen_probe:
+        print("V1_GENERIC_OPTIONS_READY", flush=True)
     counter_clock_mhz = None
     saved = [arguments[i].clone() for i in (1, 4, 13)]
     update.set_order(initial_orders)

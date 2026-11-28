@@ -151,8 +151,153 @@ grep -Fxq NEXTGEN_V0_REPO_PASS "$V0/run.log"
 grep -Fxq 26a0e198ec501d21f4ae20f3328aab8027c2fa43 "$V0/test_commit.txt"
 echo 'PREVIOUS_V0_EVIDENCE_PASS'
 
+# Require both absence of reported processes and near-idle HBM.
+# Conservative lab threshold, not a hardware limit. Do not reset a device.
+idle_gate() {
+    local label="$1"
+    npu-smi info | tee "$OUT/npu_$label.txt"
+    "$VPY" - "$OUT/npu_$label.txt" <<'PY'
+import re, sys
+from pathlib import Path
+data = Path(sys.argv[1]).read_text()
+rows = data.splitlines()
+matches = []
+for i, row in enumerate(rows[:-1]):
+    if re.match(r'^\|\s*6\s*\|\s*Ascend950DT\s*\|', row):
+        health = row.split('|')[3].strip()
+        hbm = re.search(r'(\d+)\s*/\s*(\d+)\s*\|\s*
+"$VPY" - "$CANN" <<'PY'
+import ctypes, os, sys, torch, torch_npu, acl
+from kvip.runtime.device import query_device_resources
+assert os.environ['ASCEND_RT_VISIBLE_DEVICES'] == '6'
+assert torch.npu.device_count() == 1
+lib = ctypes.CDLL(sys.argv[1] + '/lib64/libascendcl.so')
+f = lib.aclrtGetPhyDevIdByLogicDevId
+f.argtypes = [ctypes.c_int32, ctypes.POINTER(ctypes.c_int32)]
+f.restype = ctypes.c_int
+p = ctypes.c_int32(-1)
+rc = f(0, ctypes.byref(p))
+print('LOGICAL=0 PHYSICAL=', p.value, 'RC=', rc)
+assert rc == 0 and p.value == 6
+torch.npu.set_device(0)
+soc = acl.get_soc_name()
+cores = query_device_resources(sys.argv[1], 0)
+print('SOC=', soc, 'CORE_BUDGET=', cores)
+assert soc == 'Ascend950DT_9582' and cores['effective_aic'] == 32
+print('NPU6_MAPPING_PASS')
+PY
+
+echo '===== 4. START ISOLATED CPU SERVICE ====='
+PORT=29009
+"$VPY" - "$PORT" <<'PY'
+import socket, sys
+with socket.socket() as s:
+    s.bind(('127.0.0.1', int(sys.argv[1])))
+print('PORT_FREE')
+PY
+"$CPU_SERVICE" --listen 127.0.0.1 --port "$PORT" --gather-threads 8 --gather-mode active > "$OUT/cpu_service.log" 2>&1 &
+SERVICE_PID=$!
+printf '%s\n' "$SERVICE_PID" > "$OUT/service.pid"
+"$VPY" - "$SERVICE_PID" "$PORT" <<'PY'
+import os, sys, time
+from pathlib import Path
+pid = int(sys.argv[1])
+addr = f'0100007F:{int(sys.argv[2]):04X}'
+for _ in range(100):
+    os.kill(pid, 0)
+    sockets = set()
+    for fd in Path(f'/proc/{pid}/fd').iterdir():
+        try:
+            link = os.readlink(fd)
+        except FileNotFoundError:
+            continue
+        if link.startswith('socket:['):
+            sockets.add(link[8:-1])
+    for line in Path('/proc/net/tcp').read_text().splitlines()[1:]:
+        fields = line.split()
+        if fields[1] == addr and fields[3] == '0A' and fields[9] in sockets:
+            print('OWNED_LISTENER_PASS', pid, addr)
+            sys.exit(0)
+    time.sleep(.1)
+raise SystemExit('service listener not ready')
+PY
+
+echo '===== 5. VARIABLE K FIRST-ROUND PROBE (Q4) ====='
+for BS in 4 16; do
+    CASE="basic_bs$BS"
+    idle_gate "before_$CASE"
+    echo "V1_CASE_START $CASE"
+    "$VPY" -u "$ENTRY" check --transport urma --device 0 --suite basic --cases "$CASE" \
+        --check-varlen-probe --kvaf-root "$NEW_KVAF" --kvaf-server "127.0.0.1:$PORT" \
+        --output "$OUT/$CASE" --timeout-seconds 900 2>&1 | tee "$OUT/$CASE.log"
+    "$VPY" - "$OUT" "$CASE" "$BS" "$LIFETCH_LIBRARY" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+import numpy as np
+out,case,bs,frozen=Path(sys.argv[1]),sys.argv[2],int(sys.argv[3]),Path(sys.argv[4])
+summaries=list((out/case).glob('*/summary.json'))
+assert len(summaries)==1
+rows=json.loads(summaries[0].read_text())['cases']
+assert len(rows)==1 and rows[0]['correctness']=='PASS' and rows[0]['execution']=='COMPLETED' and rows[0]['accepted'] is True, rows
+worker=summaries[0].parent/'cases'/case
+assert json.loads((worker/'worker-result.json').read_text())['exit_code']==0
+path=Path(rows[0]['report']).resolve()
+assert path.is_relative_to(worker.resolve()) and path.name=='report.json'
+r=json.loads(path.read_text())
+assert r['correctness']=='PASS' and not r['correctness_failures']
+assert r['batch']==bs and r['history']==131072 and r['resident']==16384 and r['index_heads']==32
+expected=[32768,65536,98304,131072] if bs==4 else [131072]*8+[32768]*8
+assert r['actual_k']==expected and r['actual_q']==[4]*bs
+assert r['explicit_generic_streaming'] is True and r['parallel_terminal'] is False
+assert r['production_lease_type']=='KvafGetLease' and r['first_round_verified']==3 and r['stateful_rounds']==0
+assert r['sfa'] is None
+with np.load(path.parent/'v1_topk_evidence.npz') as ev:
+    assert ev['actual_k'].tolist()==expected
+    for name in ('native','fused'):
+        ids=ev[name]
+        assert ids.shape==(bs,4,2048)
+        assert (ids>=0).all() and (ids<np.asarray(expected)[:,None,None]).all()
+lib=(worker/'universal-build'/'libv9_bridge.so').resolve()
+assert hashlib.sha256(lib.read_bytes()).hexdigest()==hashlib.sha256(frozen.read_bytes()).hexdigest()
+(out/(case+'.evidence.json')).write_text(json.dumps(dict(report=str(path),actual_k=expected,
+    binary_sha256=hashlib.sha256(lib.read_bytes()).hexdigest(),scope=r['scope']),indent=2)+'\n')
+print('V1_RAW_PROBE_PASS',case,json.dumps(dict(actual_k=expected,verified=r['first_round_verified'],
+    exact_same_topk=r['exact_same_topk'],checks=r['checks'])))
+PY
+    npu-smi info > "$OUT/npu_after_$CASE.txt"
+done
+# On success stop only the child service; on failure preserve it for diagnosis.
+kill -TERM "$SERVICE_PID"
+wait "$SERVICE_PID" || true
+SERVICE_PID=''
+
+echo '===== 6. FINAL PROTECTION GATE ====='
+snapshot > "$OUT/original_after.txt"
+cmp "$OUT/original_before.txt" "$OUT/original_after.txt"
+ps -eo pid,args | grep '[k]vaf_cpu_service.*--port 28999' > "$OUT/old_service_after.txt"
+cmp "$OUT/old_service_before.txt" "$OUT/old_service_after.txt"
+sha256sum --strict -c <<EOF
+8c0c71a6806f00eb9539fe0bfeaabd6e194a0c252c88999d922f8578131fb2b7  $LIFETCH_LIBRARY
+EOF
+npu-smi info | tee "$OUT/npu_after.txt"
+COMPLETE=1
+echo 'NEXTGEN_V1_GENERIC_FIRST_ROUND_PASS'
+echo "OUTPUT_DIR=$OUT"
+, rows[i+1])
+        if hbm:
+            matches.append((health, int(hbm[1]), int(hbm[2])))
+if len(matches) != 1:
+    raise SystemExit("NPU6_IDLE_GATE_BLOCKED: unrecognized or ambiguous HBM status")
+health, used, total = matches[0]
+no_process = bool(re.search(r'^\|\s*No running processes found in NPU 6\s*\|', data, re.M))
+print(f'NPU6_IDLE_GATE health={health} hbm_used_mb={used} hbm_total_mb={total} no_process={no_process}')
+if health != 'OK' or total != 98304 or used > 8192 or not no_process:
+    raise SystemExit('NPU6_IDLE_GATE_BLOCKED: device must be healthy, process-free and HBM <= 8192 MB')
+print('NPU6_IDLE_GATE_PASS')
+PY
+}
 echo '===== 3. PHYSICAL DEVICE GATE ====='
-npu-smi info | tee "$OUT/npu_before.txt"
+idle_gate before
 "$VPY" - "$CANN" <<'PY'
 import ctypes, os, sys, torch, torch_npu, acl
 from kvip.runtime.device import query_device_resources
