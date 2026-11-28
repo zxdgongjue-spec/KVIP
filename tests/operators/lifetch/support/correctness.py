@@ -80,7 +80,8 @@ def check_jobs(config):
                       'check_suite': suite, 'check_case': name, 'batches': (batch,),
                       'miss_percent': miss, 'prefetch_tokens': budget,
                       'warmup': getattr(config, 'check_warmup', 0),
-                      'iterations': getattr(config, 'check_iterations', 1)}
+                      'iterations': getattr(config, 'check_iterations', 1),
+                      'check_profile_rounds': getattr(config, 'check_profile_rounds', 0)}
             if suite == 'stateful':
                 values.update(history=12288, resident=4096)
             jobs.append((name, SimpleNamespace(**values)))

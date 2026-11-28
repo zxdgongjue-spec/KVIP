@@ -1836,6 +1836,8 @@ def run_urma_case(
     read_samples = {}
     split_samples = {}
     fused_read_counts = []
+    fixed_profile_rounds = getattr(args, 'check_profile_rounds', 0)
+    fixed_profile_results = {}
     sampling_protocol = dict(
         version=2, transport='urma', shared_pool=owner.session.shared_pool is not None,
         warmup=args.warmup, iterations=args.iterations,
@@ -1846,6 +1848,8 @@ def run_urma_case(
         validation='full before sampling and final sample; completion every sample' if compact else 'full every sample',
         ordering='serial timing, fused timing, then diagnostic profiling',
     )
+    if fixed_profile_rounds:
+        sampling_protocol['ordering'] = 'native timing, native profile, fused timing, fused profile; profiles excluded from samples'
     atomic_json(folder / 'sampling_protocol.json', sampling_protocol)
 
     def capture_graph(call, reset, *, native_get=False):
@@ -1894,6 +1898,7 @@ def run_urma_case(
         stream.synchronize()
         check()
         samples = []
+        replay_records = []
         count_reads = timing_name == 'prototype_with_update'
         for step in range(args.warmup + args.iterations):
             reset()
@@ -1904,7 +1909,8 @@ def run_urma_case(
             graph.replay()
             end.record(stream)
             end.synchronize()
-            costs['replay_wait_s'] += time.perf_counter() - began
+            wait_seconds = time.perf_counter() - began
+            costs['replay_wait_s'] += wait_seconds
             if step >= args.warmup:
                 samples.append(start.elapsed_time(end) * 1000)
             validate = completion_check is None or step == args.warmup + args.iterations - 1
@@ -1929,6 +1935,14 @@ def run_urma_case(
                                          rotating.rows.cpu().numpy().view(np.uint32), r)
                 read_samples.setdefault(timing_name, []).append(reads)
                 costs['reads_s'] += time.perf_counter() - began
+            if fixed_profile_rounds and step >= args.warmup:
+                record = dict(sample=step-args.warmup, event_us=samples[-1], host_wait_us=wait_seconds*1e6)
+                if count_reads:
+                    record['reads'] = dict(state['fused_read_count'])
+                    record['completion'] = dict(state['completion'])
+                replay_records.append(record)
+        if fixed_profile_rounds:
+            atomic_json(folder / (timing_name + '_replay_records.json'), replay_records)
         wall_costs[timing_name] = costs
         atomic_json(folder / 'bench_wall_costs.json', wall_costs)
         print(f'BENCH WALL COSTS {timing_name}: {json.dumps(costs)}', flush=True)
@@ -1937,6 +1951,10 @@ def run_urma_case(
             batch=b, miss_percent=args.miss_percent, timing=completed_timings,
             correctness=correctness.status, failures=correctness.failures, token_bytes=TOKEN_BYTES,
             native_misses_per_request=state['native_misses'], fused_read_counts=fused_read_counts))
+        if fixed_profile_rounds and timing_name in ('native_chain', 'prototype_with_update'):
+            from nextgen_profile import capture_fixed_graph
+            fixed_profile_results[timing_name] = capture_fixed_graph(
+                torch, stream, graph, reset, check, fixed_profile_rounds, folder, timing_name)
         if keep_graph:
             return graph
         graph.reset()
@@ -2481,6 +2499,7 @@ def run_urma_case(
         split_samples=split_samples,
         fused_read_counts=fused_read_counts,
         sampling_protocol=sampling_protocol,
+        fixed_profile=fixed_profile_results,
         sfa=sfa,
         stateful_rounds=0 if bench_only else 3,
         production_lease_type=type(owner.lease).__name__ if owner.lease is not None else "released",

@@ -120,6 +120,7 @@ def configuration(argv=None):
             command.add_argument('--snapshot', type=Path)
             command.add_argument('--check-warmup', type=int, default=0)
             command.add_argument('--check-iterations', type=int, default=1)
+            command.add_argument('--check-profile-rounds', type=int, default=0)
         if mode in ('bench', 'diagnose'):
             command.add_argument('--input', choices=('synthetic', 'real'), default='synthetic')
             # None distinguishes absent arguments from explicitly supplied defaults on real input.
@@ -157,9 +158,9 @@ def configuration(argv=None):
             parser.error('unknown check suite')
         if 'real' in args.suite and args.snapshot is None:
             parser.error('suite real requires --snapshot')
-        if args.check_warmup < 0 or args.check_iterations <= 0:
+        if args.check_warmup < 0 or args.check_iterations <= 0 or not 0 <= args.check_profile_rounds <= 20:
             parser.error('invalid check sampling counts')
-        if (args.check_warmup, args.check_iterations) != (0, 1) and (args.suite != ('basic',) or args.transport != 'urma'):
+        if (args.check_warmup, args.check_iterations, args.check_profile_rounds) != (0, 1, 0) and (args.suite != ('basic',) or args.transport != 'urma'):
             parser.error('extended check sampling is supported for URMA basic only')
         if args.suite == ('all',):
             args.suite = CHECK_SUITES if args.snapshot else CHECK_SUITES[:-1]
