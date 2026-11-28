@@ -1588,6 +1588,8 @@ def run_urma(args, run_dir):
     ]
     shared_build = run_dir / "universal-build"
     f3_library = os.environ.get("NEXTGEN_F3_LIBRARY")
+    f4_replays = int(os.environ.get("NEXTGEN_F4_REPLAYS", "0"))
+    assert f4_replays in (0,3) and (not f4_replays or f3_library)
     if f3_library:
         assert getattr(args, "varlen_probe", False) and args.mode == "check"
         assert cases == [(4,131072,16384,32,8)] and args.seed == 43
@@ -1714,10 +1716,11 @@ def run_urma(args, run_dir):
             finally:
                 owner.close()
         if f3_library:
-            assert report["correctness"] == "PASS" and report["first_round_verified"] == 1
-            atomic_json(run_dir/"checks.json",[dict(case="f3_eager",correctness="PASS",
-                detail="candidate eager-only, full payload and index checks, 16 rotation events, lease closed")])
-            print("V1_F3_LEASE_CLOSED_PASS",flush=True)
+            assert report["correctness"] == "PASS" and report["first_round_verified"] == 1+f4_replays
+            atomic_json(run_dir/"checks.json",[dict(case="f4_graph" if f4_replays else "f3_eager",correctness="PASS",
+                detail=("candidate eager plus three independent graph replays" if f4_replays else "candidate eager-only")
+                       + ", full payload and index checks, 16 rotation events per sample, lease closed")])
+            print("V1_F4_LEASE_CLOSED_PASS" if f4_replays else "V1_F3_LEASE_CLOSED_PASS",flush=True)
         times = report["timing"]
         if getattr(args, 'varlen_probe', False):
             line = "V1_GENERIC_PROBE " + json.dumps(dict(batch=batch, actual_k=report['actual_k'],
@@ -1879,6 +1882,7 @@ def run_urma_case(
         state["native_misses"] = counts[:-1]
 
     f3_eager = bool(os.environ.get("NEXTGEN_F3_LIBRARY"))
+    f4_replays = int(os.environ.get("NEXTGEN_F4_REPLAYS", "0"))
     if f3_eager:
         assert varlen_probe and b == 4 and lengths.tolist() == [32768,65536,98304,131072]
     bench_only = getattr(args, "mode", None) == "bench"
@@ -1898,8 +1902,10 @@ def run_urma_case(
         ordering='serial timing, fused timing, then diagnostic profiling',
     )
     if f3_eager:
-        sampling_protocol.update(timed_region="NOT_REQUESTED",ordering="one native eager then one candidate eager",
-                                 warmup=0,iterations=0,validation="full eager")
+        sampling_protocol.update(timed_region="NOT_REQUESTED",
+                                 ordering=("one native eager, one candidate eager, one capture and three independent replays"
+                                           if f4_replays else "one native eager then one candidate eager"),
+                                 warmup=0,iterations=0,validation="full every sample" if f4_replays else "full eager")
     atomic_json(folder / 'sampling_protocol.json', sampling_protocol)
 
     def capture_graph(call, reset, *, native_get=False):
@@ -2279,25 +2285,11 @@ def run_urma_case(
                 for tensor, seed in zip(update.inputs[:3], seeds):
                     assert torch.equal(tensor[row].cpu(), seed[row,logical[row]]), "Index field ownership"
             verified.append(dict(reads=dict(state['fused_read_count']), completion=dict(state['completion'])))
-        if f3_eager:
-            state["check_phase"]="F3 first candidate eager"
-            reset()
-            stream.synchronize()
-            print("V1_F3_EAGER_BEGIN",flush=True)
-            full()
-            stream.synchronize()
-            print("V1_F3_EAGER_SYNC_PASS",flush=True)
-            # Check real completion before any diagnostic assertion can cause
-            # lease teardown. Existing verify marks completed only after CQ checks.
-            # Record the independent candidate check; assert fail-closed before
-            # emitting any success markers. Runtime/CQ exceptions propagate.
-            require_eager_check(correctness, "F3 candidate eager", probe_verify)
-            assert correctness.checked == 2
-            print("V1_F3_EAGER_RECORDER_PASS checked=2",flush=True)
+        def verify_events(stem):
             raw=rotating.events.cpu().numpy().copy().reshape(8,2,128)
             words=raw.view("<u4").reshape(8,2,32)
             rows=rotating.rows.cpu().numpy().view(np.uint32).reshape(4,256)
-            np.savez_compressed(folder/"f3_event_evidence.npz",events=raw,rows=rows)
+            np.savez_compressed(folder/(stem+"_event_evidence.npz"),events=raw,rows=rows)
             records=[]
             for epoch,core in enumerate((0,2,4,6,1,3,5,7)):
                 for lane in range(2):
@@ -2305,7 +2297,7 @@ def run_urma_case(
                     record=dict(epoch=epoch,lane=lane,core=int(w[4]),event_epoch=int(w[5]),
                                 complete=int(w[6]),skipped=int(w[7]))
                     records.append(record)
-            atomic_json(folder/"f3_event_evidence.json",records)
+            atomic_json(folder/(stem+"_event_evidence.json"),records)
             for rec in records:
                 epoch=rec["epoch"]
                 assert rec["core"]==(0,2,4,6,1,3,5,7)[epoch] and rec["event_epoch"]==epoch,rec
@@ -2313,12 +2305,51 @@ def run_urma_case(
             for epoch in (4,5,6):
                 assert not rows[:,16+epoch].any(),("skipped epoch has row admissions",epoch)
                 assert not rows[:,214+epoch].any(),("skipped epoch has row service order",epoch)
-            assert not owner.graphs, "F3 must not capture any graph"
-            print("V1_F3_EVENT_CLOSURE_PASS records=16 skipped=6",flush=True)
-            print("V1_F3_PAYLOAD_INDEX_CQ_PASS",flush=True)
+        if f3_eager:
+            graph = None
+            for sample in range(1+f4_replays):
+                stem = "f3" if sample == 0 else f"f4_replay_{sample:02d}"
+                state["check_phase"] = stem
+                if sample == 0:
+                    reset()
+                    stream.synchronize()
+                    print("V1_F3_EAGER_BEGIN",flush=True)
+                    full()
+                    stream.synchronize()
+                    print("V1_F3_EAGER_SYNC_PASS",flush=True)
+                elif sample == 1:
+                    print("V1_F4_CAPTURE_BEGIN",flush=True)
+                    graph = capture_graph(full, reset)
+                    print("V1_F4_CAPTURE_PASS",flush=True)
+                    # Same first-replay protocol as the established measure().
+                    graph.replay()
+                    stream.synchronize()
+                else:
+                    reset()
+                    stream.synchronize()
+                    graph.replay()
+                    stream.synchronize()
+                require_eager_check(correctness, "F3 candidate eager", probe_verify)
+                assert correctness.checked == sample+2
+                verify_events(stem)
+                if sample == 0:
+                    assert not owner.graphs
+                    print("V1_F3_EAGER_RECORDER_PASS checked=2",flush=True)
+                    print("V1_F3_EVENT_CLOSURE_PASS records=16 skipped=6",flush=True)
+                    print("V1_F3_PAYLOAD_INDEX_CQ_PASS",flush=True)
+                if f4_replays:
+                    # F3 demonstrated exact membership for this fixed fixture.
+                    assert np.array_equal(np.sort(state["ids"],axis=-1),np.sort(reference,axis=-1)),stem
+                    np.savez_compressed(folder/(stem+"_topk.npz"),native=reference,fused=state["ids"])
+                    print("V1_F4_SAMPLE_PASS",stem,"checked="+str(correctness.checked),flush=True)
+            if graph is not None:
+                graph.reset()
+                owner.graphs.remove(graph)
+                assert not owner.in_flight and not owner.graphs
+                print("V1_F4_GRAPH_RESET_PASS",flush=True)
         else:
             measure(full, reset, probe_verify, timing_name="prototype_with_update")
-        expected_checks=1 if f3_eager else args.iterations+args.warmup+2
+        expected_checks=1+f4_replays if f3_eager else args.iterations+args.warmup+2
         assert correctness.status == "PASS" and len(verified) == expected_checks, correctness.failures
         ids = state['ids']
         same_topk = bool(np.array_equal(np.sort(ids,axis=-1),np.sort(reference,axis=-1)))
@@ -2331,7 +2362,7 @@ def run_urma_case(
                       timing=completed_timings, stateful_rounds=0, sfa=None,
                       first_round_verified=len(verified), checks=verified,
                       exact_same_topk=same_topk, native_misses_per_request=state["native_misses"],
-                      scope=("F3 candidate first eager only; no graph or timing claim" if f3_eager else "native BSND sparse_mode=0 and generic fused route; no causal MTP, no stateful visibility or performance claim"))
+                      scope=("F4 candidate eager plus three independent graph replays; no timing or stateful claim" if f4_replays else "F3 candidate first eager only; no graph or timing claim" if f3_eager else "native BSND sparse_mode=0 and generic fused route; no causal MTP, no stateful visibility or performance claim"))
         print("V1_FIRST_ROUND_VERIFIED", json.dumps({k:v for k,v in result.items() if k!="timing"}),flush=True)
         return result
 
